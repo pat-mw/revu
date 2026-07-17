@@ -13,6 +13,7 @@ import { qk, usePullItem, useSnapshot, useSyncPull } from '@/state/queries'
 import { makePendingComment, useDraft, useDraftActions } from '@/state/drafts'
 import { useThreads } from '@/state/threads'
 import { useFileViewed, useSetFileViewed } from '@/state/viewed'
+import { usePreferences, useSetPreferences } from '@/state/preferences'
 import { FilesViewProvider } from '@/state/files-view'
 import type { FilesViewApi, JumpTarget } from '@/state/files-view'
 
@@ -43,8 +44,6 @@ import { cn } from '@/lib/cn'
  * local snapshot; the only network moment on this screen is the explicit sync
  * (first sync from the empty state, retry from the partial banner).
  */
-
-const MODE_STORAGE_KEY = 'revu:files:mode'
 
 /** Stable empties so "no data yet" never churns the flat-row memo. */
 const EMPTY_VIEWED: FileViewedState = {}
@@ -254,21 +253,20 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
   const [searchParams, setSearchParams] = useSearchParams()
 
   // ——— view state ———
-  const [mode, setModeState] = useState<DiffMode>(() => {
-    try {
-      return sessionStorage.getItem(MODE_STORAGE_KEY) === 'split' ? 'split' : 'unified'
-    } catch {
-      return 'unified'
-    }
-  })
-  const setMode = useCallback((m: DiffMode) => {
-    setModeState(m)
-    try {
-      sessionStorage.setItem(MODE_STORAGE_KEY, m)
-    } catch {
-      // Storage can be unavailable (private windows); the toggle still works.
-    }
-  }, [])
+  // The diff layout is a per-human preference persisted behind the adapter, so
+  // it survives a reload and a workspace rebuild. Until the query resolves it
+  // reads as the default; a toggle writes through the store optimistically.
+  const setPreferences = useSetPreferences()
+  const setPreferencesMutate = setPreferences.mutate
+  const mode: DiffMode = usePreferences().data?.diffMode ?? 'unified'
+  const setMode = useCallback(
+    (m: DiffMode) => {
+      if (m !== mode) setPreferencesMutate({ diffMode: m })
+    },
+    // `mutate` is stable across renders; depending on it (not the whole mutation
+    // object, which churns with mutation state) keeps this memo from recreating.
+    [mode, setPreferencesMutate],
+  )
 
   const [treeOpen, setTreeOpen] = useState<boolean>(
     () => !window.matchMedia('(max-width: 1100px)').matches,

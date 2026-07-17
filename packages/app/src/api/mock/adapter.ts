@@ -1,4 +1,4 @@
-import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, IssueComment, PendingComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
+import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, PendingComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
 import { ApiError, prefixBody, classifyAnchor } from '@revu/shared'
 import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
@@ -694,6 +694,19 @@ export function createMockApi(): RevuApi {
       viewedState[path] = { viewed, blobSha, at: nowISO() }
       store.setViewed(humanId, prNumber, viewedState)
       return viewedState
+    },
+
+    async getPreferences(): Promise<HumanPreferences> {
+      // Broker-side per-human state, cached locally — a local read that never
+      // fails, so preferences survive offline exactly like drafts and viewed.
+      await localDelay()
+      return store.getPreferences(currentHuman().id)
+    },
+
+    async setPreferences(patch: Partial<HumanPreferences>): Promise<HumanPreferences> {
+      await delay('write')
+      failWrites('The broker did not answer — your preference was not saved.')
+      return store.setPreferences(currentHuman().id, patch)
     },
 
     async getRateLimit(): Promise<RateLimitInfo> {

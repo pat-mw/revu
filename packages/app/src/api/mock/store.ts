@@ -1,4 +1,5 @@
-import type { FileBlob, FileViewedState, IssueComment, RateLimitInfo, ReactionKey, ReactionRollup, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Snapshot } from '@revu/shared'
+import type { FileBlob, FileViewedState, HumanPreferences, IssueComment, RateLimitInfo, ReactionKey, ReactionRollup, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Snapshot } from '@revu/shared'
+import { DEFAULT_PREFERENCES } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import type { DevState } from './devtools'
@@ -20,14 +21,16 @@ import type { DevState } from './devtools'
  *   shared rate bucket.
  *
  * Everything lives under ONE localStorage key as one JSON document,
- * persisted with a ~1s debounce and flushed when the tab is hidden. A
- * missing, corrupt, or version-mismatched document reseeds cleanly from
- * fixtures. Every boundary deep-clones: nothing returned to callers aliases
- * internal state, and nothing stored aliases caller-owned objects.
+ * persisted with a ~1s debounce and flushed when the tab is hidden. A missing
+ * or corrupt document reseeds cleanly from fixtures; a structurally sound
+ * document from an older version is MIGRATED in place (never reseeded), so a
+ * version bump never discards drafts or any local work. Every boundary
+ * deep-clones: nothing returned to callers aliases internal state, and nothing
+ * stored aliases caller-owned objects.
  */
 
 const STORAGE_KEY = 'revu.broker.v1'
-const STORE_VERSION = 1
+const STORE_VERSION = 2
 const RATE_LIMIT = 5000
 const HOUR_MS = 3_600_000
 /** New comment/review ids start well above any id a fixture author would use. */
@@ -70,6 +73,8 @@ interface StoreShape {
   drafts: Record<string, Record<number, ReviewDraft>>
   /** humanId → prNumber → per-file viewed state. */
   viewed: Record<string, Record<number, FileViewedState>>
+  /** humanId → per-human workspace preferences (not scoped to any PR). */
+  preferences: Record<string, HumanPreferences>
   snapshots: Record<number, Snapshot>
   /** Content-addressed: git blob SHA → blob. Only sync ever adds remote content. */
   blobs: Record<string, FileBlob>
@@ -146,6 +151,7 @@ function seed(): StoreShape {
     },
     drafts,
     viewed,
+    preferences: {},
     snapshots,
     blobs,
     remoteMut: {},
@@ -158,16 +164,32 @@ function seed(): StoreShape {
   }
 }
 
+/**
+ * Load the persisted document, MIGRATING it in place rather than reseeding when
+ * an older-but-valid version is found. Drafts, viewed state, and every overlay
+ * are irreplaceable local work — "drafts survive everything" — so a version bump
+ * must never discard a structurally sound document; it upgrades it and keeps all
+ * of it. Only a genuinely missing, corrupt (a core field absent or wrong-typed),
+ * or unknown-version (future, or not a number in [1, current]) document falls
+ * through to a full reseed from fixtures.
+ *
+ * When adding a new field in a future version, bump `STORE_VERSION` and add a
+ * migration step below (default the field, then stamp the new version) — DO NOT
+ * add the field to the corruption check above, or upgrading an old document
+ * would wipe it. Migrate, never reseed, for additive changes.
+ */
 function load(): StoreShape {
   if (typeof localStorage === 'undefined') return seed()
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return seed()
     const parsed = JSON.parse(raw) as Partial<StoreShape> | null
+    // Fields present since the first version: their absence means the document
+    // is genuinely corrupt (not merely old), so reseeding is correct.
     if (
       !parsed ||
       typeof parsed !== 'object' ||
-      parsed.v !== STORE_VERSION ||
+      typeof parsed.v !== 'number' ||
       !parsed.dev ||
       !parsed.drafts ||
       !parsed.viewed ||
@@ -180,6 +202,15 @@ function load(): StoreShape {
     ) {
       return seed()
     }
+    // An unknown version — a future document this build can't reason about, or a
+    // nonsense value — is not safe to migrate blindly, so reseed.
+    if (parsed.v < 1 || parsed.v > STORE_VERSION) return seed()
+
+    // Migrations, oldest → newest. v1 documents predate per-human preferences;
+    // default the field so the whole document loads intact instead of reseeding.
+    if (parsed.preferences === undefined) parsed.preferences = {}
+
+    parsed.v = STORE_VERSION
     return parsed as StoreShape
   } catch {
     return seed()
@@ -422,6 +453,20 @@ export const store = {
   setViewed(humanId: string, prNumber: number, s: FileViewedState): void {
     ;(state.viewed[humanId] ??= {})[prNumber] = clone(s)
     schedulePersist()
+  },
+
+  // ——— per-human workspace preferences ———
+
+  getPreferences(humanId: string): HumanPreferences {
+    return { ...DEFAULT_PREFERENCES, ...state.preferences[humanId] }
+  },
+
+  /** Merge a partial patch over the stored set; returns the full updated set. */
+  setPreferences(humanId: string, patch: Partial<HumanPreferences>): HumanPreferences {
+    const next = { ...DEFAULT_PREFERENCES, ...state.preferences[humanId], ...patch }
+    state.preferences[humanId] = next
+    schedulePersist()
+    return { ...next }
   },
 
   // ——— sync attempt tracking ———

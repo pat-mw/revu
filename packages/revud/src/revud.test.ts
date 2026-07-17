@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Subprocess } from 'bun'
 import type {
+  FileViewedState,
   PullListResponse,
   ReviewDraft,
   Session,
@@ -317,6 +318,22 @@ describe('writes + error envelope', () => {
     expect(rollup.total_count).toBeGreaterThan(0)
   })
 
+  test('a preferences PUT persists and the GET reads it back', async () => {
+    const put = await api('/api/preferences', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ diffMode: 'split' }),
+    })
+    expect(put.status).toBe(200)
+    const saved = await json<{ diffMode: string }>(put)
+    expect(saved.diffMode).toBe('split')
+
+    const get = await api('/api/preferences')
+    expect(get.status).toBe(200)
+    const read = await json<{ diffMode: string }>(get)
+    expect(read.diffMode).toBe('split')
+  })
+
   test('failureMode maps a thrown ApiError to its envelope status', async () => {
     // Force remote reads to fail, then hit a remote read (getRateLimit). The
     // adapter throws broker_unreachable → HTTP 502 with a { code, message } body.
@@ -502,5 +519,104 @@ describe('durability: a saved draft survives a restart', () => {
     expect(loaded).not.toBeNull()
     expect(loaded?.body).toContain('must survive a restart')
     expect(loaded?.headSha).toBe('draft-head-sha')
+  })
+})
+
+describe('cross-version durability: an older document is migrated, not wiped', () => {
+  // The same-version restart above proves a draft survives a restart on THIS
+  // build. It cannot catch the upgrade case: an on-disk document written by an
+  // EARLIER build (before per-human preferences existed) has a lower store
+  // version and no `preferences` field. If load() treated that as corruption it
+  // would reseed from fixtures and flush the reseed over the file — permanently
+  // wiping every draft, viewed entry, and overlay. This test writes exactly such
+  // an older document (a draft + viewed entry that are NOT in the fixtures) and
+  // asserts both survive the boot intact.
+  let migDir: string
+  let migDaemon: Daemon
+
+  afterAll(async () => {
+    if (migDaemon) await stopDaemon(migDaemon)
+    if (migDir) rmSync(migDir, { recursive: true, force: true })
+  })
+
+  test('a pre-preferences (v1) document keeps its draft and viewed state on boot', async () => {
+    migDir = mkdtempSync(join(tmpdir(), 'revud-mig-'))
+
+    // A NON-fixture draft under PR 204 (no fixture seeds a draft there) with a
+    // distinctive body: a reseed produces zero drafts for 204, so its presence
+    // afterward proves the document was migrated rather than reseeded.
+    const draft: ReviewDraft = {
+      humanId: 'h-priya',
+      prNumber: 204,
+      headSha: 'legacy-head-sha',
+      compareKey: 'base...legacy-head-sha',
+      body: 'Legacy draft written before preferences existed — must survive the upgrade.',
+      event: 'COMMENT',
+      comments: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+    const viewed: FileViewedState = {
+      'src/legacy.ts': { viewed: true, blobSha: 'legacy-blob-sha', at: new Date().toISOString() },
+    }
+
+    // The shape a PRE-preferences build persisted: version 1, and crucially NO
+    // `preferences` key. Everything else is a structurally sound document. The
+    // `dev.humanId` selects which human the daemon's session reads back as, so
+    // it must match the draft/viewed owner.
+    const legacyDoc = {
+      v: 1,
+      dev: { humanId: 'h-priya', latency: 'zero', failureMode: 'none' },
+      drafts: { 'h-priya': { '204': draft } },
+      viewed: { 'h-priya': { '204': viewed } },
+      snapshots: {},
+      blobs: {},
+      remoteMut: {},
+      syncAttempts: {},
+      rate: { remaining: 5000, reset: new Date(Date.now() + 3_600_000).toISOString() },
+      counter: 0,
+    }
+
+    mkdirSync(migDir, { recursive: true })
+    const docPath = join(migDir, 'revu.broker.v1.json')
+    writeFileSync(docPath, JSON.stringify(legacyDoc), 'utf8')
+
+    // Boot the daemon against the data dir that already holds the v1 document.
+    migDaemon = await startDaemon(migDir, distDir)
+
+    // The draft must still be there — migration, not reseed.
+    const draftRes = await fetch(`${migDaemon.base}/api/pulls/204/draft`)
+    expect(draftRes.status).toBe(200)
+    const loadedDraft = await json<ReviewDraft | null>(draftRes)
+    expect(loadedDraft).not.toBeNull()
+    expect(loadedDraft?.body).toContain('must survive the upgrade')
+    expect(loadedDraft?.headSha).toBe('legacy-head-sha')
+
+    // The viewed entry must still be there too.
+    const viewedRes = await fetch(`${migDaemon.base}/api/pulls/204/viewed`)
+    expect(viewedRes.status).toBe(200)
+    const loadedViewed = await json<FileViewedState>(viewedRes)
+    expect(loadedViewed['src/legacy.ts']?.viewed).toBe(true)
+    expect(loadedViewed['src/legacy.ts']?.blobSha).toBe('legacy-blob-sha')
+
+    // The migration stamps the current version and defaults the new field. The
+    // daemon writes on any mutation; force a flush by saving the preference,
+    // then confirm the on-disk document upgraded and STILL holds the draft.
+    const put = await fetch(`${migDaemon.base}/api/preferences`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ diffMode: 'split' }),
+    })
+    expect(put.status).toBe(200)
+    await put.body?.cancel()
+
+    const onDisk = JSON.parse(readFileSync(docPath, 'utf8')) as {
+      v: number
+      preferences: Record<string, { diffMode: string }>
+      drafts: Record<string, Record<string, ReviewDraft>>
+    }
+    expect(onDisk.v).toBeGreaterThan(1)
+    expect(onDisk.preferences['h-priya']?.diffMode).toBe('split')
+    expect(onDisk.drafts['h-priya']?.['204']?.body).toContain('must survive the upgrade')
   })
 })

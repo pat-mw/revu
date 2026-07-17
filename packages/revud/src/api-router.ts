@@ -9,6 +9,7 @@ import {
   validateReplyBody,
   validateResolveBody,
   validateReviewDraft,
+  validateSetPreferencesBody,
   validateSetViewedBody,
   validateSubmitReviewInput,
 } from '@revu/shared'
@@ -304,6 +305,16 @@ export async function handleApi(req: Request, mock: MockBundle): Promise<Respons
         const state = await api.setFileViewed(n, body.path, body.viewed, body.blobSha)
         store.flush()
         return json(state)
+      }
+
+      case 'getPreferences':
+        return json(await api.getPreferences())
+
+      case 'setPreferences': {
+        const patch = validateSetPreferencesBody(await readJsonBody(req))
+        const prefs = await api.setPreferences(patch)
+        store.flush()
+        return json(prefs)
       }
 
       case 'getRateLimit':
