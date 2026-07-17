@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api'
 import type { Human, Session } from '@revu/shared'
 import { ErrorState } from '@/components/ui/error-state'
+import { qk } from './queries'
 
 /**
  * Dispatched on `window` by the dev panel whenever identity, latency, or
@@ -35,6 +36,16 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const load = useCallback(async () => {
     const gen = ++generation.current
     setError(null)
+    // Warm the per-human diff-layout preference alongside the session so the
+    // Files tab renders in the stored layout on first paint — without it, a
+    // split-preference user sees a unified→split re-layout while the query
+    // resolves. Prefetch (not blocking): the session gate is what actually
+    // holds children back, and the preference has the same lifetime as it.
+    void queryClient.prefetchQuery({
+      queryKey: qk.preferences,
+      queryFn: () => api.getPreferences(),
+      staleTime: Infinity,
+    })
     try {
       const next = await api.getSession()
       if (gen === generation.current) setSession(next)
@@ -43,7 +54,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setSession(null)
       setError(e instanceof Error ? e.message : 'The broker did not respond.')
     }
-  }, [])
+  }, [queryClient])
 
   useEffect(() => {
     void load()

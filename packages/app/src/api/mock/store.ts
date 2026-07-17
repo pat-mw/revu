@@ -21,10 +21,12 @@ import type { DevState } from './devtools'
  *   shared rate bucket.
  *
  * Everything lives under ONE localStorage key as one JSON document,
- * persisted with a ~1s debounce and flushed when the tab is hidden. A
- * missing, corrupt, or version-mismatched document reseeds cleanly from
- * fixtures. Every boundary deep-clones: nothing returned to callers aliases
- * internal state, and nothing stored aliases caller-owned objects.
+ * persisted with a ~1s debounce and flushed when the tab is hidden. A missing
+ * or corrupt document reseeds cleanly from fixtures; a structurally sound
+ * document from an older version is MIGRATED in place (never reseeded), so a
+ * version bump never discards drafts or any local work. Every boundary
+ * deep-clones: nothing returned to callers aliases internal state, and nothing
+ * stored aliases caller-owned objects.
  */
 
 const STORAGE_KEY = 'revu.broker.v1'
@@ -162,20 +164,35 @@ function seed(): StoreShape {
   }
 }
 
+/**
+ * Load the persisted document, MIGRATING it in place rather than reseeding when
+ * an older-but-valid version is found. Drafts, viewed state, and every overlay
+ * are irreplaceable local work — "drafts survive everything" — so a version bump
+ * must never discard a structurally sound document; it upgrades it and keeps all
+ * of it. Only a genuinely missing, corrupt (a core field absent or wrong-typed),
+ * or unknown-version (future, or not a number in [1, current]) document falls
+ * through to a full reseed from fixtures.
+ *
+ * When adding a new field in a future version, bump `STORE_VERSION` and add a
+ * migration step below (default the field, then stamp the new version) — DO NOT
+ * add the field to the corruption check above, or upgrading an old document
+ * would wipe it. Migrate, never reseed, for additive changes.
+ */
 function load(): StoreShape {
   if (typeof localStorage === 'undefined') return seed()
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return seed()
     const parsed = JSON.parse(raw) as Partial<StoreShape> | null
+    // Fields present since the first version: their absence means the document
+    // is genuinely corrupt (not merely old), so reseeding is correct.
     if (
       !parsed ||
       typeof parsed !== 'object' ||
-      parsed.v !== STORE_VERSION ||
+      typeof parsed.v !== 'number' ||
       !parsed.dev ||
       !parsed.drafts ||
       !parsed.viewed ||
-      !parsed.preferences ||
       !parsed.snapshots ||
       !parsed.blobs ||
       !parsed.remoteMut ||
@@ -185,6 +202,15 @@ function load(): StoreShape {
     ) {
       return seed()
     }
+    // An unknown version — a future document this build can't reason about, or a
+    // nonsense value — is not safe to migrate blindly, so reseed.
+    if (parsed.v < 1 || parsed.v > STORE_VERSION) return seed()
+
+    // Migrations, oldest → newest. v1 documents predate per-human preferences;
+    // default the field so the whole document loads intact instead of reseeding.
+    if (parsed.preferences === undefined) parsed.preferences = {}
+
+    parsed.v = STORE_VERSION
     return parsed as StoreShape
   } catch {
     return seed()

@@ -257,12 +257,15 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
   // it survives a reload and a workspace rebuild. Until the query resolves it
   // reads as the default; a toggle writes through the store optimistically.
   const setPreferences = useSetPreferences()
+  const setPreferencesMutate = setPreferences.mutate
   const mode: DiffMode = usePreferences().data?.diffMode ?? 'unified'
   const setMode = useCallback(
     (m: DiffMode) => {
-      if (m !== mode) setPreferences.mutate({ diffMode: m })
+      if (m !== mode) setPreferencesMutate({ diffMode: m })
     },
-    [mode, setPreferences],
+    // `mutate` is stable across renders; depending on it (not the whole mutation
+    // object, which churns with mutation state) keeps this memo from recreating.
+    [mode, setPreferencesMutate],
   )
 
   const [treeOpen, setTreeOpen] = useState<boolean>(
