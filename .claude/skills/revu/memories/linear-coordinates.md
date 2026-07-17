@@ -1,0 +1,12 @@
+# Linear coordinates & structure decisions
+
+- **Team:** Uzo (issue prefix `UZO-`). The team is shared with other projects (e.g. SkillHub) — never rename team-level labels/states.
+- **Project:** `revu` → https://linear.app/uzo/project/revu-553eaefcab18 (lead: Patrick MW). Refer to it as `"revu"` in MCP calls.
+- **Mapping:** Project = the repo · Milestone = one MILESTONES.md milestone (MT, M0–M6) · Issue = one MILESTONES.md issue ID (`M2.3`), one PR each · Sub-issue = one resumable unit, titled `Mx.y.n` in execution order · milestone comments = work log · project status updates = cross-session handover.
+- **Board seeded 2026-07-17** from `docs/agent/MILESTONES.md`, then decomposed to unit granularity the same day: every parent issue carries numbered `Mx.y.n` sub-issues (each ~one commit / one focused block with a concrete check). Issue descriptions carry the doc's **Verify** acceptance tests and a `Source:` line; milestone descriptions carry Goal / Exit criteria / Depends.
+- **Resumability discipline:** In Progress mirrors exactly what is actually in flight — parallel dispatch marks several units at once, never more than is truly running. One milestone active at a time; within it, independent units/tickets are parallelized aggressively (workflow waves). Comment outcome on each unit as it closes; new units continue the numbering, never renumber existing ones. The board must always let a cold session resume alone.
+- **The doc and the board must not drift:** `docs/agent/MILESTONES.md` is the source the board was built from — if scope changes, update the doc and the board in the same PR/session.
+- **Labels created for revu (team-scoped):** `revu:app`, `revu:revud`, `revu:broker`, `revu:shared` (surface axis). Kind axis reuses team labels: Feature · Improvement · Bug · Chore · Infra · Docs · Research · Security.
+- **States:** Backlog (M1–M6 seed state) · Todo (MT + M0, the active milestones) · In Progress · In Review · Done. Issues were seeded unassigned — assign `me` when picking one up.
+- **Milestone order = creation order** (MT was added after M6 and so lists last — drag it first in the UI if desired; no target dates were invented, the doc has none). Dependencies live in milestone descriptions: MT←none (parallel with M0; MT.4←M0.3/M0.4) · M1←M0.1 · M2←M0,M1.5 · M3←M2 · M4←M3 · M5←M2,M3(,M4) · M6←M5.
+- **Session harness:** `.claude/skills/revu/` (skill name `revu`); memories live in `.claude/skills/revu/memories/`.

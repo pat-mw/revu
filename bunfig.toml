@@ -1,0 +1,5 @@
+[test]
+# Install the browser globals the mock API layer touches (localStorage,
+# window, document) before any test module loads, so the in-browser mock
+# adapter and store run unchanged headlessly. See test/preload.ts.
+preload = ["./test/preload.ts"]
