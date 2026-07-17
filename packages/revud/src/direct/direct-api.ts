@@ -2,9 +2,15 @@ import type {
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  ReactionKey,
+  ReactionRollup,
+  ReviewComment,
   ReviewDraft,
+  ReviewThread,
   Session,
   Snapshot,
+  SubmitResult,
+  SubmitReviewInput,
 } from '@revu/shared'
 import { ApiError } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
@@ -12,18 +18,29 @@ import type { GithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
 import { syncPull as runSyncPull } from './sync'
+import type { WriteDecorator } from './write-decorator'
+import { createDirectWriteDecorator } from './write-decorator'
+import {
+  addReaction as runAddReaction,
+  replyToThread as runReplyToThread,
+  resolveThread as runResolveThread,
+  submitReview as runSubmitReview,
+} from './writes'
 
 /**
  * The direct-mode read/persist surface the router dispatches to. It is the small
  * shared core the integration guide describes — sync engine, snapshot store,
- * draft store — bound to one injected `GithubClient` (whose `TokenSource` is the
- * only strategy that differs by deployment mode) and one durable `DirectStore`.
+ * draft store — bound to one injected `GithubClient` (whose `TokenSource` is one
+ * of the two strategies that differ by deployment mode) and one durable
+ * `DirectStore`.
  *
- * The write path (submitReview, replyToThread, resolveThread, addReaction) and
- * the GraphQL thread read are NOT here: they are separate concerns that land
- * later. This surface covers exactly the routes direct mode answers today —
- * sync, snapshot, drafts, viewed, preferences — plus a blob read that is a store
- * lookup (the byte-transfer path is separate).
+ * The write path (submitReview, replyToThread, resolveThread, addReaction) runs
+ * through the second injected strategy — a `WriteDecorator` — a passthrough in
+ * direct mode (no stamping, no audit log) that a later broker mode swaps for one
+ * that stamps every body and appends to the write log. The GraphQL thread READ
+ * lands elsewhere. This surface covers the routes direct mode answers — sync,
+ * snapshot, drafts, viewed, preferences, and the writes — plus a blob read that
+ * is a store lookup (the byte-transfer path is separate).
  *
  * The session is captured once and used to key per-human state (drafts, viewed,
  * preferences) by `session.human.id` — the git-config email — never by any
@@ -58,6 +75,29 @@ export interface DirectApi {
 
   getPreferences(): HumanPreferences
   setPreferences(patch: Partial<HumanPreferences>): HumanPreferences
+
+  // ——— the write path ———
+
+  /**
+   * Submit a review: head-guard, then one `POST /pulls/{n}/reviews`. Returns
+   * `head_moved`/`forbidden` as VALUES (never throws for them); a 422 surfaces as
+   * `conflict`. The store draft is deleted ONLY on a confirmed success, and a
+   * retry-after-timeout short-circuits to an already-created matching review
+   * rather than double-posting.
+   */
+  submitReview(input: SubmitReviewInput): Promise<SubmitResult>
+
+  /** Reply to a thread by posting to its first comment; returns the new comment. */
+  replyToThread(prNumber: number, threadId: string, body: string): Promise<ReviewComment>
+
+  /** Resolve/unresolve a thread via the GraphQL mutation; returns the mutated thread. */
+  resolveThread(prNumber: number, threadId: string, resolved: boolean): Promise<ReviewThread>
+
+  /**
+   * Add a reaction to a review or conversation comment (the id is classified
+   * against the PR's snapshot); returns the comment's current rollup.
+   */
+  addReaction(prNumber: number, commentId: number, reaction: ReactionKey): Promise<ReactionRollup>
 }
 
 export interface DirectApiDeps {
@@ -71,12 +111,30 @@ export interface DirectApiDeps {
   cwd?: string
   /** Timestamp source; injectable for deterministic tests. */
   now?: () => string
+  /**
+   * The write strategy — stamp+log vs passthrough. Defaults to the direct-mode
+   * passthrough (`createDirectWriteDecorator`), so a direct daemon never stamps
+   * and keeps no audit log; a broker daemon injects the stamping decorator here.
+   */
+  writeDecorator?: WriteDecorator
 }
 
 /** Build the direct-mode API surface over an injected client + durable store. */
 export function createDirectApi(deps: DirectApiDeps): DirectApi {
   const humanId = deps.session.human.id
   const now = deps.now ?? (() => new Date().toISOString())
+  const writeDecorator =
+    deps.writeDecorator ?? createDirectWriteDecorator(deps.session.human)
+
+  /** The invariant bundle every write operation shares. */
+  const writeDeps = {
+    github: deps.github,
+    repo: deps.repo,
+    store: deps.store,
+    session: deps.session,
+    writeDecorator,
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  }
 
   return {
     async syncPull(prNumber: number): Promise<Snapshot> {
@@ -149,6 +207,31 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
 
     setPreferences(patch: Partial<HumanPreferences>): HumanPreferences {
       return deps.store.setPreferences(humanId, patch)
+    },
+
+    submitReview(input: SubmitReviewInput): Promise<SubmitResult> {
+      return runSubmitReview(writeDeps, input)
+    },
+
+    replyToThread(prNumber: number, threadId: string, body: string): Promise<ReviewComment> {
+      return runReplyToThread(writeDeps, prNumber, threadId, body)
+    },
+
+    resolveThread(
+      prNumber: number,
+      threadId: string,
+      resolved: boolean,
+    ): Promise<ReviewThread> {
+      void prNumber
+      return runResolveThread(writeDeps, threadId, resolved)
+    },
+
+    addReaction(
+      prNumber: number,
+      commentId: number,
+      reaction: ReactionKey,
+    ): Promise<ReactionRollup> {
+      return runAddReaction(writeDeps, prNumber, commentId, reaction)
     },
   }
 }

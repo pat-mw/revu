@@ -28,6 +28,7 @@ import type {
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
 import type { CommandRunner } from './command-runner'
 import type { RepoRef } from './repo'
+import { unusedWriteMethods } from './github-write-stubs'
 import { openDirectStore, type DirectStore } from './store'
 import { MAX_FILES, syncPull } from './sync'
 
@@ -176,6 +177,7 @@ function fakeClient(cfg: FakeConfig): { client: GithubClient; calls: Calls } {
     }> {
       return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
     },
+    ...unusedWriteMethods(),
   }
   return { client, calls }
 }

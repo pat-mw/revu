@@ -30,11 +30,14 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { ReviewDraft, Session } from '@revu/shared'
 import { createDirectTokenSource } from '../packages/revud/src/direct/token-source'
 import { createBunCommandRunner } from '../packages/revud/src/direct/command-runner'
 import type { GithubClient } from '../packages/revud/src/direct/github-client'
 import { createGithubClient } from '../packages/revud/src/direct/github-client'
+import { createDirectApi } from '../packages/revud/src/direct/direct-api'
 import { openDirectStore } from '../packages/revud/src/direct/store'
+import type { DirectStore } from '../packages/revud/src/direct/store'
 import { syncPull } from '../packages/revud/src/direct/sync'
 import type { CommandRunner } from '../packages/revud/src/direct/command-runner'
 import type { RepoRef } from '../packages/revud/src/direct/repo'
@@ -191,8 +194,200 @@ async function main(): Promise<void> {
   // ——————————————————————————————————————————————————————————————
   await blobSection(github, runner)
 
+  // ——————————————————————————————————————————————————————————————
+  // Section C — the full manual review loop, LIVE, against sandbox PR #1.
+  // ——————————————————————————————————————————————————————————————
+  await writeSection(github)
+
   console.log(`\n${failures === 0 ? 'ALL LIVE CHECKS PASSED' : `${failures} LIVE CHECK(S) FAILED`}`)
   process.exit(failures === 0 ? 0 : 1)
+}
+
+/**
+ * Run one `gh api` call as the authenticated pat-mw user and parse the JSON.
+ * Used to VERIFY, from GitHub's own side, that what the write path posted is
+ * actually visible on github.com (not just what revud believes it posted).
+ */
+async function ghApi(runner: CommandRunner, path: string): Promise<unknown> {
+  const result = await runner.run(['gh', 'api', path])
+  if (!result.ok) {
+    throw new Error(`gh api ${path} failed: ${result.stderr.trim()}`)
+  }
+  return JSON.parse(result.stdout) as unknown
+}
+
+/**
+ * The full manual review loop, LIVE, against sandbox PR #1 (clean-small,
+ * self-authored so APPROVE is out of scope — a COMMENT review):
+ *
+ *   1. Sync PR #1.
+ *   2. Build a draft with an inline comment INCLUDING a multi-line comment and a
+ *      ```suggestion``` block, save it to the store.
+ *   3. Submit a COMMENT review through the real write path — the draft is deleted
+ *      only on confirmed success.
+ *   4. VERIFY via `gh api` that the review and its inline comments are visible on
+ *      github.com.
+ *   5. Post a reply to the new thread's first comment (as the gh user — this
+ *      stands in for a github.com-side reply).
+ *   6. Resolve one of the threads.
+ *   7. Re-sync and confirm the thread now carries the reply and reads resolved,
+ *      with genuine identity (the gh user's real login, no bot, no smuggled name).
+ *
+ * Every posted id is logged. The loop is re-runnable: each run posts a fresh
+ * review/reply and the draft is rebuilt from scratch, so nothing accumulates in
+ * a way that breaks a later run (GitHub simply gains more review comments, which
+ * is the honest record of repeated smoke runs).
+ */
+async function writeSection(github: GithubClient): Promise<void> {
+  console.log('\n=== Section C: full manual review loop (LIVE, sandbox PR #1) ===')
+  const runner = createBunCommandRunner()
+  const dataDir = mkdtempSync(join(tmpdir(), 'revu-write-'))
+  try {
+    const viewer = await github.getViewer()
+    const session: Session = {
+      human: {
+        id: `${viewer.login}@smoke.local`,
+        name: viewer.login,
+        role: 'contractor',
+        email: `${viewer.login}@smoke.local`,
+      },
+      brokerLogin: '',
+      workspace: 'direct-smoke',
+      viewerLogin: viewer.login,
+    }
+    const store: DirectStore = openDirectStore({ dataDir })
+    const api = createDirectApi({ session, github, repo: REPO, store })
+
+    // 1. Sync PR #1 — establishes the snapshot the reply lookup reads from.
+    const snap = await api.syncPull(1)
+    const headSha = snap.immutable.headSha
+    const file = snap.immutable.files[0]
+    console.log(`  step 1 — synced PR #1: head=${headSha.slice(0, 8)}, file=${file?.filename}`)
+    check('step 1: PR #1 synced with a head SHA', headSha.length > 0)
+    check('step 1: PR #1 has a changed file to anchor a comment on', file !== undefined)
+    if (file === undefined) return
+
+    // 2. Build a draft: one multi-line comment (RIGHT side, lines 5–9 — inside the
+    //    added titleCase function) plus a single-line ```suggestion``` on line 6.
+    const stamp = new Date().toISOString()
+    const draft: ReviewDraft = {
+      humanId: session.human.id,
+      prNumber: 1,
+      headSha,
+      compareKey: snap.immutable.compareKey,
+      body: `Smoke review ${stamp} — direct-mode write path.`,
+      event: 'COMMENT',
+      comments: [
+        {
+          key: 'multi-1',
+          path: file.filename,
+          side: 'RIGHT',
+          start_side: 'RIGHT',
+          line: 9,
+          start_line: 5,
+          body: `Multi-line note (${stamp}): this block spans several lines.`,
+          createdAt: stamp,
+          updatedAt: stamp,
+          anchor: { lineText: '', contextBefore: [], contextAfter: [] },
+        },
+        {
+          key: 'suggest-1',
+          path: file.filename,
+          side: 'RIGHT',
+          start_side: null,
+          line: 6,
+          start_line: null,
+          body: 'A suggestion:\n```suggestion\n    .split(\' \')\n```',
+          createdAt: stamp,
+          updatedAt: stamp,
+          anchor: { lineText: '', contextBefore: [], contextAfter: [] },
+        },
+      ],
+    }
+    api.saveDraft(draft)
+    console.log(`  step 2 — saved a draft with ${draft.comments.length} inline comments (1 multi-line, 1 suggestion)`)
+    check('step 2: the draft is in the store before submit', store.getDraft(session.human.id, 1) !== null)
+
+    // 3. Submit the COMMENT review through the real write path.
+    const result = await api.submitReview({
+      prNumber: 1,
+      expectedHeadSha: headSha,
+      event: 'COMMENT',
+      body: draft.body,
+      comments: draft.comments,
+    })
+    console.log(`  step 3 — submitReview → status=${result.status}`)
+    if (result.status !== 'ok') {
+      check('step 3: submitReview succeeded', false, result)
+      return
+    }
+    const reviewId = result.review.id
+    console.log(`    review id=${reviewId}, state=${result.review.state}, commit=${result.review.commit_id.slice(0, 8)}`)
+    check('step 3: submit returned a COMMENTED review', result.review.state === 'COMMENTED')
+    check('step 3: the draft was deleted ONLY after a confirmed submit', store.getDraft(session.human.id, 1) === null)
+
+    // 4. VERIFY on github.com via gh api — the review and its comments are real.
+    const ghReviews = (await ghApi(runner, `repos/${REPO.owner}/${REPO.repo}/pulls/1/reviews`)) as {
+      id: number
+      user: { login: string }
+      state: string
+    }[]
+    const seenReview = ghReviews.find((r) => r.id === reviewId)
+    console.log(`  step 4 — gh api sees ${ghReviews.length} review(s); this one present=${seenReview !== undefined}`)
+    check('step 4: the review is visible on github.com via gh api', seenReview !== undefined)
+    check('step 4: the review is authored by the real gh user (no bot, genuine identity)', seenReview?.user.login === viewer.login)
+
+    const ghComments = (await ghApi(runner, `repos/${REPO.owner}/${REPO.repo}/pulls/1/comments?per_page=100`)) as {
+      id: number
+      pull_request_review_id: number | null
+      body: string
+      line: number | null
+      start_line: number | null
+    }[]
+    const mine = ghComments.filter((c) => c.pull_request_review_id === reviewId)
+    console.log(`  step 4 — this review has ${mine.length} inline comment(s) on github.com`)
+    check('step 4: both inline comments landed on github.com', mine.length === 2, mine.map((c) => ({ line: c.line, start_line: c.start_line })))
+    check('step 4: the multi-line comment carries a start_line on github.com', mine.some((c) => c.start_line !== null))
+    check('step 4: the single-line comment carries NO start_line on github.com', mine.some((c) => c.start_line === null))
+    check('step 4: no email leaked into any comment body', mine.every((c) => !c.body.includes('@smoke.local')))
+
+    // 5. Reply to the new thread's first comment (stands in for a github.com reply).
+    //    Re-sync so the snapshot carries the freshly-created threads to reply into.
+    const synced2 = await api.syncPull(1)
+    const myThread = synced2.mutable.threads.find((t) =>
+      t.comments.some((c) => mine.some((m) => m.id === c.id)),
+    )
+    check('step 5: the new thread is in the re-synced snapshot', myThread !== undefined, synced2.mutable.threads.length)
+    if (myThread === undefined) return
+    const reply = await api.replyToThread(1, myThread.id, `Reply from the smoke loop (${stamp}).`)
+    console.log(`  step 5 — replied to thread ${myThread.id} (first comment id=${myThread.comments[0].id}) → new comment id=${reply.id}`)
+    check('step 5: the reply is attached to the thread root (in_reply_to_id set)', reply.in_reply_to_id !== undefined)
+    check('step 5: the reply is authored by the real gh user', reply.user.login === viewer.login)
+
+    // 6. Resolve the thread.
+    const resolved = await api.resolveThread(1, myThread.id, true)
+    console.log(`  step 6 — resolved thread ${myThread.id} → isResolved=${resolved.isResolved}, resolvedBy=${resolved.resolvedBy?.login}`)
+    check('step 6: the thread reads resolved after the mutation', resolved.isResolved === true)
+
+    // 7. Re-sync: the thread now carries the reply AND reads resolved, with genuine identity.
+    const synced3 = await api.syncPull(1)
+    const finalThread = synced3.mutable.threads.find((t) => t.id === myThread.id)
+    const carriesReply = finalThread?.comments.some((c) => c.id === reply.id) === true
+    console.log(
+      `  step 7 — re-sync: thread ${myThread.id} isResolved=${finalThread?.isResolved}, ` +
+        `comments=${finalThread?.comments.length}, carriesReply=${carriesReply}`,
+    )
+    check('step 7: the re-synced thread reads resolved', finalThread?.isResolved === true)
+    check('step 7: the re-synced thread carries the reply', carriesReply)
+    check(
+      'step 7: every comment renders with a genuine login (no bot, no smuggled name prefix)',
+      finalThread?.comments.every((c) => c.user.login.length > 0 && !c.body.startsWith('**')) === true,
+    )
+
+    store.close()
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true })
+  }
 }
 
 /**

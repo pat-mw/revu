@@ -23,6 +23,7 @@ import type {
   GithubClient,
 } from './github-client'
 import type { RepoRef } from './repo'
+import { unusedWriteMethods } from './github-write-stubs'
 import { openDirectStore, type DirectStore } from './store'
 import { isBinaryContent, provisionBlobs } from './blobs'
 
@@ -134,6 +135,7 @@ function fakeApi(opts: {
     async getThreadComments(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: never[] }> {
       return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
     },
+    ...unusedWriteMethods(),
   }
   return { client, calls }
 }
