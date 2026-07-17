@@ -30,6 +30,7 @@ function makeComment(overrides: {
   lineText: string
   contextBefore?: string[]
   contextAfter?: string[]
+  startLineText?: string | null
 }): PendingComment {
   return {
     key: 'k',
@@ -45,6 +46,9 @@ function makeComment(overrides: {
       lineText: overrides.lineText,
       contextBefore: overrides.contextBefore ?? [],
       contextAfter: overrides.contextAfter ?? [],
+      ...(overrides.startLineText !== undefined
+        ? { startLineText: overrides.startLineText }
+        : {}),
     },
   }
 }
@@ -174,6 +178,124 @@ describe('classifyAnchor — drifted', () => {
       delta: 2,
       newStartLine: null,
     })
+  })
+})
+
+describe('classifyAnchor — ranged start validated against startLineText', () => {
+  it('re-finds the true start when a line is inserted INSIDE the span', () => {
+    // A ranged comment covered start (line 2) through end (line 4). Two edits
+    // land: one line inserted ABOVE the range (shifts the whole span down by 1)
+    // and one line inserted INSIDE the range between the start and end (shifts
+    // only the END down by a further 1). The end anchor drifts by delta +2, but
+    // the START only moved by +1. A rigid `start_line + delta` = 2 + 2 = 4 would
+    // land on the inserted-inside line — mis-covering the block. Validation
+    // against the captured start text re-finds the true start at line 3.
+    const comment = makeComment({
+      line: 4,
+      start_line: 2,
+      lineText: 'end-anchor',
+      startLineText: 'start-anchor',
+    })
+    const newAnchorLines = [
+      'inserted-above', // 0  line 1 (new)
+      'pad', // 1  line 2 (was line 1)
+      'start-anchor', // 2  line 3  <- true start, moved +1
+      'middle', // 3  line 4
+      'inserted-inside', // 4  line 5 (new, INSIDE the range)
+      'end-anchor', // 5  line 6  <- end, moved +2
+      'tail', // 6  line 7
+    ]
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
+    expect(result).toMatchObject({
+      kind: 'drifted',
+      newLine: 6,
+      delta: 2,
+      newStartLine: 3,
+    })
+    // The start was confirmed by re-finding its text, so no uncertainty flag.
+    if (result.kind === 'drifted') {
+      expect(result.startLineUncertain).toBeUndefined()
+    }
+  })
+
+  it('flags startLineUncertain when the start text vanished near the shift', () => {
+    // The end anchor drifts, but the captured start text is nowhere near where
+    // the rigid shift would place it (it was edited away). The rigid shift is
+    // returned as a best effort but flagged so the dialog asks the human to
+    // confirm the span rather than attaching silently to the wrong block.
+    const comment = makeComment({
+      line: 3,
+      start_line: 1,
+      lineText: 'end-anchor',
+      startLineText: 'start-anchor',
+    })
+    const newAnchorLines = [
+      'ins-a', // 0
+      'ins-b', // 1
+      'was-start-now-different', // 2  line 3: rigid start would land here
+      'noise', // 3
+      'end-anchor', // 4  line 5  <- end drifted, delta +2
+      'tail', // 5
+    ]
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
+    expect(result).toMatchObject({
+      kind: 'drifted',
+      newLine: 5,
+      delta: 2,
+      startLineUncertain: true,
+    })
+  })
+
+  it('applies the rigid shift silently when it lands on the start text', () => {
+    // The whole span moved as one block: the rigid `start_line + delta` lands
+    // exactly on the captured start text, so the span is confirmed and applied
+    // with no uncertainty flag — the common, correct case.
+    const comment = makeComment({
+      line: 4,
+      start_line: 2,
+      lineText: 'end-anchor',
+      startLineText: 'start-anchor',
+    })
+    const newAnchorLines = [
+      'ins-a', // 0  line 1 (new)
+      'ins-b', // 1  line 2 (new)
+      'pad', // 2  line 3 (was line 1)
+      'start-anchor', // 3  line 4  <- start, moved +2
+      'middle', // 4  line 5
+      'end-anchor', // 5  line 6  <- end, moved +2
+      'tail', // 6
+    ]
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
+    expect(result).toMatchObject({
+      kind: 'drifted',
+      newLine: 6,
+      delta: 2,
+      newStartLine: 4,
+    })
+    if (result.kind === 'drifted') {
+      expect(result.startLineUncertain).toBeUndefined()
+    }
+  })
+
+  it('falls back to the rigid shift, unflagged, when no startLineText was captured', () => {
+    // An older draft (written before startLineText existed) has no captured
+    // start text: reconcile must behave exactly as before — a rigid delta shift
+    // with no uncertainty flag, no re-search.
+    const comment = makeComment({ line: 2, start_line: 1, lineText: 'anchor' })
+    const result = classifyAnchor({
+      comment,
+      newAnchorLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
+      filePresence: 'present',
+    })
+    expect(result).toMatchObject({
+      kind: 'drifted',
+      newLine: 4,
+      delta: 2,
+      newStartLine: 3,
+    })
+    if (result.kind === 'drifted') {
+      expect(result.startLineUncertain).toBeUndefined()
+    }
   })
 })
 

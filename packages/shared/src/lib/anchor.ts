@@ -36,6 +36,15 @@ export type FilePresence = 'present' | 'deleted' | 'renamed' | 'added'
 /** How far (in lines, each direction) a drifted anchor is searched for. */
 const SEARCH_RADIUS = 400
 
+/**
+ * How far (in lines, each direction) a ranged comment's START line is searched
+ * for when the rigid delta shift does not land it on its captured text. Kept
+ * tight: the START of a span sits close to its END, so a small window finds a
+ * shift caused by an edit INSIDE the range without matching an unrelated
+ * identical line far away.
+ */
+const START_SEARCH_RADIUS = 40
+
 /** Context lines consulted on each side when scoring drift candidates. */
 const CONTEXT_DEPTH = 3
 
@@ -155,6 +164,81 @@ function isDuplicatedInWindow(
 }
 
 /**
+ * Resolves the new START line of a ranged comment after its END anchor drifted
+ * by `delta`. A single-line comment (`start_line === null`) has no start to
+ * resolve — returns `null` with no uncertainty.
+ *
+ * The END anchor is matched by text + context, but the START is a separate line
+ * that the drift search never looked at: shifting it rigidly by `delta` assumes
+ * the whole span moved as one block, which a line inserted or removed INSIDE the
+ * range breaks — the END would land correctly while the START silently points at
+ * the wrong line, mis-covering the block. To keep the report honest:
+ *
+ * - With no captured `startLineText` (a document written before it was recorded)
+ *   there is nothing to check against, so the rigid shift stands, unflagged —
+ *   exactly today's behavior.
+ * - When the rigid shift lands on the captured start text, the span is confirmed
+ *   and applied silently.
+ * - Otherwise the start text is searched for within a tight window around the
+ *   shifted position: the nearest occurrence (ties toward the rigid position)
+ *   becomes the new start, still confirmed. This re-finds a start displaced by an
+ *   in-range edit.
+ * - If it is nowhere in that window, the rigid shift is returned as a best effort
+ *   but marked `uncertain`, so the dialog asks the human to confirm the span
+ *   rather than attaching the comment to a block that may no longer be the block.
+ *
+ * The returned start is clamped to at least 1 and never past the END line.
+ */
+function resolveRangedStart(args: {
+  comment: PendingComment
+  newAnchorLines: string[]
+  newLine: number
+  delta: number
+}): { newStartLine: number | null; uncertain: boolean } {
+  const { comment, newAnchorLines, newLine, delta } = args
+  if (comment.start_line === null) {
+    return { newStartLine: null, uncertain: false }
+  }
+
+  const rigid = Math.min(newLine, Math.max(1, comment.start_line + delta))
+  const startText = comment.anchor.startLineText
+  // No captured start text (older document): behave exactly as before.
+  if (startText === undefined || startText === null) {
+    return { newStartLine: rigid, uncertain: false }
+  }
+
+  // The rigid shift already lands on the captured start text: span confirmed.
+  if (lineEq(newAnchorLines[rigid - 1], startText)) {
+    return { newStartLine: rigid, uncertain: false }
+  }
+
+  // Search a tight window around the rigid position for the start text, taking
+  // the occurrence nearest the rigid guess (ties keep the rigid position). Never
+  // search past the END line — the start of a span is always above its end.
+  const rigidIdx = rigid - 1
+  const endIdx = newLine - 1
+  const lo = Math.max(0, rigidIdx - START_SEARCH_RADIUS)
+  const hi = Math.min(endIdx, rigidIdx + START_SEARCH_RADIUS)
+  let bestIdx = -1
+  let bestDist = Number.POSITIVE_INFINITY
+  for (let i = lo; i <= hi; i++) {
+    if (!lineEq(newAnchorLines[i], startText)) continue
+    const dist = Math.abs(i - rigidIdx)
+    if (dist < bestDist) {
+      bestIdx = i
+      bestDist = dist
+    }
+  }
+  if (bestIdx !== -1) {
+    return { newStartLine: bestIdx + 1, uncertain: false }
+  }
+
+  // The captured start text is gone from the neighborhood of where the rigid
+  // shift put it: keep the shift as a best effort but flag it for confirmation.
+  return { newStartLine: rigid, uncertain: true }
+}
+
+/**
  * Classifies one pending comment against the current content of the side its
  * anchor lives on (`newAnchorLines` — head lines for a RIGHT-side comment,
  * base lines for a LEFT-side comment; the caller is responsible for having
@@ -172,10 +256,10 @@ function isDuplicatedInWindow(
  *   `anchor.lineText` is a drift candidate. Candidates are ranked by context
  *   score (see `contextScore`); ties break toward the smallest |delta|, and
  *   a full tie keeps the earliest (lowest line number) candidate. The winner
- *   yields `drifted` with `newLine`, a shifted `newStartLine` when the
- *   comment spans a range, and the signed `delta`. A genuinely-unmoved line
- *   that failed the clean floor only because its neighborhood also changed
- *   wins its own comparison at `delta: 0`.
+ *   yields `drifted` with `newLine`, a `newStartLine` when the comment spans a
+ *   range (see `resolveRangedStart`), and the signed `delta`. A
+ *   genuinely-unmoved line that failed the clean floor only because its
+ *   neighborhood also changed wins its own comparison at `delta: 0`.
  * - No candidate in the window — including the cases where the anchor content
  *   is unavailable (`newAnchorLines` null) or the file is now empty — means
  *   `lost` with reason 'line-deleted'.
@@ -239,12 +323,14 @@ export function classifyAnchor(args: {
 
   const newLine = best.idx + 1
   const delta = newLine - comment.line
+  const start = resolveRangedStart({ comment, newAnchorLines, newLine, delta })
   return {
     kind: 'drifted',
     comment,
     newLine,
-    newStartLine: comment.start_line !== null ? comment.start_line + delta : null,
+    newStartLine: start.newStartLine,
     delta,
+    ...(start.uncertain ? { startLineUncertain: true } : {}),
   }
 }
 

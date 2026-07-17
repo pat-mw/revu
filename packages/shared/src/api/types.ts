@@ -388,6 +388,17 @@ export interface PendingComment {
     lineText: string
     contextBefore: string[]
     contextAfter: string[]
+    /**
+     * The text of the range's START line (`start_line`), captured for a ranged
+     * comment so reconcile can validate the START independently after the head
+     * moves. The END anchor drives the drift search; without this the START was
+     * shifted rigidly by the same delta and never checked, so a line inserted
+     * INSIDE the range would silently mis-cover the block. Null/absent for a
+     * single-line comment (`start_line === null`) and for documents written
+     * before this field existed — in both cases reconcile falls back to the
+     * rigid shift, unchanged.
+     */
+    startLineText?: string | null
   }
 }
 
@@ -452,6 +463,17 @@ export type AnchorResult =
       newLine: number
       newStartLine: number | null
       delta: number
+      /**
+       * Set for a ranged comment whose START line could not be confirmed at the
+       * shifted position: the captured `startLineText` was not found there, nor
+       * within a short search around it, so `newStartLine` is the best-effort
+       * rigid shift and the new span is NOT trusted. The reconcile dialog surfaces
+       * the span for the human to confirm rather than applying it silently. Absent
+       * when the START was confirmed, when the comment is single-line, or when no
+       * `startLineText` was captured (an older document) — those keep today's
+       * silent rigid shift.
+       */
+      startLineUncertain?: boolean
     }
   | {
       kind: 'lost'

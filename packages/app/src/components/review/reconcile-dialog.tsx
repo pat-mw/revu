@@ -64,13 +64,20 @@ function initialDecisions(
  * Re-capture an anchor at `line` (1-based) from blob content: the exact line
  * text plus up to three neighbors each side, in file order — the last element
  * of `contextBefore` is the line immediately above, the first element of
- * `contextAfter` is the line immediately below.
+ * `contextAfter` is the line immediately below. When the comment spans a range,
+ * `startLine` re-captures the range's START line text so the next reconcile can
+ * validate the start independently; it stays null for a single-line comment.
  */
-function captureAnchor(lines: string[], line: number): PendingComment['anchor'] {
+function captureAnchor(
+  lines: string[],
+  line: number,
+  startLine: number | null,
+): PendingComment['anchor'] {
   return {
     lineText: lines[line - 1] ?? '',
     contextBefore: lines.slice(Math.max(0, line - 4), Math.max(0, line - 1)),
     contextAfter: lines.slice(line, line + 3),
+    startLineText: startLine !== null ? (lines[startLine - 1] ?? '') : null,
   }
 }
 
@@ -206,7 +213,7 @@ export function ReconcileDialog({
           ...comment,
           line: newLine,
           start_line: newStartLine,
-          anchor: captureAnchor(lines, newLine),
+          anchor: captureAnchor(lines, newLine, newStartLine),
           updatedAt: new Date().toISOString(),
         }
         actions.upsertComment(next)
@@ -492,6 +499,16 @@ function DriftedRow({
           <span className="text-ink-faint">line text unavailable</span>
         )}
       </div>
+      {result.startLineUncertain && result.newStartLine !== null && (
+        // The end anchor moved, but the range's START could not be confirmed at
+        // the shifted position (its captured text was edited away). Surface the
+        // best-effort span so the human confirms the range covers the intended
+        // block instead of trusting a silent rigid shift.
+        <p className="mt-1 text-2xs text-stale">
+          Range start uncertain — assumed line {result.newStartLine}; confirm the
+          span still covers what you meant.
+        </p>
+      )}
       <DecisionActions
         decision={decision}
         onDecide={onDecide}

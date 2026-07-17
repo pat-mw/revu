@@ -19,6 +19,7 @@ import { join } from 'node:path'
 import type { Subprocess } from 'bun'
 import type {
   FileViewedState,
+  PendingComment,
   PullListResponse,
   ReviewDraft,
   Session,
@@ -618,5 +619,118 @@ describe('cross-version durability: an older document is migrated, not wiped', (
     expect(onDisk.v).toBeGreaterThan(1)
     expect(onDisk.preferences['h-priya']?.diffMode).toBe('split')
     expect(onDisk.drafts['h-priya']?.['204']?.body).toContain('must survive the upgrade')
+  })
+})
+
+describe('cross-version durability: a v2 document upgrades to v3 without wiping drafts', () => {
+  // Draft comments gained an optional `anchor.startLineText` (reconcile uses it
+  // to validate a ranged comment's start line). That store change bumps the
+  // version 2 → 3. A v2 document's draft comments have NO `startLineText`; if
+  // load() treated the bump as reason to reseed it would flush fixtures over the
+  // file and destroy every draft — the exact "drafts survive everything" failure.
+  // This test writes a v2 document holding a draft with a RANGED comment that
+  // lacks `startLineText` (a non-fixture PR so a reseed would produce nothing
+  // there) and asserts the draft, its ranged comment, and its start_line all
+  // survive the v2 → v3 boot intact.
+  let migDir: string
+  let migDaemon: Daemon
+
+  afterAll(async () => {
+    if (migDaemon) await stopDaemon(migDaemon)
+    if (migDir) rmSync(migDir, { recursive: true, force: true })
+  })
+
+  test('a v2 document keeps a ranged draft comment lacking startLineText on boot', async () => {
+    migDir = mkdtempSync(join(tmpdir(), 'revud-mig-v2-'))
+
+    // A v2-shaped ranged comment: it spans start_line 8 → line 12 and its anchor
+    // has NO `startLineText` (that field did not exist when v2 was written).
+    const rangedComment: PendingComment = {
+      key: 'legacy-ranged-key',
+      path: 'src/legacy.ts',
+      side: 'RIGHT',
+      start_side: 'RIGHT',
+      line: 12,
+      start_line: 8,
+      body: 'Ranged draft comment from a v2 document — must survive the upgrade.',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      anchor: {
+        lineText: 'const end = compute()',
+        contextBefore: ['  const mid = step()'],
+        contextAfter: ['}'],
+        // No startLineText — this is the whole point of the regression.
+      },
+    }
+
+    // A NON-fixture draft under PR 204 with the ranged comment above.
+    const draft: ReviewDraft = {
+      humanId: 'h-priya',
+      prNumber: 204,
+      headSha: 'v2-head-sha',
+      compareKey: 'base...v2-head-sha',
+      body: 'v2 draft with a ranged comment — must survive the upgrade to v3.',
+      event: 'COMMENT',
+      comments: [rangedComment],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+
+    // The shape a v2 build persisted: version 2, WITH `preferences` (added in v2)
+    // but no `startLineText` on any draft comment. Everything else is sound.
+    const v2Doc = {
+      v: 2,
+      dev: { humanId: 'h-priya', latency: 'zero', failureMode: 'none' },
+      drafts: { 'h-priya': { '204': draft } },
+      viewed: {},
+      preferences: { 'h-priya': { diffMode: 'unified' } },
+      snapshots: {},
+      blobs: {},
+      remoteMut: {},
+      syncAttempts: {},
+      rate: { remaining: 5000, reset: new Date(Date.now() + 3_600_000).toISOString() },
+      counter: 0,
+    }
+
+    mkdirSync(migDir, { recursive: true })
+    const docPath = join(migDir, 'revu.broker.v1.json')
+    writeFileSync(docPath, JSON.stringify(v2Doc), 'utf8')
+
+    // Boot the daemon against the data dir that already holds the v2 document.
+    migDaemon = await startDaemon(migDir, distDir)
+
+    // The ranged draft comment must still be there — migration, not reseed —
+    // with its start_line and its startLineText-less anchor intact.
+    const draftRes = await fetch(`${migDaemon.base}/api/pulls/204/draft`)
+    expect(draftRes.status).toBe(200)
+    const loadedDraft = await json<ReviewDraft | null>(draftRes)
+    expect(loadedDraft).not.toBeNull()
+    expect(loadedDraft?.body).toContain('must survive the upgrade to v3')
+    expect(loadedDraft?.comments).toHaveLength(1)
+    const loadedComment = loadedDraft?.comments[0]
+    expect(loadedComment?.start_line).toBe(8)
+    expect(loadedComment?.line).toBe(12)
+    expect(loadedComment?.anchor.lineText).toBe('const end = compute()')
+    // The field never existed on this document; it stays absent, which makes
+    // reconcile fall back to the old rigid start shift — no behavior change.
+    expect(loadedComment?.anchor.startLineText).toBeUndefined()
+
+    // Force a flush (any mutation persists) and confirm the on-disk document
+    // upgraded to v3 while STILL holding the draft.
+    const put = await fetch(`${migDaemon.base}/api/preferences`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ diffMode: 'split' }),
+    })
+    expect(put.status).toBe(200)
+    await put.body?.cancel()
+
+    const onDisk = JSON.parse(readFileSync(docPath, 'utf8')) as {
+      v: number
+      drafts: Record<string, Record<string, ReviewDraft>>
+    }
+    expect(onDisk.v).toBe(3)
+    expect(onDisk.drafts['h-priya']?.['204']?.body).toContain('must survive the upgrade to v3')
+    expect(onDisk.drafts['h-priya']?.['204']?.comments[0]?.start_line).toBe(8)
   })
 })

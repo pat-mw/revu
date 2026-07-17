@@ -30,7 +30,7 @@ import type { DevState } from './devtools'
  */
 
 const STORAGE_KEY = 'revu.broker.v1'
-const STORE_VERSION = 2
+const STORE_VERSION = 3
 const RATE_LIMIT = 5000
 const HOUR_MS = 3_600_000
 /** New comment/review ids start well above any id a fixture author would use. */
@@ -206,9 +206,19 @@ function load(): StoreShape {
     // nonsense value — is not safe to migrate blindly, so reseed.
     if (parsed.v < 1 || parsed.v > STORE_VERSION) return seed()
 
-    // Migrations, oldest → newest. v1 documents predate per-human preferences;
-    // default the field so the whole document loads intact instead of reseeding.
+    // Migrations, oldest → newest. Each step upgrades a structurally sound
+    // older document IN PLACE — defaulting any new field and keeping every
+    // draft, viewed entry, and overlay — so a version bump never reseeds.
+
+    // v1 → v2: v1 documents predate per-human preferences; default the field.
     if (parsed.preferences === undefined) parsed.preferences = {}
+
+    // v2 → v3: draft comments gained an optional `anchor.startLineText`, used by
+    // reconcile to validate a ranged comment's start line. A v2 draft comment
+    // has no such field; leaving it absent is exactly the correct default — an
+    // absent `startLineText` makes reconcile fall back to the old rigid start
+    // shift, unchanged. No per-comment rewrite is needed, so this step only
+    // stamps the version below; the drafts themselves carry across untouched.
 
     parsed.v = STORE_VERSION
     return parsed as StoreShape
