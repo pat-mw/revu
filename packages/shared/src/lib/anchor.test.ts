@@ -31,10 +31,11 @@ function makeComment(overrides: {
   contextBefore?: string[]
   contextAfter?: string[]
   startLineText?: string | null
+  path?: string
 }): PendingComment {
   return {
     key: 'k',
-    path: 'src/file.ts',
+    path: overrides.path ?? 'src/file.ts',
     side: overrides.side ?? 'RIGHT',
     start_side: null,
     line: overrides.line,
@@ -578,7 +579,30 @@ describe('resolveFilePresence — side-aware file fate', () => {
     ).toBe('present')
   })
 
-  it('a renamed path reports renamed on either side', () => {
+  it('a renamed file found DIRECTLY by its new name is present, not renamed', () => {
+    // `filename` is the current (new) path; a comment written against it finds
+    // the live file, whose head/base blob still anchors normally.
+    expect(
+      resolveFilePresence({
+        path: 'new.ts',
+        side: 'RIGHT',
+        file: renamed,
+        files: [renamed],
+        entry,
+      }),
+    ).toBe('present')
+    expect(
+      resolveFilePresence({
+        path: 'new.ts',
+        side: 'LEFT',
+        file: renamed,
+        files: [renamed],
+        entry,
+      }),
+    ).toBe('present')
+  })
+
+  it('the OLD path of a renamed file (matched by previous_filename) is renamed', () => {
     expect(
       resolveFilePresence({
         path: 'old.ts',
@@ -676,5 +700,92 @@ describe('classifyPendingComment — end-to-end side-aware classification', () =
         sha === 'base-sha' ? ['pad', 'pad', 'moved-line', 'tail'] : ['head'],
     })
     expect(result).toMatchObject({ kind: 'drifted', newLine: 3, delta: 1 })
+  })
+
+  it('RIGHT comment on a renamed file addressed by its NEW path is clean, not lost', () => {
+    // The compare lists the file under its new name; the comment targets that
+    // new path directly, so the head blob is found and anchors normally.
+    const renamedFiles: PullFile[] = [
+      {
+        sha: 'head-sha',
+        filename: 'src/renamed.ts',
+        status: 'renamed',
+        previous_filename: 'src/original.ts',
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+    ]
+    const renamedIndex = { 'src/renamed.ts': { base: 'base-sha', head: 'head-sha' } }
+    const comment = makeComment({
+      line: 2,
+      side: 'RIGHT',
+      lineText: 'const value = 1',
+      path: 'src/renamed.ts',
+    })
+    const result = classifyPendingComment({
+      comment,
+      files: renamedFiles,
+      blobIndex: renamedIndex,
+      resolveBlobLines: (sha) =>
+        sha === 'head-sha' ? ['head', 'const value = 1', 'tail'] : ['base'],
+    })
+    expect(result).toEqual({ kind: 'clean', comment })
+  })
+
+  it('LEFT comment on a renamed file addressed by its NEW path is clean, not lost', () => {
+    const renamedFiles: PullFile[] = [
+      {
+        sha: 'head-sha',
+        filename: 'src/renamed.ts',
+        status: 'renamed',
+        previous_filename: 'src/original.ts',
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+    ]
+    const renamedIndex = { 'src/renamed.ts': { base: 'base-sha', head: 'head-sha' } }
+    const comment = makeComment({
+      line: 2,
+      side: 'LEFT',
+      lineText: 'const value = 1',
+      path: 'src/renamed.ts',
+    })
+    const result = classifyPendingComment({
+      comment,
+      files: renamedFiles,
+      blobIndex: renamedIndex,
+      resolveBlobLines: (sha) =>
+        sha === 'base-sha' ? ['base', 'const value = 1', 'tail'] : ['head'],
+    })
+    expect(result).toEqual({ kind: 'clean', comment })
+  })
+
+  it('comment on the OLD path of a renamed file is lost/file-renamed', () => {
+    const renamedFiles: PullFile[] = [
+      {
+        sha: 'head-sha',
+        filename: 'src/renamed.ts',
+        status: 'renamed',
+        previous_filename: 'src/original.ts',
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+    ]
+    const comment = makeComment({
+      line: 2,
+      side: 'RIGHT',
+      lineText: 'const value = 1',
+      path: 'src/original.ts',
+    })
+    const result = classifyPendingComment({
+      comment,
+      files: renamedFiles,
+      blobIndex: {},
+      resolveBlobLines: () => ['head', 'const value = 1', 'tail'],
+    })
+    expect(result).toEqual({ kind: 'lost', comment, reason: 'file-renamed' })
   })
 })

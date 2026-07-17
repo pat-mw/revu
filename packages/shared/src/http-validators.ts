@@ -608,11 +608,12 @@ export const vAnchorResult: Validator<AnchorResult> = vDiscriminatedUnion<Anchor
       newLine: vNumber,
       newStartLine: vNullable(vNumber),
       delta: vNumber,
+      startLineUncertain: vOptional(vBoolean),
     }),
     lost: vObject({
       kind: vLiteral('lost'),
       comment: vPendingComment,
-      reason: vLiteral('line-deleted', 'file-deleted', 'file-renamed'),
+      reason: vLiteral('line-deleted', 'file-deleted', 'file-renamed', 'file-added'),
     }),
   },
 )
