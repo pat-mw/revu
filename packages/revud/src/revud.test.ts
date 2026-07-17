@@ -13,7 +13,7 @@
  * never bleeds between runs.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Subprocess } from 'bun'
@@ -26,7 +26,26 @@ import type {
 } from '@revu/shared'
 
 const ENTRY = join(import.meta.dir, 'index.ts')
-const DIST = join(import.meta.dir, '..', '..', 'app', 'dist')
+
+// These tests only need the daemon to START, which requires SOME valid dist with
+// an `index.html`; they do not need the real built frontend. A per-run stub dist
+// keeps the suite hermetic — it passes on a fresh checkout where the app has not
+// been built yet, and never depends on stale build output. `STUB_INDEX_HTML` and
+// `STUB_ASSET_*` are what the static/SPA tests assert against.
+const STUB_INDEX_HTML =
+  '<!doctype html><html><head><title>revud stub</title></head>' +
+  '<body><div id="root"></div></body></html>'
+const STUB_ASSET_PATH = 'favicon.svg'
+const STUB_ASSET_BODY = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>'
+
+/** Build a temp stub dist with a minimal `index.html` and one static asset. */
+function makeStubDist(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'revud-dist-'))
+  writeFileSync(join(dir, 'index.html'), STUB_INDEX_HTML, 'utf8')
+  mkdirSync(join(dir, 'assets'), { recursive: true })
+  writeFileSync(join(dir, STUB_ASSET_PATH), STUB_ASSET_BODY, 'utf8')
+  return dir
+}
 
 interface Daemon {
   proc: Subprocess
@@ -52,13 +71,13 @@ async function waitReady(base: string, tries = 100): Promise<void> {
 }
 
 /** Start a revud child process on an ephemeral port with zero simulated latency. */
-async function startDaemon(dataDir: string): Promise<Daemon> {
+async function startDaemon(dataDir: string, distDir: string): Promise<Daemon> {
   const proc = Bun.spawn(['bun', 'run', ENTRY], {
     env: {
       ...process.env,
       REVU_PORT: '0',
       REVU_DATA_DIR: dataDir,
-      REVU_DIST_DIR: DIST,
+      REVU_DIST_DIR: distDir,
       REVU_MODE: 'mock',
     },
     stdout: 'pipe',
@@ -106,14 +125,19 @@ async function stopDaemon(d: Daemon): Promise<void> {
 
 let daemon: Daemon
 let dataDir: string
+let distDir: string
 
 beforeAll(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'revud-it-'))
-  daemon = await startDaemon(dataDir)
+  distDir = makeStubDist()
+  daemon = await startDaemon(dataDir, distDir)
 })
 
 afterAll(async () => {
   if (daemon) await stopDaemon(daemon)
+  // Best-effort cleanup so temp dirs never accumulate across runs.
+  if (dataDir) rmSync(dataDir, { recursive: true, force: true })
+  if (distDir) rmSync(distDir, { recursive: true, force: true })
 })
 
 function api(path: string, init?: RequestInit): Promise<Response> {
@@ -129,13 +153,20 @@ describe('static + session', () => {
     const res = await api('/')
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type') ?? '').toContain('text/html')
-    expect(await res.text()).toContain('<!doctype html>')
+    expect(await res.text()).toBe(STUB_INDEX_HTML)
+  })
+
+  test('serves a real static asset from dist', async () => {
+    const res = await api(`/${STUB_ASSET_PATH}`)
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(STUB_ASSET_BODY)
   })
 
   test('SPA fallback: unknown non-file path returns index.html', async () => {
     const res = await api('/pulls/204/files')
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type') ?? '').toContain('text/html')
+    expect(await res.text()).toBe(STUB_INDEX_HTML)
   })
 
   test('getSession returns the session identity', async () => {
@@ -463,7 +494,7 @@ describe('durability: a saved draft survives a restart', () => {
     // Restart the daemon against the SAME data dir: a fresh store instance must
     // hydrate the draft from disk.
     await stopDaemon(daemon)
-    daemon = await startDaemon(dataDir)
+    daemon = await startDaemon(dataDir, distDir)
 
     const reload = await api('/api/pulls/204/draft')
     expect(reload.status).toBe(200)
