@@ -32,3 +32,16 @@ Each of these has a ticket or a doc section; listed here so no session rediscove
 
 **Linear MCP (tracking):**
 - Milestone names ≤ 80 chars or `save_milestone` fails. Milestone comments need the milestone **UUID** (`list_milestones` first). Status-update reads need `orderBy:"createdAt"`. `list_issues` has no milestone filter. Real newlines in bodies, never literal `\n`.
+
+**CHECKPOINT_1 (independent pre-M2 review of `main` @ `5985f34` → milestone M1.6) — traps + do-not-undo:**
+- **`/api/dev`, `/api/dev/reset` are mock-only forever (C3).** They change identity (`dev.setHuman`) and reseed the store; gated at the revud router boundary on an **explicitly-passed** mode (not `process.env`, so a stray env var can't re-enable it). **M3/direct must never expose them.** They sit outside the shared `ROUTES` table by design — documented in `http.ts`.
+- **Durability is a daemon concern, not a browser one (C5).** The mock's `flush()`/`load()` swallow storage errors — correct for localStorage, wrong on disk. revud surfaces write failures as typed errors (never 200 on an unpersisted draft) and distinguishes absent from unreadable (never reseed over a present-but-unreadable document). **M2.3's SQLite store owns durability end-to-end: no error swallowing on the write path; unreadable ≠ absent.** Do not inherit the browser swallow into the durable path.
+- **`STORE_VERSION` migrations migrate in place, never reseed (C4 — restates the M1.4 P0).** Any store-shape change bumps the version and defaults new fields in `load()`'s migration ladder; a bump that reseeds wipes drafts and violates "drafts survive everything." A new field (e.g. `startLineText`) defaults to null on old documents.
+- **`anchor.ts` reconcile logic is shared truth, written once (C1/C2).** Blob-side selection (base for LEFT, head for RIGHT) lives in ONE selector imported by both the adapter and the reconcile dialog; the `clean` fast path requires a context-score floor (a coincidental duplicate line at the original index must not short-circuit to `clean`). The conformance suite is where reconcile correctness is proven — add scenarios (LEFT-side, preview/report parity), don't re-verify by hand.
+
+**Do NOT "fix" these — correct unasked-for calls a checkpoint could provoke undoing (CHECKPOINT_1 §What-is-solid):**
+- **Reusing the app's mock in revud** (`import('@revu/app/mock')` + a disk-backed `Storage` polyfill) instead of M0.3's specified port — one oracle, no divergence. Keep it.
+- **The `load()` migration ladder + the M1.4 in-place prefs migration** (a version bump never wipes drafts) — exactly right.
+- **The `network`-code enveloping** (client-side-only code, no HTTP status, surfaced as an enveloped 5xx and reconstructed adapter-side) — a careful, correctly-documented call at both ends.
+- **DOM-global guards** (`typeof document`/`typeof localStorage`) for headless reuse, and the boot-order dependency (install storage → then load mock) — load-bearing, documented, tested.
+- **MT** (the TDD milestone inserted ahead of M0) and **the transport-parameterized conformance suite** — the right assets; C1/C2 are gaps in its *scenarios*, not its design.
