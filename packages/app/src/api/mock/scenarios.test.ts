@@ -19,6 +19,11 @@ import { ApiError, parseCommentIdentity } from '@revu/shared'
 const api = createMockApi()
 
 beforeAll(() => {
+  // Start from a pristine seed: `bun test` shares one localStorage-backed store
+  // across every file in the process, so another file's mock mutations (or a
+  // debounced flush of them) could otherwise leak in and derail this ordered
+  // walk. Resetting here makes the walk depend only on the fixtures.
+  mockDev.reset()
   mockDev.setLatency('zero')
   mockDev.setFailureMode('none')
 })

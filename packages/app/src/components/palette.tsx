@@ -26,7 +26,8 @@ import { usePullList } from '@/state/queries'
 import { useSyncPull } from '@/state/queries'
 import { useCurrentHuman } from '@/state/session'
 import { useToast } from '@/components/ui/toast'
-import { mockDev } from '@/api/mock/devtools'
+import { devControls } from '@/api/dev'
+import { useHumans } from '@/state/dev-humans'
 import { useShortcut } from '@/lib/keyboard'
 import { formatKeys } from '@/lib/keyboard'
 import { SHORTCUT_CATALOG } from '@/lib/shortcuts'
@@ -95,7 +96,7 @@ export function CommandPalette({
       .map((i) => ({ number: i.pull.number, title: i.pull.title }))
   }, [pulls.data])
 
-  const humans = useMemo(() => mockDev.listHumans(), [])
+  const humans = useHumans()
 
   const run = useCallback(
     (action: () => void) => {
@@ -215,7 +216,7 @@ export function CommandPalette({
             <CommandItem
               key={h.id}
               value={`identity switch ${h.name} ${h.role}`}
-              onSelect={() => run(() => mockDev.setHuman(h.id))}
+              onSelect={() => run(() => void devControls.setHuman(h.id))}
             >
               {h.id === currentHuman.id ? (
                 <User strokeWidth={1.5} aria-hidden />

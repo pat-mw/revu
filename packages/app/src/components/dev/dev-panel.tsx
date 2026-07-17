@@ -9,26 +9,37 @@ import {
 } from '@/components/ui/dialog'
 import { NameAvatar } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
-import { mockDev, DEV_EVENT } from '@/api/mock/devtools'
-import type { DevState } from '@/api/mock/devtools'
+import { devControls, DEV_EVENT } from '@/api/dev'
+import type { DevSnapshot } from '@/api/dev'
+import type { DevState } from '@/api/dev'
 import { minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 
 /**
- * Subscribe a component to dev-panel state. Reads `mockDev.get()` and re-reads
- * on every `DEV_EVENT`, so an identity/latency/failure change made here or
- * elsewhere is reflected immediately. The rate reading is refreshed alongside.
+ * Subscribe a component to dev-panel state. Fetches `devControls.get()` on mount
+ * and re-fetches on every `DEV_EVENT`, so an identity/latency/failure change
+ * made here or elsewhere (and in HTTP mode, on the daemon) is reflected
+ * immediately. `null` until the first fetch resolves — the panel renders a quiet
+ * empty state meanwhile. The state carries dev config, the rate budget, and the
+ * human roster together, since both modes return them from one call.
  */
-function useDevState(): { dev: DevState; rate: ReturnType<typeof mockDev.getRate> } {
-  const [tick, setTick] = useState(0)
+function useDevState(): DevSnapshot | null {
+  const [snapshot, setSnapshot] = useState<DevSnapshot | null>(null)
   useEffect(() => {
-    const onChange = () => setTick((n) => n + 1)
-    window.addEventListener(DEV_EVENT, onChange)
-    return () => window.removeEventListener(DEV_EVENT, onChange)
+    let live = true
+    const refresh = () => {
+      void devControls.get().then((next) => {
+        if (live) setSnapshot(next)
+      })
+    }
+    refresh()
+    window.addEventListener(DEV_EVENT, refresh)
+    return () => {
+      live = false
+      window.removeEventListener(DEV_EVENT, refresh)
+    }
   }, [])
-  // `tick` is only a re-render trigger; the fresh reads happen on every render.
-  void tick
-  return { dev: mockDev.get(), rate: mockDev.getRate() }
+  return snapshot
 }
 
 /** Section label — dense uppercase micro-label in the faintest ink. */
@@ -115,11 +126,12 @@ const SCENARIOS: { n: number; note: string }[] = [
 
 /**
  * The demo control room. Everything here is out-of-band production tooling that
- * would not ship in the real broker client, so it is the one sanctioned importer
- * of the mock transport's dev hooks (`mockDev`). It lets a presenter prove the
- * app's hardest invariants on demand: identity isolation (drafts are broker-side,
- * keyed to the human), offline-first reads, honest rate accounting, and the full
- * map of which PR demonstrates which behavior.
+ * would not ship in the real broker client. It drives the mock's dev hooks
+ * through the mode-neutral `devControls`, which targets the in-browser mock or
+ * the daemon's `/api/dev` surface depending on the active transport. It lets a
+ * presenter prove the app's hardest invariants on demand: identity isolation
+ * (drafts are broker-side, keyed to the human), offline-first reads, honest rate
+ * accounting, and the full map of which PR demonstrates which behavior.
  */
 export function DevPanel({
   open,
@@ -129,15 +141,13 @@ export function DevPanel({
   onOpenChange: (open: boolean) => void
 }) {
   const navigate = useNavigate()
-  const { dev, rate } = useDevState()
+  const snapshot = useDevState()
   const [confirmingReset, setConfirmingReset] = useState(false)
 
   // A closing panel abandons any half-committed reset confirmation.
   useEffect(() => {
     if (!open) setConfirmingReset(false)
   }, [open])
-
-  const humans = mockDev.listHumans()
 
   const goToPr = useCallback(
     (n: number) => {
@@ -148,11 +158,28 @@ export function DevPanel({
   )
 
   const doReset = useCallback(() => {
-    mockDev.reset()
+    void devControls.reset()
     setConfirmingReset(false)
     onOpenChange(false)
     navigate('/')
   }, [navigate, onOpenChange])
+
+  // Until the first fetch lands, render nothing but the shell chrome — the
+  // controls need dev state and the human roster to render meaningfully.
+  if (!snapshot) {
+    return (
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Demo controls</DialogTitle>
+            <DialogDescription>Loading demo state…</DialogDescription>
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+    )
+  }
+
+  const { dev, rate, humans } = snapshot
 
   const spentPct =
     rate.limit > 0 ? Math.min(100, (rate.used / rate.limit) * 100) : 0
@@ -178,7 +205,7 @@ export function DevPanel({
                   <button
                     key={h.id}
                     type="button"
-                    onClick={() => mockDev.setHuman(h.id)}
+                    onClick={() => void devControls.setHuman(h.id)}
                     aria-pressed={active}
                     className={cn(
                       'flex items-center gap-2.5 rounded-(--radius-sm) px-2 py-1.5 text-left transition-colors',
@@ -220,13 +247,13 @@ export function DevPanel({
               label="Latency"
               value={dev.latency}
               options={LATENCY_OPTIONS}
-              onChange={(v) => mockDev.setLatency(v)}
+              onChange={(v) => void devControls.setLatency(v)}
             />
             <DevSelect
               label="Failure mode"
               value={dev.failureMode}
               options={FAILURE_OPTIONS}
-              onChange={(v) => mockDev.setFailureMode(v)}
+              onChange={(v) => void devControls.setFailureMode(v)}
             />
             <p className="text-xs leading-relaxed text-ink-faint">
               {FAILURE_CAPTION[dev.failureMode]}

@@ -21,7 +21,8 @@ import { ShortcutSheet } from '@/components/shortcut-sheet'
 import { DevPanel } from '@/components/dev/dev-panel'
 import { useRateLimit } from '@/state/queries'
 import { useCurrentHuman, useSession } from '@/state/session'
-import { mockDev } from '@/api/mock/devtools'
+import { devControls } from '@/api/dev'
+import { useHumans } from '@/state/dev-humans'
 import { useSequenceShortcut } from '@/lib/keyboard'
 import { minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
@@ -80,7 +81,7 @@ function RateChip() {
 function IdentityMenu({ onOpenDevPanel }: { onOpenDevPanel: () => void }) {
   const human = useCurrentHuman()
   const session = useSession()
-  const humans = mockDev.listHumans()
+  const humans = useHumans()
 
   return (
     <DropdownMenu>
@@ -109,7 +110,7 @@ function IdentityMenu({ onOpenDevPanel }: { onOpenDevPanel: () => void }) {
           return (
             <DropdownMenuItem
               key={h.id}
-              onSelect={() => mockDev.setHuman(h.id)}
+              onSelect={() => void devControls.setHuman(h.id)}
               className="gap-2"
             >
               <NameAvatar name={h.name} size="sm" />
