@@ -166,14 +166,16 @@ describe('parsePrefixedBody name validation', () => {
     // like these parses as the bot rather than a bogus person.
     expect(parsePrefixedBody('**a1 b2 c3 d4 e5**\n\nx')).toBeNull()
     expect(parsePrefixedBody('**user@2fa**\n\nx')).toBeNull()
-    expect(parsePrefixedBody(`**${'x9'.repeat(13)}**\n\nx`)).toBeNull()
+    // 34 chars, one past the 32-character single-token cap.
+    expect(parsePrefixedBody(`**${'x9'.repeat(17)}**\n\nx`)).toBeNull()
   })
 
-  it('accepts a token at the 24-character cap and rejects one past it', () => {
-    // The token regex is one leading letter plus up to 23 more, so 24 letters
-    // is the longest accepted token; 25 letters is rejected.
-    const cap = 'A'.repeat(24)
-    const over = 'A'.repeat(25)
+  it('accepts a token at the 32-character cap and rejects one past it', () => {
+    // The token regex is one leading letter plus up to 31 more, matching the
+    // broker's maximum username length of 32, so 32 letters is the longest
+    // accepted token; 33 letters is rejected.
+    const cap = 'A'.repeat(32)
+    const over = 'A'.repeat(33)
     expect(parsePrefixedBody(`**${cap}**\n\nx`)?.name).toBe(cap)
     expect(parsePrefixedBody(`**${over}**\n\nx`)).toBeNull()
   })
@@ -291,6 +293,82 @@ describe('prefixBody round-trip', () => {
     const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, prefixBody(author, 'x')), BOT_LOGIN)
     expect(parsed.identity).toEqual({ kind: 'human', name: 'Bob', role: 'lead' })
     expect(parsed.body).toBe('x')
+  })
+})
+
+describe('stamper ↔ parser inverse property', () => {
+  // The stamper (prefixBody) and the parser (parsePrefixedBody) are inverses by
+  // construction: the same code owns the smuggled prefix format on both ends,
+  // so any legal display name it can stamp it must be able to read back out.
+  // This corpus spans every axis of a legal author name — the maximum single
+  // token, the widened charset (digits, underscore, hyphen, apostrophe), non
+  // Latin scripts, and one through four tokens up to the longest legal display
+  // name — and asserts the name and the body survive the round trip byte for
+  // byte. It bites the moment either end is tightened by a single character:
+  // shrink the token cap or the name capture and a corpus entry stops round
+  // tripping. A representative role and a multi-line body ride along so the
+  // full stamped shape is exercised, not just the name.
+
+  // One leading character plus 31 more is the longest legal single token.
+  const MAX_TOKEN = `u${'x'.repeat(31)}`
+  // Four maximum-length tokens joined by single spaces is the longest legal
+  // display name; the name capture must admit it without truncating.
+  const MAX_DISPLAY_NAME = [MAX_TOKEN, MAX_TOKEN, MAX_TOKEN, MAX_TOKEN].join(' ')
+
+  const NAMES = [
+    'Ada', // single ASCII token
+    MAX_TOKEN, // a 32-character single token
+    'alice2', // digits
+    'j_doe', // underscore
+    'Anne-Marie', // hyphen
+    "O'Brien", // straight apostrophe
+    'O’Brien', // curly apostrophe
+    'Председатель', // Cyrillic
+    '田中太郎', // CJK
+    'Ada Lovelace', // two tokens
+    'Ada Byron Lovelace', // three tokens
+    'Ada Bee Cee Dee', // four tokens
+    MAX_DISPLAY_NAME, // longest legal four-token display name
+  ]
+
+  const BODY = 'First line of the review.\n\n- a bullet\n- another\n\nClosing thought.'
+
+  for (const name of NAMES) {
+    it(`round-trips ${JSON.stringify(name)} through prefixBody → parsePrefixedBody`, () => {
+      const stamped = prefixBody(human(name, 'contractor'), BODY)
+      const parsed = parsePrefixedBody(stamped)
+      expect(parsed).not.toBeNull()
+      expect(parsed?.name).toBe(name)
+      expect(parsed?.role).toBe('contractor')
+      expect(parsed?.rest).toBe(BODY)
+    })
+  }
+})
+
+describe('prefix degradation boundaries (safe: falls back to the bot, never spoofs)', () => {
+  it('degrades to the bot when a name carries an asterisk rather than corrupting the prefix', () => {
+    // A `*` in the name breaks the `[^*\n]` name capture, so the prefix does not
+    // parse and the comment renders as the bare bot. This is safe degradation,
+    // not a spoof: an unparseable prefix can only ever LOSE a display identity,
+    // never forge a different human's. Pinned so nobody "fixes" it by loosening
+    // the capture in a way that would let a crafted body impersonate someone.
+    const stamped = prefixBody(human('Ali*ce', 'contractor'), 'the review body')
+    expect(parsePrefixedBody(stamped)).toBeNull()
+
+    const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, stamped), BOT_LOGIN)
+    expect(parsed.identity).toEqual({ kind: 'bot', user: ghUser(BOT_LOGIN) })
+    expect(parsed.body).toBe(stamped)
+  })
+
+  it('degrades to the bot when a single token exceeds the length cap', () => {
+    // A username one character past the cap stamps fine but fails validation on
+    // the way back, so it too falls back to the bot rather than mis-attributing.
+    const overLong = `u${'x'.repeat(32)}` // 33 characters, one past the cap
+    const stamped = prefixBody(human(overLong, 'contractor'), 'the review body')
+    expect(parsePrefixedBody(stamped)).toBeNull()
+
+    const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, stamped), BOT_LOGIN)
+    expect(parsed.identity).toEqual({ kind: 'bot', user: ghUser(BOT_LOGIN) })
   })
 })
 
