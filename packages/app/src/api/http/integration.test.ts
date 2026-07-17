@@ -233,7 +233,7 @@ describe('createHttpApi against revud', () => {
   })
 })
 
-describe('mock ↔ http parity (UZO-607: faithful adapter → identical rollback)', () => {
+describe('mock ↔ http parity: faithful adapter → identical rollback', () => {
   // A fresh mock instance seeded from the same fixtures at latency zero, driven
   // through the same calls as the daemon. Reset both stores' dev knobs first so
   // neither carries state from an earlier test.

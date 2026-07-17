@@ -21,9 +21,19 @@ import {
   validateFileViewedState,
   validateHumanPreferences,
   validateSetPreferencesBody,
+  validateReconcileReport,
+  vAnchorResult,
   ValidationError,
 } from '@revu/shared'
-import type { HumanPreferences, ReviewSummary, Snapshot, SubmitResult } from '@revu/shared'
+import type {
+  AnchorResult,
+  HumanPreferences,
+  PendingComment,
+  ReconcileReport,
+  ReviewSummary,
+  Snapshot,
+  SubmitResult,
+} from '@revu/shared'
 import { fixtureDB } from '@/fixtures'
 import { buildSnapshot } from '@/fixtures/helpers'
 
@@ -203,5 +213,75 @@ describe('human preferences validators', () => {
       diffMode: 'unified',
     })
     expect(() => validateSetPreferencesBody({ diffMode: 'nope' })).toThrow(ValidationError)
+  })
+})
+
+describe('anchor-result validator mirrors the full AnchorResult contract', () => {
+  // A minimal but complete PendingComment; the validator reconstructs every
+  // declared field, so this must satisfy vPendingComment exactly.
+  const comment: PendingComment = {
+    key: 'k',
+    path: 'src/file.ts',
+    side: 'RIGHT',
+    start_side: null,
+    line: 7,
+    start_line: null,
+    body: 'a note',
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+    anchor: { lineText: 'const x = 1', contextBefore: [], contextAfter: [] },
+  }
+
+  test("a lost result with reason 'file-added' validates and keeps the reason", () => {
+    // A comment on a file that only exists on the head side reconciles to
+    // lost/file-added; a validator missing that literal throws here, and a
+    // silent drop would lose the reason from the output.
+    const result: AnchorResult = { kind: 'lost', comment, reason: 'file-added' }
+    const wire = JSON.parse(JSON.stringify(result))
+    const validated = vAnchorResult(wire) as Extract<AnchorResult, { kind: 'lost' }>
+    expect(validated).toStrictEqual(wire)
+    expect(validated.reason).toBe('file-added')
+  })
+
+  test('a drifted result preserves startLineUncertain through validation', () => {
+    // The uncertain-start warning is an optional boolean on drifted; an object
+    // validator that omits the key from its shape strips it silently, so the
+    // flag must survive the round-trip to reach the reconcile dialog.
+    const result: AnchorResult = {
+      kind: 'drifted',
+      comment,
+      newLine: 12,
+      newStartLine: 9,
+      delta: 5,
+      startLineUncertain: true,
+    }
+    const wire = JSON.parse(JSON.stringify(result))
+    const validated = vAnchorResult(wire) as Extract<AnchorResult, { kind: 'drifted' }>
+    expect(validated).toStrictEqual(wire)
+    expect(validated.startLineUncertain).toBe(true)
+  })
+
+  test('both new members survive the full ReconcileReport transport wrapper', () => {
+    // The wire path validates the whole report, so the new AnchorResult members
+    // must also survive validateReconcileReport (what the HTTP adapter runs).
+    const report: ReconcileReport = {
+      prNumber: 3,
+      draftHeadSha: 'draft',
+      currentHeadSha: 'current',
+      newCommits: [],
+      results: [
+        { kind: 'lost', comment, reason: 'file-added' },
+        {
+          kind: 'drifted',
+          comment,
+          newLine: 12,
+          newStartLine: 9,
+          delta: 5,
+          startLineUncertain: true,
+        },
+      ],
+    }
+    const wire = JSON.parse(JSON.stringify(report))
+    expect(validateReconcileReport(wire)).toStrictEqual(wire)
   })
 })

@@ -337,20 +337,29 @@ export function classifyAnchor(args: {
 /**
  * Side-aware file presence for one comment against the fresh compare. A
  * comment anchors into the base blob when LEFT and the head blob when RIGHT,
- * so a path's fate is read from the side that holds the anchor text:
+ * so a path's fate is read from the side that holds the anchor text.
+ *
+ * `PullFile.filename` is a file's CURRENT (new) path, and comments are written
+ * against the path they target. A file found DIRECTLY by the comment's path is
+ * therefore the live file — a rename shows up here under its new name and its
+ * blob is anchored normally:
  *
  * - RIGHT: a file `removed` in the compare has no head content left to anchor
- *   to → `deleted`; a `renamed` path (old name absent, matched by
- *   `previous_filename`) → `renamed`; anything else with head content →
- *   `present`.
+ *   to → `deleted`; anything else with head content (INCLUDING a `renamed`
+ *   file found by its new name) → `present`.
  * - LEFT: the anchor targets base content, which a `removed` file still holds
  *   in full — so a removal is NOT terminal and the comment can still anchor
  *   `clean`/`drifted` against the base blob. An `added` file, however, never
  *   existed on the base side, so a LEFT anchor into it is `added` (there is no
- *   base blob to match). A `renamed` path still reports `renamed`.
+ *   base blob to match).
  *
- * When the path is absent from the compare entirely, presence follows whether
- * a blob exists on the anchoring side (the base for LEFT, the head for RIGHT).
+ * `renamed` presence (→ terminal `lost/file-renamed`) is reserved for the case
+ * where the comment's path is NOT found directly but matches a renamed file's
+ * `previous_filename`: the comment targets the OLD path, which is gone.
+ *
+ * When the path is absent from the compare entirely (and matches no rename's
+ * old name), presence follows whether a blob exists on the anchoring side (the
+ * base for LEFT, the head for RIGHT).
  */
 export function resolveFilePresence(args: {
   path: string
@@ -362,7 +371,6 @@ export function resolveFilePresence(args: {
   const { path, side, file, files, entry } = args
 
   if (file) {
-    if (file.status === 'renamed') return 'renamed'
     if (side === 'RIGHT') {
       return file.status === 'removed' ? 'deleted' : 'present'
     }

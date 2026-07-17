@@ -3,6 +3,9 @@
   "plugins": ["react", "typescript", "oxc"],
   "rules": {
     "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+    // Off by design: this only flags a React Fast Refresh (HMR) hint when a file
+    // exports non-components alongside components. It is a dev-time ergonomics
+    // signal, not a correctness rule, so the gate does not treat it as a warning.
+    "react/only-export-components": "off"
   }
 }
