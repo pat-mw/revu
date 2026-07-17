@@ -7,13 +7,14 @@
  */
 import { describe, expect, test } from 'bun:test'
 import type {
+  FileBlob,
   FileViewedState,
   HumanPreferences,
   ReviewDraft,
   Session,
   Snapshot,
 } from '@revu/shared'
-import { DEFAULT_PREFERENCES } from '@revu/shared'
+import { ApiError, DEFAULT_PREFERENCES } from '@revu/shared'
 import type { DirectApi } from './direct/direct-api'
 import { StoreWriteError } from './direct/store'
 import { handleDirectApi } from './direct-router'
@@ -31,6 +32,7 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
   const snapshots = new Map<number, Snapshot>()
   const drafts = new Map<number, ReviewDraft>()
   const viewed = new Map<number, FileViewedState>()
+  const blobs = new Map<string, FileBlob>()
   let prefs: HumanPreferences = { ...DEFAULT_PREFERENCES }
   return {
     async syncPull(prNumber: number): Promise<Snapshot> {
@@ -40,6 +42,13 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     },
     getSnapshot(prNumber: number): Snapshot | null {
       return snapshots.get(prNumber) ?? null
+    },
+    getBlob(sha: string): FileBlob {
+      const blob = blobs.get(sha)
+      if (!blob) {
+        throw new ApiError('not_found', `Blob ${sha} is not in the store.`)
+      }
+      return blob
     },
     getDraft(prNumber: number): ReviewDraft | null {
       return drafts.get(prNumber) ?? null
@@ -248,12 +257,11 @@ describe('handleDirectApi', () => {
     expect(body.code).toBe('persist_failed')
   })
 
-  test('a not-yet-built route (threads, review, blobs) is a 501 not_implemented', async () => {
+  test('a not-yet-built route (threads, review, rate-limit) is a 501 not_implemented', async () => {
     for (const [method, path] of [
       ['GET', '/api/pulls'],
       ['GET', '/api/pulls/204/threads'],
       ['POST', '/api/pulls/204/review'],
-      ['GET', '/api/blobs/deadbeef'],
       ['GET', '/api/rate-limit'],
     ] as const) {
       const res = await handleDirectApi(req(method, path), SESSION, fakeApi())
@@ -261,6 +269,36 @@ describe('handleDirectApi', () => {
       const body = (await res?.json()) as { code: string }
       expect(body.code).toBe('not_implemented')
     }
+  })
+
+  test('GET blob returns the FileBlob (200) for a present SHA', async () => {
+    const blob: FileBlob = {
+      sha: 'sha-1',
+      path: 'a.ts',
+      content: 'export const x = 1\n',
+      size: 19,
+      binary: false,
+    }
+    const api = fakeApi({
+      getBlob(sha: string): FileBlob {
+        if (sha === 'sha-1') return blob
+        throw new ApiError('not_found', 'absent')
+      },
+    })
+    const res = await handleDirectApi(req('GET', '/api/blobs/sha-1'), SESSION, api)
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as FileBlob
+    expect(body.sha).toBe('sha-1')
+    expect(body.content).toBe('export const x = 1\n')
+    expect(body.binary).toBe(false)
+  })
+
+  test('GET blob for an absent SHA is a typed not_found (404), never a fabricated blob', async () => {
+    // The default fakeApi store is empty, so any SHA is absent.
+    const res = await handleDirectApi(req('GET', '/api/blobs/deadbeef'), SESSION, fakeApi())
+    expect(res?.status).toBe(404)
+    const body = (await res?.json()) as { code: string }
+    expect(body.code).toBe('not_found')
   })
 
   test('an unknown API path is a 404 not_found', async () => {

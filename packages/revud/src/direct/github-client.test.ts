@@ -166,3 +166,99 @@ describe('createGithubClient.getReviewThreads', () => {
     expect(page.pageInfo.hasNextPage).toBe(false)
   })
 })
+
+describe('createGithubClient.getBlob (the single-blob REST fallback)', () => {
+  test('returns the base64 content, encoding, and size from git/blobs/{sha}', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(
+        200,
+        { content: 'aGVsbG8=\n', encoding: 'base64', size: 5 },
+        captured,
+      ),
+      baseUrl: 'https://api.github.test',
+    })
+    const blob = await client.getBlob('o', 'r', 'abc123')
+    expect(blob.encoding).toBe('base64')
+    expect(blob.size).toBe(5)
+    // The raw base64 is returned verbatim; the caller decodes it.
+    expect(blob.content).toBe('aGVsbG8=\n')
+    expect(captured[0].url).toBe('https://api.github.test/repos/o/r/git/blobs/abc123')
+  })
+
+  test('throws GithubRequestError on a non-2xx', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(404, { message: 'Not Found' }, []),
+    })
+    await expect(client.getBlob('o', 'r', 'missing')).rejects.toBeInstanceOf(GithubRequestError)
+  })
+})
+
+describe('createGithubClient.getBlobObjects (the GraphQL object() batch)', () => {
+  test('aliases each SHA under object(oid:) and maps the results back by SHA', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(
+        200,
+        {
+          data: {
+            repository: {
+              b0: { isBinary: false, text: 'alpha\n', byteSize: 6 },
+              b1: { isBinary: true, text: null, byteSize: 2048 },
+            },
+          },
+        },
+        captured,
+      ),
+      graphqlUrl: 'https://api.github.test/graphql',
+    })
+    const result = await client.getBlobObjects('o', 'r', ['SHA_A', 'SHA_B'])
+    expect(result.SHA_A).toEqual({ isBinary: false, text: 'alpha\n', byteSize: 6 })
+    expect(result.SHA_B).toEqual({ isBinary: true, text: null, byteSize: 2048 })
+
+    // SHAs travel as $o<index> variables, never spliced into the query string.
+    const body = JSON.parse(captured[0].init?.body as string) as {
+      query: string
+      variables: Record<string, unknown>
+    }
+    expect(body.query).toContain('object(oid:$o0)')
+    expect(body.query).toContain('... on Blob { isBinary text byteSize isTruncated }')
+    expect(body.query).not.toContain('SHA_A')
+    expect(body.variables.o0).toBe('SHA_A')
+    expect(body.variables.o1).toBe('SHA_B')
+  })
+
+  test('an unresolved alias (null repository field) maps that SHA to null', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { data: { repository: { b0: null } } }, []),
+    })
+    const result = await client.getBlobObjects('o', 'r', ['GONE'])
+    expect(result.GONE).toBeNull()
+  })
+
+  test('an empty SHA list makes no request and returns an empty map', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { data: {} }, captured),
+    })
+    const result = await client.getBlobObjects('o', 'r', [])
+    expect(result).toEqual({})
+    expect(captured).toHaveLength(0)
+  })
+
+  test('never puts the token in the request URL or body', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('leak-me-not'),
+      fetchImpl: fakeFetch(200, { data: { repository: { b0: null } } }, captured),
+    })
+    await client.getBlobObjects('o', 'r', ['X'])
+    expect(captured[0].url).not.toContain('leak-me-not')
+    expect(captured[0].init?.body as string).not.toContain('leak-me-not')
+  })
+})

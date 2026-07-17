@@ -8,9 +8,11 @@ import type {
   SnapshotImmutable,
   SnapshotMutable,
 } from '@revu/shared'
+import type { CommandRunner } from './command-runner'
 import type { GithubClient, GhTreeEntry, Page, PageParams } from './github-client'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
+import { provisionBlobs } from './blobs'
 import {
   mapCheckRuns,
   mapCommit,
@@ -49,15 +51,56 @@ import { fetchReviewThreads } from './threads'
  * calls are part of the mutable half — fetched every sync — and are counted in
  * `syncStats.requests` alongside the REST calls.
  *
- * Deferred and stubbed here, contract-valid regardless:
- *   - Blob CONTENT bytes are read from the local git clone (or the API) later; the
- *     blob INDEX (SHAs per side) is built here so the assembly slots in cleanly.
- *     `syncStats.blobsFetched`/`blobsReused` are wired honestly against the store's
- *     content-addressed blob presence even though no bytes are transferred yet.
+ * Blob BYTES are provisioned by the injected blob provider after the immutable
+ * half is known: every SHA the blob index references (base + head) is resolved
+ * from the content-addressed store first, then the local git clone (zero API
+ * cost, works offline), then the GitHub API for anything the clone lacks. Only
+ * true API transfers count as `blobsFetched`; store hits are `blobsReused` and
+ * local-git reads cost nothing — so a cold sync with a warm clone reports
+ * `blobsFetched: 0`. A blob no tier could produce is named in `partial` rather
+ * than reported as present, and API requests the provider spent (only the cold-
+ * cache fallback) are folded into `syncStats.requests`.
  */
 
 /** GitHub's maximum page size; the engine always requests it to minimize requests. */
 const PER_PAGE = 100
+
+/**
+ * A `CommandRunner` that never produces a local blob — used when no runner is
+ * injected, so the provider's local-git tier is skipped cleanly (every probe
+ * reports "not found") and blobs resolve from the store or the API instead.
+ */
+const NO_LOCAL_GIT_RUNNER: CommandRunner = {
+  async run() {
+    return { ok: false, code: -1, stdout: '', stderr: 'no local git runner injected' }
+  },
+}
+
+/**
+ * Merge the immutable half's own partial reason (file cap, truncated tree) with a
+ * snapshot-scoped list of blob SHAs no tier could provision. The result carries
+ * the union of both incompletenesses so the UI names everything it did not get;
+ * `null` only when there is nothing missing on either axis.
+ */
+function mergePartial(
+  immutablePartial: Snapshot['partial'],
+  missingBlobShas: string[],
+): Snapshot['partial'] {
+  if (missingBlobShas.length === 0) return immutablePartial
+  const reasons: string[] = []
+  if (immutablePartial && immutablePartial.reason.length > 0) {
+    reasons.push(immutablePartial.reason)
+  }
+  reasons.push(
+    `${missingBlobShas.length} blob(s) could not be provisioned from the local ` +
+      'git clone or the GitHub API; re-sync to retry fetching them.',
+  )
+  const priorMissing = immutablePartial?.missingBlobShas ?? []
+  return {
+    missingBlobShas: [...priorMissing, ...missingBlobShas],
+    reason: reasons.join(' '),
+  }
+}
 
 /**
  * The upper bound on files a single sync will paginate. A PR larger than this is
@@ -255,36 +298,23 @@ async function fetchMutable(
   }
 }
 
-/**
- * Count blob transfer honestly against the store's content-addressed blob table,
- * WITHOUT transferring bytes (blob content is fetched by a later local-git path).
- * A blob SHA already present in the store is a reuse; one absent would be a fetch.
- * This keeps `syncStats.blobsFetched`/`blobsReused` truthful the moment the blob
- * byte path lands, with no change to the split logic here.
- */
-function countBlobs(
-  store: DirectStore,
-  blobIndex: SnapshotImmutable['blobIndex'],
-): { blobsFetched: number; blobsReused: number } {
-  const shas = new Set<string>()
-  for (const sides of Object.values(blobIndex)) {
-    if (sides.base) shas.add(sides.base)
-    if (sides.head) shas.add(sides.head)
-  }
-  let reused = 0
-  let fetched = 0
-  for (const sha of shas) {
-    if (store.hasBlob(sha)) reused += 1
-    else fetched += 1
-  }
-  return { blobsFetched: fetched, blobsReused: reused }
-}
-
 /** Everything `syncPull` needs, injected so it is unit-testable with fakes. */
 export interface SyncDeps {
   github: GithubClient
   repo: RepoRef
   store: DirectStore
+  /**
+   * Runs `git cat-file` for the local-first blob provider. Optional: when absent,
+   * blob provisioning skips the local-git tier and resolves every blob from the
+   * store or the API. Injected so tests drive `cat-file` with a fake.
+   */
+  runner?: CommandRunner
+  /**
+   * The git clone directory the blob provider's `git cat-file` runs in — the repo
+   * being reviewed. Required alongside `runner` for the local-git tier; absent
+   * with no `runner`, blobs come from the store/API only.
+   */
+  cwd?: string
   /** Timestamp source; injectable so tests get deterministic `syncedAt`. */
   now?: () => string
 }
@@ -362,14 +392,37 @@ export async function syncPull(deps: SyncDeps, prNumber: number): Promise<SyncRe
     counter,
   )
 
-  const blobStats = countBlobs(store, immutable.blobIndex)
+  // Provision blob BYTES for every SHA the index references (base + head): store
+  // reuse first, then the local git clone (zero API cost, works offline), then
+  // the API for anything the clone lacked. Only API transfers count as fetches;
+  // any request the provider spends is folded into the shared counter, so
+  // `syncStats.requests` stays honest.
+  const blobs = await provisionBlobs(
+    {
+      github,
+      repo,
+      store,
+      runner: deps.runner ?? NO_LOCAL_GIT_RUNNER,
+      cwd: deps.cwd ?? '.',
+      counter,
+    },
+    immutable.blobIndex,
+  )
+
+  // A blob that no tier could produce (local git missing AND the API omitted it)
+  // is named in `partial` rather than reported present — never fabricate a blob.
+  // This is a snapshot-scoped partial (missing bytes a retry can fix), distinct
+  // from the immutable half's own file-cap/tree-truncation partial, so the two
+  // reasons are merged honestly.
+  const finalPartial = mergePartial(partial, blobs.missing)
+
   const snapshot: Snapshot = {
     prNumber,
     syncedAt,
-    partial,
+    partial: finalPartial,
     syncStats: {
-      blobsFetched: blobStats.blobsFetched,
-      blobsReused: blobStats.blobsReused,
+      blobsFetched: blobs.stats.blobsFetched,
+      blobsReused: blobs.stats.blobsReused,
       requests: counter.count,
     },
     immutable,

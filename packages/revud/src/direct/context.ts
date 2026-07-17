@@ -27,6 +27,10 @@ export interface DirectContext {
   repo: RepoRef
   tokenSource: TokenSource
   github: GithubClient
+  /** The subprocess runner used for git/gh — reused by the local-first blob provider. */
+  runner: CommandRunner
+  /** The directory git commands run in (the repo clone); where blob `cat-file` reads. */
+  cwd: string
 }
 
 /**
@@ -119,7 +123,11 @@ export async function resolveDirectContext(
     throw new DirectStartupError(err instanceof Error ? err.message : String(err))
   }
 
-  return { session, repo, tokenSource, github }
+  // The cwd git ran in is where the blob provider's `git cat-file` must read the
+  // clone; carry it (and the runner) so the local-first blob path uses the same
+  // seam startup validated against.
+  const cwd = opts.cwd ?? process.cwd()
+  return { session, repo, tokenSource, github, runner, cwd }
 }
 
 /** Turn a repo-resolution failure into the exact line the user should read. */

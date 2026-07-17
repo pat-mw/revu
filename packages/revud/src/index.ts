@@ -159,6 +159,10 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
     github: context.github,
     repo: context.repo,
     store,
+    // The local-first blob provider reads the git clone via the same runner and
+    // directory startup validated, so blob bytes come free from local git.
+    runner: context.runner,
+    cwd: context.cwd,
   })
 
   const server = startServer({
