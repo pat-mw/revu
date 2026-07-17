@@ -1,12 +1,15 @@
 {
   "files": [],
   "references": [
-    { "path": "./tsconfig.app.json" },
-    { "path": "./tsconfig.node.json" }
+    { "path": "./packages/shared/tsconfig.json" },
+    { "path": "./packages/revud/tsconfig.json" },
+    { "path": "./packages/app/tsconfig.app.json" },
+    { "path": "./packages/app/tsconfig.node.json" }
   ],
   "compilerOptions": {
     "paths": {
-      "@/*": ["./src/*"]
+      "@revu/shared": ["./packages/shared/src/index.ts"],
+      "@revu/shared/*": ["./packages/shared/src/*"]
     }
   }
 }

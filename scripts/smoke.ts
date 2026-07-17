@@ -28,10 +28,10 @@ if (!('document' in globalThis)) {
   }
 }
 
-const { createMockApi } = await import('../src/api/mock/adapter')
-const { mockDev } = await import('../src/api/mock/devtools')
-const { parseCommentIdentity } = await import('../src/lib/identity')
-const { ApiError } = await import('../src/api/types')
+const { createMockApi } = await import('../packages/app/src/api/mock/adapter')
+const { mockDev } = await import('../packages/app/src/api/mock/devtools')
+const { parseCommentIdentity } = await import('@revu/shared')
+const { ApiError } = await import('@revu/shared')
 
 let failures = 0
 function check(label: string, cond: boolean, detail?: unknown) {
