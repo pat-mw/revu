@@ -551,6 +551,7 @@ export const vPendingComment: Validator<PendingComment> = vObject({
     lineText: vString,
     contextBefore: vArray(vString),
     contextAfter: vArray(vString),
+    startLineText: vOptional(vNullable(vString)),
   }),
 })
 

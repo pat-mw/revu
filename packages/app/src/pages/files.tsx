@@ -490,6 +490,17 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
       ''
     const contextBefore = lines !== null ? lines.slice(Math.max(0, anchor.line - 4), anchor.line - 1) : []
     const contextAfter = lines !== null ? lines.slice(anchor.line, anchor.line + 3) : []
+    // For a ranged comment, capture the START line's text so reconcile can
+    // validate the start independently after the head moves (a single-line
+    // comment has no separate start, so this stays null).
+    const startLineText =
+      anchor.startLine !== null
+        ? (lines?.[anchor.startLine - 1] ??
+          (model !== undefined
+            ? lineTextFromModel(model, anchor.side, anchor.startLine)
+            : null) ??
+          '')
+        : null
     draftActions.ensureDraft({
       headSha: snapshot.immutable.headSha,
       compareKey: snapshot.immutable.compareKey,
@@ -502,7 +513,7 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
         start_line: anchor.startLine,
         start_side: anchor.startLine !== null ? anchor.side : null,
         body: composer.text,
-        anchor: { lineText, contextBefore, contextAfter },
+        anchor: { lineText, contextBefore, contextAfter, startLineText },
       }),
     )
     canceledTextRef.current.delete(anchorKey(anchor))
