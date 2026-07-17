@@ -13,7 +13,7 @@ import {
   validateSetViewedBody,
   validateSubmitReviewInput,
 } from '@revu/shared'
-import type { DevStateShape, MockBundle } from './mock-bridge'
+import type { DevStateShape, MockBundle, MockStore } from './mock-bridge'
 
 /**
  * The `/api/*` router: dispatches each route in the shared `ROUTES` table to the
@@ -33,7 +33,13 @@ import type { DevStateShape, MockBundle } from './mock-bridge'
  *
  * After every MUTATING handler the reused store is flushed to disk before the
  * response is sent, so a restart between the mutation and the debounced write
- * loses nothing.
+ * loses nothing. That flush uses the THROWING variant (`flushOrThrow`): the
+ * store's plain `flush` swallows storage failures (correct in a browser, where
+ * quota/privacy mode must not break the session), but here `localStorage` is a
+ * disk file — a swallowed write failure would return 200 for a mutation that
+ * never reached disk. A flush failure is surfaced as a `persist_failed`
+ * envelope (500); the mutation itself is retained in memory, so nothing the
+ * user wrote is lost and a later retry can persist it.
  */
 
 /**
@@ -82,6 +88,27 @@ function errorResponse(err: unknown): Response {
   }
   const message = err instanceof Error ? err.message : String(err)
   return json({ code: 'broker_unreachable', message }, 500)
+}
+
+/**
+ * Persist the store after a mutation, mapping a storage-write failure to the
+ * typed `persist_failed` envelope (a 5xx) instead of letting the handler answer
+ * with a success the client would trust as saved. The mutation is still applied
+ * in memory — drafts and overlays remain readable and a later flush can land it
+ * — so the honest answer is "written, not durable", never a silent 200 and
+ * never a discarded write.
+ */
+function flushDurable(store: MockStore): void {
+  try {
+    store.flushOrThrow()
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new ApiError(
+      'persist_failed',
+      `The change was applied but could not be saved to disk: ${detail}. ` +
+        'Nothing you wrote was discarded; fix the storage (disk space, permissions) and retry.',
+    )
+  }
 }
 
 /** Parse a `:n`-style integer path param; `null` when absent or malformed. */
@@ -204,7 +231,7 @@ export async function handleApi(
         // Pass the request's AbortSignal straight through: aborting the HTTP
         // request cancels the in-flight sync without corrupting store state.
         const snap = await api.syncPull(n, { signal: req.signal })
-        store.flush()
+        flushDurable(store)
         return json(snap)
       }
 
@@ -226,7 +253,7 @@ export async function handleApi(
         if (n === null) return badRequest('Malformed pull number.')
         const body = validateReplyBody(await readJsonBody(req))
         const comment = await api.replyToThread(n, params.threadId, body.body)
-        store.flush()
+        flushDurable(store)
         return json(comment)
       }
 
@@ -234,7 +261,7 @@ export async function handleApi(
         if (n === null) return badRequest('Malformed pull number.')
         const body = validateResolveBody(await readJsonBody(req))
         const thread = await api.resolveThread(n, params.threadId, body.resolved)
-        store.flush()
+        flushDurable(store)
         return json(thread)
       }
 
@@ -255,7 +282,7 @@ export async function handleApi(
           return badRequest('addReaction requires the owning pull number (?pr= or prNumber).')
         }
         const rollup = await api.addReaction(prNumber, commentId, body.reaction as ReactionKey)
-        store.flush()
+        flushDurable(store)
         return json(rollup)
       }
 
@@ -268,7 +295,7 @@ export async function handleApi(
         }
         // head_moved / forbidden come back as 200 values, never error statuses.
         const result = await api.submitReview(input)
-        store.flush()
+        flushDurable(store)
         return json(result)
       }
 
@@ -306,14 +333,14 @@ export async function handleApi(
           return badRequest('Path pull number does not match body prNumber.')
         }
         const saved = await api.saveDraft(draft)
-        store.flush()
+        flushDurable(store)
         return json(saved)
       }
 
       case 'discardDraft': {
         if (n === null) return badRequest('Malformed pull number.')
         await api.discardDraft(n)
-        store.flush()
+        flushDurable(store)
         return json({ ok: true })
       }
 
@@ -326,7 +353,7 @@ export async function handleApi(
         if (n === null) return badRequest('Malformed pull number.')
         const body = validateSetViewedBody(await readJsonBody(req))
         const state = await api.setFileViewed(n, body.path, body.viewed, body.blobSha)
-        store.flush()
+        flushDurable(store)
         return json(state)
       }
 
@@ -336,7 +363,7 @@ export async function handleApi(
       case 'setPreferences': {
         const patch = validateSetPreferencesBody(await readJsonBody(req))
         const prefs = await api.setPreferences(patch)
-        store.flush()
+        flushDurable(store)
         return json(prefs)
       }
 

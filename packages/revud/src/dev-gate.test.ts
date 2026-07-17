@@ -30,6 +30,7 @@ interface DevCalls {
   setFailureMode: string[]
   reset: number
   flush: number
+  flushOrThrow: number
 }
 
 const STUB_HUMANS: Human[] = [
@@ -38,7 +39,14 @@ const STUB_HUMANS: Human[] = [
 
 /** A stub bundle whose dev controls record every call; `api` throws on any use. */
 function makeStubMock(): { mock: MockBundle; calls: DevCalls } {
-  const calls: DevCalls = { setHuman: [], setLatency: [], setFailureMode: [], reset: 0, flush: 0 }
+  const calls: DevCalls = {
+    setHuman: [],
+    setLatency: [],
+    setFailureMode: [],
+    reset: 0,
+    flush: 0,
+    flushOrThrow: 0,
+  }
   const state: DevStateShape = { humanId: 'h-priya', latency: 'zero', failureMode: 'none' }
   const api = new Proxy(
     {},
@@ -78,6 +86,9 @@ function makeStubMock(): { mock: MockBundle; calls: DevCalls } {
     store: {
       flush() {
         calls.flush += 1
+      },
+      flushOrThrow() {
+        calls.flushOrThrow += 1
       },
     },
   }

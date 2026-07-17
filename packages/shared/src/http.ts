@@ -165,6 +165,12 @@ export const HTTP_STATUS_BY_CODE: Record<Exclude<ApiErrorCode, 'network'>, numbe
   conflict: 409,
   not_found: 404,
   forbidden: 403,
+  /**
+   * The server applied the mutation in memory but could not persist it to its
+   * storage — a server-side fault, so 5xx, never a 2xx the client would trust
+   * as saved.
+   */
+  persist_failed: 500,
 }
 
 /** Serialize an `ApiError` into its wire body. Used by `revud`. */

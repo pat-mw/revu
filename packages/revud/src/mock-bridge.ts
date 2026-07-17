@@ -37,9 +37,22 @@ export interface MockDev {
   getRate(): RateLimitInfo
 }
 
-/** The single durability lever the daemon needs from the store. */
+/** The durability levers the daemon needs from the store. */
 export interface MockStore {
+  /**
+   * Persist synchronously, swallowing a storage-write failure. Browser
+   * semantics — used only where a failure must not mask another error (the
+   * router's error path, shutdown).
+   */
   flush(): void
+  /**
+   * Persist synchronously, propagating a storage-write failure. The daemon's
+   * `localStorage` is a disk file, so a swallowed failure would turn an
+   * unpersisted mutation into a silent HTTP success; mutating handlers use
+   * this variant and surface the throw as a typed error instead. In-memory
+   * state survives the failure.
+   */
+  flushOrThrow(): void
 }
 
 /** The reused mock surface: the adapter, the dev controls, and the store flush. */

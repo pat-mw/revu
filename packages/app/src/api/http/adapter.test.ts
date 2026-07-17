@@ -96,6 +96,33 @@ describe('error mapping', () => {
     expect((err as ApiError).code).toBe('network')
   })
 
+  test('a persist_failed envelope on a saveDraft 500 maps to the typed ApiError', async () => {
+    // The daemon answers persist_failed when a mutation applied in memory could
+    // not be flushed to disk. The adapter must hand the app the typed error —
+    // the draft-save path's catch keeps the text in the editing cache — never a
+    // resolved save the UI would report as durable.
+    stubFetch(() =>
+      jsonResponse({ code: 'persist_failed', message: 'could not be saved to disk' }, 500),
+    )
+    const api = createHttpApi('http://d')
+    const at = new Date().toISOString()
+    const err = await api
+      .saveDraft({
+        humanId: 'h-priya',
+        prNumber: 204,
+        headSha: 'sha',
+        compareKey: 'base...sha',
+        body: 'draft text',
+        event: 'COMMENT',
+        comments: [],
+        createdAt: at,
+        updatedAt: at,
+      })
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).code).toBe('persist_failed')
+  })
+
   test('non-envelope error body (proxy HTML) degrades to broker_unreachable', async () => {
     stubFetch(
       () =>

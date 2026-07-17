@@ -235,14 +235,26 @@ let state: StoreShape = load()
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null
 
-function flush(): void {
+/**
+ * Write the whole document to `localStorage` NOW, cancelling any pending
+ * debounce. A `setItem` failure PROPAGATES — this is the raw persistence
+ * primitive; whether a failure is swallowed or surfaced is the caller's call
+ * (`flush` swallows for the browser, `flushOrThrow` propagates for a durable
+ * host). In-memory state is already updated either way, so a failed write
+ * never loses the session's working copy.
+ */
+function persistNow(): void {
   if (persistTimer !== null) {
     clearTimeout(persistTimer)
     persistTimer = null
   }
   if (typeof localStorage === 'undefined') return
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+}
+
+function flush(): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+    persistNow()
   } catch {
     // Quota or privacy-mode failure: state keeps working in memory for the session.
   }
@@ -354,12 +366,27 @@ export const store = {
    * Persist the whole document synchronously, cancelling any pending debounce.
    * The browser already flushes on the ~1s debounce and on visibilitychange;
    * a durable host (a daemon writing to disk through a `localStorage` polyfill)
-   * calls this after every mutation and on shutdown so no in-flight write is
-   * lost to a crash. Behavior-preserving: in the browser this is exactly the
-   * debounced `setItem` run eagerly.
+   * calls this on shutdown so no in-flight write is lost to a crash. A
+   * `setItem` failure is SWALLOWED: in a browser, quota or privacy mode must
+   * not break the session — state keeps working in memory. Behavior-preserving:
+   * in the browser this is exactly the debounced `setItem` run eagerly.
    */
   flush(): void {
     flush()
+  },
+
+  /**
+   * Persist the whole document synchronously, PROPAGATING a `setItem` failure
+   * instead of swallowing it. For a durable host whose `localStorage` is a real
+   * disk (where a failed write means the document is NOT persisted — disk full,
+   * permissions, read-only filesystem) and which must report that to its caller
+   * rather than pretend the write landed. In-memory state is untouched by the
+   * failure: every draft and overlay stays readable and a later flush can still
+   * succeed. Browser code paths keep using `flush`; the swallow there is
+   * deliberate and load-bearing.
+   */
+  flushOrThrow(): void {
+    persistNow()
   },
 
   // ——— dev panel state ———

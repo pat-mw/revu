@@ -12,7 +12,11 @@ declare module 'bun:test' {
 
   export function describe(label: string, fn: () => void): void
   export function it(label: string, fn: TestFn): void
-  export function test(label: string, fn: TestFn): void
+  export const test: {
+    (label: string, fn: TestFn): void
+    /** Registers the test, skipping it when `condition` is true (e.g. an environment where the setup cannot fail as intended). */
+    skipIf(condition: boolean): (label: string, fn: TestFn) => void
+  }
 
   export function beforeAll(fn: TestFn): void
   export function afterAll(fn: TestFn): void

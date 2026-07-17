@@ -13,7 +13,7 @@
  * never bleeds between runs.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Subprocess } from 'bun'
@@ -28,6 +28,11 @@ import type {
 } from '@revu/shared'
 
 const ENTRY = join(import.meta.dir, 'index.ts')
+
+// Permission-based failure injection (a read-only dir, an unreadable file) is
+// a no-op for root, which bypasses mode bits — skip those tests rather than
+// let them fail for the wrong reason.
+const runningAsRoot = typeof process.getuid === 'function' && process.getuid() === 0
 
 // These tests only need the daemon to START, which requires SOME valid dist with
 // an `index.html`; they do not need the real built frontend. A per-run stub dist
@@ -732,5 +737,171 @@ describe('cross-version durability: a v2 document upgrades to v3 without wiping 
     expect(onDisk.v).toBe(3)
     expect(onDisk.drafts['h-priya']?.['204']?.body).toContain('must survive the upgrade to v3')
     expect(onDisk.drafts['h-priya']?.['204']?.comments[0]?.start_line).toBe(8)
+  })
+})
+
+describe('durability: a failed disk write is a persist_failed 5xx, text retained', () => {
+  // The store applies every mutation in memory and flushes to disk before the
+  // response. When the disk refuses the write (here: the data dir made
+  // read-only mid-session, so the atomic tmp-file write fails), the daemon must
+  // NOT answer 200 — the UI would report the draft saved when it never reached
+  // disk. It must answer the typed persist_failed envelope while keeping the
+  // draft readable in memory, so nothing the user wrote is lost and a retry
+  // after the disk recovers persists it.
+  let roDir: string
+  let roDaemon: Daemon
+
+  afterAll(async () => {
+    // Restore write permission first: tearing down a still-read-only dir would
+    // fail, and the daemon's shutdown flush needs a writable dir to be clean.
+    if (roDir) {
+      try {
+        chmodSync(roDir, 0o755)
+      } catch {
+        // Already writable or already gone.
+      }
+    }
+    if (roDaemon) await stopDaemon(roDaemon)
+    if (roDir) rmSync(roDir, { recursive: true, force: true })
+  })
+
+  test.skipIf(runningAsRoot)(
+    'a read-only data dir mid-session: saveDraft answers 500 persist_failed, the draft stays readable, and a retry after recovery lands on disk',
+    async () => {
+      roDir = mkdtempSync(join(tmpdir(), 'revud-ro-'))
+      roDaemon = await startDaemon(roDir, distDir)
+      const docPath = join(roDir, 'revu.broker.v1.json')
+
+      // A first draft persists normally and is on disk.
+      const before: ReviewDraft = {
+        humanId: 'h-priya',
+        prNumber: 204,
+        headSha: 'ro-head-sha',
+        compareKey: 'base...ro-head-sha',
+        body: 'Saved while the disk was healthy.',
+        event: 'COMMENT',
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }
+      const okSave = await fetch(`${roDaemon.base}/api/pulls/204/draft`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(before),
+      })
+      expect(okSave.status).toBe(200)
+      await okSave.body?.cancel()
+      expect(readFileSync(docPath, 'utf8')).toContain('Saved while the disk was healthy.')
+
+      // The disk goes read-only. The atomic write path (tmp file + rename)
+      // needs a writable directory, so the next flush throws server-side.
+      chmodSync(roDir, 0o555)
+      const edited: ReviewDraft = {
+        ...before,
+        body: 'Edited while the disk was read-only — must not be lost.',
+        updatedAt: new Date().toISOString(),
+      }
+      try {
+        const failed = await fetch(`${roDaemon.base}/api/pulls/204/draft`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(edited),
+        })
+        expect(failed.status).toBe(500)
+        const envelope = await json<{ code: string; message: string }>(failed)
+        expect(envelope.code).toBe('persist_failed')
+        expect(envelope.message.length).toBeGreaterThan(0)
+
+        // The edit was applied in memory before the flush failed: reading the
+        // draft back returns the NEW text — surfaced error, retained text.
+        const read = await fetch(`${roDaemon.base}/api/pulls/204/draft`)
+        expect(read.status).toBe(200)
+        const kept = await json<ReviewDraft | null>(read)
+        expect(kept?.body).toBe('Edited while the disk was read-only — must not be lost.')
+
+        // The on-disk document still holds the pre-failure copy — the failed
+        // write neither corrupted nor truncated it (atomic tmp+rename).
+        expect(readFileSync(docPath, 'utf8')).toContain('Saved while the disk was healthy.')
+      } finally {
+        chmodSync(roDir, 0o755)
+      }
+
+      // The disk recovered: retrying the same save now succeeds and persists.
+      const retry = await fetch(`${roDaemon.base}/api/pulls/204/draft`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(edited),
+      })
+      expect(retry.status).toBe(200)
+      await retry.body?.cancel()
+      expect(readFileSync(docPath, 'utf8')).toContain(
+        'Edited while the disk was read-only — must not be lost.',
+      )
+    },
+  )
+})
+
+describe('boot: unreadable is not absent — never reseed over a present store file', () => {
+  // DiskStorage returns null only for a genuinely ABSENT document (never
+  // persisted — seeding is correct). A PRESENT file that cannot be read must
+  // fail the boot loudly instead: the store treats null as absent and reseeds,
+  // and the next flush would overwrite the real document — full of drafts —
+  // with fresh seed state, turning a transient I/O error into permanent loss.
+  test.skipIf(runningAsRoot)(
+    'a present-but-unreadable store file refuses to boot and is left untouched',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'revud-unreadable-'))
+      const docPath = join(dir, 'revu.broker.v1.json')
+      try {
+        const original = JSON.stringify({ sentinel: 'irreplaceable document — must never be reseeded over' })
+        writeFileSync(docPath, original, 'utf8')
+        chmodSync(docPath, 0o000)
+
+        const proc = Bun.spawn(['bun', 'run', ENTRY], {
+          env: {
+            ...process.env,
+            REVU_PORT: '0',
+            REVU_DATA_DIR: dir,
+            REVU_DIST_DIR: distDir,
+            REVU_MODE: 'mock',
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        })
+        const exitCode = await proc.exited
+        const stderr = await new Response(proc.stderr).text()
+
+        // A hard startup failure with a message that names the file and the fix.
+        expect(exitCode).not.toBe(0)
+        expect(stderr).toContain(docPath)
+        expect(stderr).toContain('could not be read')
+
+        // The file was not overwritten with seed state — byte-identical.
+        chmodSync(docPath, 0o644)
+        expect(readFileSync(docPath, 'utf8')).toBe(original)
+      } finally {
+        try {
+          chmodSync(docPath, 0o644)
+        } catch {
+          // Already readable or already gone.
+        }
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('a genuinely absent store file still seeds normally', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'revud-fresh-'))
+    let fresh: Daemon | null = null
+    try {
+      fresh = await startDaemon(dir, distDir)
+      const res = await fetch(`${fresh.base}/api/pulls`)
+      expect(res.status).toBe(200)
+      const list = await json<PullListResponse>(res)
+      expect(list.items.length).toBeGreaterThan(0)
+    } finally {
+      if (fresh) await stopDaemon(fresh)
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
