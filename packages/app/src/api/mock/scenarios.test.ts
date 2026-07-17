@@ -236,7 +236,7 @@ describe('per-human isolation', () => {
 
   it('draft survives identity round-trip', async () => {
     mockDev.setHuman('h-priya')
-    expect((await api.getDraft(389))?.comments.length).toBe(3)
+    expect((await api.getDraft(389))?.comments.length).toBe(4)
   })
 })
 

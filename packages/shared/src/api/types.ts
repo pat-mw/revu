@@ -456,7 +456,7 @@ export type AnchorResult =
   | {
       kind: 'lost'
       comment: PendingComment
-      reason: 'line-deleted' | 'file-deleted' | 'file-renamed'
+      reason: 'line-deleted' | 'file-deleted' | 'file-renamed' | 'file-added'
     }
 
 export interface ReconcileReport {

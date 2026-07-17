@@ -977,6 +977,7 @@ const remoteV1: RemotePull = {
 }
 
 const H1_LINES = SCHED_H1.replace(/\n$/, '').split('\n')
+const BASE_LINES = SCHED_BASE.replace(/\n$/, '').split('\n')
 
 /** Anchor context copied verbatim from the H1 blob around a 1-based line. */
 function anchorAt(line: number): PendingComment['anchor'] {
@@ -988,8 +989,24 @@ function anchorAt(line: number): PendingComment['anchor'] {
 }
 
 /**
+ * Anchor context copied from the BASE blob around a 1-based line — the content
+ * a LEFT-side comment targets. LEFT comments annotate lines the PR deletes, so
+ * their anchor text lives in base, not head, and reconcile must re-anchor them
+ * against the base blob.
+ */
+function baseAnchorAt(line: number): PendingComment['anchor'] {
+  return {
+    lineText: BASE_LINES[line - 1],
+    contextBefore: BASE_LINES.slice(Math.max(0, line - 4), line - 1),
+    contextAfter: BASE_LINES.slice(line, line + 2),
+  }
+}
+
+/**
  * Priya's pending review, written against H1. Comment targets, in order:
- * clean (H1:15 → H2:15), drifted (+12; H1:29 → H2:41), lost (H1:70 deleted).
+ * clean (H1:15 → H2:15), drifted (+12; H1:29 → H2:41), lost (H1:70 deleted),
+ * and a LEFT-side note on a deleted base line (base:8) that re-anchors clean
+ * because the merge base is unchanged between H1 and H2.
  */
 const draft: ReviewDraft = {
   humanId: 'h-priya',
@@ -1034,6 +1051,18 @@ const draft: ReviewDraft = {
       createdAt: daysAgo(1),
       updatedAt: hoursAgo(22),
       anchor: anchorAt(70),
+    },
+    {
+      key: 'pc-389-legacy-signature',
+      path: 'src/auth/refresh-scheduler.ts',
+      side: 'LEFT',
+      start_side: null,
+      line: 8,
+      start_line: null,
+      body: 'Worth a one-line note in the PR body that refreshIfExpiring is gone entirely — a few call sites still import it and will break until they move to the scheduler.',
+      createdAt: daysAgo(1),
+      updatedAt: hoursAgo(22),
+      anchor: baseAnchorAt(8),
     },
   ],
   createdAt: daysAgo(1),

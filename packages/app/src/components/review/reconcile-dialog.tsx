@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, ChevronRight, MoveVertical, Undo2, XCircle } from 'lucide-react'
 import { api } from '@/api'
 import type { AnchorResult, CommitInfo, PendingComment, ReconcileReport } from '@revu/shared'
+import { selectAnchorBlobSha } from '@revu/shared'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -77,6 +78,7 @@ const LOST_REASON: Record<LostResult['reason'], string> = {
   'line-deleted': 'that line no longer exists',
   'file-deleted': 'the file was deleted',
   'file-renamed': 'the file was renamed',
+  'file-added': 'that file is new — it has no base version to anchor to',
 }
 
 /**
@@ -143,14 +145,12 @@ export function ReconcileDialog({
   }
 
   /**
-   * The blob a comment's anchor text lives in on the freshly synced snapshot:
-   * RIGHT-side anchors read the head blob, LEFT-side anchors the base blob.
+   * The blob a comment's anchor text lives in on the freshly synced snapshot,
+   * chosen through the shared side selector so the blob shown for re-anchor
+   * matches the one the reconcile report classified against.
    */
-  const blobShaFor = (comment: PendingComment): string | null => {
-    const entry = snapshot?.immutable.blobIndex[comment.path]
-    if (!entry) return null
-    return comment.side === 'LEFT' ? entry.base : entry.head
-  }
+  const blobShaFor = (comment: PendingComment): string | null =>
+    selectAnchorBlobSha(snapshot?.immutable.blobIndex[comment.path], comment.side)
 
   const apply = async () => {
     if (!draft || !allDecided || busy) return
