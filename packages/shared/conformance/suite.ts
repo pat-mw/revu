@@ -21,8 +21,8 @@
  * pull that was never synced. Every adapter must uphold all three.
  */
 import { beforeAll, describe, expect, it } from 'bun:test'
-import { ApiError } from '../src/index.ts'
-import type { PendingComment, RevuApi } from '../src/index.ts'
+import { ApiError, blobContentToLines, classifyPendingComment, selectAnchorBlobSha } from '../src/index.ts'
+import type { AnchorResult, PendingComment, RevuApi } from '../src/index.ts'
 
 /**
  * Names the fixture pull that exercises each invariant. Every runner passes the
@@ -239,11 +239,74 @@ export function runConformanceSuite(config: ConformanceConfig): void {
         await api.syncPull(scenarios.reconcile)
         const report = await api.reconcileDraft(scenarios.reconcile)
         const kinds = report.results.map((r) => r.kind).sort()
-        expect(kinds).toEqual(['clean', 'drifted', 'lost'])
+        // A RIGHT-side clean/drifted/lost trio plus a LEFT-side clean anchor:
+        // the LEFT note targets a deleted base line whose merge base is
+        // unchanged, so it re-anchors cleanly against the base blob.
+        expect(kinds).toEqual(['clean', 'clean', 'drifted', 'lost'])
         const drifted = report.results.find((r) => r.kind === 'drifted')
         expect(drifted?.kind).toBe('drifted')
         expect(drifted?.kind === 'drifted' ? drifted.delta : null).toBe(12)
+        // The LEFT-side comment classified against BASE content, not head.
+        const leftResult = report.results.find((r) => r.comment.side === 'LEFT')
+        expect(leftResult?.kind).toBe('clean')
         expect(report.newCommits).toHaveLength(3)
+      })
+
+      it('the client-side preview matches the reconcile report for every comment, both sides', async () => {
+        // The dialog previews each draft comment by running the SAME shared
+        // classifier the adapter's report runs, resolving blob lines from the
+        // freshly synced snapshot via getBlob. Recomputing it here through the
+        // transport-agnostic contract proves preview and report cannot diverge
+        // — the whole point of a single blob-selection + classification rule.
+        await api.syncPull(scenarios.reconcile)
+        const report = await api.reconcileDraft(scenarios.reconcile)
+        const snap = await api.getSnapshot(scenarios.reconcile)
+        const draft = await api.getDraft(scenarios.reconcile)
+        expect(snap).not.toBeNull()
+        expect(draft).not.toBeNull()
+
+        // A blob-line resolver over the contract surface, memoized so each
+        // blob is fetched at most once per comment classification.
+        const lineCache = new Map<string, string[] | null>()
+        const resolveBlobLines = async (sha: string): Promise<string[] | null> => {
+          if (lineCache.has(sha)) return lineCache.get(sha) ?? null
+          let lines: string[] | null = null
+          try {
+            const blob = await api.getBlob(sha)
+            lines = blob.binary ? null : blobContentToLines(blob.content)
+          } catch {
+            lines = null
+          }
+          lineCache.set(sha, lines)
+          return lines
+        }
+
+        // Both sides must appear, or the parity check is only exercising one.
+        const sides = new Set(draft!.comments.map((c) => c.side))
+        expect(sides.has('LEFT')).toBe(true)
+        expect(sides.has('RIGHT')).toBe(true)
+
+        for (const comment of draft!.comments) {
+          // Pre-warm the blob line cache for this comment's anchoring side so
+          // the classifier's synchronous resolver is a pure cache read. The
+          // side is chosen through the same shared selector the classifier
+          // uses, so the parity check cannot accidentally prefetch the wrong
+          // blob and mask a divergence.
+          const entry = snap!.immutable.blobIndex[comment.path]
+          const sha = selectAnchorBlobSha(entry, comment.side)
+          if (sha) await resolveBlobLines(sha)
+
+          const preview: AnchorResult = classifyPendingComment({
+            comment,
+            files: snap!.immutable.files,
+            blobIndex: snap!.immutable.blobIndex,
+            resolveBlobLines: (s) => lineCache.get(s) ?? null,
+          })
+          const reported = report.results.find((r) => r.comment.key === comment.key)
+          expect(reported).toBeDefined()
+          // Preview and report must be byte-identical for this comment.
+          expect(preview).toEqual(reported!)
+        }
       })
     })
 

@@ -1,5 +1,5 @@
-import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, PendingComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
-import { ApiError, prefixBody, classifyAnchor } from '@revu/shared'
+import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
+import { ApiError, prefixBody, blobContentToLines, classifyPendingComment } from '@revu/shared'
 import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
@@ -27,15 +27,6 @@ import { delay, localDelay } from './latency'
  */
 
 const db = fixtureDB as FixtureDB
-
-type FilePresence = 'present' | 'deleted' | 'renamed'
-
-/** Local pin of the anchor-classification contract. */
-const classify: (args: {
-  comment: PendingComment
-  newHeadLines: string[]
-  filePresence: FilePresence
-}) => AnchorResult = classifyAnchor
 
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v)) as T
@@ -612,28 +603,21 @@ export function createMockApi(): RevuApi {
       }
       const { files, blobIndex, commits, headSha } = snap.immutable
 
-      const results: AnchorResult[] = draft.comments.map((c) => {
-        const file = files.find((f) => f.filename === c.path)
-        let filePresence: FilePresence
-        if (file) {
-          filePresence = file.status === 'removed' ? 'deleted' : 'present'
-        } else if (
-          files.some((f) => f.status === 'renamed' && f.previous_filename === c.path)
-        ) {
-          filePresence = 'renamed'
-        } else {
-          // Absent from the compare: the PR no longer touches this file, so
-          // it cannot host a diff comment. For this prototype it counts as
-          // present when the head blob is still indexed (the anchor logic
-          // decides clean/drifted/lost); with no head blob it is deleted.
-          filePresence = blobIndex[c.path]?.head ? 'present' : 'deleted'
-        }
-        const headBlobSha = blobIndex[c.path]?.head ?? null
-        const headBlob = headBlobSha ? store.getBlob(headBlobSha) : null
-        const newHeadLines =
-          headBlob && !headBlob.binary ? headBlob.content.split('\n') : []
-        return classify({ comment: c, newHeadLines, filePresence })
-      })
+      // Each comment is classified against the side its anchor lives on
+      // (base for LEFT, head for RIGHT), resolving the blob lines from the
+      // store. This is the SAME shared decision the reconcile dialog previews
+      // with, so a preview and this report never disagree.
+      const results: AnchorResult[] = draft.comments.map((c) =>
+        classifyPendingComment({
+          comment: c,
+          files,
+          blobIndex,
+          resolveBlobLines: (sha) => {
+            const blob = store.getBlob(sha)
+            return blob && !blob.binary ? blobContentToLines(blob.content) : null
+          },
+        }),
+      )
 
       // Commits that landed after the draft was written. Preferred: slice the
       // snapshot's base→head commit list after the draft's head SHA. When the

@@ -7,8 +7,15 @@
  */
 
 import { describe, it, expect } from 'bun:test'
-import { classifyAnchor } from './anchor'
-import type { PendingComment } from '../api/types'
+import {
+  anchorSideKey,
+  blobContentToLines,
+  classifyAnchor,
+  classifyPendingComment,
+  resolveFilePresence,
+  selectAnchorBlobSha,
+} from './anchor'
+import type { PendingComment, PullFile } from '../api/types'
 
 /**
  * Builds a PendingComment carrying only the anchoring-relevant fields. `line`
@@ -18,6 +25,7 @@ import type { PendingComment } from '../api/types'
  */
 function makeComment(overrides: {
   line: number
+  side?: 'LEFT' | 'RIGHT'
   start_line?: number | null
   lineText: string
   contextBefore?: string[]
@@ -26,7 +34,7 @@ function makeComment(overrides: {
   return {
     key: 'k',
     path: 'src/file.ts',
-    side: 'RIGHT',
+    side: overrides.side ?? 'RIGHT',
     start_side: null,
     line: overrides.line,
     start_line: overrides.start_line ?? null,
@@ -48,7 +56,7 @@ describe('classifyAnchor — terminal file-presence branches', () => {
     const comment = makeComment({ line: 1, lineText: 'const x = 1' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['const x = 1'],
+      newAnchorLines: ['const x = 1'],
       filePresence: 'deleted',
     })
     expect(result).toEqual({ kind: 'lost', comment, reason: 'file-deleted' })
@@ -58,7 +66,7 @@ describe('classifyAnchor — terminal file-presence branches', () => {
     const comment = makeComment({ line: 1, lineText: 'const x = 1' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['const x = 1'],
+      newAnchorLines: ['const x = 1'],
       filePresence: 'renamed',
     })
     expect(result).toEqual({ kind: 'lost', comment, reason: 'file-renamed' })
@@ -70,7 +78,7 @@ describe('classifyAnchor — unavailable or empty head content', () => {
     const comment = makeComment({ line: 3, lineText: 'anything' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: null,
+      newAnchorLines: null,
       filePresence: 'present',
     })
     expect(result).toEqual({ kind: 'lost', comment, reason: 'line-deleted' })
@@ -80,7 +88,7 @@ describe('classifyAnchor — unavailable or empty head content', () => {
     const comment = makeComment({ line: 3, lineText: 'anything' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: [],
+      newAnchorLines: [],
       filePresence: 'present',
     })
     expect(result).toEqual({ kind: 'lost', comment, reason: 'line-deleted' })
@@ -93,7 +101,7 @@ describe('classifyAnchor — clean (line held its position)', () => {
     const comment = makeComment({ line: 2, lineText: 'target line' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['first', 'target line', 'third'],
+      newAnchorLines: ['first', 'target line', 'third'],
       filePresence: 'present',
     })
     expect(result).toEqual({ kind: 'clean', comment })
@@ -104,7 +112,7 @@ describe('classifyAnchor — clean (line held its position)', () => {
     const comment = makeComment({ line: 2, lineText: 'target line' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['first', 'target line   \t', 'third'],
+      newAnchorLines: ['first', 'target line   \t', 'third'],
       filePresence: 'present',
     })
     expect(result).toEqual({ kind: 'clean', comment })
@@ -118,7 +126,7 @@ describe('classifyAnchor — drifted', () => {
     const comment = makeComment({ line: 2, lineText: 'anchor' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
+      newAnchorLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
       filePresence: 'present',
     })
     expect(result).toMatchObject({ kind: 'drifted', newLine: 4, delta: 2 })
@@ -130,7 +138,7 @@ describe('classifyAnchor — drifted', () => {
     const comment = makeComment({ line: 4, lineText: 'anchor' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['head', 'anchor', 'x', 'y', 'z'],
+      newAnchorLines: ['head', 'anchor', 'x', 'y', 'z'],
       filePresence: 'present',
     })
     expect(result).toMatchObject({ kind: 'drifted', newLine: 2, delta: -2 })
@@ -142,7 +150,7 @@ describe('classifyAnchor — drifted', () => {
     const comment = makeComment({ line: 2, start_line: 1, lineText: 'anchor' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
+      newAnchorLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
       filePresence: 'present',
     })
     expect(result).toMatchObject({
@@ -157,7 +165,7 @@ describe('classifyAnchor — drifted', () => {
     const comment = makeComment({ line: 2, start_line: null, lineText: 'anchor' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
+      newAnchorLines: ['ins-a', 'ins-b', 'other', 'anchor', 'tail'],
       filePresence: 'present',
     })
     expect(result).toMatchObject({
@@ -174,7 +182,7 @@ describe('classifyAnchor — lost (line-deleted despite present file)', () => {
     const comment = makeComment({ line: 2, lineText: 'gone forever' })
     const result = classifyAnchor({
       comment,
-      newHeadLines: ['alpha', 'beta', 'gamma'],
+      newAnchorLines: ['alpha', 'beta', 'gamma'],
       filePresence: 'present',
     })
     expect(result).toEqual({ kind: 'lost', comment, reason: 'line-deleted' })
@@ -195,7 +203,7 @@ describe('classifyAnchor — tie-break by context score', () => {
       contextBefore: ['ctx-above'],
       contextAfter: ['ctx-below'],
     })
-    const newHeadLines = [
+    const newAnchorLines = [
       'l0', // 0
       'l1', // 1
       'l2', // 2
@@ -208,7 +216,7 @@ describe('classifyAnchor — tie-break by context score', () => {
       'ctx-below', // 9  matches contextAfter first element
       'l10', // 10
     ]
-    const result = classifyAnchor({ comment, newHeadLines, filePresence: 'present' })
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
     // Far candidate at index 8 => line 9, delta = 9 - 6 = 3.
     expect(result).toMatchObject({ kind: 'drifted', newLine: 9, delta: 3 })
   })
@@ -220,7 +228,7 @@ describe('classifyAnchor — tie-break by distance then position', () => {
     // (index 5). Candidates at index 3 (|delta| 2) and index 4 (|delta| 1);
     // the nearer one (index 4 => line 5) must win.
     const comment = makeComment({ line: 6, lineText: 'dup' })
-    const newHeadLines = [
+    const newAnchorLines = [
       'a', // 0
       'b', // 1
       'c', // 2
@@ -229,7 +237,7 @@ describe('classifyAnchor — tie-break by distance then position', () => {
       'x', // 5  original index
       'y', // 6
     ]
-    const result = classifyAnchor({ comment, newHeadLines, filePresence: 'present' })
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
     // index 4 => line 5, delta = 5 - 6 = -1.
     expect(result).toMatchObject({ kind: 'drifted', newLine: 5, delta: -1 })
   })
@@ -241,7 +249,7 @@ describe('classifyAnchor — tie-break by distance then position', () => {
     // (index 1) is retained because neither a higher score nor a smaller
     // |delta| ever displaces it.
     const comment = makeComment({ line: 4, lineText: 'dup' })
-    const newHeadLines = [
+    const newAnchorLines = [
       'a', // 0
       'dup', // 1  |delta| 2, above  <- winner (lowest line number)
       'c', // 2
@@ -250,7 +258,7 @@ describe('classifyAnchor — tie-break by distance then position', () => {
       'dup', // 5  |delta| 2, below
       'g', // 6
     ]
-    const result = classifyAnchor({ comment, newHeadLines, filePresence: 'present' })
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
     // index 1 => line 2, delta = 2 - 4 = -2.
     expect(result).toMatchObject({ kind: 'drifted', newLine: 2, delta: -2 })
   })
@@ -267,7 +275,7 @@ describe('classifyAnchor — search radius', () => {
     )
     const outOfRange = classifyAnchor({
       comment,
-      newHeadLines: beyond,
+      newAnchorLines: beyond,
       filePresence: 'present',
     })
     expect(outOfRange).toEqual({ kind: 'lost', comment, reason: 'line-deleted' })
@@ -279,10 +287,272 @@ describe('classifyAnchor — search radius', () => {
     )
     const inRange = classifyAnchor({
       comment,
-      newHeadLines: within,
+      newAnchorLines: within,
       filePresence: 'present',
     })
     // index 400 => line 401, delta = 401 - 1 = 400.
     expect(inRange).toMatchObject({ kind: 'drifted', newLine: 401, delta: 400 })
+  })
+})
+
+describe('classifyAnchor — lost/file-added (base side never held the file)', () => {
+  it('reports lost/file-added before any text match', () => {
+    // Anchor text is present in the supplied lines; presence must win so the
+    // human sees "the file is new" rather than a bogus clean/drifted anchor.
+    const comment = makeComment({ line: 1, side: 'LEFT', lineText: 'const x = 1' })
+    const result = classifyAnchor({
+      comment,
+      newAnchorLines: ['const x = 1'],
+      filePresence: 'added',
+    })
+    expect(result).toEqual({ kind: 'lost', comment, reason: 'file-added' })
+  })
+})
+
+describe('classifyAnchor — clean requires context on a repeated line', () => {
+  it('keeps clean cheaply for a unique unmoved line with no context', () => {
+    // Single occurrence of the anchor text in the window: nothing else could
+    // be confused for it, so it short-circuits clean without any context.
+    const comment = makeComment({ line: 2, lineText: 'unique-anchor' })
+    const result = classifyAnchor({
+      comment,
+      newAnchorLines: ['a', 'unique-anchor', 'b'],
+      filePresence: 'present',
+    })
+    expect(result).toEqual({ kind: 'clean', comment })
+  })
+
+  it('stays clean for an unmoved line whose surrounding context is intact', () => {
+    // The line repeats (a bare `}`), but its captured neighbors still sit
+    // around the original index, clearing the clean context floor.
+    const comment = makeComment({
+      line: 4,
+      lineText: '}',
+      contextBefore: ['  doThing()'],
+      contextAfter: ['const next = 1'],
+    })
+    const result = classifyAnchor({
+      comment,
+      newAnchorLines: ['function f() {', '}', '  doThing()', '}', 'const next = 1'],
+      filePresence: 'present',
+    })
+    expect(result).toEqual({ kind: 'clean', comment })
+  })
+
+  it('does NOT report clean when a duplicate line shifted under the anchor', () => {
+    // A `}` was captured at line 4 with distinctive context. After a large
+    // insertion above, a DIFFERENT `}` now occupies index 3 (line 4) while the
+    // originally-commented block moved far down with its context intact. A
+    // text-only clean would silently re-point the comment at the wrong brace;
+    // the context floor forces the ranked drift search, which follows the
+    // captured neighborhood to the moved block instead.
+    const comment = makeComment({
+      line: 4,
+      lineText: '}',
+      contextBefore: ['    return cached'],
+      contextAfter: ['export function next() {'],
+    })
+    const inserted = Array.from({ length: 24 }, () => 'const pad = 0')
+    const newAnchorLines = [
+      'function first() {', // 0
+      '  const a = 1', // 1
+      '  if (a) {', // 2
+      '}', // 3  <- original index (line 4): a coincidental brace
+      ...inserted, // 4..27
+      '    return cached', // 28  captured context-before
+      '}', // 29  the ORIGINAL commented brace, moved down
+      'export function next() {', // 30 captured context-after
+    ]
+    const result = classifyAnchor({ comment, newAnchorLines, filePresence: 'present' })
+    // The moved brace at index 29 => line 30 wins on context; NOT clean.
+    expect(result).toMatchObject({ kind: 'drifted', newLine: 30 })
+    expect(result.kind).not.toBe('clean')
+  })
+
+  it('resolves an unmoved-but-repeated line to drifted delta 0, never lost', () => {
+    // The anchor text repeats and its context also changed, so the clean
+    // fast-path is skipped — but the original position still holds the text
+    // and (with no better-scoring candidate) wins the search at delta 0, so a
+    // genuinely-unmoved line is never wrongly reported lost.
+    const comment = makeComment({
+      line: 2,
+      lineText: 'return',
+      contextBefore: ['gone-context'],
+      contextAfter: ['also-gone'],
+    })
+    const result = classifyAnchor({
+      comment,
+      newAnchorLines: ['return', 'return', 'return'],
+      filePresence: 'present',
+    })
+    expect(result).toMatchObject({ kind: 'drifted', newLine: 2, delta: 0 })
+  })
+})
+
+describe('shared side selectors', () => {
+  it('maps LEFT to base and RIGHT to head exactly once', () => {
+    expect(anchorSideKey('LEFT')).toBe('base')
+    expect(anchorSideKey('RIGHT')).toBe('head')
+  })
+
+  it('selectAnchorBlobSha reads the side the anchor lives on', () => {
+    const entry = { base: 'base-sha', head: 'head-sha' }
+    expect(selectAnchorBlobSha(entry, 'LEFT')).toBe('base-sha')
+    expect(selectAnchorBlobSha(entry, 'RIGHT')).toBe('head-sha')
+    expect(selectAnchorBlobSha(undefined, 'LEFT')).toBeNull()
+    expect(selectAnchorBlobSha({ base: null, head: 'h' }, 'LEFT')).toBeNull()
+  })
+
+  it('blobContentToLines counts a trailing newline as a terminator', () => {
+    expect(blobContentToLines('a\nb\n')).toEqual(['a', 'b'])
+    expect(blobContentToLines('a\nb')).toEqual(['a', 'b'])
+    expect(blobContentToLines('')).toEqual([])
+  })
+})
+
+describe('resolveFilePresence — side-aware file fate', () => {
+  const modified: PullFile = {
+    sha: 's',
+    filename: 'f.ts',
+    status: 'modified',
+    additions: 1,
+    deletions: 1,
+    changes: 2,
+  }
+  const removed: PullFile = { ...modified, status: 'removed' }
+  const added: PullFile = { ...modified, status: 'added' }
+  const renamed: PullFile = {
+    ...modified,
+    status: 'renamed',
+    filename: 'new.ts',
+    previous_filename: 'old.ts',
+  }
+  const entry = { base: 'b', head: 'h' }
+
+  it('RIGHT: removed is deleted, modified is present', () => {
+    expect(
+      resolveFilePresence({ path: 'f.ts', side: 'RIGHT', file: removed, files: [removed], entry }),
+    ).toBe('deleted')
+    expect(
+      resolveFilePresence({ path: 'f.ts', side: 'RIGHT', file: modified, files: [modified], entry }),
+    ).toBe('present')
+  })
+
+  it('LEFT: a removed file is still present (base content survives)', () => {
+    expect(
+      resolveFilePresence({ path: 'f.ts', side: 'LEFT', file: removed, files: [removed], entry }),
+    ).toBe('present')
+  })
+
+  it('LEFT: an added file is `added` (no base version existed)', () => {
+    expect(
+      resolveFilePresence({ path: 'f.ts', side: 'LEFT', file: added, files: [added], entry }),
+    ).toBe('added')
+  })
+
+  it('RIGHT: an added file is present (head content exists)', () => {
+    expect(
+      resolveFilePresence({ path: 'f.ts', side: 'RIGHT', file: added, files: [added], entry }),
+    ).toBe('present')
+  })
+
+  it('a renamed path reports renamed on either side', () => {
+    expect(
+      resolveFilePresence({
+        path: 'old.ts',
+        side: 'RIGHT',
+        file: undefined,
+        files: [renamed],
+        entry: undefined,
+      }),
+    ).toBe('renamed')
+    expect(
+      resolveFilePresence({
+        path: 'old.ts',
+        side: 'LEFT',
+        file: undefined,
+        files: [renamed],
+        entry: undefined,
+      }),
+    ).toBe('renamed')
+  })
+
+  it('absent from the compare: present iff the anchoring side has a blob', () => {
+    expect(
+      resolveFilePresence({
+        path: 'gone.ts',
+        side: 'LEFT',
+        file: undefined,
+        files: [],
+        entry: { base: 'b', head: null },
+      }),
+    ).toBe('present')
+    expect(
+      resolveFilePresence({
+        path: 'gone.ts',
+        side: 'LEFT',
+        file: undefined,
+        files: [],
+        entry: { base: null, head: 'h' },
+      }),
+    ).toBe('deleted')
+  })
+})
+
+describe('classifyPendingComment — end-to-end side-aware classification', () => {
+  const files: PullFile[] = [
+    {
+      sha: 'head-sha',
+      filename: 'src/file.ts',
+      status: 'modified',
+      additions: 1,
+      deletions: 1,
+      changes: 2,
+    },
+  ]
+  const blobIndex = { 'src/file.ts': { base: 'base-sha', head: 'head-sha' } }
+
+  it('LEFT anchors against BASE content, ignoring head entirely', () => {
+    // The deleted line lives only in base; head has unrelated content. A
+    // head-only classifier would call this lost — the base read finds it clean.
+    const comment = makeComment({
+      line: 2,
+      side: 'LEFT',
+      lineText: 'const legacy = true',
+    })
+    const result = classifyPendingComment({
+      comment,
+      files,
+      blobIndex,
+      resolveBlobLines: (sha) =>
+        sha === 'base-sha'
+          ? ['top', 'const legacy = true', 'bottom']
+          : ['totally', 'different', 'head'],
+    })
+    expect(result).toEqual({ kind: 'clean', comment })
+  })
+
+  it('RIGHT anchors against HEAD content', () => {
+    const comment = makeComment({ line: 2, side: 'RIGHT', lineText: 'const fresh = 1' })
+    const result = classifyPendingComment({
+      comment,
+      files,
+      blobIndex,
+      resolveBlobLines: (sha) =>
+        sha === 'head-sha' ? ['a', 'const fresh = 1', 'b'] : ['base', 'only'],
+    })
+    expect(result).toEqual({ kind: 'clean', comment })
+  })
+
+  it('LEFT drifts against the base side when the base blob moved', () => {
+    const comment = makeComment({ line: 2, side: 'LEFT', lineText: 'moved-line' })
+    const result = classifyPendingComment({
+      comment,
+      files,
+      blobIndex,
+      resolveBlobLines: (sha) =>
+        sha === 'base-sha' ? ['pad', 'pad', 'moved-line', 'tail'] : ['head'],
+    })
+    expect(result).toMatchObject({ kind: 'drifted', newLine: 3, delta: 1 })
   })
 })
