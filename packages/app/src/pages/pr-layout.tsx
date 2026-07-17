@@ -5,6 +5,7 @@ import { Download, Inbox, RefreshCw } from 'lucide-react'
 import type { ApiError, CheckRun, Snapshot, StalenessInfo } from '@revu/shared'
 import { identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
+import { useSession } from '@/state/session'
 import { minutesUntil, relativeTime, shortSha } from '@/lib/time'
 import { useShortcut } from '@/lib/keyboard'
 import { cn } from '@/lib/cn'
@@ -295,6 +296,7 @@ export function PrLayout() {
   const params = useParams<{ n: string }>()
   const prNumber = Number(params.n)
 
+  const session = useSession()
   const list = usePullList()
   const snapshotQuery = useSnapshot(prNumber)
   const staleness = useStaleness(prNumber)
@@ -384,7 +386,10 @@ export function PrLayout() {
   }
 
   const pull = item.pull
-  const author = parseCommentIdentity({ user: pull.user, body: pull.body ?? '' })
+  const author = parseCommentIdentity(
+    { user: pull.user, body: pull.body ?? '' },
+    session.brokerLogin,
+  )
   const detail = snapshot?.mutable.pull
   const rollup = snapshot ? checksRollup(snapshot.mutable.checks) : null
   const checksDot =

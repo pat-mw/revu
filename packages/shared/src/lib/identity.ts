@@ -1,4 +1,4 @@
-import { BROKER_LOGIN, type GhUser, type Human, type ReviewComment } from '../api/types'
+import type { GhUser, Human, ReviewComment } from '../api/types'
 
 /**
  * Identity smuggling: comments written through revu are posted by the broker
@@ -59,13 +59,18 @@ export function parsePrefixedBody(
 /**
  * Resolve who a comment is "from". Comments from real GitHub users (org
  * members reviewing on github.com) keep their genuine identity untouched —
- * prefix parsing only ever applies to the broker bot's comments.
+ * prefix parsing only ever applies to the broker bot's comments. `botLogin`
+ * is the login every workspace write authenticates as; it comes from the
+ * session, so the same comment renders correctly whatever the broker is named.
  */
-export function parseCommentIdentity(comment: {
-  user: GhUser
-  body: string
-}): ParsedComment {
-  if (comment.user.login !== BROKER_LOGIN) {
+export function parseCommentIdentity(
+  comment: {
+    user: GhUser
+    body: string
+  },
+  botLogin: string,
+): ParsedComment {
+  if (comment.user.login !== botLogin) {
     return { identity: { kind: 'github', user: comment.user }, body: comment.body }
   }
   const parsed = parsePrefixedBody(comment.body)
@@ -100,8 +105,8 @@ export function identityName(identity: CommentIdentity): string {
  * no `viewer`, so "yours" is derived by matching the smuggled name — the only
  * signal that exists.
  */
-export function isOwnComment(comment: ReviewComment, human: Human): boolean {
-  const { identity } = parseCommentIdentity(comment)
+export function isOwnComment(comment: ReviewComment, human: Human, botLogin: string): boolean {
+  const { identity } = parseCommentIdentity(comment, botLogin)
   return identity.kind === 'human' && identity.name === human.name
 }
 

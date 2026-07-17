@@ -1,5 +1,5 @@
 import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, IssueComment, PendingComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
-import { ApiError, BROKER_LOGIN, prefixBody, classifyAnchor } from '@revu/shared'
+import { ApiError, prefixBody, classifyAnchor } from '@revu/shared'
 import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
@@ -225,7 +225,7 @@ export function createMockApi(): RevuApi {
       const human = currentHuman()
       return {
         human,
-        brokerLogin: BROKER_LOGIN,
+        brokerLogin: db.brokerBot.login,
         workspace: `coder-ws-${human.id}`,
       }
     },
@@ -425,7 +425,7 @@ export function createMockApi(): RevuApi {
           `Thread ${threadId} was not found on pull #${prNumber}.`,
         )
       }
-      const resolvedBy = resolved ? { login: BROKER_LOGIN } : null
+      const resolvedBy = resolved ? { login: db.brokerBot.login } : null
       store.setResolution(prNumber, threadId, resolved, resolvedBy)
       const snap = store.getSnapshot(prNumber)
       if (snap) {

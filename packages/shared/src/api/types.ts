@@ -27,9 +27,6 @@ export interface GhUser {
   type: 'User' | 'Bot' | 'Organization'
 }
 
-/** Every write from a workspace authenticates as this login. */
-export const BROKER_LOGIN = 'acme-broker[bot]'
-
 export interface GhLabel {
   id: number
   name: string

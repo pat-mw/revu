@@ -13,7 +13,7 @@
  * relaxation.
  */
 import { describe, it, expect } from 'bun:test'
-import { BROKER_LOGIN, type GhUser, type Human, type ReviewComment } from '../api/types'
+import type { GhUser, Human, ReviewComment } from '../api/types'
 import {
   avatarStyle,
   identityName,
@@ -29,6 +29,14 @@ import {
 // each GitHub-shaped record is padded through a narrow cast so the fixtures
 // stay small without weakening the fields under test.
 // ————————————————————————————————————————————————————————————————
+
+/**
+ * The bot login these tests thread into the parser. It is deliberately NOT the
+ * value any adapter or fixture uses: a hardcoded broker login left anywhere in
+ * the parser would make comments authored by this login parse as the bot
+ * instead of resolving their smuggled human, so these tests would fail.
+ */
+const BOT_LOGIN = 'test-broker[bot]'
 
 function ghUser(login: string): GhUser {
   return {
@@ -175,29 +183,46 @@ describe('parsePrefixedBody documented ambiguities', () => {
 describe('parseCommentIdentity', () => {
   it('leaves a real GitHub user untouched even when the body looks prefixed', () => {
     const comment = reviewComment('octocat', '**Alice**\n\ncontent')
-    const parsed = parseCommentIdentity(comment)
+    const parsed = parseCommentIdentity(comment, BOT_LOGIN)
     expect(parsed.identity).toEqual({ kind: 'github', user: comment.user })
     // Prefix parsing never applies to non-broker comments: body is unchanged.
     expect(parsed.body).toBe('**Alice**\n\ncontent')
   })
 
   it('resolves a broker comment with a valid prefix to a human and strips the prefix', () => {
-    const parsed = parseCommentIdentity(reviewComment(BROKER_LOGIN, '**Alice** (lead)\n\nhello'))
+    const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, '**Alice** (lead)\n\nhello'), BOT_LOGIN)
     expect(parsed.identity).toEqual({ kind: 'human', name: 'Alice', role: 'lead' })
     expect(parsed.body).toBe('hello')
   })
 
   it('resolves a broker comment with a valid prefix and no role to a null role', () => {
-    const parsed = parseCommentIdentity(reviewComment(BROKER_LOGIN, '**Alice**\n\nhello'))
+    const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, '**Alice**\n\nhello'), BOT_LOGIN)
     expect(parsed.identity).toEqual({ kind: 'human', name: 'Alice', role: null })
     expect(parsed.body).toBe('hello')
   })
 
   it('falls back to the bot when a broker comment has no parseable prefix', () => {
-    const comment = reviewComment(BROKER_LOGIN, 'just a plain body, no prefix')
-    const parsed = parseCommentIdentity(comment)
+    const comment = reviewComment(BOT_LOGIN, 'just a plain body, no prefix')
+    const parsed = parseCommentIdentity(comment, BOT_LOGIN)
     expect(parsed.identity).toEqual({ kind: 'bot', user: comment.user })
     expect(parsed.body).toBe('just a plain body, no prefix')
+  })
+
+  it('routes off the passed bot login, not any hardcoded string', () => {
+    // The broker login is configuration, threaded in from the session. The same
+    // prefixed comment resolves to its smuggled human ONLY when its author login
+    // is named as the bot; under any other bot login it is a genuine GitHub
+    // user whose body is left verbatim. A parser that pinned a constant login
+    // would break one of these two assertions.
+    const comment = reviewComment('renamed-broker[bot]', '**Alice**\n\nhello')
+
+    const asBot = parseCommentIdentity(comment, 'renamed-broker[bot]')
+    expect(asBot.identity).toEqual({ kind: 'human', name: 'Alice', role: null })
+    expect(asBot.body).toBe('hello')
+
+    const asStranger = parseCommentIdentity(comment, BOT_LOGIN)
+    expect(asStranger.identity).toEqual({ kind: 'github', user: comment.user })
+    expect(asStranger.body).toBe('**Alice**\n\nhello')
   })
 })
 
@@ -212,7 +237,7 @@ describe('prefixBody round-trip', () => {
     const author = human('Alice Nguyen', 'contractor')
     const markdown = 'Actually this should be a `Map`.\n\nSecond paragraph.'
     const body = prefixBody(author, markdown)
-    const parsed = parseCommentIdentity(reviewComment(BROKER_LOGIN, body))
+    const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, body), BOT_LOGIN)
     expect(parsed.identity).toEqual({
       kind: 'human',
       name: author.name,
@@ -223,7 +248,7 @@ describe('prefixBody round-trip', () => {
 
   it('round-trips the lead role too', () => {
     const author = human('Bob', 'lead')
-    const parsed = parseCommentIdentity(reviewComment(BROKER_LOGIN, prefixBody(author, 'x')))
+    const parsed = parseCommentIdentity(reviewComment(BOT_LOGIN, prefixBody(author, 'x')), BOT_LOGIN)
     expect(parsed.identity).toEqual({ kind: 'human', name: 'Bob', role: 'lead' })
     expect(parsed.body).toBe('x')
   })
@@ -239,30 +264,30 @@ describe('identityName', () => {
   })
 
   it('returns the login for a bot identity', () => {
-    expect(identityName({ kind: 'bot', user: ghUser(BROKER_LOGIN) })).toBe(BROKER_LOGIN)
+    expect(identityName({ kind: 'bot', user: ghUser(BOT_LOGIN) })).toBe(BOT_LOGIN)
   })
 })
 
 describe('isOwnComment', () => {
   it('is true when the parsed human name matches the session human', () => {
     const body = prefixBody(human('Alice'), 'mine')
-    expect(isOwnComment(reviewComment(BROKER_LOGIN, body), human('Alice'))).toBe(true)
+    expect(isOwnComment(reviewComment(BOT_LOGIN, body), human('Alice'), BOT_LOGIN)).toBe(true)
   })
 
   it('is false when a broker comment resolves to a different human name', () => {
     const body = prefixBody(human('Bob'), 'theirs')
-    expect(isOwnComment(reviewComment(BROKER_LOGIN, body), human('Alice'))).toBe(false)
+    expect(isOwnComment(reviewComment(BOT_LOGIN, body), human('Alice'), BOT_LOGIN)).toBe(false)
   })
 
   it('is false for a real GitHub (non-broker) comment', () => {
     // Even a body that looks prefixed stays github-kind for a real login.
     const comment = reviewComment('octocat', '**Alice**\n\nx')
-    expect(isOwnComment(comment, human('Alice'))).toBe(false)
+    expect(isOwnComment(comment, human('Alice'), BOT_LOGIN)).toBe(false)
   })
 
   it('is false for a bot comment with no parseable prefix', () => {
-    const comment = reviewComment(BROKER_LOGIN, 'plain body')
-    expect(isOwnComment(comment, human('Alice'))).toBe(false)
+    const comment = reviewComment(BOT_LOGIN, 'plain body')
+    expect(isOwnComment(comment, human('Alice'), BOT_LOGIN)).toBe(false)
   })
 })
 

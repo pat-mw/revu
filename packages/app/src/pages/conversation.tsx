@@ -5,6 +5,7 @@ import type { IssueComment, ReviewComment, ReviewSummary, ReviewThread } from '@
 import { identityName, parseCommentIdentity } from '@revu/shared'
 import { useSnapshot } from '@/state/queries'
 import { useThreads } from '@/state/threads'
+import { useSession } from '@/state/session'
 import { relativeTime } from '@/lib/time'
 import { IdentityAvatar } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -44,7 +45,8 @@ const REVIEW_STATE_META: Record<
  * approved/commented and yields the clean body to render.
  */
 function ReviewRow({ review }: { review: ReviewSummary }) {
-  const parsed = parseCommentIdentity({ user: review.user, body: review.body })
+  const session = useSession()
+  const parsed = parseCommentIdentity({ user: review.user, body: review.body }, session.brokerLogin)
   const meta = REVIEW_STATE_META[review.state]
   const body = parsed.body.trim()
   return (
@@ -119,6 +121,7 @@ function threadRank(t: ReviewThread): number {
 
 export function ConversationPage() {
   const prNumber = Number(useParams<{ n: string }>().n)
+  const session = useSession()
   const snapshot = useSnapshot(prNumber).data
   const threads = useThreads(prNumber)
 
@@ -180,7 +183,10 @@ export function ConversationPage() {
   }
 
   const pull = snapshot.mutable.pull
-  const description = parseCommentIdentity({ user: pull.user, body: pull.body ?? '' })
+  const description = parseCommentIdentity(
+    { user: pull.user, body: pull.body ?? '' },
+    session.brokerLogin,
+  )
   const descriptionBody = description.body.trim()
   const isEmpty = timeline.length === 0 && (threads?.length ?? 0) === 0
 
