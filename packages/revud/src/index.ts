@@ -53,13 +53,16 @@ export function assertMode(env: Record<string, string | undefined> = process.env
 export async function main(
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
-  assertMode(env)
+  const mode = assertMode(env)
   const port = resolvePort(env)
   const distDir = resolveDistDir(env)
 
   const { dataDir } = installDiskStorage(env)
   const mock = await loadMock()
-  const server = startServer({ port, distDir, mock })
+  // The mode is threaded explicitly from here down to the router: the router
+  // never reads the environment, so the mock-only dev routes cannot be
+  // re-enabled after boot by a changed env var.
+  const server = startServer({ port, distDir, mock, mode })
 
   const shutdown = (signal: string): void => {
     try {
@@ -75,7 +78,7 @@ export async function main(
 
   console.log(
     `revud: serving ${distDir} on http://localhost:${server.port} ` +
-      `(mode=mock, data=${dataDir})`,
+      `(mode=${mode}, data=${dataDir})`,
   )
 }
 

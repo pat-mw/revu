@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { join, normalize } from 'node:path'
 import type { Server } from 'bun'
 import type { MockBundle } from './mock-bridge'
+import type { RevuMode } from './api-router'
 import { handleApi } from './api-router'
 
 /**
@@ -20,6 +21,12 @@ export interface ServeOptions {
   port: number
   distDir: string
   mock: MockBundle
+  /**
+   * The transport mode the daemon was booted with. Threaded explicitly into
+   * the router (never read from the environment per-request) so the mock-only
+   * dev routes are provably unreachable in any other mode.
+   */
+  mode: RevuMode
 }
 
 /** Resolve a URL pathname to a safe absolute path inside `distDir`, or null. */
@@ -33,16 +40,18 @@ function resolveStaticPath(distDir: string, pathname: string): string | null {
 
 /**
  * Build the request handler. Serves `/api/*` from the mock, otherwise static
- * files from `distDir` with an `index.html` SPA fallback.
+ * files from `distDir` with an `index.html` SPA fallback. `mode` is forwarded
+ * to the API router, which uses it to keep the dev-panel routes mock-only.
  */
 export function createFetchHandler(
   distDir: string,
   mock: MockBundle,
+  mode: RevuMode,
 ): (req: Request) => Promise<Response> {
   const indexPath = join(distDir, 'index.html')
 
   return async function fetch(req: Request): Promise<Response> {
-    const apiResponse = await handleApi(req, mock)
+    const apiResponse = await handleApi(req, mock, mode)
     if (apiResponse) return apiResponse
 
     const url = new URL(req.url)
@@ -65,8 +74,9 @@ export function createFetchHandler(
 }
 
 /**
- * Start the daemon. Asserts `dist/` exists (a clear build-first error otherwise)
- * and that the mode is `mock`, then serves on `port`. Returns the Bun `Server`.
+ * Start the daemon. Asserts `dist/` exists (a clear build-first error
+ * otherwise), then serves on `port` in the given transport mode. Returns the
+ * Bun `Server`.
  */
 export function startServer(opts: ServeOptions): Server {
   if (!existsSync(opts.distDir) || !existsSync(join(opts.distDir, 'index.html'))) {
@@ -76,6 +86,6 @@ export function startServer(opts: ServeOptions): Server {
     )
   }
 
-  const fetch = createFetchHandler(opts.distDir, opts.mock)
+  const fetch = createFetchHandler(opts.distDir, opts.mock, opts.mode)
   return Bun.serve({ port: opts.port, fetch })
 }
