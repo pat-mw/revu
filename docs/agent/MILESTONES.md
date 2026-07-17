@@ -114,6 +114,40 @@ Move unified/split preference (`pages/files.tsx`) into the viewed/preferences st
 
 ---
 
+## Milestone M1.6 — reconcile correctness + surface hygiene
+
+**Goal:** close the nine defects an independent pre-M2 code review (`docs/agent/CHECKPOINT_1.md`, review of `main` @ `5985f34`) found in code that M2 blesses as production-shared. Three P0s (C1–C3) must land before M2 opens; the P1/P2 findings (C4–C9) ride along before M2 closes. The through-line: every P0 is a place where two things that must agree were written twice, or where something outside the contract was allowed to matter — the conformance suite is the right structural answer and these are the scenarios it doesn't yet have.
+
+**Exit criteria:** all nine findings closed with tests; the conformance suite gains LEFT-side + reconcile preview/report parity scenarios; the gate (`bun run check` + e2e) green on the stack tip.
+
+**Depends:** M1 (landed). Blocks M2 — fix shared `anchor.ts`/`identity.ts` before M2 imports them verbatim.
+
+### Issue M1.6.1 — Reconcile side-awareness + clean-path integrity (C1, C2)
+`reconcileDraft` resolves the anchor blob unconditionally to head (`adapter.ts`), so LEFT-side comments (whose text lives in the base blob) mis-classify — while the dialog already selects base for LEFT. Introduce one shared blob selector imported by both; rename `classifyAnchor`'s line param so the wrong blob can't be passed silently; make `filePresence` side-aware (`added`→`lost` reason `file-added` for LEFT; `removed` non-terminal for LEFT). Separately, the `clean` fast path matches text-only at the original index with no context scoring, so a coincidental duplicate line classifies `clean` and is submitted with no human in the loop — require a context-score floor, demoting to the drift search below it.
+**Verify:** LEFT-side comment on a deleted line in a base-unchanged PR → `clean`; a moved base blob → `drifted` with the base-side delta; dialog preview and adapter report agree on every fixture comment on both sides; a `}` at the original index after a 20-line insertion → `drifted`/`lost`, not `clean`; unmoved+intact-context still `clean`. Add LEFT-side comments to the PR 389 draft + a conformance parity scenario.
+
+### Issue M1.6.2 — Gate /api/dev to mock mode (C3)
+`/api/dev` (PUT `{humanId}` → `setHuman`), `failureMode`/`latency`, and `POST /api/dev/reset` (reseeds the store) run before any mode check and are absent from the shared `ROUTES` table — an unauthenticated call changes who you are, harmless only while `assertMode` permits mock alone. Gate `handleDev` at the router boundary on an explicitly-passed mode (not `process.env`), returning `null` (→ 404) in any non-mock mode; document the routes' out-of-table existence in `http.ts`; record the M3-regression landmine.
+**Verify:** a daemon in any non-mock mode returns 404 for `GET/PUT /api/dev` and `POST /api/dev/reset`, asserted directly (not via `assertMode` rejecting boot first).
+
+### Issue M1.6.3 — Identity token cap + stamper↔parser round-trip property test (C6)
+`NAME_TOKEN_RE` caps a name token at 24 chars; Coder usernames reach 32, so a long-username contractor stamps fine but fails `looksLikePersonName` on the way back and renders as the bare bot — the M1.2 failure mode on the length axis. Raise the cap to Coder's real limit and make the inverse structural: a property/table test that `parsePrefixedBody(prefixBody(human, body))` round-trips exactly, for a corpus of legal Coder identities.
+**Verify:** the property test passes for the corpus; a deliberate one-char tightening of the stamper or the parser fails it.
+
+### Issue M1.6.4 — Ranged-comment start-line validation + STORE_VERSION bump (C4)
+The range end is text-matched and context-scored; the start line is shifted rigidly by the same delta and never validated, so a line inserted inside a commented span silently mis-covers. Capture `startLineText` in `PendingComment.anchor` at write time and validate after shifting (search independently or surface the changed span for confirmation). Extending `anchor` bumps `STORE_VERSION` with an in-place migration (no reseed — the M1.4 lesson).
+**Verify:** a ranged comment with a line inserted inside its span doesn't silently apply the old span length; a pre-existing store document loads intact across the version bump.
+
+### Issue M1.6.5 — Durable flush: revud surfaces write/read failures (C5)
+The mock's `flush()`/`load()` swallow storage errors — browser-correct for localStorage, wrong on disk, where the router returns 200 on a draft that never persisted and reseeds over a present-but-unreadable document. Surface failure at the revud boundary only (leave the browser semantics intact): a daemon flush path that returns a typed error on write failure, and a `getItem` that distinguishes absent from unreadable and never reseeds the latter.
+**Verify:** a data dir made read-only mid-session → a draft save returns a typed error and the UI keeps the text editable; a corrupted-but-present document is not silently replaced by seed state. (Records the durability constraint for M2.3's SQLite store.)
+
+### Issue M1.6.6 — Surface hygiene: strip ticket ref · lint gate · static path (C7, C8, C9)
+C7: remove the `UZO-607` reference from an `integration.test.ts` describe (only ticket id in code; `AGENTS.md` forbids it). C8: resolve the 65 tolerated oxlint warnings — fix the `no-useless-escape` cluster, make `only-export-components` a configured choice — so the gate reports 0 warnings or an explicitly-justified set. C9: replace `resolveStaticPath`'s `startsWith(distDir)` prefix check and dead regex with a `relative()`-based containment check, exported and unit-tested.
+**Verify:** `grep -rn "UZO-" packages e2e scripts` empty; `bunx oxlint` at 0 warnings (or configured); `/../secret` and its `%2e%2e%2f` encoding fall through to the SPA index, covered by a `resolveStaticPath` unit test.
+
+---
+
 ## Milestone M2 — Direct mode: real GitHub, smallest surface
 
 **Goal:** `revud --direct` in any cloned repo gives a working end-to-end review pipeline as the authenticated user, against a scratch repo first. This is where the sync engine, normalizer, and write path get real; it also ships the general-purpose tool.

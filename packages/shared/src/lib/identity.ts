@@ -27,8 +27,14 @@ export interface ParsedComment {
 /**
  * `**Name**` optionally followed by ` (role)`, then a blank line, then content.
  * The blank line is load-bearing: `**Alice** hi` inline is regular markdown.
+ *
+ * The name capture is wide enough for the longest legal stamped display name:
+ * up to four tokens of the maximum single-token length plus their single-space
+ * separators. It stays narrower than that would strictly allow so the capture
+ * never truncates a name the token validator would otherwise accept, which
+ * would make the stamper and this parser disagree at the boundary.
  */
-const PREFIX_RE = /^\*\*([^*\n]{1,60})\*\*(?:[ \t]*\(([^)\n]{1,32})\))?[ \t]*\r?\n[ \t]*\r?\n([\s\S]*)$/
+const PREFIX_RE = /^\*\*([^*\n]{1,140})\*\*(?:[ \t]*\(([^)\n]{1,32})\))?[ \t]*\r?\n[ \t]*\r?\n([\s\S]*)$/
 
 /**
  * A prefix name must look like a stamped identity: 1–4 tokens over the same
@@ -43,8 +49,14 @@ const PREFIX_RE = /^\*\*([^*\n]{1,60})\*\*(?:[ \t]*\(([^)\n]{1,32})\))?[ \t]*\r?
  * `**Warning**`-style bold openers and other markdown out — not the charset.
  * A comment literally starting with `**Bob**\n\n` still parses; that ambiguity
  * is inherent to the smuggling scheme.
+ *
+ * The per-token length cap tracks the broker's maximum username length of 32
+ * characters (one leading character plus up to 31 more). A shorter cap would
+ * drop a legitimately long username on the way back out — the stamper writes
+ * it, so this parser must accept it — and render that contributor as the bare
+ * bot; a longer cap would let more markdown through.
  */
-const NAME_TOKEN_RE = /^[\p{L}\p{N}_][\p{L}\p{N}_'’.-]{0,23}$/u
+const NAME_TOKEN_RE = /^[\p{L}\p{N}_][\p{L}\p{N}_'’.-]{0,31}$/u
 
 function looksLikePersonName(candidate: string): boolean {
   const tokens = candidate.trim().split(/\s+/)
