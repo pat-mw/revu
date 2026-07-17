@@ -62,6 +62,10 @@ export function parsePrefixedBody(
  * prefix parsing only ever applies to the broker bot's comments. `botLogin`
  * is the login every workspace write authenticates as; it comes from the
  * session, so the same comment renders correctly whatever the broker is named.
+ *
+ * `botLogin` is trusted config, but an empty string must never match a real
+ * author: it takes the non-bot path so a misconfigured empty login can never
+ * mis-attribute a genuine GitHub user (or an empty login) as the bot.
  */
 export function parseCommentIdentity(
   comment: {
@@ -70,7 +74,7 @@ export function parseCommentIdentity(
   },
   botLogin: string,
 ): ParsedComment {
-  if (comment.user.login !== botLogin) {
+  if (botLogin === '' || comment.user.login !== botLogin) {
     return { identity: { kind: 'github', user: comment.user }, body: comment.body }
   }
   const parsed = parsePrefixedBody(comment.body)

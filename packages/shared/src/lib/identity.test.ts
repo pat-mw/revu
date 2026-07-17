@@ -224,6 +224,19 @@ describe('parseCommentIdentity', () => {
     expect(asStranger.identity).toEqual({ kind: 'github', user: comment.user })
     expect(asStranger.body).toBe('**Alice**\n\nhello')
   })
+
+  it('never treats a real author as the bot when botLogin is empty', () => {
+    // An empty botLogin is misconfiguration: it must take the non-bot path so
+    // no genuine author is mis-attributed. Even a comment whose own author
+    // login is the empty string stays github-kind with its body verbatim.
+    const realAuthor = parseCommentIdentity(reviewComment('octocat', '**Alice**\n\nhello'), '')
+    expect(realAuthor.identity).toEqual({ kind: 'github', user: ghUser('octocat') })
+    expect(realAuthor.body).toBe('**Alice**\n\nhello')
+
+    const emptyLoginAuthor = parseCommentIdentity(reviewComment('', '**Alice**\n\nhello'), '')
+    expect(emptyLoginAuthor.identity).toEqual({ kind: 'github', user: ghUser('') })
+    expect(emptyLoginAuthor.body).toBe('**Alice**\n\nhello')
+  })
 })
 
 describe('prefixBody round-trip', () => {
