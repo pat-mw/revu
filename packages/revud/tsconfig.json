@@ -1,12 +1,18 @@
 {
+  "references": [{ "path": "../shared/tsconfig.json" }],
   "compilerOptions": {
     "composite": true,
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.revud.tsbuildinfo",
     "target": "es2023",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"],
     "module": "esnext",
     "strict": true,
     "skipLibCheck": true,
+    "paths": {
+      "@revu/shared": ["../shared/src/index.ts"],
+      "@revu/shared/*": ["../shared/src/*"]
+    },
 
     /* Bundler mode */
     "moduleResolution": "bundler",

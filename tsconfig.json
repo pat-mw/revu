@@ -9,7 +9,8 @@
   "compilerOptions": {
     "paths": {
       "@revu/shared": ["./packages/shared/src/index.ts"],
-      "@revu/shared/*": ["./packages/shared/src/*"]
+      "@revu/shared/*": ["./packages/shared/src/*"],
+      "@/*": ["./packages/app/src/*"]
     }
   }
 }

@@ -10,6 +10,8 @@
     "typecheck": "tsc -b",
     "test": "bun test",
     "build:app": "bun run --filter '@revu/app' build",
+    "revud": "bun run packages/revud/src/index.ts",
+    "dev:e2e": "bun run build:app && bun run packages/revud/src/index.ts",
     "check": "oxlint && tsc -b && bun test && bun run --filter '@revu/app' build",
     "preview": "bun run --filter '@revu/app' preview"
   },
