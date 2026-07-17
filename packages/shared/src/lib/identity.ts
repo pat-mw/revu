@@ -1,6 +1,23 @@
 import type { GhUser, Human } from '../api/types'
 
 /**
+ * Derive the stable `Human.id` from a git-config email. The id is the email
+ * lowercased and trimmed — nothing more — so it is a deterministic, stable key
+ * for drafts, viewed state, and the audit log.
+ *
+ * Email, not display name, is the key on purpose: names driven by workspace
+ * usernames are unique only per deployment at a point in time, and a username
+ * can be renamed or a departed one re-registered, at which point a name-keyed
+ * history silently reattributes. Lowercasing folds the case-insensitive local
+ * part and domain of an address to one canonical key so the same person is one
+ * id regardless of how their client cased the address. The email is never
+ * rendered into a comment body — it is a key, not display copy.
+ */
+export function emailToId(email: string): string {
+  return email.trim().toLowerCase()
+}
+
+/**
  * Identity smuggling: comments written through revu are posted by the broker
  * bot with the human's name prepended to the markdown body:
  *

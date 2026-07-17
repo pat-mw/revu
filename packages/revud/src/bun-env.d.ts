@@ -36,6 +36,8 @@ interface BunSubprocess {
 
 interface BunSpawnOptions {
   env?: Record<string, string | undefined>
+  /** Working directory for the child process (defaults to the parent's cwd). */
+  cwd?: string
   stdout?: 'pipe' | 'inherit' | 'ignore'
   stderr?: 'pipe' | 'inherit' | 'ignore'
 }
