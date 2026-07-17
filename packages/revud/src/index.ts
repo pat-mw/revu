@@ -4,6 +4,8 @@ import { loadMock } from './mock-bridge'
 import { startServer } from './server'
 import type { RevuMode } from './api-router'
 import { DirectStartupError, resolveDirectContext } from './direct/context'
+import { createDirectApi } from './direct/direct-api'
+import { openDirectStore, resolveDirectDataDir } from './direct/store'
 
 /**
  * Entry point for the revu daemon. One Bun process serves the built frontend
@@ -128,12 +130,14 @@ async function mainMock(env: Record<string, string | undefined>): Promise<void> 
  * Direct-mode boot: resolve the target repo, prove a GitHub token is obtainable,
  * and build the real session — all guarded, so a missing repo/token stops the
  * daemon with a clear message and non-zero exit (thrown as `DirectStartupError`
- * and handled at the entry point). There is no mock store and no disk-backed
- * broker document here: the sync and draft stores do not exist yet, so this boot
- * only serves the session and a `not_implemented` placeholder for the rest.
+ * and handled at the entry point). Then open the durable SQLite store and bind
+ * the read/persist surface (sync engine + store) that serves sync, snapshot,
+ * drafts, viewed, and preferences. GraphQL threads and the write path stay
+ * `not_implemented` until they land.
  *
- * The token is never logged: only the resolved repo and viewer login appear in
- * the startup line.
+ * The token is never logged: only the resolved repo, viewer login, and data dir
+ * appear in the startup line. The store lives under
+ * `${XDG_DATA_HOME:-~/.local/share}/revu`, so a restart loses no draft.
  */
 async function mainDirect(env: Record<string, string | undefined>): Promise<void> {
   const port = resolvePort(env)
@@ -145,12 +149,34 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
     ...(repoOverride !== undefined ? { repoOverride } : {}),
   })
 
-  const server = startServer({ port, distDir, directSession: context.session, mode: 'direct' })
+  // Opening the store reads the store-version row once and migrates in place; a
+  // present-but-unreadable row throws here, failing startup loudly rather than
+  // reseeding over real drafts.
+  const dataDir = resolveDirectDataDir(env)
+  const store = openDirectStore({ dataDir, env })
+  const directApi = createDirectApi({
+    session: context.session,
+    github: context.github,
+    repo: context.repo,
+    store,
+  })
+
+  const server = startServer({
+    port,
+    distDir,
+    directSession: context.session,
+    directApi,
+    mode: 'direct',
+  })
 
   const shutdown = (signal: string): void => {
-    server.stop(true)
-    console.log(`revud: ${signal} received, stopped.`)
-    process.exit(0)
+    try {
+      store.close()
+    } finally {
+      server.stop(true)
+      console.log(`revud: ${signal} received, stopped.`)
+      process.exit(0)
+    }
   }
   process.on('SIGTERM', () => shutdown('SIGTERM'))
   process.on('SIGINT', () => shutdown('SIGINT'))
@@ -158,7 +184,7 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   console.log(
     `revud: serving ${distDir} on http://localhost:${server.port} ` +
       `(mode=direct, repo=${context.repo.owner}/${context.repo.repo}, ` +
-      `viewer=${context.session.viewerLogin ?? '?'})`,
+      `viewer=${context.session.viewerLogin ?? '?'}, data=${dataDir})`,
   )
 }
 

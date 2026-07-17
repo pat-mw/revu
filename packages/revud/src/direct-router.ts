@@ -1,19 +1,39 @@
 import type { Session } from '@revu/shared'
-import { ROUTES } from '@revu/shared'
+import {
+  ROUTES,
+  ValidationError,
+  validateReviewDraft,
+  validateSetPreferencesBody,
+  validateSetViewedBody,
+} from '@revu/shared'
+import type { DirectApi } from './direct/direct-api'
+import { GithubRequestError } from './direct/github-client'
+import { StoreUnreadableError, StoreWriteError } from './direct/store'
 
 /**
- * The `/api/*` router for direct mode. Only `getSession` is implemented here:
- * it returns the real session built at startup from git config and the
- * authenticated GitHub viewer. Every other `RevuApi` route belongs to the
- * not-yet-built sync engine and write path, so it answers a typed, honest
- * `not_implemented` envelope rather than fabricating data or crashing the
- * server. Unknown paths 404, exactly as mock mode does.
+ * The `/api/*` router for direct mode. It serves the real session and the read/
+ * persist surface direct mode implements today — sync, snapshot, drafts, viewed,
+ * preferences — off a `DirectApi` bound to the authenticated GitHub client and
+ * the durable SQLite store.
  *
- * The dev-panel routes do not exist here: they are gated to mock mode by the
- * caller, so direct mode never even reaches this router for `/api/dev*`.
+ * Contract semantics enforced here:
+ *   - `GET /api/pulls/:n/snapshot` returns a JSON `null` body (HTTP 200) for a
+ *     never-synced PR — NEVER 404-as-error.
+ *   - `POST /api/pulls/:n/sync` may resolve a `partial` snapshot; that is a 200
+ *     body, not an error.
+ *   - A durable write failure surfaces as `persist_failed` (HTTP 500), never a
+ *     200 the client would trust as saved.
+ *   - Mutation bodies are shape-validated with the shared validators before any
+ *     write, and a draft PUT must name the same PR in the path and the body — a
+ *     malformed or mismatched body is a 400, never a silent write elsewhere.
+ *
+ * Routes that belong to the not-yet-built GraphQL thread read and the write path
+ * still answer a typed `not_implemented` (501). Unknown API paths 404; non-API
+ * paths return `null` so the caller serves static assets. There is no mock and no
+ * dev panel in direct mode.
  *
  * The session is captured at startup and never re-derived per request: identity
- * is fixed for the life of the daemon, and no request can influence it.
+ * is fixed for the daemon's life and no request can influence it.
  */
 
 /** JSON response with the app-expected content type. */
@@ -24,11 +44,61 @@ function json(value: unknown, status = 200): Response {
   })
 }
 
+/** An error envelope in the contract's `{ code, message }` shape. */
+function errorJson(code: string, message: string, status: number): Response {
+  return json({ code, message }, status)
+}
+
 /**
- * The set of API path templates the contract defines, used to tell a
- * genuinely-unknown path (404) from a known-but-unimplemented route (501). The
- * comparison ignores `:param` segments so `/api/pulls/204/sync` matches the
- * `/api/pulls/:n/sync` template.
+ * The routes the not-yet-built parts of the surface own. They stay `501` until
+ * the GraphQL thread read (`listReviewThreads`) and the write path
+ * (`submitReview`, `replyToThread`, `resolveThread`, `addReaction`,
+ * `reconcileDraft`) land. `getBlob`/`getRateLimit` are also not yet answered.
+ */
+const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
+  ROUTES.listPulls.path,
+  ROUTES.getBlob.path,
+  ROUTES.listReviewThreads.path,
+  ROUTES.replyToThread.path,
+  ROUTES.resolveThread.path,
+  ROUTES.addReaction.path,
+  ROUTES.submitReview.path,
+  ROUTES.reconcileDraft.path,
+  ROUTES.getRateLimit.path,
+])
+
+/**
+ * Match a request path against a route template, returning captured `:param`
+ * values, or `null` when the template does not match. `/api/pulls/204/sync`
+ * against `/api/pulls/:n/sync` yields `{ n: '204' }`.
+ */
+function matchRoute(
+  template: string,
+  pathname: string,
+): Record<string, string> | null {
+  const t = template.split('/').filter((s) => s.length > 0)
+  const p = pathname.split('/').filter((s) => s.length > 0)
+  if (t.length !== p.length) return null
+  const params: Record<string, string> = {}
+  for (let i = 0; i < t.length; i++) {
+    if (t[i].startsWith(':')) {
+      params[t[i].slice(1)] = decodeURIComponent(p[i])
+      continue
+    }
+    if (t[i] !== p[i]) return null
+  }
+  return params
+}
+
+/** Parse `:n` as a positive integer PR number, or `null` when malformed. */
+function prNumberOf(params: Record<string, string>): number | null {
+  const n = Number(params.n)
+  return Number.isInteger(n) && n > 0 ? n : null
+}
+
+/**
+ * Any known contract path? Used to tell a genuinely-unknown path (404) from a
+ * known-but-unimplemented one (501). Ignores `:param` segments.
  */
 function isKnownApiPath(method: string, pathname: string): boolean {
   const segments = pathname.split('/').filter((s) => s.length > 0)
@@ -51,34 +121,162 @@ function isKnownApiPath(method: string, pathname: string): boolean {
 }
 
 /**
- * Handle one `/api/*` request in direct mode. Returns `null` when the path is
- * not an API path (the caller then serves static assets).
- *
- *   - `GET /api/session` → the real session, HTTP 200.
- *   - any other route the contract defines → HTTP 501 `{ code: 'not_implemented' }`,
- *     an honest placeholder until the sync engine and write path exist.
- *   - anything else under `/api` → HTTP 404 `{ code: 'not_found' }`.
+ * Translate an error thrown while serving a route into the contract's error
+ * envelope. A durable write failure is `persist_failed` (500) — the mutation did
+ * not reach disk, so the client must not be told it saved. A present-but-
+ * unreadable store row is also `persist_failed`: the daemon's state is corrupt
+ * and must not be papered over as an empty read. A GitHub HTTP error is mapped by
+ * its status (404 → not_found, 403 → forbidden, 429 → rate_limited, else
+ * broker_unreachable). Anything else is a generic 500.
  */
-export function handleDirectApi(req: Request, session: Session): Response | null {
+function envelopeForError(err: unknown): Response {
+  if (err instanceof StoreWriteError || err instanceof StoreUnreadableError) {
+    return errorJson('persist_failed', err.message, 500)
+  }
+  // A request body that failed shape validation is a CLIENT error (400), using
+  // the same bad-request envelope the mock-mode router answers with.
+  if (err instanceof ValidationError) {
+    return errorJson('not_found', err.message, 400)
+  }
+  if (err instanceof GithubRequestError) {
+    if (err.status === 404) return errorJson('not_found', err.message, 404)
+    if (err.status === 403) return errorJson('forbidden', err.message, 403)
+    if (err.status === 429) return errorJson('rate_limited', err.message, 429)
+    return errorJson('broker_unreachable', err.message, 502)
+  }
+  const message = err instanceof Error ? err.message : String(err)
+  return errorJson('broker_unreachable', message, 500)
+}
+
+async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
+  try {
+    const body = (await req.json()) as unknown
+    return body && typeof body === 'object' ? (body as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Handle one `/api/*` request in direct mode against the read/persist surface.
+ * Returns `null` when the path is not an API path (the caller serves static
+ * assets). The `session` answers `GET /api/session`; `api` answers the rest.
+ */
+export async function handleDirectApi(
+  req: Request,
+  session: Session,
+  api: DirectApi,
+): Promise<Response | null> {
   const url = new URL(req.url)
   if (url.pathname !== '/api' && !url.pathname.startsWith('/api/')) return null
+  const { method } = req
+  const path = url.pathname
 
-  if (req.method === ROUTES.getSession.method && url.pathname === ROUTES.getSession.path) {
+  // getSession — the real session built at startup.
+  if (method === ROUTES.getSession.method && path === ROUTES.getSession.path) {
     return json(session)
   }
 
-  if (isKnownApiPath(req.method, url.pathname)) {
+  try {
+    // ——— syncPull ———
+    if (method === ROUTES.syncPull.method) {
+      const params = matchRoute(ROUTES.syncPull.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        const snapshot = await api.syncPull(n)
+        return json(snapshot)
+      }
+    }
+
+    // ——— getSnapshot: null for never-synced (200), never 404-as-error. ———
+    if (method === ROUTES.getSnapshot.method) {
+      const params = matchRoute(ROUTES.getSnapshot.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        return json(api.getSnapshot(n))
+      }
+    }
+
+    // ——— drafts: GET / PUT / DELETE /api/pulls/:n/draft ———
+    if (path.endsWith('/draft')) {
+      const params = matchRoute(ROUTES.getDraft.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        if (method === 'GET') return json(api.getDraft(n))
+        if (method === 'PUT') {
+          const draft = validateReviewDraft(await readJsonBody(req))
+          // Act on the PR named in the path, not a mismatched body `prNumber` —
+          // otherwise a buggy client gets a 200 while the draft it thinks it
+          // saved for this PR was written somewhere else.
+          if (draft.prNumber !== n) {
+            return errorJson(
+              'not_found',
+              'Path pull number does not match body prNumber.',
+              400,
+            )
+          }
+          return json(api.saveDraft(draft))
+        }
+        if (method === 'DELETE') {
+          api.discardDraft(n)
+          return json(null)
+        }
+      }
+    }
+
+    // ——— viewed: GET / PUT /api/pulls/:n/viewed ———
+    if (path.endsWith('/viewed')) {
+      const params = matchRoute(ROUTES.getFileViewed.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        if (method === 'GET') return json(api.getFileViewed(n))
+        if (method === 'PUT') {
+          const body = validateSetViewedBody(await readJsonBody(req))
+          return json(api.setFileViewed(n, body.path, body.viewed, body.blobSha))
+        }
+      }
+    }
+
+    // ——— preferences: GET / PUT /api/preferences ———
+    if (path === ROUTES.getPreferences.path) {
+      if (method === 'GET') return json(api.getPreferences())
+      if (method === 'PUT') {
+        const patch = validateSetPreferencesBody(await readJsonBody(req))
+        return json(api.setPreferences(patch))
+      }
+    }
+  } catch (err) {
+    return envelopeForError(err)
+  }
+
+  // Known-but-unimplemented contract routes (GraphQL threads, write path, blobs,
+  // rate limit) answer an honest 501.
+  if (isKnownApiPath(method, path)) {
+    for (const template of NOT_IMPLEMENTED_ROUTES) {
+      if (matchRoute(template, path)) {
+        return json(
+          {
+            code: 'not_implemented',
+            message: `${method} ${path} is not available in direct mode yet.`,
+          },
+          501,
+        )
+      }
+    }
+    // A known path whose method is not the one direct mode serves (e.g. a POST to
+    // a GET-only route) is also an honest 501 placeholder.
     return json(
       {
         code: 'not_implemented',
-        message: `${req.method} ${url.pathname} is not available in direct mode yet.`,
+        message: `${method} ${path} is not available in direct mode yet.`,
       },
       501,
     )
   }
 
-  return json(
-    { code: 'not_found', message: `No route for ${req.method} ${url.pathname}.` },
-    404,
-  )
+  return errorJson('not_found', `No route for ${method} ${path}.`, 404)
 }

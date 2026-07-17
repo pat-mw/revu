@@ -9,7 +9,7 @@
 import { describe, expect, test } from 'bun:test'
 import { isOwnComment, parseCommentIdentity } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
-import type { GithubClient, GithubViewer } from './github-client'
+import type { GithubViewer, GithubViewerClient } from './github-client'
 import { buildDirectSession, buildHuman, MissingGitIdentityError } from './session'
 
 /** A CommandRunner answering `git config <key>` from a map; anything else fails. */
@@ -27,7 +27,7 @@ function gitConfigRunner(config: Record<string, string>): CommandRunner {
   }
 }
 
-const fakeGithub = (viewer: GithubViewer): GithubClient => ({
+const fakeGithub = (viewer: GithubViewer): GithubViewerClient => ({
   async getViewer() {
     return viewer
   },

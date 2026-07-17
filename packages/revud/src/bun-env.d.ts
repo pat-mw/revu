@@ -56,6 +56,32 @@ declare module 'bun' {
   export type Subprocess = BunSubprocess
 }
 
+/**
+ * Minimal `bun:sqlite` surface the durable store uses. Only the members the
+ * store calls are declared; Bun provides the real implementation at runtime.
+ * A bound query/statement's row type is unknown here — callers narrow it — so
+ * `get`/`all` return `unknown`.
+ */
+declare module 'bun:sqlite' {
+  /** A prepared statement, run with positional parameters. */
+  export interface Statement {
+    run(...params: (string | number | null)[]): void
+    get(...params: (string | number | null)[]): unknown
+    all(...params: (string | number | null)[]): unknown[]
+  }
+
+  /** A single SQLite database handle over one file (or `:memory:`). */
+  export class Database {
+    constructor(filename: string)
+    run(sql: string, params?: (string | number | null)[]): void
+    query(sql: string): Statement
+    prepare(sql: string): Statement
+    /** Wrap `fn` in a transaction; the returned function commits on success, rolls back on throw. */
+    transaction<Args extends unknown[]>(fn: (...args: Args) => void): (...args: Args) => void
+    close(): void
+  }
+}
+
 interface ImportMeta {
   /** True when this module is the program entry point (`bun run <file>`). */
   readonly main: boolean

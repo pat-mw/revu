@@ -4,6 +4,7 @@ import type { Server } from 'bun'
 import type { Session } from '@revu/shared'
 import type { MockBundle } from './mock-bridge'
 import type { RevuMode } from './api-router'
+import type { DirectApi } from './direct/direct-api'
 import { handleApi } from './api-router'
 import { handleDirectApi } from './direct-router'
 
@@ -34,6 +35,12 @@ export interface ServeOptions {
    * returns it from `GET /api/session` and never re-derives it per request.
    */
   directSession?: Session
+  /**
+   * The direct-mode read/persist surface (sync engine + durable store). Present
+   * only in direct mode; the direct router dispatches sync/snapshot/draft/viewed/
+   * preferences routes to it.
+   */
+  directApi?: DirectApi
   /**
    * The transport mode the daemon was booted with. Threaded explicitly into
    * the router (never read from the environment per-request) so the mock-only
@@ -111,11 +118,12 @@ export function createFetchHandler(
 export function createDirectFetchHandler(
   distDir: string,
   session: Session,
+  api: DirectApi,
 ): (req: Request) => Promise<Response> {
   const indexPath = join(distDir, 'index.html')
 
   return async function fetch(req: Request): Promise<Response> {
-    const apiResponse = handleDirectApi(req, session)
+    const apiResponse = await handleDirectApi(req, session, api)
     if (apiResponse) return apiResponse
     return serveStatic(distDir, indexPath, req)
   }
@@ -140,7 +148,10 @@ export function startServer(opts: ServeOptions): Server {
     if (opts.directSession === undefined) {
       throw new Error('revud: direct mode requires a resolved session.')
     }
-    fetch = createDirectFetchHandler(opts.distDir, opts.directSession)
+    if (opts.directApi === undefined) {
+      throw new Error('revud: direct mode requires a resolved read/persist surface.')
+    }
+    fetch = createDirectFetchHandler(opts.distDir, opts.directSession, opts.directApi)
   } else {
     if (opts.mock === undefined) {
       throw new Error(`revud: ${opts.mode} mode requires the mock bundle.`)
