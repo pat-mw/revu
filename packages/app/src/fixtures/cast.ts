@@ -28,6 +28,15 @@ export const HUMANS: Human[] = [
     role: 'contractor',
     email: 'marcus.webb@acme.dev',
   },
+  {
+    // Display name is a Coder username carrying a digit — the broker stamps it
+    // verbatim, so this seat pins that a digit-in-username prefix still parses
+    // back to a human instead of collapsing to the bare bot.
+    id: 'h-alice2',
+    name: 'alice2',
+    role: 'contractor',
+    email: 'alice.tan@acme.dev',
+  },
 ]
 
 export const DEFAULT_HUMAN_ID = 'h-priya'

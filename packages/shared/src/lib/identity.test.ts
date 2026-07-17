@@ -7,10 +7,13 @@
  * behavior of the code as written — including the honestly-documented
  * ambiguities (a lone all-letters word such as "Warning" parses as a person).
  *
- * Name validation is LETTERS-ONLY as implemented: a token containing a digit
- * is rejected, so such a body currently parses as the bot. These tests assert
- * that letters-only contract exactly and do not anticipate any future
- * relaxation.
+ * Name validation spans the broker's author-name charset: letters (any
+ * script), digits, underscore, and hyphen, with apostrophes and periods also
+ * allowed inside a token. A Coder username such as `alice2` or `j_doe` is a
+ * valid stamped name, so these tests pin those as parsing to a person. What
+ * still keeps markdown out is the 1–4 token cap and the per-token length cap,
+ * not the charset — so a symbol like `@`, five tokens, or an over-length token
+ * is still rejected. These tests assert both sides of that contract.
  */
 import { describe, it, expect } from 'bun:test'
 import type { GhUser, Human, ReviewComment } from '../api/types'
@@ -143,11 +146,27 @@ describe('parsePrefixedBody name validation', () => {
     expect(parsePrefixedBody('**Ada Bee Cee Dee Eff**\n\nx')).toBeNull()
   })
 
-  it('rejects a token containing a digit (letters-only contract)', () => {
-    // A digit anywhere in a token fails the token regex, so the whole body
-    // parses as the bot rather than a person. This is the current contract.
-    expect(parsePrefixedBody('**Bob2**\n\nx')).toBeNull()
-    expect(parsePrefixedBody('**alice2**\n\nx')).toBeNull()
+  it('accepts a token carrying digits or an underscore (Coder username charset)', () => {
+    // Coder usernames carry digits and underscores; the broker stamps them
+    // verbatim, so the parser must recover them as a person rather than
+    // dropping the prefix and rendering the bare bot.
+    expect(parsePrefixedBody('**Bob2**\n\nx')?.name).toBe('Bob2')
+    expect(parsePrefixedBody('**alice2**\n\nx')?.name).toBe('alice2')
+    expect(parsePrefixedBody('**j_doe**\n\nx')?.name).toBe('j_doe')
+  })
+
+  it('accepts digits and underscore across the token-count range', () => {
+    expect(parsePrefixedBody('**dev_1 qa_2**\n\nx')?.name).toBe('dev_1 qa_2')
+    expect(parsePrefixedBody('**a1 b2 c3 d4**\n\nx')?.name).toBe('a1 b2 c3 d4')
+  })
+
+  it('still rejects a digit/underscore string that is not a valid stamped prefix', () => {
+    // The charset widened, but the caps did not: five tokens, a symbol outside
+    // the charset, and an over-length token are all still rejected, so a body
+    // like these parses as the bot rather than a bogus person.
+    expect(parsePrefixedBody('**a1 b2 c3 d4 e5**\n\nx')).toBeNull()
+    expect(parsePrefixedBody('**user@2fa**\n\nx')).toBeNull()
+    expect(parsePrefixedBody(`**${'x9'.repeat(13)}**\n\nx`)).toBeNull()
   })
 
   it('accepts a token at the 24-character cap and rejects one past it', () => {
@@ -171,11 +190,19 @@ describe('parsePrefixedBody documented ambiguities', () => {
     })
   })
 
-  it('rejects a bold opener whose token carries a digit', () => {
-    expect(parsePrefixedBody('**Note 1**\n\nx')).toBeNull()
+  it('parses a bold opener whose token carries a digit (charset now admits it)', () => {
+    // Digits joined the charset, so `Note 1` reads as a two-token person the
+    // same way `Warning` reads as a one-token person — the smuggling format
+    // owns this. The token-count and length caps, not the charset, are what
+    // fence markdown out.
+    expect(parsePrefixedBody('**Note 1**\n\nx')).toEqual({
+      name: 'Note 1',
+      role: null,
+      rest: 'x',
+    })
   })
 
-  it('rejects a bold opener containing a non-letter symbol', () => {
+  it('rejects a bold opener containing a symbol outside the charset', () => {
     expect(parsePrefixedBody('**No@te**\n\nx')).toBeNull()
   })
 })
