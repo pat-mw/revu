@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# revud on-disk broker document (durable localStorage backend)
+.revud/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

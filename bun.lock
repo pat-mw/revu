@@ -60,6 +60,10 @@
     "packages/revud": {
       "name": "@revu/revud",
       "version": "0.0.0",
+      "dependencies": {
+        "@revu/app": "workspace:*",
+        "@revu/shared": "workspace:*",
+      },
     },
     "packages/shared": {
       "name": "@revu/shared",

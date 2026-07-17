@@ -3,6 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./mock": {
+      "types": "./mock.d.ts",
+      "default": "./src/api/mock/revud.ts"
+    }
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",

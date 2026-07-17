@@ -5,5 +5,12 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@revu/app": "workspace:*",
+    "@revu/shared": "workspace:*"
   }
 }

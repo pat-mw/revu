@@ -309,6 +309,18 @@ function overlayFor(prNumber: number): RemoteOverlay {
 // ————————————————————————————————————————————————————————————————
 
 export const store = {
+  /**
+   * Persist the whole document synchronously, cancelling any pending debounce.
+   * The browser already flushes on the ~1s debounce and on visibilitychange;
+   * a durable host (a daemon writing to disk through a `localStorage` polyfill)
+   * calls this after every mutation and on shutdown so no in-flight write is
+   * lost to a crash. Behavior-preserving: in the browser this is exactly the
+   * debounced `setItem` run eagerly.
+   */
+  flush(): void {
+    flush()
+  },
+
   // ——— dev panel state ———
 
   getDev(): DevState {
