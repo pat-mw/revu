@@ -4,6 +4,7 @@ import type {
   HumanPreferences,
   ReactionKey,
   ReactionRollup,
+  ReconcileReport,
   ReviewComment,
   ReviewDraft,
   ReviewThread,
@@ -15,6 +16,7 @@ import type {
 import { ApiError } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import type { GithubClient } from './github-client'
+import { reconcileDraft as runReconcileDraft } from './reconcile'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
 import { syncPull as runSyncPull } from './sync'
@@ -64,6 +66,17 @@ export interface DirectApi {
   getDraft(prNumber: number): ReviewDraft | null
   saveDraft(draft: ReviewDraft): ReviewDraft
   discardDraft(prNumber: number): void
+
+  /**
+   * Classify the draft's pending comments against the freshly-synced snapshot:
+   * `clean` / `drifted` / `lost`. A PURE READ of snapshot + draft state — no
+   * writes, the draft is untouched — so the client can preview where its comments
+   * landed after a force-push before resubmitting. Runs the SAME shared
+   * `classifyPendingComment` the reconcile dialog previews with, so the report and
+   * the preview can never disagree. A missing draft or a never-synced PR is a typed
+   * `not_found`, matching the mock oracle.
+   */
+  reconcileDraft(prNumber: number): ReconcileReport
 
   getFileViewed(prNumber: number): FileViewedState
   setFileViewed(
@@ -183,6 +196,10 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
 
     discardDraft(prNumber: number): void {
       deps.store.deleteDraft(humanId, prNumber)
+    },
+
+    reconcileDraft(prNumber: number): ReconcileReport {
+      return runReconcileDraft({ store: deps.store, humanId }, prNumber)
     },
 
     getFileViewed(prNumber: number): FileViewedState {

@@ -50,10 +50,10 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  *     as a `?pr=<n>` query param (or a `prNumber` body field), mirroring the mock
  *     router; it is shared-and-honest (one GitHub user, one reaction).
  *
- * Routes that belong to the not-yet-built GraphQL thread read, reconcile, and
- * rate-limit still answer a typed `not_implemented` (501). Unknown API paths 404;
- * non-API paths return `null` so the caller serves static assets. There is no
- * mock and no dev panel in direct mode.
+ * Routes that belong to the not-yet-built GraphQL thread read and rate-limit
+ * still answer a typed `not_implemented` (501). Unknown API paths 404; non-API
+ * paths return `null` so the caller serves static assets. There is no mock and
+ * no dev panel in direct mode.
  *
  * The session is captured at startup and never re-derived per request: identity
  * is fixed for the daemon's life and no request can influence it.
@@ -74,15 +74,14 @@ function errorJson(code: string, message: string, status: number): Response {
 
 /**
  * The routes the not-yet-built parts of the surface own. They stay `501` until
- * the GraphQL thread read (`listReviewThreads`), reconcile (`reconcileDraft`),
- * and the rate-limit read (`getRateLimit`) land. The write path (submitReview,
- * replyToThread, resolveThread, addReaction) is served below. `getBlob` is served
- * — it reads the content-addressed store.
+ * the GraphQL thread read (`listReviewThreads`) and the rate-limit read
+ * (`getRateLimit`) land. The write path (submitReview, replyToThread,
+ * resolveThread, addReaction), `getBlob` (a content-addressed store read), and
+ * `reconcileDraft` (a pure read of snapshot + draft state) are all served below.
  */
 const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
   ROUTES.listPulls.path,
   ROUTES.listReviewThreads.path,
-  ROUTES.reconcileDraft.path,
   ROUTES.getRateLimit.path,
 ])
 
@@ -229,6 +228,19 @@ export async function handleDirectApi(
         const n = prNumberOf(params)
         if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
         return json(api.getSnapshot(n))
+      }
+    }
+
+    // ——— reconcileDraft: GET /api/pulls/:n/reconcile ———
+    // A pure read of snapshot + draft state — no writes, the draft is untouched.
+    // A missing draft or a never-synced PR surfaces as a typed not_found (404)
+    // via the thrown ApiError, matching the mock oracle.
+    if (method === ROUTES.reconcileDraft.method) {
+      const params = matchRoute(ROUTES.reconcileDraft.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        return json(api.reconcileDraft(n))
       }
     }
 
