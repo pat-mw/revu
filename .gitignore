@@ -15,6 +15,9 @@ dist-ssr
 # revud on-disk broker document (durable localStorage backend)
 .revud/
 
+# e2e failure screenshots are build output, never committed
+e2e/artifacts/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
