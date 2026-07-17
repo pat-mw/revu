@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { SmilePlus } from 'lucide-react'
 import type { ReactionKey, ReviewComment, CommentIdentity } from '@revu/shared'
-import { identityName, parseCommentIdentity } from '@revu/shared'
+import { identityName, isOwnComment, parseCommentIdentity } from '@revu/shared'
 import { IdentityAvatar } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { Markdown } from '@/components/ui/markdown'
@@ -9,6 +9,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
 import { formatDate, relativeTime } from '@/lib/time'
+import { useSnapshot } from '@/state/queries'
 import { useSession } from '@/state/session'
 import { useAddReaction } from '@/state/threads'
 
@@ -88,10 +89,20 @@ export function CommentView({
     () => parseCommentIdentity(comment, session.brokerLogin),
     [comment, session.brokerLogin],
   )
-  // "Yours" is derived from the smuggled name — the same rule isOwnComment
-  // applies — reusing the single parse above instead of parsing again.
-  const own =
-    parsed.identity.kind === 'human' && parsed.identity.name === session.human.name
+  // "Yours" resolves through the shared rule: the broker's write log
+  // (commentAuthors) by author id first — correct across a Coder username
+  // rename — then direct-mode viewer login, then the smuggled-name fallback.
+  const commentAuthors = useSnapshot(prNumber).data?.mutable.commentAuthors
+  const own = useMemo(
+    () =>
+      isOwnComment(comment, {
+        human: session.human,
+        commentAuthors,
+        botLogin: session.brokerLogin,
+        viewerLogin: session.viewerLogin,
+      }),
+    [comment, commentAuthors, session.human, session.brokerLogin, session.viewerLogin],
+  )
 
   const chip = identityChip(parsed.identity)
   const active = REACTION_KEYS.filter((k) => comment.reactions[k] > 0)

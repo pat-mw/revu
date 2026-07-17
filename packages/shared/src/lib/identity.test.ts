@@ -308,26 +308,161 @@ describe('identityName', () => {
   })
 })
 
-describe('isOwnComment', () => {
-  it('is true when the parsed human name matches the session human', () => {
+describe('isOwnComment id-map branch (broker write log)', () => {
+  it('is true when the write log attributes the comment id to the session human', () => {
+    // The write log keys on Human.id, so this holds regardless of the smuggled
+    // name — even when the body carries a DIFFERENT (stale) display name.
+    const comment = reviewComment(BOT_LOGIN, prefixBody(human('Stale Name'), 'mine'))
+    const me = { ...human('Whatever'), id: 'h-alice' }
+    expect(
+      isOwnComment(comment, {
+        human: me,
+        commentAuthors: { [comment.id]: 'h-alice' },
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(true)
+  })
+
+  it('is false when the write log attributes the comment id to a different human', () => {
+    const comment = reviewComment(BOT_LOGIN, prefixBody(human('Alice'), 'theirs'))
+    const me = { ...human('Alice'), id: 'h-alice' }
+    expect(
+      isOwnComment(comment, {
+        human: me,
+        commentAuthors: { [comment.id]: 'h-bob' },
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(false)
+  })
+
+  it('takes precedence over the smuggled name (the map wins on a rename)', () => {
+    // Name says Alice, but the log says h-bob authored it: the log is truth.
+    const comment = reviewComment(BOT_LOGIN, prefixBody(human('Alice'), 'x'))
+    const alice = { ...human('Alice'), id: 'h-alice' }
+    expect(
+      isOwnComment(comment, {
+        human: alice,
+        commentAuthors: { [comment.id]: 'h-bob' },
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(false)
+  })
+})
+
+describe('isOwnComment name-fallback branch (write log absent)', () => {
+  it('is true when the parsed human name matches and no map covers the comment', () => {
     const body = prefixBody(human('Alice'), 'mine')
-    expect(isOwnComment(reviewComment(BOT_LOGIN, body), human('Alice'), BOT_LOGIN)).toBe(true)
+    expect(
+      isOwnComment(reviewComment(BOT_LOGIN, body), {
+        human: human('Alice'),
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(true)
+  })
+
+  it('is true via the name fallback when the map is present but silent on this comment', () => {
+    // commentAuthors exists but has no entry for THIS comment id — detection
+    // must fall through to the name match rather than treating it as not-yours.
+    const body = prefixBody(human('Alice'), 'mine')
+    const comment = reviewComment(BOT_LOGIN, body)
+    expect(
+      isOwnComment(comment, {
+        human: human('Alice'),
+        commentAuthors: { 999999: 'h-someone-else' },
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(true)
   })
 
   it('is false when a broker comment resolves to a different human name', () => {
     const body = prefixBody(human('Bob'), 'theirs')
-    expect(isOwnComment(reviewComment(BOT_LOGIN, body), human('Alice'), BOT_LOGIN)).toBe(false)
+    expect(
+      isOwnComment(reviewComment(BOT_LOGIN, body), {
+        human: human('Alice'),
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(false)
   })
 
   it('is false for a real GitHub (non-broker) comment', () => {
     // Even a body that looks prefixed stays github-kind for a real login.
     const comment = reviewComment('octocat', '**Alice**\n\nx')
-    expect(isOwnComment(comment, human('Alice'), BOT_LOGIN)).toBe(false)
+    expect(isOwnComment(comment, { human: human('Alice'), botLogin: BOT_LOGIN })).toBe(false)
   })
 
   it('is false for a bot comment with no parseable prefix', () => {
     const comment = reviewComment(BOT_LOGIN, 'plain body')
-    expect(isOwnComment(comment, human('Alice'), BOT_LOGIN)).toBe(false)
+    expect(isOwnComment(comment, { human: human('Alice'), botLogin: BOT_LOGIN })).toBe(false)
+  })
+})
+
+describe('isOwnComment direct-mode branch (viewer login, no write log)', () => {
+  it('is true when the comment author login equals the viewer login', () => {
+    // Direct GitHub connection: no broker, no smuggled prefix — the real login
+    // is trustworthy, so "yours" is a login comparison.
+    const comment = reviewComment('alice-gh', 'a plain comment from github.com')
+    expect(
+      isOwnComment(comment, {
+        human: human('Alice'),
+        botLogin: '',
+        viewerLogin: 'alice-gh',
+      }),
+    ).toBe(true)
+  })
+
+  it('is false when the comment author login differs from the viewer login', () => {
+    const comment = reviewComment('someone-else', 'not mine')
+    expect(
+      isOwnComment(comment, {
+        human: human('Alice'),
+        botLogin: '',
+        viewerLogin: 'alice-gh',
+      }),
+    ).toBe(false)
+  })
+
+  it('the write log still wins over the viewer login when it names the comment', () => {
+    // Both signals present: the authoritative write log takes precedence.
+    const comment = reviewComment('alice-gh', 'x')
+    const me = { ...human('Alice'), id: 'h-alice' }
+    expect(
+      isOwnComment(comment, {
+        human: me,
+        commentAuthors: { [comment.id]: 'h-bob' },
+        botLogin: '',
+        viewerLogin: 'alice-gh',
+      }),
+    ).toBe(false)
+  })
+})
+
+describe('isOwnComment survives a Coder username rename', () => {
+  it('still resolves via the write log after the human display name changes', () => {
+    // Ground truth: Alice authored this comment. The broker stamped her
+    // then-current display name into the body and logged her stable id.
+    const originalName = 'alice2'
+    const authored = reviewComment(BOT_LOGIN, prefixBody(human(originalName), 'mine'))
+    const writeLog = { [authored.id]: 'h-alice' }
+
+    // Coder renames Alice AFTER the comment exists: her display name is now
+    // something entirely different, so the smuggled prefix is stale.
+    const renamedAlice: Human = { ...human('Alice Tan-Rivera'), id: 'h-alice' }
+
+    // Name-matching alone would fail (the body still says "alice2"), but the
+    // write log keys on the stable id, so "yours" still resolves.
+    expect(
+      isOwnComment(authored, {
+        human: renamedAlice,
+        commentAuthors: writeLog,
+        botLogin: BOT_LOGIN,
+      }),
+    ).toBe(true)
+
+    // And the failure the id map fixes: with NO write log, the stale name no
+    // longer matches the renamed human — the exact regression this guards.
+    expect(
+      isOwnComment(authored, { human: renamedAlice, botLogin: BOT_LOGIN }),
+    ).toBe(false)
   })
 })
 

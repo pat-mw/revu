@@ -1,4 +1,4 @@
-import type { GhUser, Human, ReviewComment } from '../api/types'
+import type { GhUser, Human } from '../api/types'
 
 /**
  * Identity smuggling: comments written through revu are posted by the broker
@@ -111,14 +111,56 @@ export function identityName(identity: CommentIdentity): string {
   }
 }
 
+/** Everything `isOwnComment` needs to decide "is this comment mine?". */
+export interface OwnCommentContext {
+  /** The human currently driving the session. */
+  human: Human
+  /**
+   * The broker's write log for this snapshot (comment id → author `Human.id`).
+   * When it names this comment, it is authoritative and survives a rename;
+   * absent or silent on a comment, detection falls back to the smuggled name.
+   */
+  commentAuthors?: Record<number, string>
+  /** The bot login the broker writes as — needed only for the name fallback. */
+  botLogin: string
+  /**
+   * The viewer's own GitHub login in direct mode (no broker, no write log).
+   * When set, a comment is yours iff its real author login equals it.
+   */
+  viewerLogin?: string
+}
+
 /**
- * Whether a comment was written by the given session human. GitHub provides
- * no `viewer`, so "yours" is derived by matching the smuggled name — the only
- * signal that exists.
+ * Whether a comment was written by the session human. Three signals, checked in
+ * order of trust:
+ *
+ * 1. The broker's write log (`commentAuthors[comment.id]`). This is ground
+ *    truth: it keys on `Human.id`, so it stays correct across a Coder username
+ *    rename or a reused username — the failures display-name matching cannot
+ *    survive. Consulted first, and only when it actually names this comment.
+ * 2. Direct mode (`viewerLogin` set, no write log for this comment): GitHub is
+ *    talked to directly, so the comment's real author login is trustworthy —
+ *    yours iff `comment.user.login === viewerLogin`.
+ * 3. Name fallback: with no write-log entry and no direct-mode login, the only
+ *    remaining signal is the name the broker smuggled into the body. This is
+ *    the legacy behavior, kept so non-broker-logged comments still resolve.
+ *
+ * The write log wins whenever it names the comment, so a stale smuggled name
+ * never overrides it.
  */
-export function isOwnComment(comment: ReviewComment, human: Human, botLogin: string): boolean {
-  const { identity } = parseCommentIdentity(comment, botLogin)
-  return identity.kind === 'human' && identity.name === human.name
+export function isOwnComment(
+  comment: { id: number; user: GhUser; body: string },
+  ctx: OwnCommentContext,
+): boolean {
+  const loggedAuthor = ctx.commentAuthors?.[comment.id]
+  if (loggedAuthor !== undefined) {
+    return loggedAuthor === ctx.human.id
+  }
+  if (ctx.viewerLogin !== undefined && ctx.viewerLogin !== '') {
+    return comment.user.login === ctx.viewerLogin
+  }
+  const { identity } = parseCommentIdentity(comment, ctx.botLogin)
+  return identity.kind === 'human' && identity.name === ctx.human.name
 }
 
 // ————————————————————————————————————————————————————————————————

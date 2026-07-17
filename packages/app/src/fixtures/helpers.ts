@@ -1,5 +1,7 @@
-import type { FileBlob, PullFile, ReactionRollup, Snapshot } from '@revu/shared'
+import type { FileBlob, PullFile, ReactionRollup, ReviewThread, Snapshot } from '@revu/shared'
+import { parseCommentIdentity } from '@revu/shared'
 import type { RemotePull } from './contract'
+import { BROKER_BOT, HUMANS } from './cast'
 
 /**
  * Fixture timestamps are offsets from load time so relative labels
@@ -103,10 +105,40 @@ export function pullFile(
 }
 
 /**
+ * Reconstruct the broker's write log for a set of threads: comment id → the id
+ * of the human who authored it. A real broker records this at write time; the
+ * mock has no separate log, so it recovers the same mapping from the identity
+ * the broker smuggled into each body — the stamp IS the record. Only comments
+ * the broker bot authored (and whose smuggled name resolves to a known human)
+ * are listed; org-member comments and unparseable bot bodies are omitted, so
+ * the map covers exactly the broker-authored comments and nothing else.
+ *
+ * Keyed on `Human.id`, the stable identity — so a later display-name change on
+ * that human leaves this map pointing at the same person.
+ */
+function deriveCommentAuthors(threads: ReviewThread[]): Record<number, string> {
+  const byName = new Map(HUMANS.map((h) => [h.name, h.id]))
+  const authors: Record<number, string> = {}
+  for (const thread of threads) {
+    for (const comment of thread.comments) {
+      const { identity } = parseCommentIdentity(comment, BROKER_BOT.login)
+      if (identity.kind !== 'human') continue
+      const humanId = byName.get(identity.name)
+      if (humanId !== undefined) authors[comment.id] = humanId
+    }
+  }
+  return authors
+}
+
+/**
  * Assemble a Snapshot from a remote-shaped description — used both for seeding
  * pre-synced fixtures and (by the mock sync engine) as the canonical
  * remote → cache copy. Deep-clones so later remote mutation can't leak into a
  * snapshot that is supposed to be a point-in-time copy.
+ *
+ * `commentAuthors` carries the broker's write log alongside the threads, so
+ * own-comment detection resolves by author id instead of by the smuggled
+ * display name — correct across a Coder username rename.
  */
 export function buildSnapshot(
   remote: RemotePull,
@@ -137,6 +169,7 @@ export function buildSnapshot(
       issueComments: clone(remote.issueComments),
       reviews: clone(remote.reviews),
       checks: clone(remote.checks),
+      commentAuthors: deriveCommentAuthors(remote.threads),
     },
   }
 }

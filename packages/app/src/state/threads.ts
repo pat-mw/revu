@@ -33,6 +33,25 @@ function withThread(
   }
 }
 
+/** Record a comment's author in the snapshot's write log (a new reference). */
+function withCommentAuthor(snap: Snapshot, commentId: number, humanId: string): Snapshot {
+  return {
+    ...snap,
+    mutable: {
+      ...snap.mutable,
+      commentAuthors: { ...snap.mutable.commentAuthors, [commentId]: humanId },
+    },
+  }
+}
+
+/** Drop a comment id from the write log (used to clear an orphaned synthetic id). */
+function dropCommentAuthor(snap: Snapshot, commentId: number): Snapshot {
+  const authors = snap.mutable.commentAuthors
+  if (!authors || !(commentId in authors)) return snap
+  const { [commentId]: _dropped, ...rest } = authors
+  return { ...snap, mutable: { ...snap.mutable, commentAuthors: rest } }
+}
+
 /** Replace the rollup on whichever comment (review or issue) carries the id. */
 function withCommentRollup(
   snap: Snapshot,
@@ -193,12 +212,16 @@ export function useReplyToThread(
         const thread = previousSnapshot.mutable.threads.find((t) => t.id === threadId)
         if (thread) {
           const synthetic = syntheticReply(thread, session, body, syntheticId)
+          const withReply = withThread(previousSnapshot, threadId, (t) => ({
+            ...t,
+            comments: [...t.comments, synthetic],
+          }))
+          // Record the optimistic comment's author in the snapshot's write log
+          // so its "(you)" affordance resolves by id, exactly as the server
+          // comment that replaces it will.
           qc.setQueryData<Snapshot | null>(
             qk.snapshot(prNumber),
-            withThread(previousSnapshot, threadId, (t) => ({
-              ...t,
-              comments: [...t.comments, synthetic],
-            })),
+            withCommentAuthor(withReply, syntheticId, session.human.id),
           )
         }
       }
@@ -212,17 +235,24 @@ export function useReplyToThread(
     onSuccess: (comment, { threadId }, context) => {
       const current = qc.getQueryData<Snapshot | null>(qk.snapshot(prNumber))
       if (current) {
+        const swapped = withThread(current, threadId, (t) => {
+          const hasSynthetic = t.comments.some((c) => c.id === context.syntheticId)
+          return {
+            ...t,
+            comments: hasSynthetic
+              ? t.comments.map((c) => (c.id === context.syntheticId ? comment : c))
+              : [...t.comments, comment],
+          }
+        })
+        // Re-key the write log from the optimistic id onto the server id so the
+        // comment's author survives the swap; drop the now-orphaned synthetic
+        // entry.
+        const prior = swapped.mutable.commentAuthors ?? {}
+        const author = prior[context.syntheticId] ?? session.human.id
+        const rekeyed = withCommentAuthor(swapped, comment.id, author)
         qc.setQueryData<Snapshot | null>(
           qk.snapshot(prNumber),
-          withThread(current, threadId, (t) => {
-            const hasSynthetic = t.comments.some((c) => c.id === context.syntheticId)
-            return {
-              ...t,
-              comments: hasSynthetic
-                ? t.comments.map((c) => (c.id === context.syntheticId ? comment : c))
-                : [...t.comments, comment],
-            }
-          }),
+          dropCommentAuthor(rekeyed, context.syntheticId),
         )
       } else {
         void qc.invalidateQueries({ queryKey: qk.snapshot(prNumber) })

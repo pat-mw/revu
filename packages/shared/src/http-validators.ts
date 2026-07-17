@@ -463,6 +463,7 @@ export const vSession: Validator<Session> = vObject({
   human: vHuman,
   brokerLogin: vString,
   workspace: vString,
+  viewerLogin: vOptional(vString),
 })
 
 export const vBrokerPullMeta: Validator<BrokerPullMeta> = vObject({
@@ -512,6 +513,12 @@ export const vSnapshotMutable: Validator<SnapshotMutable> = vObject({
   issueComments: vArray(vIssueComment),
   reviews: vArray(vReviewSummary),
   checks: vArray(vCheckRun),
+  // Keys are comment ids. JSON object keys are always strings, so the wire
+  // record is `Record<string, string>`; the declared type indexes by number
+  // (the id) but the runtime keys are the string form of those ids.
+  commentAuthors: vOptional(vRecord(vString)) as Validator<
+    Record<number, string> | undefined
+  >,
 })
 
 export const vSnapshot: Validator<Snapshot> = vObject({
