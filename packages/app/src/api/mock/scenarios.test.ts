@@ -268,7 +268,8 @@ describe('submit paths (312)', () => {
     expect(await api.getDraft(312)).toBeNull()
 
     const newThread = after312[after312.length - 1]
-    const parsed = parseCommentIdentity(newThread.comments[0])
+    const { brokerLogin } = await api.getSession()
+    const parsed = parseCommentIdentity(newThread.comments[0], brokerLogin)
     expect(parsed.identity.kind === 'human' && parsed.identity.name === 'Priya Raman').toBe(true)
   })
 })
@@ -297,7 +298,8 @@ describe('reply + reaction dedupe (347)', () => {
   it('347 reply smuggles current human', async () => {
     target347 = threads347.find((t) => !t.isResolved)!
     const reply = await api.replyToThread(347, target347.id, 'Pushed a fix in the latest commit.')
-    const replyParsed = parseCommentIdentity(reply)
+    const { brokerLogin } = await api.getSession()
+    const replyParsed = parseCommentIdentity(reply, brokerLogin)
     expect(replyParsed.identity.kind === 'human' && replyParsed.identity.name === 'Priya Raman').toBe(
       true,
     )

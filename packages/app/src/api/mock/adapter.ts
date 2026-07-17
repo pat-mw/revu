@@ -1,10 +1,9 @@
 import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, IssueComment, PendingComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
-import { ApiError, BROKER_LOGIN, prefixBody, classifyAnchor } from '@revu/shared'
+import { ApiError, prefixBody, classifyAnchor } from '@revu/shared'
 import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import { buildSnapshot, emptyReactions, nodeId } from '@/fixtures/helpers'
-import { BROKER_BOT } from '@/fixtures/cast'
 import { store } from './store'
 import { delay, localDelay } from './latency'
 
@@ -225,7 +224,7 @@ export function createMockApi(): RevuApi {
       const human = currentHuman()
       return {
         human,
-        brokerLogin: BROKER_LOGIN,
+        brokerLogin: db.brokerBot.login,
         workspace: `coder-ws-${human.id}`,
       }
     },
@@ -390,7 +389,7 @@ export function createMockApi(): RevuApi {
         side: thread.diffSide,
         start_side: null,
         subject_type: thread.subjectType === 'FILE' ? 'file' : 'line',
-        user: { ...BROKER_BOT },
+        user: { ...db.brokerBot },
         body: prefixBody(human, body),
         created_at: at,
         updated_at: at,
@@ -425,7 +424,7 @@ export function createMockApi(): RevuApi {
           `Thread ${threadId} was not found on pull #${prNumber}.`,
         )
       }
-      const resolvedBy = resolved ? { login: BROKER_LOGIN } : null
+      const resolvedBy = resolved ? { login: db.brokerBot.login } : null
       store.setResolution(prNumber, threadId, resolved, resolvedBy)
       const snap = store.getSnapshot(prNumber)
       if (snap) {
@@ -522,7 +521,7 @@ export function createMockApi(): RevuApi {
       const review: ReviewSummary = {
         id: reviewId,
         node_id: nodeId('PRR', reviewId),
-        user: { ...BROKER_BOT },
+        user: { ...db.brokerBot },
         body: input.body.trim().length > 0 ? prefixBody(human, input.body) : '',
         state: stateMap[input.event],
         submitted_at: at,
@@ -548,7 +547,7 @@ export function createMockApi(): RevuApi {
           side: c.side,
           start_side: c.start_side,
           subject_type: 'line',
-          user: { ...BROKER_BOT },
+          user: { ...db.brokerBot },
           body: prefixBody(human, c.body),
           created_at: at,
           updated_at: at,

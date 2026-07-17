@@ -24,7 +24,7 @@ this resolution instead of re-running the router:
 
 A mock-data-driven, fully interactive prototype of **revu** — the only code-review surface
 for contractors working in disposable Coder workspaces against a client's private repos,
-where every GitHub call authenticates as one shared GitHub App (`acme-broker[bot]`).
+where every GitHub call authenticates as one shared GitHub App (`meridian-review-bot[bot]`).
 Drafts and per-file viewed state are broker-side and keyed to the human; a PR is an
 offline snapshot with an honest age; submit reconciles rather than fails.
 

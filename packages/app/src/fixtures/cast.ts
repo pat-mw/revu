@@ -33,11 +33,11 @@ export const HUMANS: Human[] = [
 export const DEFAULT_HUMAN_ID = 'h-priya'
 
 export const BROKER_BOT: GhUser = {
-  login: 'acme-broker[bot]',
+  login: 'meridian-review-bot[bot]',
   id: 9000001,
   node_id: 'BOT_kgDOACmVoQ',
   avatar_url: '',
-  html_url: 'https://github.com/apps/acme-broker',
+  html_url: 'https://github.com/apps/meridian-review-bot',
   type: 'Bot',
 }
 

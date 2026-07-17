@@ -9,7 +9,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
 import { formatDate, relativeTime } from '@/lib/time'
-import { useCurrentHuman } from '@/state/session'
+import { useSession } from '@/state/session'
 import { useAddReaction } from '@/state/threads'
 
 const REACTION_KEYS: ReactionKey[] = [
@@ -80,15 +80,18 @@ export function CommentView({
   prNumber: number
   comment: RenderableComment
 }) {
-  const currentHuman = useCurrentHuman()
+  const session = useSession()
   const addReaction = useAddReaction(prNumber)
   const [pickerOpen, setPickerOpen] = useState(false)
 
-  const parsed = useMemo(() => parseCommentIdentity(comment), [comment])
+  const parsed = useMemo(
+    () => parseCommentIdentity(comment, session.brokerLogin),
+    [comment, session.brokerLogin],
+  )
   // "Yours" is derived from the smuggled name — the same rule isOwnComment
   // applies — reusing the single parse above instead of parsing again.
   const own =
-    parsed.identity.kind === 'human' && parsed.identity.name === currentHuman.name
+    parsed.identity.kind === 'human' && parsed.identity.name === session.human.name
 
   const chip = identityChip(parsed.identity)
   const active = REACTION_KEYS.filter((k) => comment.reactions[k] > 0)

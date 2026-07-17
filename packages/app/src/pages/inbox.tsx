@@ -5,7 +5,7 @@ import { Inbox } from 'lucide-react'
 
 import { api } from '@/api'
 import { qk, usePullList, useRateLimit } from '@/state/queries'
-import { useCurrentHuman } from '@/state/session'
+import { useSession } from '@/state/session'
 import type { PullListItem, ReviewDraft } from '@revu/shared'
 import { parseCommentIdentity } from '@revu/shared'
 import { IdentityAvatar } from '@/components/ui/avatar'
@@ -46,12 +46,15 @@ interface Section {
 type SectionId = 'waiting' | 'review' | 'drafts' | 'everything'
 
 /** Case-insensitive match over a PR's title, number, and author display name. */
-function matchesFilter(item: PullListItem, needle: string): boolean {
+function matchesFilter(item: PullListItem, needle: string, botLogin: string): boolean {
   if (!needle) return true
-  const { identity } = parseCommentIdentity({
-    user: item.pull.user,
-    body: item.pull.body ?? '',
-  })
+  const { identity } = parseCommentIdentity(
+    {
+      user: item.pull.user,
+      body: item.pull.body ?? '',
+    },
+    botLogin,
+  )
   const authorName =
     identity.kind === 'human' ? identity.name : item.pull.user.login
   const haystack = `${item.pull.title} #${item.pull.number} ${authorName}`.toLowerCase()
@@ -60,7 +63,8 @@ function matchesFilter(item: PullListItem, needle: string): boolean {
 
 export function InboxPage() {
   const navigate = useNavigate()
-  const human = useCurrentHuman()
+  const session = useSession()
+  const human = session.human
   const pulls = usePullList()
   const rate = useRateLimit()
 
@@ -101,7 +105,7 @@ export function InboxPage() {
 
   const sections = useMemo<Section[]>(() => {
     const open = items.filter((it) => it.pull.state === 'open')
-    const filtered = open.filter((it) => matchesFilter(it, needle))
+    const filtered = open.filter((it) => matchesFilter(it, needle, session.brokerLogin))
 
     const waiting = filtered.filter(
       (it) =>
@@ -135,7 +139,7 @@ export function InboxPage() {
       { id: 'drafts' as const, title: 'Drafts in progress', rows: drafts.map(toRow) },
       { id: 'everything' as const, title: 'Everything else', rows: everything.map(toRow) },
     ]
-  }, [items, needle, human.id, draftByNumber])
+  }, [items, needle, human.id, draftByNumber, session.brokerLogin])
 
   // A single flat list of every visible row, in section order, so keyboard
   // navigation crosses section boundaries as one continuous column.
@@ -363,8 +367,12 @@ const InboxRowView = forwardRef<
     onFocus: () => void
   }
 >(({ row, showUnresolvedNumber, focused, onFocus }, ref) => {
+  const session = useSession()
   const { pull, broker } = row.item
-  const parsed = parseCommentIdentity({ user: pull.user, body: pull.body ?? '' })
+  const parsed = parseCommentIdentity(
+    { user: pull.user, body: pull.body ?? '' },
+    session.brokerLogin,
+  )
   const authorName =
     parsed.identity.kind === 'human' ? parsed.identity.name : pull.user.login
   const labels = pull.labels.slice(0, 2)

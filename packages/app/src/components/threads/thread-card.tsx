@@ -11,6 +11,7 @@ import { cn } from '@/lib/cn'
 import { useShortcut } from '@/lib/keyboard'
 import { useReplyToThread, useResolveThread } from '@/state/threads'
 import { useFilesView } from '@/state/files-view'
+import { useSession } from '@/state/session'
 import { CommentComposer } from './composer'
 import { CommentView } from './comment-view'
 
@@ -105,11 +106,12 @@ export function ThreadCard({
   const { toast } = useToast()
   const navigate = useNavigate()
   const filesView = useFilesView()
+  const session = useSession()
 
   const comments = thread.comments
   const first = comments.length > 0 ? comments[0] : null
   const replies = comments.slice(1)
-  const firstParsed = first ? parseCommentIdentity(first) : null
+  const firstParsed = first ? parseCommentIdentity(first, session.brokerLogin) : null
 
   /** In-place jump on the files page; a hash navigation from anywhere else. */
   const jumpToThread = () => {

@@ -70,7 +70,7 @@ rather than smoothed over:
 
 | Constraint | What the design does about it |
 |---|---|
-| Every human is `acme-broker[bot]` to GitHub | Author names are smuggled through comment-body prefixes and parsed back out — defensively. Org members' comments keep their real identity; both render native side by side |
+| Every human is `meridian-review-bot[bot]` to GitHub | Author names are smuggled through comment-body prefixes and parsed back out — defensively. Org members' comments keep their real identity; both render native side by side |
 | GitHub allows one pending review per identity | Drafts live broker-side, keyed to the human. They survive reloads, tomorrow, and a workspace rebuild — and the UI treats that persistence as quietly load-bearing |
 | The App can't approve its own PRs | **Comment** is the primary action. Approve/Request-changes are gated per-PR; when unavailable, the UI says what to actually do instead of graying out a dead end |
 | 5,000 req/hr shared across every workspace | A PR is a **snapshot**: one sync burst, then fully-local review — context expansion, thread reading, file jumping all work with the network gone. Only the PR list polls (free on ETag 304s) |

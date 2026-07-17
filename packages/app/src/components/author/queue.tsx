@@ -12,6 +12,7 @@ import { useShortcut } from '@/lib/keyboard'
 import { useFilesView } from '@/state/files-view'
 import { useSnapshot } from '@/state/queries'
 import { useResolveThread, useThreads } from '@/state/threads'
+import { useSession } from '@/state/session'
 
 /**
  * The walk order: unresolved threads only, current (non-outdated) ones first,
@@ -74,6 +75,7 @@ export function AuthorQueue({ prNumber }: { prNumber: number }) {
   const filesView = useFilesView()
   const resolve = useResolveThread(prNumber)
   const { toast } = useToast()
+  const session = useSession()
 
   const [currentId, setCurrentId] = useState<string | null>(null)
   /** Ordering as of the previous commit — where a departed id used to sit. */
@@ -258,7 +260,7 @@ export function AuthorQueue({ prNumber }: { prNumber: number }) {
               const line = t.line ?? t.originalLine
               const first = t.comments.length > 0 ? t.comments[0] : null
               const excerpt = first
-                ? excerptOf(parseCommentIdentity(first).body)
+                ? excerptOf(parseCommentIdentity(first, session.brokerLogin).body)
                 : 'No comments'
               return (
                 <button
