@@ -238,6 +238,15 @@ export interface Session {
   human: Human
   brokerLogin: string
   workspace: string
+  /**
+   * The viewer's own GitHub login, present only when the client talks to GitHub
+   * directly rather than through the broker. In broker mode every write posts as
+   * the shared bot, so own-comment detection reads the broker's write log
+   * (`SnapshotMutable.commentAuthors`) instead; in direct mode there is no write
+   * log, so "yours" is `comment.user.login === viewerLogin`. Absent under the
+   * broker, where it would be meaningless.
+   */
+  viewerLogin?: string
 }
 
 /** Broker-side annotations that ride alongside a pure GitHub list item. */
@@ -314,6 +323,23 @@ export interface SnapshotMutable {
   issueComments: IssueComment[]
   reviews: ReviewSummary[]
   checks: CheckRun[]
+  /**
+   * The broker's write log, carried into the snapshot: comment id → the id of
+   * the human who authored it (`Human.id`, the stable key that survives a Coder
+   * username rename). Every comment written through the broker posts as the same
+   * bot with the author's display name smuggled into the body, so this map is
+   * the only ground truth for "who wrote this" — a rename or a reused username
+   * leaves the map correct while the smuggled name goes stale.
+   *
+   * Optional and broker-only: it covers the comments the broker authored, and is
+   * absent under a direct GitHub connection (no write log exists) and for any
+   * comment the broker did not write. Own-comment detection consults it first
+   * and falls back to matching the smuggled name when a comment is not listed.
+   *
+   * Values are human ids, used only for detection — never rendered into a
+   * comment body, which would leak an audit identity onto github.com.
+   */
+  commentAuthors?: Record<number, string>
 }
 
 export interface Snapshot {

@@ -14,6 +14,7 @@
 import { beforeAll, describe, expect, it } from 'bun:test'
 import { createMockApi } from '@/api/mock/adapter'
 import { mockDev } from '@/api/mock/devtools'
+import { fixtureDB } from '@/fixtures'
 import type { PullListItem, PullListResponse, ReviewDraft, ReviewThread, Snapshot } from '@revu/shared'
 import { ApiError, parseCommentIdentity } from '@revu/shared'
 const api = createMockApi()
@@ -308,6 +309,32 @@ describe('reply + reaction dedupe (347)', () => {
   it('347 has 4 unresolved threads', async () => {
     threads347 = await api.listReviewThreads(347)
     expect(threads347.filter((t) => !t.isResolved)).toHaveLength(4)
+  })
+
+  it('347 sync output carries a commentAuthors entry for every broker-authored comment', async () => {
+    // The write log rides the snapshot's mutable half. Every comment the broker
+    // bot authored (smuggled human prefix, not an org member) must appear in
+    // commentAuthors, and each mapped value must be a real human id — so
+    // own-comment detection has ground truth for exactly those comments.
+    const snap347 = (await api.getSnapshot(347))!
+    const { brokerLogin } = await api.getSession()
+    const authors = snap347.mutable.commentAuthors ?? {}
+    const humanIds = new Set(fixtureDB.humans.map((h) => h.id))
+
+    const brokerComments = snap347.mutable.threads
+      .flatMap((t) => t.comments)
+      .filter((c) => parseCommentIdentity(c, brokerLogin).identity.kind === 'human')
+
+    expect(brokerComments.length).toBeGreaterThan(0)
+    for (const c of brokerComments) {
+      expect(authors[c.id]).toBeDefined()
+      expect(humanIds.has(authors[c.id])).toBe(true)
+    }
+    // And an org-member (non-broker) comment is NOT in the write log.
+    const orgComment = snap347.mutable.threads
+      .flatMap((t) => t.comments)
+      .find((c) => parseCommentIdentity(c, brokerLogin).identity.kind === 'github')
+    if (orgComment) expect(authors[orgComment.id]).toBeUndefined()
   })
 
   it('347 reply smuggles current human', async () => {

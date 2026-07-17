@@ -402,6 +402,9 @@ export function createMockApi(): RevuApi {
         const cached = snap.mutable.threads.find((t) => t.id === threadId)
         if (cached) {
           cached.comments.push(clone(comment))
+          // Record this broker-authored comment in the write log carried by the
+          // snapshot, so own-comment detection resolves it by author id.
+          ;(snap.mutable.commentAuthors ??= {})[comment.id] = human.id
           store.putSnapshot(snap)
         }
       }
@@ -575,6 +578,12 @@ export function createMockApi(): RevuApi {
       if (snap) {
         snap.mutable.reviews.push(clone(review))
         snap.mutable.threads.push(...newThreads.map((t) => clone(t)))
+        // Record every broker-authored comment this review opened in the write
+        // log, so own-comment detection resolves them by author id.
+        const authors = (snap.mutable.commentAuthors ??= {})
+        for (const t of newThreads) {
+          for (const c of t.comments) authors[c.id] = human.id
+        }
         store.putSnapshot(snap)
       }
       store.deleteDraft(human.id, input.prNumber)
