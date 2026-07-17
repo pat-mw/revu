@@ -140,6 +140,10 @@ afterAll(async () => {
   if (daemon) await stopDaemon(daemon)
   if (dataDir) rmSync(dataDir, { recursive: true, force: true })
   if (distDir) rmSync(distDir, { recursive: true, force: true })
+  // The parity checks drive an in-process mock whose store is shared across the
+  // whole `bun test` process; reseed it so this file leaves no state behind for
+  // another file to trip over.
+  mockDev.reset()
 })
 
 describe('createHttpApi against revud', () => {
