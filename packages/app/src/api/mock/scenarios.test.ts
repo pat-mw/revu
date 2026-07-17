@@ -426,3 +426,29 @@ describe('failure modes', () => {
     mockDev.setFailureMode('none')
   })
 })
+
+describe('per-human preferences', () => {
+  it('defaults to unified diff layout', async () => {
+    mockDev.setHuman('h-priya')
+    expect((await api.getPreferences()).diffMode).toBe('unified')
+  })
+
+  it('a set persists and reads back', async () => {
+    const saved = await api.setPreferences({ diffMode: 'split' })
+    expect(saved.diffMode).toBe('split')
+    expect((await api.getPreferences()).diffMode).toBe('split')
+  })
+
+  it('is per-human: another human still sees the default', async () => {
+    mockDev.setHuman('h-alice')
+    expect((await api.getPreferences()).diffMode).toBe('unified')
+    mockDev.setHuman('h-priya')
+    expect((await api.getPreferences()).diffMode).toBe('split')
+  })
+
+  it('reads offline: the preference is broker-side cache, not a remote read', async () => {
+    mockDev.setFailureMode('all')
+    expect((await api.getPreferences()).diffMode).toBe('split')
+    mockDev.setFailureMode('none')
+  })
+})

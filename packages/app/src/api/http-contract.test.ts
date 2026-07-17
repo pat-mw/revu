@@ -19,9 +19,11 @@ import {
   validateSnapshotResponse,
   validateSubmitResult,
   validateFileViewedState,
+  validateHumanPreferences,
+  validateSetPreferencesBody,
   ValidationError,
 } from '@revu/shared'
-import type { ReviewSummary, Snapshot, SubmitResult } from '@revu/shared'
+import type { HumanPreferences, ReviewSummary, Snapshot, SubmitResult } from '@revu/shared'
 import { fixtureDB } from '@/fixtures'
 import { buildSnapshot } from '@/fixtures/helpers'
 
@@ -178,5 +180,28 @@ describe('a record key literally named __proto__ survives vRecord', () => {
     )
     const result = validateFileViewedState(wire)
     expect(Object.getOwnPropertyNames(result)).toContain('__proto__')
+  })
+})
+
+describe('human preferences validators', () => {
+  test('a full preferences body round-trips losslessly', () => {
+    const prefs: HumanPreferences = { diffMode: 'split' }
+    const wire = JSON.parse(JSON.stringify(prefs))
+    expect(validateHumanPreferences(wire)).toStrictEqual(wire)
+  })
+
+  test('an unknown diffMode is rejected (no coercion)', () => {
+    expect(() => validateHumanPreferences({ diffMode: 'side-by-side' })).toThrow(
+      ValidationError,
+    )
+  })
+
+  test('the set body accepts a partial patch and rejects a bad value', () => {
+    // Empty patch is valid (every field optional); a present field must type-check.
+    expect(validateSetPreferencesBody({})).toStrictEqual({})
+    expect(validateSetPreferencesBody({ diffMode: 'unified' })).toStrictEqual({
+      diffMode: 'unified',
+    })
+    expect(() => validateSetPreferencesBody({ diffMode: 'nope' })).toThrow(ValidationError)
   })
 })

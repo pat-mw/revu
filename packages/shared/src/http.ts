@@ -63,6 +63,9 @@ export const ROUTES = {
   getFileViewed: { method: 'GET', path: '/api/pulls/:n/viewed' },
   /** Body `{ path, viewed, blobSha }`. */
   setFileViewed: { method: 'PUT', path: '/api/pulls/:n/viewed' },
+  getPreferences: { method: 'GET', path: '/api/preferences' },
+  /** Body is a partial `HumanPreferences` patch, e.g. `{ diffMode }`. */
+  setPreferences: { method: 'PUT', path: '/api/preferences' },
   getRateLimit: { method: 'GET', path: '/api/rate-limit' },
 } as const satisfies Record<string, Route>
 

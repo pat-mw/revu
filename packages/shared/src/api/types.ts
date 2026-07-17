@@ -410,6 +410,22 @@ export type FileViewedState = Record<
   { viewed: boolean; blobSha: string | null; at: string }
 >
 
+/**
+ * Per-human workspace preferences — broker-side settings that are not scoped to
+ * any one PR and must survive a page reload and a workspace rebuild (they are
+ * invisible to GitHub, keyed by the human). `diffMode` is the diff layout the
+ * Files tab opens in. New preference fields append here; the setter merges a
+ * partial patch so a caller changing one field never overwrites the others.
+ */
+export interface HumanPreferences {
+  diffMode: 'unified' | 'split'
+}
+
+/** Defaults applied when a human has no stored preferences yet. */
+export const DEFAULT_PREFERENCES: HumanPreferences = {
+  diffMode: 'unified',
+}
+
 // ————————————————————————————————————————————————————————————————
 // Submit & reconcile — the most important error path in the app
 // ————————————————————————————————————————————————————————————————

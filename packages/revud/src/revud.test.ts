@@ -317,6 +317,22 @@ describe('writes + error envelope', () => {
     expect(rollup.total_count).toBeGreaterThan(0)
   })
 
+  test('a preferences PUT persists and the GET reads it back', async () => {
+    const put = await api('/api/preferences', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ diffMode: 'split' }),
+    })
+    expect(put.status).toBe(200)
+    const saved = await json<{ diffMode: string }>(put)
+    expect(saved.diffMode).toBe('split')
+
+    const get = await api('/api/preferences')
+    expect(get.status).toBe(200)
+    const read = await json<{ diffMode: string }>(get)
+    expect(read.diffMode).toBe('split')
+  })
+
   test('failureMode maps a thrown ApiError to its envelope status', async () => {
     // Force remote reads to fail, then hit a remote read (getRateLimit). The
     // adapter throws broker_unreachable → HTTP 502 with a { code, message } body.

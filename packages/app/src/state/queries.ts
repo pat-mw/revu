@@ -38,6 +38,8 @@ export const qk = {
   blob: (sha: string) => ['blob', sha] as const,
   draft: (n: number) => ['draft', n] as const,
   viewed: (n: number) => ['viewed', n] as const,
+  /** Per-human workspace preferences — not scoped to any PR. */
+  preferences: ['preferences'] as const,
   rate: ['rate'] as const,
 }
 

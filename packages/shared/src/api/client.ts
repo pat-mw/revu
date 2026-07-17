@@ -1,6 +1,7 @@
 import type {
   FileBlob,
   FileViewedState,
+  HumanPreferences,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -100,6 +101,15 @@ export interface RevuApi {
     viewed: boolean,
     blobSha: string | null,
   ): Promise<FileViewedState>
+
+  /**
+   * Per-human workspace preferences (not scoped to any PR). `getPreferences`
+   * returns the stored set merged over the defaults. `setPreferences` merges a
+   * partial patch — changing one field leaves the rest untouched — and returns
+   * the full updated set.
+   */
+  getPreferences(): Promise<HumanPreferences>
+  setPreferences(patch: Partial<HumanPreferences>): Promise<HumanPreferences>
 
   /** Current shared-bucket status, for honest error copy. */
   getRateLimit(): Promise<RateLimitInfo>

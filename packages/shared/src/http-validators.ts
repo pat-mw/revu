@@ -28,6 +28,7 @@ import type {
   GhRef,
   GhUser,
   Human,
+  HumanPreferences,
   IssueComment,
   PendingComment,
   PullDetail,
@@ -569,6 +570,10 @@ export const vFileViewedState: Validator<FileViewedState> = vRecord(
   vObject({ viewed: vBoolean, blobSha: vNullable(vString), at: vString }),
 )
 
+export const vHumanPreferences: Validator<HumanPreferences> = vObject({
+  diffMode: vLiteral('unified', 'split'),
+})
+
 // Submit & reconcile
 
 export const vSubmitReviewInput: Validator<SubmitReviewInput> = vObject({
@@ -668,6 +673,9 @@ export const validateDraftResponse: Validator<ReviewDraft | null> =
 /** `getFileViewed` / `setFileViewed` response body. */
 export const validateFileViewedState: Validator<FileViewedState> = vFileViewedState
 
+/** `getPreferences` / `setPreferences` response body. */
+export const validateHumanPreferences: Validator<HumanPreferences> = vHumanPreferences
+
 /** `reconcileDraft` response body. */
 export const validateReconcileReport: Validator<ReconcileReport> = vReconcileReport
 
@@ -701,6 +709,14 @@ export const validateSetViewedBody: Validator<{
   viewed: boolean
   blobSha: string | null
 }> = vObject({ path: vString, viewed: vBoolean, blobSha: vNullable(vString) })
+
+/**
+ * `setPreferences` request body — a partial `HumanPreferences` patch. Every
+ * field is optional (the adapter merges the patch over the stored set), but any
+ * field that IS present must satisfy its type.
+ */
+export const validateSetPreferencesBody: Validator<Partial<HumanPreferences>> =
+  vObject({ diffMode: vOptional(vLiteral('unified', 'split')) })
 
 // Error envelope validator
 

@@ -1,4 +1,5 @@
-import type { FileBlob, FileViewedState, IssueComment, RateLimitInfo, ReactionKey, ReactionRollup, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Snapshot } from '@revu/shared'
+import type { FileBlob, FileViewedState, HumanPreferences, IssueComment, RateLimitInfo, ReactionKey, ReactionRollup, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Snapshot } from '@revu/shared'
+import { DEFAULT_PREFERENCES } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import type { DevState } from './devtools'
@@ -27,7 +28,7 @@ import type { DevState } from './devtools'
  */
 
 const STORAGE_KEY = 'revu.broker.v1'
-const STORE_VERSION = 1
+const STORE_VERSION = 2
 const RATE_LIMIT = 5000
 const HOUR_MS = 3_600_000
 /** New comment/review ids start well above any id a fixture author would use. */
@@ -70,6 +71,8 @@ interface StoreShape {
   drafts: Record<string, Record<number, ReviewDraft>>
   /** humanId → prNumber → per-file viewed state. */
   viewed: Record<string, Record<number, FileViewedState>>
+  /** humanId → per-human workspace preferences (not scoped to any PR). */
+  preferences: Record<string, HumanPreferences>
   snapshots: Record<number, Snapshot>
   /** Content-addressed: git blob SHA → blob. Only sync ever adds remote content. */
   blobs: Record<string, FileBlob>
@@ -146,6 +149,7 @@ function seed(): StoreShape {
     },
     drafts,
     viewed,
+    preferences: {},
     snapshots,
     blobs,
     remoteMut: {},
@@ -171,6 +175,7 @@ function load(): StoreShape {
       !parsed.dev ||
       !parsed.drafts ||
       !parsed.viewed ||
+      !parsed.preferences ||
       !parsed.snapshots ||
       !parsed.blobs ||
       !parsed.remoteMut ||
@@ -422,6 +427,20 @@ export const store = {
   setViewed(humanId: string, prNumber: number, s: FileViewedState): void {
     ;(state.viewed[humanId] ??= {})[prNumber] = clone(s)
     schedulePersist()
+  },
+
+  // ——— per-human workspace preferences ———
+
+  getPreferences(humanId: string): HumanPreferences {
+    return { ...DEFAULT_PREFERENCES, ...state.preferences[humanId] }
+  },
+
+  /** Merge a partial patch over the stored set; returns the full updated set. */
+  setPreferences(humanId: string, patch: Partial<HumanPreferences>): HumanPreferences {
+    const next = { ...DEFAULT_PREFERENCES, ...state.preferences[humanId], ...patch }
+    state.preferences[humanId] = next
+    schedulePersist()
+    return { ...next }
   },
 
   // ——— sync attempt tracking ———

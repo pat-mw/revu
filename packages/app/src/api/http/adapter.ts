@@ -2,6 +2,7 @@ import type {
   FileBlob,
   FileViewedState,
   HttpErrorBody,
+  HumanPreferences,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -25,6 +26,7 @@ import {
   validateFileBlob,
   validateFileViewedState,
   validateHttpErrorBody,
+  validateHumanPreferences,
   validatePullListResponse,
   validateRateLimitInfo,
   validateReactionRollup,
@@ -295,6 +297,16 @@ export function createHttpApi(baseUrl: string): RevuApi {
         { body: { path, viewed, blobSha } },
       )
       return dev ? validateFileViewedState(res) : (res as FileViewedState)
+    },
+
+    async getPreferences(): Promise<HumanPreferences> {
+      const body = await send('getPreferences', {})
+      return dev ? validateHumanPreferences(body) : (body as HumanPreferences)
+    },
+
+    async setPreferences(patch: Partial<HumanPreferences>): Promise<HumanPreferences> {
+      const res = await send('setPreferences', {}, { body: patch })
+      return dev ? validateHumanPreferences(res) : (res as HumanPreferences)
     },
 
     async getRateLimit(): Promise<RateLimitInfo> {
