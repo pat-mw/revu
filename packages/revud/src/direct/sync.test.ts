@@ -13,10 +13,11 @@
  *     resolves an honest `partial` rather than throwing.
  *   - Snapshot assembly matches the contract shape: immutable carries files +
  *     blobIndex (base + head) + commits; mutable carries pull/comments/reviews/
- *     checks with `threads: []` and no `commentAuthors`.
+ *     checks plus the GraphQL-sourced threads (normalized to the REST shape),
+ *     and no `commentAuthors`.
  */
 import { describe, expect, test } from 'bun:test'
-import type { Page, PageParams } from './github-client'
+import type { GhGraphqlPageInfo, GhReviewThreadNode, Page, PageParams } from './github-client'
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import { openDirectStore, type DirectStore } from './store'
@@ -34,6 +35,7 @@ interface Calls {
   issueComments: number
   reviews: number
   checkRuns: number
+  reviewThreads: number
 }
 
 interface FakeConfig {
@@ -49,6 +51,8 @@ interface FakeConfig {
   issueComments?: unknown[]
   reviews?: unknown[]
   checkRuns?: unknown[]
+  /** GraphQL review-thread nodes returned as a single page (no next page). */
+  reviewThreads?: GhReviewThreadNode[]
 }
 
 /** Build a fake GithubClient plus the call counter it increments. */
@@ -62,6 +66,7 @@ function fakeClient(cfg: FakeConfig): { client: GithubClient; calls: Calls } {
     issueComments: 0,
     reviews: 0,
     checkRuns: 0,
+    reviewThreads: 0,
   }
   const page = <T>(all: T[][], params: PageParams): Page<T> => {
     const idx = params.page - 1
@@ -112,6 +117,22 @@ function fakeClient(cfg: FakeConfig): { client: GithubClient; calls: Calls } {
     async getTree(): Promise<GhTreeRaw> {
       calls.tree += 1
       return { tree: cfg.treeEntries, truncated: cfg.treeTruncated === true }
+    },
+    async graphql<T>(): Promise<T> {
+      throw new Error('graphql not used directly in this fake')
+    },
+    async getReviewThreads(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }> {
+      calls.reviewThreads += 1
+      return {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: cfg.reviewThreads ?? [],
+      }
+    },
+    async getThreadComments(): Promise<{
+      pageInfo: GhGraphqlPageInfo
+      nodes: never[]
+    }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
     },
   }
   return { client, calls }
@@ -172,17 +193,75 @@ describe('Snapshot assembly matches the contract shape', () => {
     expect(snap.immutable.commits).toHaveLength(1)
   })
 
-  test('mutable half carries pull/comments/reviews/checks, threads empty, no commentAuthors', async () => {
+  test('mutable half carries pull/comments/reviews/checks/threads, no commentAuthors', async () => {
     const { client } = fakeClient(baseConfig())
     const snap = await syncPull({ github: client, repo: REPO, store: store() }, 204)
     expect(snap.mutable.pull.number).toBe(204)
     expect(snap.mutable.issueComments).toHaveLength(1)
     expect(snap.mutable.reviews).toHaveLength(1)
     expect(snap.mutable.checks).toHaveLength(1)
-    // Threads are GraphQL (not wired yet) — an empty array is contract-valid.
+    // No threads in the base config → an empty array is contract-valid.
     expect(snap.mutable.threads).toEqual([])
     // commentAuthors is broker-only and must be absent in direct mode.
     expect(snap.mutable.commentAuthors).toBeUndefined()
+  })
+
+  test('mutable half normalizes GraphQL threads onto the REST ReviewThread shape', async () => {
+    const cfg = baseConfig()
+    cfg.reviewThreads = [
+      {
+        id: 'PRRT_kwDOthread1',
+        isResolved: true,
+        isOutdated: false,
+        path: 'a.ts',
+        line: 12,
+        originalLine: 12,
+        startLine: null,
+        originalStartLine: null,
+        diffSide: 'RIGHT',
+        startDiffSide: null,
+        subjectType: 'LINE',
+        resolvedBy: { login: 'reviewer' },
+        comments: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              fullDatabaseId: '3605992420',
+              path: 'a.ts',
+              diffHunk: '@@ -1 +1 @@\n-a\n+b',
+              line: 12,
+              originalLine: 12,
+              startLine: null,
+              originalStartLine: null,
+              subjectType: 'LINE',
+              body: 'looks good',
+              createdAt: '2026-07-01T00:00:00Z',
+              updatedAt: '2026-07-01T00:00:00Z',
+              author: { login: 'reviewer' },
+              pullRequestReview: { fullDatabaseId: '4725905880' },
+              replyTo: null,
+              commit: { oid: 'headoid' },
+              originalCommit: { oid: 'origoid' },
+              url: 'https://github.com/o/r/pull/204#discussion_r3605992420',
+            },
+          ],
+        },
+      },
+    ]
+    const { client } = fakeClient(cfg)
+    const snap = await syncPull({ github: client, repo: REPO, store: store() }, 204)
+    expect(snap.mutable.threads).toHaveLength(1)
+    const t = snap.mutable.threads[0]
+    // Thread id is the PRRT_ node id verbatim; resolved/outdated carried straight.
+    expect(t.id).toBe('PRRT_kwDOthread1')
+    expect(t.isResolved).toBe(true)
+    expect(t.resolvedBy).toEqual({ login: 'reviewer' })
+    // The comment id is the REST-numeric fullDatabaseId (a BigInt string → number).
+    expect(t.comments[0].id).toBe(3605992420)
+    // diffSide → side (RIGHT); diffHunk → diff_hunk carried verbatim.
+    expect(t.comments[0].side).toBe('RIGHT')
+    expect(t.comments[0].diff_hunk).toBe('@@ -1 +1 @@\n-a\n+b')
+    expect(t.comments[0].pull_request_review_id).toBe(4725905880)
   })
 
   test('an added file has no base side; a removed file has no head side', async () => {
@@ -242,6 +321,7 @@ describe('the two-half split (enforced in one place)', () => {
     expect(calls.issueComments).toBeGreaterThan(0)
     expect(calls.reviews).toBeGreaterThan(0)
     expect(calls.checkRuns).toBe(1)
+    expect(calls.reviewThreads).toBe(1)
   })
 
   test('a warm re-sync of an UNCHANGED compare skips the immutable fetch entirely', async () => {
@@ -264,6 +344,8 @@ describe('the two-half split (enforced in one place)', () => {
     expect(warm.calls.issueComments).toBe(1)
     expect(warm.calls.reviews).toBe(1)
     expect(warm.calls.checkRuns).toBe(1)
+    // Threads are mutable — refetched on the warm path too.
+    expect(warm.calls.reviewThreads).toBe(1)
     // The reused immutable half is intact.
     expect(snap.immutable.compareKey).toBe('MB1...HEAD1')
   })
@@ -348,8 +430,9 @@ describe('syncStats and persistence', () => {
     const { client } = fakeClient(baseConfig())
     const snap = await syncPull({ github: client, repo: REPO, store: store() }, 204)
     // detail(1) + compare(1) + files(1) + tree(1) + commits(1) + issueComments(1)
-    // + reviews(1) + checkRuns(1) = 8 for this single-page cold sync.
-    expect(snap.syncStats!.requests).toBe(8)
+    // + reviews(1) + checkRuns(1) + reviewThreads(1) = 9 for this single-page cold
+    // sync — the review-thread GraphQL call is mutable-half cost, counted honestly.
+    expect(snap.syncStats!.requests).toBe(9)
   })
 
   test('the synced snapshot is persisted and reads back', async () => {

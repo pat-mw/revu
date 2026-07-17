@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 import type { FetchLike } from './github-client'
-import { createGithubClient, GithubRequestError } from './github-client'
+import { createGithubClient, GithubGraphqlError, GithubRequestError } from './github-client'
 import type { TokenSource } from './token-source'
 
 const staticToken = (token: string): TokenSource => ({
@@ -76,5 +76,93 @@ describe('createGithubClient.getViewer', () => {
     })
     await client.getViewer()
     expect(captured[0].url).not.toContain('super-secret')
+  })
+})
+
+describe('createGithubClient.graphql (the review-thread read seam)', () => {
+  test('POSTs to the GraphQL endpoint with Bearer auth, User-Agent, and a JSON body', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('gql-secret'),
+      fetchImpl: fakeFetch(200, { data: { ping: 'pong' } }, captured),
+      graphqlUrl: 'https://api.github.test/graphql',
+    })
+    const data = await client.graphql<{ ping: string }>('query { ping }', { a: 1 })
+    expect(data).toEqual({ ping: 'pong' })
+
+    const req = captured[0]
+    expect(req.url).toBe('https://api.github.test/graphql')
+    expect(req.init?.method).toBe('POST')
+    const headers = req.init?.headers as Record<string, string>
+    expect(headers.authorization).toBe('Bearer gql-secret')
+    expect(headers['user-agent']).toBeTruthy()
+    expect(headers['content-type']).toContain('application/json')
+    const body = JSON.parse(req.init?.body as string) as { query: string; variables: unknown }
+    expect(body.query).toContain('ping')
+    expect(body.variables).toEqual({ a: 1 })
+  })
+
+  test('never puts the token in the request URL or the body', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('do-not-leak'),
+      fetchImpl: fakeFetch(200, { data: {} }, captured),
+    })
+    await client.graphql('query { x }', {})
+    expect(captured[0].url).not.toContain('do-not-leak')
+    expect(captured[0].init?.body as string).not.toContain('do-not-leak')
+  })
+
+  test('throws GithubGraphqlError on a non-2xx', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(502, { message: 'bad gateway' }, []),
+    })
+    await expect(client.graphql('query { x }', {})).rejects.toBeInstanceOf(GithubGraphqlError)
+  })
+
+  test('throws GithubGraphqlError when the response carries top-level errors', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { errors: [{ message: "Field 'x' doesn't exist" }] }, []),
+    })
+    await expect(client.graphql('query { x }', {})).rejects.toBeInstanceOf(GithubGraphqlError)
+  })
+})
+
+describe('createGithubClient.getReviewThreads', () => {
+  test('returns the connection nodes + pageInfo, defaulting an empty PR to no threads', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(
+        200,
+        {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{ id: 'PRRT_x', comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } }],
+                },
+              },
+            },
+          },
+        },
+        [],
+      ),
+    })
+    const page = await client.getReviewThreads('o', 'r', 3, null)
+    expect(page.nodes.map((n) => n.id)).toEqual(['PRRT_x'])
+    expect(page.pageInfo.hasNextPage).toBe(false)
+  })
+
+  test('a null pullRequest (deleted/absent) yields an empty page, not a throw', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { data: { repository: { pullRequest: null } } }, []),
+    })
+    const page = await client.getReviewThreads('o', 'r', 999, null)
+    expect(page.nodes).toEqual([])
+    expect(page.pageInfo.hasNextPage).toBe(false)
   })
 })

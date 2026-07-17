@@ -19,6 +19,7 @@ import {
   mapPullFile,
   mapReview,
 } from './mappers'
+import { fetchReviewThreads } from './threads'
 
 /**
  * The direct-mode sync engine: the REST read path that `syncPull` runs and the
@@ -42,9 +43,13 @@ import {
  * ONLY the mutable half; otherwise it fetches both and persists the immutable
  * half under the compareKey. There is no other code path that decides this.
  *
+ * Review THREADS are the one mutable field that comes from GraphQL, not REST:
+ * `fetchMutable` runs the paginated `reviewThreads` query and normalizes the
+ * nodes onto the REST `ReviewThread`/`ReviewComment` vocabulary. Those GraphQL
+ * calls are part of the mutable half — fetched every sync — and are counted in
+ * `syncStats.requests` alongside the REST calls.
+ *
  * Deferred and stubbed here, contract-valid regardless:
- *   - Review THREADS come from GraphQL; they are not fetched yet, so the mutable
- *     half carries `threads: []`. The snapshot is still contract-valid.
  *   - Blob CONTENT bytes are read from the local git clone (or the API) later; the
  *     blob INDEX (SHAs per side) is built here so the assembly slots in cleanly.
  *     `syncStats.blobsFetched`/`blobsReused` are wired honestly against the store's
@@ -200,8 +205,10 @@ async function fetchImmutable(
 
 /**
  * Fetch the mutable half: pull detail (with the derived merge base folded in),
- * issue comments, reviews, and check runs for the head commit. Threads are a
- * GraphQL concern and are left empty here; the snapshot stays contract-valid.
+ * issue comments, reviews, check runs for the head commit, and the review
+ * threads. Threads are the one field sourced from GraphQL rather than REST; they
+ * are refetched every sync (a thread can resolve with no head movement) and the
+ * GraphQL calls they cost are folded into the same request counter.
  */
 async function fetchMutable(
   github: GithubClient,
@@ -231,14 +238,17 @@ async function fetchMutable(
   counter.bump()
   const checks = mapCheckRuns(checkRunsRaw)
 
-  // `threads` is a GraphQL read that is not wired yet: leave it empty. It is the
-  // only mutable field the direct REST path cannot supply, and an empty array is
-  // a valid `ReviewThread[]`. `commentAuthors` is broker-only (there is no write
-  // log in direct mode), so it is deliberately absent.
+  // Threads come from the GraphQL `reviewThreads` connection, normalized to the
+  // REST `ReviewThread`/`ReviewComment` shape. Each GraphQL page is counted in
+  // the shared request counter, so `syncStats.requests` reflects the mutable-half
+  // GraphQL cost honestly. `commentAuthors` is broker-only (there is no write log
+  // in direct mode), so it is deliberately absent.
+  const threads = await fetchReviewThreads(github, repo, prNumber, counter)
+
   return {
     fetchedAt: syncedAt,
     pull,
-    threads: [],
+    threads,
     issueComments,
     reviews,
     checks,
@@ -289,7 +299,8 @@ export interface SyncDeps {
  *               capped or truncated half stays partial on reuse) — and fetch
  *               ONLY the mutable half (files, base tree, commits all skipped).
  *      - MISS → fetch BOTH halves and persist the immutable half under the key.
- *   3. Assemble the snapshot (threads empty — GraphQL is separate) and persist it.
+ *   3. Assemble the snapshot (threads from GraphQL, folded into the mutable half)
+ *      and persist it.
  *
  * The mutable half is fetched on EVERY path, so a head-SHA match never
  * short-circuits it. There is no TTL: a compareKey hit is reused forever.

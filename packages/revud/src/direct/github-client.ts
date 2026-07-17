@@ -42,9 +42,15 @@ export interface GithubClientOptions {
   fetchImpl?: FetchLike
   /** Base API URL; defaults to public GitHub. Overridable for a test double. */
   baseUrl?: string
+  /**
+   * GraphQL endpoint URL; defaults to public GitHub's. Overridable for a test
+   * double so the thread read never opens a socket.
+   */
+  graphqlUrl?: string
 }
 
 const DEFAULT_BASE_URL = 'https://api.github.com'
+const DEFAULT_GRAPHQL_URL = 'https://api.github.com/graphql'
 
 /** Pinned REST API version and a descriptive agent, sent on every request. */
 const API_VERSION = '2022-11-28'
@@ -63,6 +69,19 @@ export class GithubRequestError extends Error {
     super(`GitHub request GET ${path} failed with HTTP ${status}: ${bodyExcerpt}`)
     this.name = 'GithubRequestError'
     this.status = status
+  }
+}
+
+/**
+ * A GraphQL request failed — either at the HTTP layer (a non-2xx) or because the
+ * response carried a top-level `errors` array. The excerpt is bounded and the
+ * token is never part of the request that produced it, so nothing sensitive is
+ * captured here.
+ */
+export class GithubGraphqlError extends Error {
+  constructor(detail: string) {
+    super(`GitHub GraphQL request failed: ${detail}`)
+    this.name = 'GithubGraphqlError'
   }
 }
 
@@ -94,6 +113,60 @@ export interface GhTreeRaw {
   tree: GhTreeEntry[]
   /** True when the tree was too large to return whole (rare; handled honestly). */
   truncated: boolean
+}
+
+/**
+ * Raw GraphQL nodes for a PR's review threads. These mirror the GraphQL schema's
+ * `PullRequestReviewThread` / `PullRequestReviewComment` shapes (only the fields
+ * the normalizer reads are named); the normalizer maps them onto the contract's
+ * REST-shaped `ReviewThread` / `ReviewComment`.
+ *
+ * Two schema facts drive the shape:
+ *   - `fullDatabaseId` is a GraphQL `BigInt`, serialized as a JSON STRING, so it
+ *     is typed `string | number | null` here and coerced to the REST-numeric id.
+ *   - `diffSide` and `subjectType` live on the THREAD, not the comment: a comment
+ *     node has no `diffSide` field. The thread's values are pushed onto each of
+ *     its comments during normalization.
+ */
+export interface GhGraphqlPageInfo {
+  hasNextPage: boolean
+  endCursor: string | null
+}
+
+export interface GhReviewCommentNode {
+  fullDatabaseId: string | number | null
+  path: string | null
+  diffHunk: string | null
+  line: number | null
+  originalLine: number | null
+  startLine: number | null
+  originalStartLine: number | null
+  subjectType: string | null
+  body: string | null
+  createdAt: string | null
+  updatedAt: string | null
+  author: { login: string } | null
+  pullRequestReview: { fullDatabaseId: string | number | null } | null
+  replyTo: { fullDatabaseId: string | number | null } | null
+  commit: { oid: string } | null
+  originalCommit: { oid: string } | null
+  url: string | null
+}
+
+export interface GhReviewThreadNode {
+  id: string
+  isResolved: boolean
+  isOutdated: boolean
+  path: string | null
+  line: number | null
+  originalLine: number | null
+  startLine: number | null
+  originalStartLine: number | null
+  diffSide: string | null
+  startDiffSide: string | null
+  subjectType: string | null
+  resolvedBy: { login: string } | null
+  comments: { pageInfo: GhGraphqlPageInfo; nodes: GhReviewCommentNode[] }
 }
 
 /**
@@ -160,7 +233,129 @@ export interface GithubClient extends GithubViewerClient {
 
   /** `GET /repos/{o}/{r}/git/trees/{sha}?recursive=1` — the full recursive tree of a commit. */
   getTree(owner: string, repo: string, sha: string): Promise<GhTreeRaw>
+
+  /**
+   * `POST /graphql` — run one GraphQL query with variables, returning the parsed
+   * `data` payload typed as `T`. Throws `GithubGraphqlError` on a non-2xx or when
+   * the response carries top-level `errors`. This is the seam the review-thread
+   * read (a GraphQL-only concern) is built on; the token is confined to the
+   * Bearer header exactly as the REST path does.
+   */
+  graphql<T>(query: string, variables: Record<string, unknown>): Promise<T>
+
+  /**
+   * One page of a pull request's review threads, in GraphQL vocabulary. `cursor`
+   * is the `after` argument for `reviewThreads` — null for the first page. The
+   * sync engine paginates with the returned `pageInfo`; the normalizer maps the
+   * nodes onto the contract's REST `ReviewThread[]`.
+   */
+  getReviewThreads(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    cursor: string | null,
+  ): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }>
+
+  /**
+   * One page of a single thread's comments, addressed by the thread's node id.
+   * Called only to drain a thread whose comments exceeded the first page; `cursor`
+   * is the `after` argument (null for the first overflow page).
+   */
+  getThreadComments(
+    threadId: string,
+    cursor: string | null,
+  ): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewCommentNode[] }>
 }
+
+/**
+ * The GraphQL query for one page of a PR's review threads with nested comments.
+ *
+ * `diffSide` / `subjectType` are read at the THREAD level (the comment type has
+ * no `diffSide`); `fullDatabaseId` gives the REST-numeric comment id (a `BigInt`,
+ * so it arrives as a JSON string). Both connections carry `pageInfo` so a PR with
+ * more than 100 threads — or a thread with more than 100 comments — paginates
+ * honestly rather than silently truncating.
+ */
+const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      reviewThreads(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          startLine
+          originalStartLine
+          diffSide
+          startDiffSide
+          subjectType
+          resolvedBy { login }
+          comments(first:100) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              fullDatabaseId
+              path
+              diffHunk
+              line
+              originalLine
+              startLine
+              originalStartLine
+              subjectType
+              body
+              createdAt
+              updatedAt
+              author { login }
+              pullRequestReview { fullDatabaseId }
+              replyTo { fullDatabaseId }
+              commit { oid }
+              originalCommit { oid }
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}`
+
+/**
+ * One page of a SINGLE thread's comments, addressed by the thread's node id via
+ * `node(id:)` — used only when a thread carries more than 100 comments. Fetching
+ * the thread directly avoids re-walking the whole `reviewThreads` connection just
+ * to reach the one thread whose comments overflowed a page.
+ */
+const THREAD_COMMENTS_QUERY = `query($threadId:ID!,$after:String) {
+  node(id:$threadId) {
+    ... on PullRequestReviewThread {
+      comments(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          fullDatabaseId
+          path
+          diffHunk
+          line
+          originalLine
+          startLine
+          originalStartLine
+          subjectType
+          body
+          createdAt
+          updatedAt
+          author { login }
+          pullRequestReview { fullDatabaseId }
+          replyTo { fullDatabaseId }
+          commit { oid }
+          originalCommit { oid }
+          url
+        }
+      }
+    }
+  }
+}`
 
 /** Parse a `Link` header for a `rel="next"` relation (GitHub pagination). */
 function hasNextLink(link: string | null): boolean {
@@ -177,6 +372,7 @@ function hasNextLink(link: string | null): boolean {
 export function createGithubClient(opts: GithubClientOptions): GithubClient {
   const fetchImpl = opts.fetchImpl ?? fetch
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
+  const graphqlUrl = opts.graphqlUrl ?? DEFAULT_GRAPHQL_URL
 
   /** Issue one authenticated GET, returning the parsed body and the raw response. */
   async function getRaw(path: string): Promise<{ body: unknown; res: Response }> {
@@ -209,6 +405,38 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
     const { body, res } = await getRaw(url)
     const items = Array.isArray(body) ? (body as unknown[]) : []
     return { items, hasNext: hasNextLink(res.headers.get('link')) }
+  }
+
+  /**
+   * POST one GraphQL query with variables. Same Bearer token and User-Agent as
+   * the REST path; the token stays in the header. A non-2xx or a top-level
+   * `errors` array becomes a `GithubGraphqlError` with a bounded, token-free
+   * excerpt.
+   */
+  async function postGraphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+    const token = await opts.tokenSource.getToken()
+    const res = await fetchImpl(graphqlUrl, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'user-agent': USER_AGENT,
+      },
+      body: JSON.stringify({ query, variables }),
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new GithubGraphqlError(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+    }
+    const payload = (await res.json()) as { data?: T; errors?: unknown }
+    if (payload.errors !== undefined && payload.errors !== null) {
+      throw new GithubGraphqlError(JSON.stringify(payload.errors).slice(0, 300))
+    }
+    if (payload.data === undefined || payload.data === null) {
+      throw new GithubGraphqlError('response carried no data')
+    }
+    return payload.data
   }
 
   const enc = encodeURIComponent
@@ -292,6 +520,44 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
       )) as { tree?: unknown; truncated?: unknown }
       const tree = Array.isArray(body.tree) ? (body.tree as GhTreeEntry[]) : []
       return { tree, truncated: body.truncated === true }
+    },
+
+    graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+      return postGraphql<T>(query, variables)
+    },
+
+    async getReviewThreads(
+      owner: string,
+      repo: string,
+      prNumber: number,
+      cursor: string | null,
+    ): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }> {
+      const data = await postGraphql<{
+        repository: {
+          pullRequest: {
+            reviewThreads: { pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }
+          } | null
+        } | null
+      }>(REVIEW_THREADS_QUERY, { owner, repo, number: prNumber, after: cursor })
+      const conn = data.repository?.pullRequest?.reviewThreads
+      if (conn === undefined || conn === null) {
+        return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+      }
+      return { pageInfo: conn.pageInfo, nodes: conn.nodes }
+    },
+
+    async getThreadComments(
+      threadId: string,
+      cursor: string | null,
+    ): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewCommentNode[] }> {
+      const data = await postGraphql<{
+        node: { comments: { pageInfo: GhGraphqlPageInfo; nodes: GhReviewCommentNode[] } } | null
+      }>(THREAD_COMMENTS_QUERY, { threadId, after: cursor })
+      const conn = data.node?.comments
+      if (conn === undefined || conn === null) {
+        return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+      }
+      return { pageInfo: conn.pageInfo, nodes: conn.nodes }
     },
   }
 }
