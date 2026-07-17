@@ -500,6 +500,16 @@ export type ApiErrorCode =
   | 'forbidden'
   | 'conflict'
   | 'broker_unreachable'
+  /**
+   * The mutation was applied in memory but could not be made durable: the
+   * server's storage write failed (disk full, permissions, read-only
+   * filesystem). The submitted text is NOT lost — it is retained in memory
+   * server-side and in the client's editing cache — but it did not reach disk,
+   * so the server must answer with this instead of a success the client would
+   * trust as saved. Server-emitted only; the in-browser mock never emits it
+   * (a browser storage failure keeps the session working in memory).
+   */
+  | 'persist_failed'
 
 export class ApiError extends Error {
   code: ApiErrorCode

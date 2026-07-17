@@ -724,7 +724,7 @@ export const validateSetPreferencesBody: Validator<Partial<HumanPreferences>> =
 /**
  * The JSON body of an error response, mirroring `HttpErrorBody` exactly. Lets
  * the fetch adapter validate a `{ code, message, resetAt? }` body before handing
- * it to `apiErrorFromHttp`. All six `ApiErrorCode` values are accepted so the
+ * it to `apiErrorFromHttp`. Every `ApiErrorCode` value is accepted so the
  * validator mirrors the type; the "`network` never rides the wire" invariant is
  * enforced separately by `statusForApiError`.
  */
@@ -736,6 +736,7 @@ export const validateHttpErrorBody: Validator<HttpErrorBody> = vObject({
     'forbidden',
     'conflict',
     'broker_unreachable',
+    'persist_failed',
   ),
   message: vString,
   resetAt: vOptional(vString),

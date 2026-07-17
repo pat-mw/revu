@@ -28,5 +28,12 @@ export declare const mockDev: {
 }
 
 export declare const store: {
+  /** Persist synchronously, swallowing a storage-write failure (browser semantics). */
   flush(): void
+  /**
+   * Persist synchronously, propagating a storage-write failure. A durable host
+   * uses this after mutations so a failed disk write surfaces as an error
+   * instead of a silent success; in-memory state survives the failure.
+   */
+  flushOrThrow(): void
 }
