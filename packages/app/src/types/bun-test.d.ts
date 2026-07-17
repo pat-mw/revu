@@ -49,4 +49,11 @@ declare module 'bun:test' {
   }
 
   export function expect(actual: unknown): Matchers
+
+  /**
+   * `mock(fn)` wraps a function as a spy/replacement. The suites use it only to
+   * stand in for `globalThis.fetch`, so the surface declared here is just a
+   * callable that preserves the wrapped function's signature.
+   */
+  export function mock<F extends (...args: never[]) => unknown>(fn: F): F
 }
