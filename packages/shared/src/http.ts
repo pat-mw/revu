@@ -69,6 +69,18 @@ export const ROUTES = {
   getRateLimit: { method: 'GET', path: '/api/rate-limit' },
 } as const satisfies Record<string, Route>
 
+/**
+ * Deliberately ABSENT from the table: the daemon's dev-panel routes —
+ * `GET /api/dev`, `PUT /api/dev`, and `POST /api/dev/reset`. They are not part
+ * of the `RevuApi` contract (no `RevuApi` method maps to them) and exist ONLY
+ * when the daemon runs in mock mode: they select the acting human, toggle
+ * simulated latency/failures, and reseed the store from fixtures, all
+ * unauthenticated. In any other mode the daemon's router refuses to dispatch
+ * them and the paths 404 — identity must come from the channel, never from a
+ * client-settable value, and no unauthenticated route may wipe stored drafts.
+ * No client adapter may build on them.
+ */
+
 /** Method names present in the route table — one per `RevuApi` method. */
 export type RouteName = keyof typeof ROUTES
 

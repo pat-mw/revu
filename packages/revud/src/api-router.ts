@@ -36,6 +36,13 @@ import type { DevStateShape, MockBundle } from './mock-bridge'
  * loses nothing.
  */
 
+/**
+ * The daemon's transport mode. Only `mock` may expose the dev-panel routes:
+ * they are backed by the reused in-process mock and have no meaning against a
+ * real broker or a direct GitHub connection.
+ */
+export type RevuMode = 'mock' | 'broker' | 'direct'
+
 /** JSON response with the app-expected content type. */
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value ?? null), {
@@ -133,15 +140,31 @@ function badRequest(message: string): Response {
  * (the caller then serves static assets). The request's `AbortSignal` is passed
  * into `syncPull` so a client that aborts the HTTP request cancels the in-flight
  * sync exactly as an in-process signal would.
+ *
+ * `mode` is an explicit argument — never read from the environment here — so
+ * the dev-route gate below is directly testable and cannot be re-enabled by a
+ * stray env var at request time.
  */
-export async function handleApi(req: Request, mock: MockBundle): Promise<Response | null> {
+export async function handleApi(
+  req: Request,
+  mock: MockBundle,
+  mode: RevuMode,
+): Promise<Response | null> {
   const url = new URL(req.url)
   // Treat both `/api/...` and an exact `/api` as API paths, so a bare `/api`
   // returns the JSON 404 from the no-route branch rather than the SPA fallback.
   if (url.pathname !== '/api' && !url.pathname.startsWith('/api/')) return null
 
-  const dev = await handleDev(req, url, mock)
-  if (dev) return dev
+  // The dev-panel routes are a mock-only convenience and must NEVER exist in
+  // broker or direct mode: they are unauthenticated, they let any caller pick
+  // the acting human (audit identity must be established by the channel, never
+  // chosen by the client), and the reset route wipes every human's drafts.
+  // Outside mock mode the dev branch never runs, so `/api/dev*` falls through
+  // to the ordinary no-route 404 below.
+  if (mode === 'mock') {
+    const dev = await handleDev(req, url, mock)
+    if (dev) return dev
+  }
 
   const match = matchRoute(req.method, url.pathname)
   if (!match) {
@@ -349,6 +372,10 @@ export async function handleApi(req: Request, mock: MockBundle): Promise<Respons
  *   - `PUT  /api/dev`        → patch humanId / latency / failureMode.
  *   - `POST /api/dev/reset`  → reseed the store from fixtures.
  * Returns `null` when the path is not a dev route.
+ *
+ * Only reachable in mock mode — the caller gates on `mode` before dispatching
+ * here, because these routes change identity and destroy state with no
+ * authentication.
  */
 async function handleDev(req: Request, url: URL, mock: MockBundle): Promise<Response | null> {
   const { dev, store } = mock
