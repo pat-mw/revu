@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { join, normalize } from 'node:path'
+import { join, normalize, relative, isAbsolute } from 'node:path'
 import type { Server } from 'bun'
 import type { MockBundle } from './mock-bridge'
 import type { RevuMode } from './api-router'
@@ -29,12 +29,19 @@ export interface ServeOptions {
   mode: RevuMode
 }
 
-/** Resolve a URL pathname to a safe absolute path inside `distDir`, or null. */
-function resolveStaticPath(distDir: string, pathname: string): string | null {
-  // Strip the leading slash and normalize; reject any path that escapes distDir.
-  const rel = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, '')
-  const abs = join(distDir, rel)
-  if (!abs.startsWith(distDir)) return null
+/**
+ * Resolve a URL pathname to a safe absolute path inside `distDir`, or null when
+ * the path escapes `distDir`.
+ *
+ * Containment is checked via `relative(distDir, abs)`: a path that resolves
+ * outside starts with `..` (or is absolute on Windows across drives), so it is
+ * rejected. A plain `startsWith(distDir)` prefix test is avoided because a
+ * sibling directory such as `${distDir}-evil` shares the prefix and would pass.
+ */
+export function resolveStaticPath(distDir: string, pathname: string): string | null {
+  const abs = join(distDir, normalize(decodeURIComponent(pathname)))
+  const rel = relative(distDir, abs)
+  if (rel.startsWith('..') || isAbsolute(rel)) return null
   return abs
 }
 

@@ -6,7 +6,7 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "dev": "bun run --filter '@revu/app' dev",
-    "lint": "oxlint",
+    "lint": "oxlint --deny-warnings",
     "typecheck": "tsc -b",
     "test": "bun test",
     "build:app": "bun run --filter '@revu/app' build",
@@ -14,7 +14,7 @@
     "revud": "bun run packages/revud/src/index.ts",
     "dev:e2e": "VITE_REVU_API=/ bun run build:app && bun run packages/revud/src/index.ts",
     "test:e2e": "bun run build:e2e && bun run e2e/happy-path.ts",
-    "check": "oxlint && tsc -b && bun test && bun run --filter '@revu/app' build",
+    "check": "oxlint --deny-warnings && tsc -b && bun test && bun run --filter '@revu/app' build",
     "preview": "bun run --filter '@revu/app' preview"
   },
   "devDependencies": {
