@@ -1,0 +1,192 @@
+@import "tailwindcss";
+
+/*
+ * revu token system — dark-only by decision (see DESIGN.md).
+ * Six named hexes carry the whole app:
+ *   canvas #151613 · ink #D9D7CD · add #4CC8A8 · del #E5885E · draft #A48FFF · stale #D9B44A
+ * Violet is spent exclusively on draft/pending state (work GitHub cannot see).
+ * Diff line tints stay ≤ 10% alpha so syntax highlighting survives on top;
+ * word-level emphasis steps to ~26–28% alpha. Color is never the only channel:
+ * gutters always carry +/− glyphs, staleness always carries a glyph + text.
+ */
+
+@theme {
+  --color-canvas: #151613;
+  --color-panel: #1b1d19;
+  --color-raised: #22241f;
+  --color-overlay: #282b25;
+  --color-line: #2e312b;
+  --color-line-strong: #3c4038;
+
+  --color-ink: #d9d7cd;
+  --color-ink-mut: #96948a;
+  --color-ink-faint: #6b6a61;
+
+  --color-add: #4cc8a8;
+  --color-del: #e5885e;
+  --color-draft: #a48fff;
+  --color-stale: #d9b44a;
+  --color-danger: #e5645e;
+  --color-ring: #dad8ce;
+
+  --font-mono: "Iosevka", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: "Atkinson Hyperlegible", system-ui, sans-serif;
+  --font-display: "Archivo Variable", "Archivo", system-ui, sans-serif;
+
+  --text-2xs: 0.6875rem; /* 11px — gutters, meta */
+  --text-xs: 0.75rem; /* 12px — dense labels */
+  --text-code: 0.78125rem; /* 12.5px — diff body */
+  --text-sm: 0.8125rem; /* 13px — UI default */
+  --text-base: 0.875rem; /* 14px — prose */
+
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+}
+
+:root {
+  /* Diff tints — derived from add/del, alpha-stepped. Consumed by diff viewer CSS
+     and by the Shiki theme so highlighting and diff color are designed together. */
+  --diff-add-bg: rgba(76, 200, 168, 0.09);
+  --diff-add-word-bg: rgba(76, 200, 168, 0.26);
+  --diff-add-gutter: rgba(76, 200, 168, 0.14);
+  --diff-del-bg: rgba(229, 136, 94, 0.09);
+  --diff-del-word-bg: rgba(229, 136, 94, 0.24);
+  --diff-del-gutter: rgba(229, 136, 94, 0.14);
+  --diff-hunk-bg: #1e211c;
+  --draft-tint: rgba(164, 143, 255, 0.12);
+  --draft-tint-strong: rgba(164, 143, 255, 0.24);
+  --stale-tint: rgba(217, 180, 74, 0.12);
+  --resolved-tint: rgba(150, 148, 138, 0.07);
+
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-canvas text-ink font-sans text-sm antialiased;
+  font-feature-settings: "kern";
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* Focus is always visible and never ambiguous with diff semantics. */
+:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+::selection {
+  background: rgba(164, 143, 255, 0.3);
+}
+
+/* Dense dark scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 5px;
+  border: 2px solid var(--color-canvas);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ————— shared micro-patterns ————— */
+
+.kbd {
+  @apply inline-flex items-center justify-center rounded-(--radius-xs) border border-line-strong bg-raised px-1 font-mono text-2xs text-ink-mut;
+  min-width: 1.25rem;
+  height: 1.125rem;
+  box-shadow: inset 0 -1px 0 var(--color-line);
+}
+
+.hairline-b {
+  border-bottom: 1px solid var(--color-line);
+}
+.hairline-t {
+  border-top: 1px solid var(--color-line);
+}
+.hairline-r {
+  border-right: 1px solid var(--color-line);
+}
+
+/* The snapshot seal — structural signature element. Quiet by default, gold when stale. */
+.seal {
+  @apply inline-flex items-center gap-1.5 rounded-(--radius-sm) border border-line bg-panel px-2 py-0.5 font-mono text-2xs text-ink-mut;
+}
+.seal[data-stale="true"] {
+  border-color: rgba(217, 180, 74, 0.45);
+  background: var(--stale-tint);
+  color: var(--color-stale);
+}
+
+/* Draft rail marker — violet is reserved for pending/draft state app-wide. */
+.draft-marker {
+  box-shadow: inset 2px 0 0 var(--color-draft);
+}
+
+.diff-line {
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 4;
+}
+.diff-line[data-kind="add"] {
+  background: var(--diff-add-bg);
+}
+.diff-line[data-kind="del"] {
+  background: var(--diff-del-bg);
+}
+.diff-word-add {
+  background: var(--diff-add-word-bg);
+  border-radius: 2px;
+}
+.diff-word-del {
+  background: var(--diff-del-word-bg);
+  border-radius: 2px;
+}
+
+/* Skeletons match final layout; shimmer respects reduced motion via the global rule. */
+.skeleton {
+  @apply rounded-(--radius-xs) bg-raised;
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
