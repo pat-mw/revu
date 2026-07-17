@@ -13,6 +13,20 @@ Binding for every agent writing code in this repo. Read `DESIGN.md` first.
   Until all phases land, imports of files owned by OTHER agents may fail to resolve —
   fix errors only in YOUR files; missing-module errors elsewhere are expected mid-build.
 
+## The gate — `bun run check`
+
+- `bun run check` is the mandatory pre-PR gate and runs, in order (fastest first):
+  `oxlint` → `tsc -b` → `bun test` → `vite build`. It must exit clean before any PR,
+  and CI runs the identical command — never push red, never skip a step to save time.
+- For a fast inner loop, run the pieces directly (`bun test`, `bunx tsc -b`,
+  `bunx oxlint`); `bun run check` is the whole gate you run before pushing.
+- Tests are co-located `*.test.ts` on Bun's built-in runner (no extra deps).
+  `test/preload.ts` (wired via `bunfig.toml`) shims the browser globals the mock
+  layer reads, so mock-backed suites run headlessly.
+- Optional pre-push hook that runs the gate automatically — enable once per clone
+  with `git config core.hooksPath .githooks`. `.githooks/pre-push` then blocks any
+  push whose gate is red (`--no-verify` bypasses a single push in an emergency).
+
 ## Code style
 
 - TypeScript strict + `verbatimModuleSyntax`: use `import type { … }` for types.

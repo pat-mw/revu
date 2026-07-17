@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "bun test",
+    "check": "oxlint && tsc -b && bun test && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
