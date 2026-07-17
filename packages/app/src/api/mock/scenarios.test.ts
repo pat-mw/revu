@@ -226,6 +226,21 @@ describe('mutable drift (415)', () => {
       li415.broker.unresolvedThreads
     expect(sameCompareKey && unresolvedMatches).toBe(true)
   })
+
+  it('415 seeded reply from a digit-in-username contractor parses to a human', async () => {
+    // A contractor whose display name is a Coder username carrying a digit
+    // (`alice2`) authored a reply through the broker. Its smuggled prefix must
+    // resolve back to that human, not collapse to the bare bot — the digit
+    // charset regression this fixture guards.
+    const snap = await api.getSnapshot(415)
+    const { brokerLogin } = await api.getSession()
+    const brokerComment = snap!.mutable.threads
+      .flatMap((t) => t.comments)
+      .find((c) => c.user.login === brokerLogin && c.body.includes('alice2'))
+    expect(brokerComment).toBeDefined()
+    const parsed = parseCommentIdentity(brokerComment!, brokerLogin)
+    expect(parsed.identity.kind === 'human' && parsed.identity.name === 'alice2').toBe(true)
+  })
 })
 
 describe('submit paths (312)', () => {

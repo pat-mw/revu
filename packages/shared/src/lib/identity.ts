@@ -31,13 +31,20 @@ export interface ParsedComment {
 const PREFIX_RE = /^\*\*([^*\n]{1,60})\*\*(?:[ \t]*\(([^)\n]{1,32})\))?[ \t]*\r?\n[ \t]*\r?\n([\s\S]*)$/
 
 /**
- * A prefix name must look like a personal name: 1–4 tokens of letters
- * (any script), with hyphens/apostrophes/periods allowed inside tokens.
- * This is what rejects `**Warning**`-style bold openers… mostly. A comment
- * literally starting with `**Bob**\n\n` will parse — that ambiguity is
- * inherent to the smuggling scheme, and the broker owns the format.
+ * A prefix name must look like a stamped identity: 1–4 tokens over the same
+ * charset the broker allows in an author name — letters (any script), digits,
+ * underscore, and hyphen — with apostrophes and periods also permitted inside
+ * a token so real personal names survive. Coder usernames carry digits and
+ * underscores (`alice2`, `j_doe`), so a letters-only rule would drop that
+ * contractor's smuggled prefix and render every one of their comments as the
+ * bare bot; the broker owns this format on both ends, so the parser tracks it.
+ *
+ * The token-count cap (1–4) and the per-token length cap are what keep
+ * `**Warning**`-style bold openers and other markdown out — not the charset.
+ * A comment literally starting with `**Bob**\n\n` still parses; that ambiguity
+ * is inherent to the smuggling scheme.
  */
-const NAME_TOKEN_RE = /^[\p{L}][\p{L}'’.-]{0,23}$/u
+const NAME_TOKEN_RE = /^[\p{L}\p{N}_][\p{L}\p{N}_'’.-]{0,23}$/u
 
 function looksLikePersonName(candidate: string): boolean {
   const tokens = candidate.trim().split(/\s+/)

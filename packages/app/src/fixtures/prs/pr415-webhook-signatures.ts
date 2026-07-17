@@ -36,6 +36,7 @@ const SHA_C1 = fakeSha('pr415-c1')
 const SHA_HEAD = fakeSha('pr415-head')
 
 const marcus = HUMANS.find((h) => h.id === 'h-marcus')!
+const alice2 = HUMANS.find((h) => h.id === 'h-alice2')!
 
 // ————————————————————————————————————————————————————————————————
 // Blobs
@@ -346,6 +347,23 @@ const t2: ReviewThread = {
       user: ORG_JFERRIS,
       body: 'Happy path looks good — can we also pin the legacy sha1= prefix as rejected? verify.ts treats it as a missing header rather than an invalid one, and a test would freeze that contract.',
       createdAt: hoursAgo(26),
+    }),
+    // Authored through the broker by a contractor whose display name is a Coder
+    // username carrying a digit. The smuggled prefix must parse back to this
+    // human so the reply renders as her, not the bare bot.
+    reviewComment({
+      id: 4152002,
+      inReplyTo: 4152001,
+      path: 'src/webhooks/verify.test.ts',
+      patch: PATCH_VTEST,
+      line: 17,
+      originalCommitId: SHA_HEAD,
+      user: BROKER_BOT,
+      body: prefixBody(
+        alice2,
+        'Good call — added a case asserting an sha1= header is rejected, alongside the sha256= happy path.',
+      ),
+      createdAt: hoursAgo(22),
     }),
   ],
 }
