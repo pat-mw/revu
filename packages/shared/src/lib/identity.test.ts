@@ -19,6 +19,7 @@ import { describe, it, expect } from 'bun:test'
 import type { GhUser, Human, ReviewComment } from '../api/types'
 import {
   avatarStyle,
+  emailToId,
   identityName,
   isOwnComment,
   parseCommentIdentity,
@@ -92,6 +93,25 @@ function reviewComment(login: string, body: string): ReviewComment {
 function human(name: string, role: Human['role'] = 'contractor'): Human {
   return { id: 'h_1', name, role, email: 'h@example.invalid' }
 }
+
+describe('emailToId', () => {
+  it('lowercases the email as the stable id', () => {
+    expect(emailToId('Alice.Nguyen@Contractor.CO')).toBe('alice.nguyen@contractor.co')
+  })
+
+  it('trims surrounding whitespace', () => {
+    expect(emailToId('  bob@build.co\n')).toBe('bob@build.co')
+  })
+
+  it('is idempotent — an already-lowercased email is unchanged', () => {
+    const id = emailToId('carol@example.dev')
+    expect(emailToId(id)).toBe(id)
+  })
+
+  it('folds case-only variants of the same address to one id', () => {
+    expect(emailToId('DEV@X.IO')).toBe(emailToId('dev@x.io'))
+  })
+})
 
 describe('parsePrefixedBody', () => {
   it('parses a bare name prefix separated by a blank line', () => {
