@@ -31,6 +31,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ReviewDraft, Session } from '@revu/shared'
+import { blobContentToLines, classifyPendingComment, selectAnchorBlobSha } from '@revu/shared'
 import { createDirectTokenSource } from '../packages/revud/src/direct/token-source'
 import { createBunCommandRunner } from '../packages/revud/src/direct/command-runner'
 import type { GithubClient } from '../packages/revud/src/direct/github-client'
@@ -199,8 +200,202 @@ async function main(): Promise<void> {
   // ——————————————————————————————————————————————————————————————
   await writeSection(github)
 
+  // ——————————————————————————————————————————————————————————————
+  // Section D — reconcile after a force-push, LIVE, against sandbox PR #5.
+  // ——————————————————————————————————————————————————————————————
+  await reconcileSection(github)
+
   console.log(`\n${failures === 0 ? 'ALL LIVE CHECKS PASSED' : `${failures} LIVE CHECK(S) FAILED`}`)
   process.exit(failures === 0 ? 0 : 1)
+}
+
+/**
+ * Reconcile after a force-push, LIVE, against sandbox PR #5 (the force-push PR:
+ * the head was rewritten so a commented line moved/deleted). The crown-jewel flow
+ * end to end against real GitHub:
+ *
+ *   1. Sync PR #5 — the fresh snapshot already reflects the REWRITTEN head, so the
+ *      head blob no longer holds the pre-rewrite lines.
+ *   2. Build a draft whose comments are anchored to lines as they were BEFORE the
+ *      rewrite — the anchor text of a line that SURVIVED the rewrite (moved) and a
+ *      line that was DELETED — and save it with the draft's `headSha` set to the
+ *      pre-rewrite first parent (so `newCommits` has a real split point when it is
+ *      still in the fresh commit list; otherwise it falls back to author date).
+ *   3. reconcileDraft against the fresh snapshot and REPORT the classifications
+ *      (a surviving line drifts; a deleted line is lost) and the `newCommits`.
+ *   4. Assert the report matches the client-side PREVIEW for every comment — the
+ *      same shared `classifyPendingComment` both ends run, so they cannot diverge.
+ *
+ * The draft is never submitted; reconcile is a pure read. The section leaves no
+ * write on github.com.
+ */
+async function reconcileSection(github: GithubClient): Promise<void> {
+  console.log('\n=== Section D: reconcile after force-push (LIVE, sandbox PR #5) ===')
+  const dataDir = mkdtempSync(join(tmpdir(), 'revu-reconcile-'))
+  try {
+    const viewer = await github.getViewer()
+    const session: Session = {
+      human: {
+        id: `${viewer.login}@smoke.local`,
+        name: viewer.login,
+        role: 'contractor',
+        email: `${viewer.login}@smoke.local`,
+      },
+      brokerLogin: '',
+      workspace: 'direct-smoke',
+      viewerLogin: viewer.login,
+    }
+    const store: DirectStore = openDirectStore({ dataDir })
+    const api = createDirectApi({ session, github, repo: REPO, store })
+
+    // 1. Sync PR #5 — the REWRITTEN head is what the snapshot now carries.
+    const snap = await api.syncPull(5)
+    const headSha = snap.immutable.headSha
+    const file = snap.immutable.files[0]
+    console.log(`  step 1 — synced PR #5: head=${headSha.slice(0, 8)}, file=${file?.filename}`)
+    check('step 1: PR #5 synced with a head SHA', headSha.length > 0)
+    check('step 1: PR #5 has a changed file', file !== undefined)
+    if (file === undefined) return
+
+    // Read the CURRENT (rewritten) head blob lines so the drift anchor targets a
+    // line that genuinely survived the rewrite, and log them for the record.
+    const headBlobSha = snap.immutable.blobIndex[file.filename]?.head
+    const headBlob = headBlobSha ? store.getBlob(headBlobSha) : null
+    const headLines = headBlob && !headBlob.binary ? blobContentToLines(headBlob.content) : []
+    console.log(`  step 1 — rewritten head has ${headLines.length} line(s) in ${file.filename}`)
+
+    // A line that SURVIVED the rewrite (the exported function signature) — its text
+    // still exists in the fresh head but at a different line number (drift). And a
+    // line that was DELETED by the rewrite (the pre-rewrite return) — gone (lost).
+    const survivor = headLines.find((l) => l.includes('export function handle'))
+    const survivorLine = survivor ? headLines.indexOf(survivor) + 1 : -1
+    check('step 1: a surviving line is present in the rewritten head', survivor !== undefined, headLines)
+    if (survivor === undefined) return
+
+    // The draft was written against the PRE-rewrite head, which the force-push
+    // orphaned — so it is no longer in the fresh commit list. reconcile then
+    // derives newCommits by the author-date fallback: every fresh commit authored
+    // after the draft was created is a "new commit" the rewrite added. Pin the
+    // draft's creation well before the PR so the rewrite commit surfaces as new.
+    const preRewriteHead = 'pre-rewrite-orphaned-head-sha'
+    const draftCreatedAt = '2000-01-01T00:00:00.000Z'
+
+    // 2. Build the draft. The drift comment claims the survivor was originally on
+    //    line 1 (its pre-rewrite position at the top of the v1 handler); it now
+    //    sits at `survivorLine`, so reconcile must drift it by (survivorLine - 1).
+    //    The lost comment anchors to the deleted pre-rewrite return line.
+    const stamp = new Date().toISOString()
+    const draft: ReviewDraft = {
+      humanId: session.human.id,
+      prNumber: 5,
+      // The pre-rewrite head the draft was written against — orphaned by the
+      // force-push, so it is absent from the fresh commit list and newCommits
+      // falls back to the author-date split.
+      headSha: preRewriteHead,
+      compareKey: snap.immutable.compareKey,
+      body: `Reconcile smoke ${stamp}`,
+      event: 'COMMENT',
+      createdAt: draftCreatedAt,
+      updatedAt: draftCreatedAt,
+      comments: [
+        {
+          key: 'drift-1',
+          path: file.filename,
+          side: 'RIGHT',
+          start_side: null,
+          // Pre-rewrite the handler signature was the FIRST line of the file.
+          line: 1,
+          start_line: null,
+          body: `Drift anchor (${stamp}).`,
+          createdAt: stamp,
+          updatedAt: stamp,
+          anchor: { lineText: survivor, contextBefore: [], contextAfter: [] },
+        },
+        {
+          key: 'lost-1',
+          path: file.filename,
+          side: 'RIGHT',
+          start_side: null,
+          line: 3,
+          start_line: null,
+          body: `Lost anchor (${stamp}).`,
+          createdAt: stamp,
+          updatedAt: stamp,
+          // The pre-rewrite `return 'starting'` line was deleted by the refactor.
+          anchor: { lineText: "    return 'starting'", contextBefore: [], contextAfter: [] },
+        },
+      ],
+    }
+    api.saveDraft(draft)
+    console.log(`  step 2 — saved a draft with ${draft.comments.length} anchored comments`)
+
+    // 3. Reconcile against the fresh snapshot — a PURE read; the draft is untouched.
+    const report = api.reconcileDraft(5)
+    console.log('  step 3 — reconcile classifications:')
+    for (const r of report.results) {
+      if (r.kind === 'drifted') {
+        console.log(`    ${r.comment.key}: DRIFTED newLine=${r.newLine} delta=${r.delta}`)
+      } else if (r.kind === 'lost') {
+        console.log(`    ${r.comment.key}: LOST reason=${r.reason}`)
+      } else {
+        console.log(`    ${r.comment.key}: CLEAN`)
+      }
+    }
+    console.log(
+      `  step 3 — newCommits=${report.newCommits.length} ` +
+        `(${report.newCommits.map((c) => c.sha.slice(0, 7)).join(', ') || 'none'}), ` +
+        `draftHead=${report.draftHeadSha.slice(0, 8)} currentHead=${report.currentHeadSha.slice(0, 8)}`,
+    )
+    check('step 3: the draft is untouched by reconcile (pure read)', store.getDraft(session.human.id, 5) !== null)
+
+    const drift = report.results.find((r) => r.comment.key === 'drift-1')
+    check(
+      'step 3: the surviving line is DRIFTED to its new position',
+      drift?.kind === 'drifted' && drift.newLine === survivorLine,
+      { kind: drift?.kind, newLine: drift?.kind === 'drifted' ? drift.newLine : null, expected: survivorLine },
+    )
+    const lost = report.results.find((r) => r.comment.key === 'lost-1')
+    check(
+      'step 3: the deleted line is LOST (line-deleted)',
+      lost?.kind === 'lost' && lost.reason === 'line-deleted',
+      { kind: lost?.kind, reason: lost?.kind === 'lost' ? lost.reason : null },
+    )
+    check(
+      'step 3: newCommits surfaces the rewrite commit the force-push added (author-date fallback)',
+      report.newCommits.length >= 1,
+      report.newCommits.map((c) => c.sha.slice(0, 7)),
+    )
+    check(
+      'step 3: the report names the current head as distinct from the orphaned draft head',
+      report.currentHeadSha === headSha && report.draftHeadSha === preRewriteHead,
+      { current: report.currentHeadSha, draft: report.draftHeadSha },
+    )
+
+    // 4. Preview parity — recompute each classification client-side through the
+    //    SAME shared classifier and selector, resolving blob lines through getBlob.
+    let parity = true
+    for (const comment of draft.comments) {
+      const entry = snap.immutable.blobIndex[comment.path]
+      const sha = selectAnchorBlobSha(entry, comment.side)
+      const preview = classifyPendingComment({
+        comment,
+        files: snap.immutable.files,
+        blobIndex: snap.immutable.blobIndex,
+        resolveBlobLines: (s) => {
+          if (s !== sha) return null
+          const blob = api.getBlob(s)
+          return blob.binary ? null : blobContentToLines(blob.content)
+        },
+      })
+      const reported = report.results.find((r) => r.comment.key === comment.key)
+      if (JSON.stringify(preview) !== JSON.stringify(reported)) parity = false
+    }
+    check('step 4: the client-side preview matches the reconcile report for every comment', parity)
+
+    store.close()
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true })
+  }
 }
 
 /**

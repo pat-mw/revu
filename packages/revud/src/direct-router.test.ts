@@ -11,6 +11,7 @@ import type {
   FileViewedState,
   HumanPreferences,
   ReactionRollup,
+  ReconcileReport,
   ReviewComment,
   ReviewDraft,
   ReviewThread,
@@ -64,6 +65,19 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     },
     discardDraft(prNumber: number): void {
       drafts.delete(prNumber)
+    },
+    reconcileDraft(prNumber: number): ReconcileReport {
+      const draft = drafts.get(prNumber)
+      if (!draft) {
+        throw new ApiError('not_found', `No draft for pull #${prNumber}.`)
+      }
+      return {
+        prNumber,
+        draftHeadSha: draft.headSha,
+        currentHeadSha: draft.headSha,
+        newCommits: [],
+        results: [],
+      }
     },
     getFileViewed(prNumber: number): FileViewedState {
       return viewed.get(prNumber) ?? {}
@@ -328,11 +342,10 @@ describe('handleDirectApi', () => {
     expect(body.code).toBe('persist_failed')
   })
 
-  test('a not-yet-built route (list, threads, reconcile, rate-limit) is a 501 not_implemented', async () => {
+  test('a not-yet-built route (list, threads, rate-limit) is a 501 not_implemented', async () => {
     for (const [method, path] of [
       ['GET', '/api/pulls'],
       ['GET', '/api/pulls/204/threads'],
-      ['GET', '/api/pulls/204/reconcile'],
       ['GET', '/api/rate-limit'],
     ] as const) {
       const res = await handleDirectApi(req(method, path), SESSION, fakeApi())
@@ -340,6 +353,34 @@ describe('handleDirectApi', () => {
       const body = (await res?.json()) as { code: string }
       expect(body.code).toBe('not_implemented')
     }
+  })
+
+  test('GET reconcile returns the ReconcileReport as a 200 value', async () => {
+    const draft: ReviewDraft = {
+      humanId: 'alice@x.io',
+      prNumber: 204,
+      headSha: 'head-old',
+      compareKey: 'base...head-old',
+      body: '',
+      event: 'COMMENT',
+      comments: [],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const api = fakeApi()
+    api.saveDraft(draft)
+    const res = await handleDirectApi(req('GET', '/api/pulls/204/reconcile'), SESSION, api)
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as ReconcileReport
+    expect(body.prNumber).toBe(204)
+    expect(body.draftHeadSha).toBe('head-old')
+  })
+
+  test('GET reconcile for a PR with no draft is a typed not_found (404)', async () => {
+    const res = await handleDirectApi(req('GET', '/api/pulls/999/reconcile'), SESSION, fakeApi())
+    expect(res?.status).toBe(404)
+    const body = (await res?.json()) as { code: string }
+    expect(body.code).toBe('not_found')
   })
 
   test('POST review returns the SubmitResult as a 200 value', async () => {
