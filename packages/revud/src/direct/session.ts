@@ -1,7 +1,7 @@
 import type { Human, Session } from '@revu/shared'
 import { emailToId } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
-import type { GithubClient } from './github-client'
+import type { GithubViewerClient } from './github-client'
 import type { RepoRef } from './repo'
 
 /**
@@ -95,7 +95,7 @@ export async function buildHuman(
  */
 export async function buildDirectSession(args: {
   runner: CommandRunner
-  github: GithubClient
+  github: GithubViewerClient
   repo: RepoRef
   cwd?: string
   env?: Record<string, string | undefined>
