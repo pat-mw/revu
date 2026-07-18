@@ -262,3 +262,169 @@ describe('createGithubClient.getBlobObjects (the GraphQL object() batch)', () =>
     expect(captured[0].init?.body as string).not.toContain('leak-me-not')
   })
 })
+
+describe('createGithubClient write surface', () => {
+  test('submitReview POSTs to the reviews endpoint with the review body', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { id: 42, state: 'COMMENTED', commit_id: 'h' }, captured),
+      baseUrl: 'https://api.github.test',
+    })
+    const body = {
+      commit_id: 'h',
+      event: 'COMMENT' as const,
+      body: 'review text',
+      comments: [{ path: 'a.ts', side: 'RIGHT' as const, line: 3, body: 'note' }],
+    }
+    const raw = (await client.submitReview('o', 'r', 5, body)) as { id: number }
+    expect(raw.id).toBe(42)
+    const req = captured[0]
+    expect(req.url).toBe('https://api.github.test/repos/o/r/pulls/5/reviews')
+    expect((req.init as RequestInit).method).toBe('POST')
+    const sent = JSON.parse((req.init as RequestInit).body as string) as typeof body
+    expect(sent.commit_id).toBe('h')
+    expect(sent.comments[0].path).toBe('a.ts')
+  })
+
+  test('submitReview throws a GithubRequestError carrying the 422 status', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(422, { message: 'validation failed' }, []),
+    })
+    let thrown: unknown
+    try {
+      await client.submitReview('o', 'r', 5, { commit_id: 'h', event: 'COMMENT', body: '', comments: [] })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(GithubRequestError)
+    expect((thrown as GithubRequestError).status).toBe(422)
+  })
+
+  test('replyToReviewComment POSTs to the comment replies endpoint', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(201, { id: 99, in_reply_to_id: 7 }, captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.replyToReviewComment('o', 'r', 5, 7, 'thanks')
+    const req = captured[0]
+    expect(req.url).toBe('https://api.github.test/repos/o/r/pulls/5/comments/7/replies')
+    expect((req.init as RequestInit).method).toBe('POST')
+    const sent = JSON.parse((req.init as RequestInit).body as string) as { body: string }
+    expect(sent.body).toBe('thanks')
+  })
+
+  test('addReaction POSTs the content to the pulls-comment reactions endpoint', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { id: 1, content: '+1' }, captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.addReaction('o', 'r', 88, '+1')
+    const req = captured[0]
+    expect(req.url).toBe('https://api.github.test/repos/o/r/pulls/comments/88/reactions')
+    const sent = JSON.parse((req.init as RequestInit).body as string) as { content: string }
+    expect(sent.content).toBe('+1')
+  })
+
+  test('setThreadResolution runs the resolve mutation and returns the thread node', async () => {
+    const captured: Captured[] = []
+    const node = {
+      id: 'PRRT_x',
+      isResolved: true,
+      isOutdated: false,
+      path: 'a.ts',
+      line: 3,
+      originalLine: 3,
+      startLine: null,
+      originalStartLine: null,
+      diffSide: 'RIGHT',
+      startDiffSide: null,
+      subjectType: 'LINE',
+      resolvedBy: { login: 'alice' },
+      comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+    }
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { data: { resolveReviewThread: { thread: node } } }, captured),
+    })
+    const out = await client.setThreadResolution('PRRT_x', true)
+    expect(out.id).toBe('PRRT_x')
+    expect(out.isResolved).toBe(true)
+    const sent = JSON.parse((captured[0].init as RequestInit).body as string) as { query: string }
+    expect(sent.query).toContain('resolveReviewThread')
+  })
+
+  test('setThreadResolution(false) runs the unresolve mutation', async () => {
+    const captured: Captured[] = []
+    const node = {
+      id: 'PRRT_x', isResolved: false, isOutdated: false, path: 'a.ts', line: 3,
+      originalLine: 3, startLine: null, originalStartLine: null, diffSide: 'RIGHT',
+      startDiffSide: null, subjectType: 'LINE', resolvedBy: null,
+      comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+    }
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { data: { unresolveReviewThread: { thread: node } } }, captured),
+    })
+    await client.setThreadResolution('PRRT_x', false)
+    const sent = JSON.parse((captured[0].init as RequestInit).body as string) as { query: string }
+    expect(sent.query).toContain('unresolveReviewThread')
+  })
+
+  test('getReviewComments pages the one-review comments endpoint', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, [{ id: 1, path: 'a.ts' }], captured),
+      baseUrl: 'https://api.github.test',
+    })
+    const page = await client.getReviewComments('o', 'r', 5, 42, { page: 1, perPage: 100 })
+    expect(page.items).toHaveLength(1)
+    expect(captured[0].url).toBe(
+      'https://api.github.test/repos/o/r/pulls/5/reviews/42/comments?per_page=100&page=1',
+    )
+  })
+
+  test('addIssueCommentReaction POSTs to the ISSUE comment reactions endpoint', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { id: 1, content: 'heart' }, captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.addIssueCommentReaction('o', 'r', 88, 'heart')
+    const req = captured[0]
+    expect(req.url).toBe('https://api.github.test/repos/o/r/issues/comments/88/reactions')
+    expect((req.init as RequestInit).method).toBe('POST')
+    const sent = JSON.parse((req.init as RequestInit).body as string) as { content: string }
+    expect(sent.content).toBe('heart')
+  })
+
+  test('getIssueComment GETs the single issue comment (rollup read-back)', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { id: 88, reactions: { total_count: 1 } }, captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.getIssueComment('o', 'r', 88)
+    expect(captured[0].url).toBe('https://api.github.test/repos/o/r/issues/comments/88')
+    expect((captured[0].init as RequestInit).method).toBe('GET')
+  })
+
+  test('a write never places the token in the URL or body', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('super-secret'),
+      fetchImpl: fakeFetch(200, { id: 1 }, captured),
+    })
+    await client.submitReview('o', 'r', 1, { commit_id: 'h', event: 'COMMENT', body: 'x', comments: [] })
+    expect(captured[0].url).not.toContain('super-secret')
+    expect((captured[0].init as RequestInit).body as string).not.toContain('super-secret')
+  })
+})

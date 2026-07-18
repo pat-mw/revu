@@ -10,9 +10,13 @@ import type {
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  ReactionRollup,
+  ReviewComment,
   ReviewDraft,
+  ReviewThread,
   Session,
   Snapshot,
+  SubmitResult,
 } from '@revu/shared'
 import { ApiError, DEFAULT_PREFERENCES } from '@revu/shared'
 import type { DirectApi } from './direct/direct-api'
@@ -76,6 +80,73 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     setPreferences(patch): HumanPreferences {
       prefs = { ...prefs, ...patch }
       return prefs
+    },
+    async submitReview(input): Promise<SubmitResult> {
+      // Default: the head matched, a review was created. Overridden per test to
+      // exercise head_moved / forbidden / conflict routing.
+      return {
+        status: 'ok',
+        review: {
+          id: 5001,
+          node_id: 'PRR_x',
+          user: { login: 'alice-gh', id: 1, node_id: '', avatar_url: '', html_url: '', type: 'User' },
+          body: input.body,
+          state: 'COMMENTED',
+          submitted_at: '2026-01-01T00:00:00.000Z',
+          commit_id: input.expectedHeadSha,
+        },
+      }
+    },
+    async replyToThread(_pr, threadId, body): Promise<ReviewComment> {
+      return {
+        id: 6001,
+        node_id: '',
+        pull_request_review_id: null,
+        in_reply_to_id: 42,
+        path: 'a.ts',
+        diff_hunk: '@@ -1 +1 @@',
+        commit_id: 'h',
+        original_commit_id: 'h',
+        line: 1,
+        original_line: 1,
+        start_line: null,
+        original_start_line: null,
+        side: 'RIGHT',
+        start_side: null,
+        subject_type: 'line',
+        user: { login: 'alice-gh', id: 1, node_id: '', avatar_url: '', html_url: '', type: 'User' },
+        body: `reply(${threadId}): ${body}`,
+        created_at: '',
+        updated_at: '',
+        reactions: {
+          url: '', total_count: 0, '+1': 0, '-1': 0, laugh: 0, hooray: 0, confused: 0, heart: 0, rocket: 0, eyes: 0,
+        },
+        html_url: '',
+      }
+    },
+    async resolveThread(_pr, threadId, resolved): Promise<ReviewThread> {
+      return {
+        id: threadId,
+        isResolved: resolved,
+        isOutdated: false,
+        path: 'a.ts',
+        line: 1,
+        originalLine: 1,
+        startLine: null,
+        originalStartLine: null,
+        diffSide: 'RIGHT',
+        startDiffSide: null,
+        subjectType: 'LINE',
+        resolvedBy: resolved ? { login: 'alice-gh' } : null,
+        comments: [],
+      }
+    },
+    async addReaction(_pr, _commentId, reaction): Promise<ReactionRollup> {
+      const rollup: ReactionRollup = {
+        url: '', total_count: 1, '+1': 0, '-1': 0, laugh: 0, hooray: 0, confused: 0, heart: 0, rocket: 0, eyes: 0,
+      }
+      rollup[reaction] = 1
+      return rollup
     },
     ...overrides,
   }
@@ -257,11 +328,11 @@ describe('handleDirectApi', () => {
     expect(body.code).toBe('persist_failed')
   })
 
-  test('a not-yet-built route (threads, review, rate-limit) is a 501 not_implemented', async () => {
+  test('a not-yet-built route (list, threads, reconcile, rate-limit) is a 501 not_implemented', async () => {
     for (const [method, path] of [
       ['GET', '/api/pulls'],
       ['GET', '/api/pulls/204/threads'],
-      ['POST', '/api/pulls/204/review'],
+      ['GET', '/api/pulls/204/reconcile'],
       ['GET', '/api/rate-limit'],
     ] as const) {
       const res = await handleDirectApi(req(method, path), SESSION, fakeApi())
@@ -269,6 +340,122 @@ describe('handleDirectApi', () => {
       const body = (await res?.json()) as { code: string }
       expect(body.code).toBe('not_implemented')
     }
+  })
+
+  test('POST review returns the SubmitResult as a 200 value', async () => {
+    const input = {
+      prNumber: 204,
+      expectedHeadSha: 'head1',
+      event: 'COMMENT',
+      body: 'looks good',
+      comments: [],
+    }
+    const res = await handleDirectApi(req('POST', '/api/pulls/204/review', input), SESSION, fakeApi())
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as SubmitResult
+    expect(body.status).toBe('ok')
+  })
+
+  test('POST review head_moved is a 200 VALUE, never an error status', async () => {
+    const api = fakeApi({
+      async submitReview(): Promise<SubmitResult> {
+        return { status: 'head_moved', currentHeadSha: 'head2', newCommits: 2 }
+      },
+    })
+    const input = {
+      prNumber: 204,
+      expectedHeadSha: 'head1',
+      event: 'COMMENT',
+      body: '',
+      comments: [],
+    }
+    const res = await handleDirectApi(req('POST', '/api/pulls/204/review', input), SESSION, api)
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as SubmitResult
+    expect(body.status).toBe('head_moved')
+  })
+
+  test('POST review with a body prNumber mismatching the path is a 400, never a submit', async () => {
+    let submitted = false
+    const api = fakeApi({
+      async submitReview(): Promise<SubmitResult> {
+        submitted = true
+        return { status: 'head_moved', currentHeadSha: 'x', newCommits: 0 }
+      },
+    })
+    const input = {
+      prNumber: 999,
+      expectedHeadSha: 'head1',
+      event: 'COMMENT',
+      body: '',
+      comments: [],
+    }
+    const res = await handleDirectApi(req('POST', '/api/pulls/204/review', input), SESSION, api)
+    expect(res?.status).toBe(400)
+    expect(submitted).toBe(false)
+  })
+
+  test('a submit conflict (a 422 from GitHub) surfaces as 409 conflict', async () => {
+    const api = fakeApi({
+      async submitReview(): Promise<SubmitResult> {
+        throw new ApiError('conflict', 'the diff changed under the review; draft kept')
+      },
+    })
+    const input = {
+      prNumber: 204,
+      expectedHeadSha: 'head1',
+      event: 'COMMENT',
+      body: 'x',
+      comments: [],
+    }
+    const res = await handleDirectApi(req('POST', '/api/pulls/204/review', input), SESSION, api)
+    expect(res?.status).toBe(409)
+    const body = (await res?.json()) as { code: string }
+    expect(body.code).toBe('conflict')
+  })
+
+  test('POST reply returns the new comment', async () => {
+    const res = await handleDirectApi(
+      req('POST', '/api/pulls/204/threads/PRRT_abc/reply', { body: 'thanks' }),
+      SESSION,
+      fakeApi(),
+    )
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as ReviewComment
+    expect(body.body).toContain('thanks')
+    expect(body.body).toContain('PRRT_abc')
+  })
+
+  test('POST resolve returns the mutated thread', async () => {
+    const res = await handleDirectApi(
+      req('POST', '/api/pulls/204/threads/PRRT_abc/resolve', { resolved: true }),
+      SESSION,
+      fakeApi(),
+    )
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as ReviewThread
+    expect(body.isResolved).toBe(true)
+    expect(body.id).toBe('PRRT_abc')
+  })
+
+  test('POST reaction with ?pr= returns the rollup', async () => {
+    const res = await handleDirectApi(
+      req('POST', '/api/comments/7788/reactions?pr=204', { reaction: '+1' }),
+      SESSION,
+      fakeApi(),
+    )
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as ReactionRollup
+    expect(body['+1']).toBe(1)
+  })
+
+  test('POST reaction without an owning PR (?pr= or prNumber) is a 400', async () => {
+    const res = await handleDirectApi(
+      req('POST', '/api/comments/7788/reactions', { reaction: '+1' }),
+      SESSION,
+      fakeApi(),
+    )
+    expect(res?.status).toBe(400)
   })
 
   test('GET blob returns the FileBlob (200) for a present SHA', async () => {

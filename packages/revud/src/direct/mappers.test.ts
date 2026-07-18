@@ -12,6 +12,7 @@ import {
   mapPullDetail,
   mapPullFile,
   mapReview,
+  mapReviewComment,
   mapUser,
 } from './mappers'
 
@@ -120,5 +121,47 @@ describe('mapIssueComment / mapReview / mapCommit / mapCheckRuns', () => {
       check_runs: [{ id: 1, name: 'ci', status: 'completed', conclusion: 'weird' }],
     })
     expect(runs[0].conclusion).toBeNull()
+  })
+})
+
+describe('mapReviewComment (REST reply / single-comment response)', () => {
+  test('maps a reply comment, carrying in_reply_to_id when present', () => {
+    const c = mapReviewComment({
+      id: 7001,
+      node_id: 'PRRC_x',
+      pull_request_review_id: null,
+      in_reply_to_id: 42,
+      path: 'a.ts',
+      diff_hunk: '@@ -1 +1 @@',
+      commit_id: 'h',
+      original_commit_id: 'h',
+      line: 5,
+      original_line: 5,
+      start_line: null,
+      original_start_line: null,
+      side: 'RIGHT',
+      start_side: null,
+      subject_type: 'line',
+      user: { login: 'alice', id: 1, type: 'User' },
+      body: 'thanks',
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      reactions: { total_count: 0, '+1': 0 },
+      html_url: 'https://github.com/o/r/pull/1#discussion_r7001',
+    })
+    expect(c.id).toBe(7001)
+    expect(c.in_reply_to_id).toBe(42)
+    expect(c.side).toBe('RIGHT')
+    expect(c.user.login).toBe('alice')
+    expect(c.body).toBe('thanks')
+  })
+
+  test('a root comment (no in_reply_to_id) omits the field', () => {
+    const c = mapReviewComment({ id: 1, path: 'a.ts', body: 'x' })
+    expect('in_reply_to_id' in c).toBe(false)
+    // Defensive defaults for a lean payload.
+    expect(c.side).toBe('RIGHT')
+    expect(c.line).toBeNull()
+    expect(c.reactions.total_count).toBe(0)
   })
 })

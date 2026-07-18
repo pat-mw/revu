@@ -6,6 +6,7 @@ import type {
   PullDetail,
   PullFile,
   ReactionRollup,
+  ReviewComment,
   ReviewSummary,
 } from '@revu/shared'
 
@@ -178,6 +179,52 @@ export function mapIssueComment(raw: unknown): IssueComment {
     updated_at: typeof c.updated_at === 'string' ? c.updated_at : '',
     reactions: mapReactions(c.reactions),
   }
+}
+
+/**
+ * Map one raw REST review comment (`POST …/comments/{id}/replies`, `GET
+ * …/pulls/comments/{id}`) onto the contract's `ReviewComment`. The reply and
+ * single-comment REST endpoints already return the REST shape (unlike the
+ * threads read, which comes from GraphQL and is normalized separately), so this
+ * is a structural narrowing: read the fields the app consumes, coerce the enums,
+ * default the rest. `in_reply_to_id` is carried ONLY when present, so a root
+ * comment stays honestly without the field.
+ */
+export function mapReviewComment(raw: unknown): ReviewComment {
+  const c = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const num = (k: string): number => (typeof c[k] === 'number' ? (c[k] as number) : 0)
+  const str = (k: string): string => (typeof c[k] === 'string' ? (c[k] as string) : '')
+  const nullableNum = (k: string): number | null =>
+    typeof c[k] === 'number' ? (c[k] as number) : null
+  const side: ReviewComment['side'] = c.side === 'LEFT' ? 'LEFT' : 'RIGHT'
+  const startSide: ReviewComment['start_side'] =
+    c.start_side === 'LEFT' || c.start_side === 'RIGHT' ? c.start_side : null
+  const subjectType: ReviewComment['subject_type'] = c.subject_type === 'file' ? 'file' : 'line'
+  const comment: ReviewComment = {
+    id: num('id'),
+    node_id: str('node_id'),
+    pull_request_review_id:
+      typeof c.pull_request_review_id === 'number' ? c.pull_request_review_id : null,
+    path: str('path'),
+    diff_hunk: str('diff_hunk'),
+    commit_id: str('commit_id'),
+    original_commit_id: str('original_commit_id'),
+    line: nullableNum('line'),
+    original_line: nullableNum('original_line'),
+    start_line: nullableNum('start_line'),
+    original_start_line: nullableNum('original_start_line'),
+    side,
+    start_side: startSide,
+    subject_type: subjectType,
+    user: requireUser(c.user),
+    body: str('body'),
+    created_at: str('created_at'),
+    updated_at: str('updated_at'),
+    reactions: mapReactions(c.reactions),
+    html_url: str('html_url'),
+  }
+  if (typeof c.in_reply_to_id === 'number') comment.in_reply_to_id = c.in_reply_to_id
+  return comment
 }
 
 /** Map one raw review onto `ReviewSummary`. */

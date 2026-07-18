@@ -65,8 +65,8 @@ const USER_AGENT = 'revu-revud'
 export class GithubRequestError extends Error {
   readonly status: number
 
-  constructor(status: number, path: string, bodyExcerpt: string) {
-    super(`GitHub request GET ${path} failed with HTTP ${status}: ${bodyExcerpt}`)
+  constructor(status: number, path: string, bodyExcerpt: string, method = 'GET') {
+    super(`GitHub request ${method} ${path} failed with HTTP ${status}: ${bodyExcerpt}`)
     this.name = 'GithubRequestError'
     this.status = status
   }
@@ -125,6 +125,36 @@ export interface GhBlobRaw {
   content: string
   encoding: string
   size: number
+}
+
+/**
+ * One pending comment as `POST /pulls/{n}/reviews` accepts it. Field names match
+ * the contract's `PendingComment` 1:1 (the names were chosen to). `start_line` /
+ * `start_side` are present ONLY for a multi-line comment; a single-line comment
+ * OMITS them entirely, because GitHub rejects a review comment that carries a
+ * `start_line` equal to its `line`.
+ */
+export interface ReviewCommentInput {
+  path: string
+  side: 'LEFT' | 'RIGHT'
+  line: number
+  start_line?: number
+  start_side?: 'LEFT' | 'RIGHT'
+  body: string
+}
+
+/**
+ * The body of `POST /repos/{o}/{r}/pulls/{n}/reviews`. `commit_id` pins the
+ * review to the exact head the draft targeted (the guard already proved it is
+ * current); `event` is the review verdict; `comments` are the inline comments,
+ * each mapped from a `PendingComment`. An empty `comments` array posts a review
+ * with only a body.
+ */
+export interface SubmitReviewBody {
+  commit_id: string
+  event: 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES'
+  body: string
+  comments: ReviewCommentInput[]
 }
 
 /**
@@ -317,6 +347,109 @@ export interface GithubClient extends GithubViewerClient {
     threadId: string,
     cursor: string | null,
   ): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewCommentNode[] }>
+
+  // ——— the write surface ———
+
+  /**
+   * `POST /repos/{o}/{r}/pulls/{n}/reviews` — submit one review with its inline
+   * comments in a single call. Returns the raw created-review body (the caller
+   * maps it onto `ReviewSummary`). Throws `GithubRequestError` on a non-2xx: a
+   * `422` here means a comment failed server-side validation (a force-push in the
+   * guard-to-post window), which the write path turns into a `conflict` while
+   * KEEPING the draft.
+   */
+  submitReview(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    body: SubmitReviewBody,
+  ): Promise<unknown>
+
+  /**
+   * `POST /repos/{o}/{r}/pulls/{n}/comments/{commentId}/replies` — reply to an
+   * existing review comment. The contract addresses a THREAD, but REST wants a
+   * COMMENT id; the caller passes the thread's FIRST comment id and GitHub
+   * attaches the reply to the thread root. Returns the raw created-comment body
+   * (the caller normalizes it onto `ReviewComment`).
+   */
+  replyToReviewComment(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commentId: number,
+    body: string,
+  ): Promise<unknown>
+
+  /**
+   * `POST /repos/{o}/{r}/pulls/comments/{commentId}/reactions` — add a reaction
+   * to a review comment. Returns the raw created-reaction body. GitHub dedupes a
+   * reaction per user, and there is one authenticated user here, so a repeated
+   * identical reaction is a no-op on the rollup — the shared-and-honest
+   * constraint. The caller re-reads the comment's rollup to report it.
+   */
+  addReaction(
+    owner: string,
+    repo: string,
+    commentId: number,
+    reaction: string,
+  ): Promise<unknown>
+
+  /**
+   * `GET /repos/{o}/{r}/pulls/comments/{commentId}` — one review comment by id,
+   * used to read back a comment's current reaction rollup after a reaction POST
+   * (GitHub's reaction response carries only the single reaction, not the whole
+   * rollup). Returns the raw comment body.
+   */
+  getReviewComment(owner: string, repo: string, commentId: number): Promise<unknown>
+
+  /**
+   * `GET /repos/{o}/{r}/pulls/{n}/reviews/{reviewId}/comments` — one page of the
+   * inline comments belonging to ONE submitted review. Used by the submit
+   * idempotency re-check: the review-level fields (author, commit, verdict,
+   * body) can coincide across two DIFFERENT submits — an empty summary body at
+   * the same head is the common case — so before short-circuiting to an
+   * existing review as "already posted", the write path proves its inline
+   * comments equal the ones this submit carries.
+   */
+  getReviewComments(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    reviewId: number,
+    params: PageParams,
+  ): Promise<Page<unknown>>
+
+  /**
+   * `POST /repos/{o}/{r}/issues/comments/{commentId}/reactions` — add a reaction
+   * to an ISSUE (conversation-tab) comment. Issue comments live in a different
+   * id namespace than PR review comments and take a different reactions
+   * endpoint; the write path picks this one when the target id belongs to a
+   * conversation comment in the cached snapshot.
+   */
+  addIssueCommentReaction(
+    owner: string,
+    repo: string,
+    commentId: number,
+    reaction: string,
+  ): Promise<unknown>
+
+  /**
+   * `GET /repos/{o}/{r}/issues/comments/{commentId}` — one issue (conversation)
+   * comment by id, used to read back its reaction rollup after a reaction POST,
+   * exactly as `getReviewComment` does for a review comment.
+   */
+  getIssueComment(owner: string, repo: string, commentId: number): Promise<unknown>
+
+  /**
+   * Run the GraphQL `resolveReviewThread` / `unresolveReviewThread` mutation for
+   * the `PRRT_` thread node id, returning the mutated thread node. Which mutation
+   * runs is chosen by `resolved`. Throws `GithubGraphqlError` on a non-2xx or a
+   * top-level `errors` array.
+   */
+  setThreadResolution(
+    threadId: string,
+    resolved: boolean,
+  ): Promise<GhReviewThreadNode>
 }
 
 /**
@@ -410,6 +543,63 @@ const THREAD_COMMENTS_QUERY = `query($threadId:ID!,$after:String) {
 }`
 
 /**
+ * The selection returned by a resolve/unresolve mutation: the mutated thread in
+ * the SAME node shape the read query returns, so the caller normalizes it with
+ * the one normalizer. `resolvedBy` reads as the authenticated user (direct mode)
+ * or the bot (broker mode); either way the UI already renders it.
+ */
+const RESOLVED_THREAD_SELECTION = `thread {
+        id
+        isResolved
+        isOutdated
+        path
+        line
+        originalLine
+        startLine
+        originalStartLine
+        diffSide
+        startDiffSide
+        subjectType
+        resolvedBy { login }
+        comments(first:100) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            fullDatabaseId
+            path
+            diffHunk
+            line
+            originalLine
+            startLine
+            originalStartLine
+            subjectType
+            body
+            createdAt
+            updatedAt
+            author { login }
+            pullRequestReview { fullDatabaseId }
+            replyTo { fullDatabaseId }
+            commit { oid }
+            originalCommit { oid }
+            url
+          }
+        }
+      }`
+
+/** `resolveReviewThread` mutation — marks the `PRRT_` thread resolved. */
+const RESOLVE_THREAD_MUTATION = `mutation($threadId:ID!) {
+  resolveReviewThread(input:{threadId:$threadId}) {
+    ${RESOLVED_THREAD_SELECTION}
+  }
+}`
+
+/** `unresolveReviewThread` mutation — reopens the `PRRT_` thread. */
+const UNRESOLVE_THREAD_MUTATION = `mutation($threadId:ID!) {
+  unresolveReviewThread(input:{threadId:$threadId}) {
+    ${RESOLVED_THREAD_SELECTION}
+  }
+}`
+
+/**
  * Build a GraphQL query that fetches many blobs in one request by aliasing a
  * `object(oid:)` field per SHA. Each object is narrowed with `... on Blob` to
  * read `isBinary`, `text` (null for binaries), `byteSize`, and `isTruncated`
@@ -475,6 +665,34 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
 
   async function getJson(path: string): Promise<unknown> {
     return (await getRaw(path)).body
+  }
+
+  /**
+   * Issue one authenticated POST with a JSON body, returning the parsed response.
+   * The token is confined to the header exactly as the GET path. A non-2xx throws
+   * `GithubRequestError` carrying the status (so a `422` reaches the write path
+   * as a status the draft-retention logic can branch on) and a bounded, token-
+   * free excerpt. A `204 No Content` (some write endpoints) parses to `null`.
+   */
+  async function postJson(path: string, jsonBody: unknown): Promise<unknown> {
+    const token = await opts.tokenSource.getToken()
+    const res = await fetchImpl(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/vnd.github+json',
+        'content-type': 'application/json',
+        'x-github-api-version': API_VERSION,
+        'user-agent': USER_AGENT,
+      },
+      body: JSON.stringify(jsonBody),
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new GithubRequestError(res.status, path, text.slice(0, 200), 'POST')
+    }
+    if (res.status === 204) return null
+    return (await res.json().catch(() => null)) as unknown
   }
 
   /** GET a paginated list page, reading `hasNext` from the `Link` header. */
@@ -671,6 +889,93 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
         return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
       }
       return { pageInfo: conn.pageInfo, nodes: conn.nodes }
+    },
+
+    async submitReview(
+      owner: string,
+      repo: string,
+      prNumber: number,
+      body: SubmitReviewBody,
+    ): Promise<unknown> {
+      return postJson(`/repos/${enc(owner)}/${enc(repo)}/pulls/${prNumber}/reviews`, body)
+    },
+
+    async replyToReviewComment(
+      owner: string,
+      repo: string,
+      prNumber: number,
+      commentId: number,
+      body: string,
+    ): Promise<unknown> {
+      // REST attaches a reply to the thread root regardless of which of the
+      // thread's comments is addressed; the caller passes the FIRST comment id.
+      return postJson(
+        `/repos/${enc(owner)}/${enc(repo)}/pulls/${prNumber}/comments/${commentId}/replies`,
+        { body },
+      )
+    },
+
+    async addReaction(
+      owner: string,
+      repo: string,
+      commentId: number,
+      reaction: string,
+    ): Promise<unknown> {
+      return postJson(
+        `/repos/${enc(owner)}/${enc(repo)}/pulls/comments/${commentId}/reactions`,
+        { content: reaction },
+      )
+    },
+
+    async getReviewComment(owner: string, repo: string, commentId: number): Promise<unknown> {
+      return getJson(`/repos/${enc(owner)}/${enc(repo)}/pulls/comments/${commentId}`)
+    },
+
+    async getReviewComments(
+      owner: string,
+      repo: string,
+      prNumber: number,
+      reviewId: number,
+      params: PageParams,
+    ): Promise<Page<unknown>> {
+      return getPage(
+        `/repos/${enc(owner)}/${enc(repo)}/pulls/${prNumber}/reviews/${reviewId}/comments`,
+        params,
+      )
+    },
+
+    async addIssueCommentReaction(
+      owner: string,
+      repo: string,
+      commentId: number,
+      reaction: string,
+    ): Promise<unknown> {
+      return postJson(
+        `/repos/${enc(owner)}/${enc(repo)}/issues/comments/${commentId}/reactions`,
+        { content: reaction },
+      )
+    },
+
+    async getIssueComment(owner: string, repo: string, commentId: number): Promise<unknown> {
+      return getJson(`/repos/${enc(owner)}/${enc(repo)}/issues/comments/${commentId}`)
+    },
+
+    async setThreadResolution(
+      threadId: string,
+      resolved: boolean,
+    ): Promise<GhReviewThreadNode> {
+      const mutation = resolved ? RESOLVE_THREAD_MUTATION : UNRESOLVE_THREAD_MUTATION
+      const field = resolved ? 'resolveReviewThread' : 'unresolveReviewThread'
+      const data = await postGraphql<
+        Record<string, { thread: GhReviewThreadNode | null } | null>
+      >(mutation, { threadId })
+      const thread = data[field]?.thread
+      if (thread === undefined || thread === null) {
+        throw new GithubGraphqlError(
+          `${field} returned no thread for ${threadId}`,
+        )
+      }
+      return thread
     },
   }
 }

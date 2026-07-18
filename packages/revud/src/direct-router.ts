@@ -1,16 +1,20 @@
-import type { Session } from '@revu/shared'
+import type { ReactionKey, Session, SubmitReviewInput } from '@revu/shared'
 import {
   ApiError,
   errorBodyFromApiError,
   ROUTES,
   statusForApiError,
   ValidationError,
+  validateReactionBody,
+  validateReplyBody,
+  validateResolveBody,
   validateReviewDraft,
   validateSetPreferencesBody,
   validateSetViewedBody,
+  validateSubmitReviewInput,
 } from '@revu/shared'
 import type { DirectApi } from './direct/direct-api'
-import { GithubRequestError } from './direct/github-client'
+import { GithubGraphqlError, GithubRequestError } from './direct/github-client'
 import { StoreUnreadableError, StoreWriteError } from './direct/store'
 
 /**
@@ -35,10 +39,21 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  * returns its `FileBlob` (HTTP 200) and an absent one is a typed `not_found`
  * (404) — never a fabricated blob.
  *
- * Routes that belong to the not-yet-built GraphQL thread read and the write path
- * still answer a typed `not_implemented` (501). Unknown API paths 404; non-API
- * paths return `null` so the caller serves static assets. There is no mock and no
- * dev panel in direct mode.
+ * The write path (`submitReview`, `replyToThread`, `resolveThread`,
+ * `addReaction`) is served here. Contract semantics enforced on it:
+ *   - `submitReview` returns `head_moved`/`forbidden` as a 200-level VALUE, never
+ *     an error status — it is an ordinary JSON body.
+ *   - A submit that hits a 422 (a comment failed validation despite the guard)
+ *     surfaces as `conflict` (409); the store draft is retained by the surface,
+ *     never discarded on failure.
+ *   - `addReaction`'s route carries only the comment id, so the owning PR rides
+ *     as a `?pr=<n>` query param (or a `prNumber` body field), mirroring the mock
+ *     router; it is shared-and-honest (one GitHub user, one reaction).
+ *
+ * Routes that belong to the not-yet-built GraphQL thread read, reconcile, and
+ * rate-limit still answer a typed `not_implemented` (501). Unknown API paths 404;
+ * non-API paths return `null` so the caller serves static assets. There is no
+ * mock and no dev panel in direct mode.
  *
  * The session is captured at startup and never re-derived per request: identity
  * is fixed for the daemon's life and no request can influence it.
@@ -59,18 +74,14 @@ function errorJson(code: string, message: string, status: number): Response {
 
 /**
  * The routes the not-yet-built parts of the surface own. They stay `501` until
- * the GraphQL thread read (`listReviewThreads`) and the write path
- * (`submitReview`, `replyToThread`, `resolveThread`, `addReaction`,
- * `reconcileDraft`) land. `getRateLimit` is also not yet answered. `getBlob` is
- * served — it reads the content-addressed store.
+ * the GraphQL thread read (`listReviewThreads`), reconcile (`reconcileDraft`),
+ * and the rate-limit read (`getRateLimit`) land. The write path (submitReview,
+ * replyToThread, resolveThread, addReaction) is served below. `getBlob` is served
+ * — it reads the content-addressed store.
  */
 const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
   ROUTES.listPulls.path,
   ROUTES.listReviewThreads.path,
-  ROUTES.replyToThread.path,
-  ROUTES.resolveThread.path,
-  ROUTES.addReaction.path,
-  ROUTES.submitReview.path,
   ROUTES.reconcileDraft.path,
   ROUTES.getRateLimit.path,
 ])
@@ -156,6 +167,14 @@ function envelopeForError(err: unknown): Response {
     if (err.status === 404) return errorJson('not_found', err.message, 404)
     if (err.status === 403) return errorJson('forbidden', err.message, 403)
     if (err.status === 429) return errorJson('rate_limited', err.message, 429)
+    if (err.status === 409 || err.status === 422) {
+      return errorJson('conflict', err.message, 409)
+    }
+    return errorJson('broker_unreachable', err.message, 502)
+  }
+  // A GraphQL failure (a resolve/unresolve mutation) has no HTTP status of its
+  // own; surface it as an upstream failure rather than a generic 500.
+  if (err instanceof GithubGraphqlError) {
     return errorJson('broker_unreachable', err.message, 502)
   }
   const message = err instanceof Error ? err.message : String(err)
@@ -275,12 +294,81 @@ export async function handleDirectApi(
         return json(api.setPreferences(patch))
       }
     }
+
+    // ——— submitReview: POST /api/pulls/:n/review ———
+    // head_moved / forbidden come back as 200 VALUES (never an error status); a
+    // 422 becomes `conflict` with the store draft retained by the surface.
+    if (method === ROUTES.submitReview.method) {
+      const params = matchRoute(ROUTES.submitReview.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        const input = validateSubmitReviewInput(await readJsonBody(req)) as SubmitReviewInput
+        // Act on the PR named in the path, not a mismatched body `prNumber`.
+        if (input.prNumber !== n) {
+          return errorJson('not_found', 'Path pull number does not match body prNumber.', 400)
+        }
+        return json(await api.submitReview(input))
+      }
+    }
+
+    // ——— replyToThread: POST /api/pulls/:n/threads/:threadId/reply ———
+    if (method === ROUTES.replyToThread.method) {
+      const params = matchRoute(ROUTES.replyToThread.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        const body = validateReplyBody(await readJsonBody(req))
+        return json(await api.replyToThread(n, params.threadId, body.body))
+      }
+    }
+
+    // ——— resolveThread: POST /api/pulls/:n/threads/:threadId/resolve ———
+    if (method === ROUTES.resolveThread.method) {
+      const params = matchRoute(ROUTES.resolveThread.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
+        const body = validateResolveBody(await readJsonBody(req))
+        return json(await api.resolveThread(n, params.threadId, body.resolved))
+      }
+    }
+
+    // ——— addReaction: POST /api/comments/:id/reactions ———
+    // The route carries only the comment id; the owning PR rides as `?pr=<n>` (or
+    // a `prNumber` body field), the same accommodation the mock router makes.
+    if (method === ROUTES.addReaction.method) {
+      const params = matchRoute(ROUTES.addReaction.path, path)
+      if (params) {
+        const commentId = Number(params.id)
+        if (!Number.isInteger(commentId) || commentId <= 0) {
+          return errorJson('not_found', `Bad comment id "${params.id}".`, 400)
+        }
+        const raw = await readJsonBody(req)
+        const body = validateReactionBody(raw)
+        const prFromQuery = Number(url.searchParams.get('pr'))
+        const prNumber =
+          Number.isInteger(prFromQuery) && prFromQuery > 0
+            ? prFromQuery
+            : typeof raw.prNumber === 'number'
+              ? raw.prNumber
+              : null
+        if (prNumber === null) {
+          return errorJson(
+            'not_found',
+            'addReaction requires the owning pull number (?pr= or prNumber).',
+            400,
+          )
+        }
+        return json(await api.addReaction(prNumber, commentId, body.reaction as ReactionKey))
+      }
+    }
   } catch (err) {
     return envelopeForError(err)
   }
 
-  // Known-but-unimplemented contract routes (GraphQL threads, write path, blobs,
-  // rate limit) answer an honest 501.
+  // Known-but-unimplemented contract routes (pull list, GraphQL threads,
+  // reconcile, rate limit) answer an honest 501.
   if (isKnownApiPath(method, path)) {
     for (const template of NOT_IMPLEMENTED_ROUTES) {
       if (matchRoute(template, path)) {

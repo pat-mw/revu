@@ -24,6 +24,7 @@ import type {
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import { createDirectApi, type DirectApi } from './direct-api'
+import { unusedWriteMethods } from './github-write-stubs'
 import { openDirectStore, type DirectStore } from './store'
 import type { Session } from '@revu/shared'
 
@@ -118,6 +119,7 @@ function movingBaseClient(state: { mergeBaseSha: string; unresolvedComments: num
     async getThreadComments(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: never[] }> {
       return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
     },
+    ...unusedWriteMethods(),
   }
 }
 
