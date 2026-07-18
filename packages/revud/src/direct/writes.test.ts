@@ -13,7 +13,9 @@
  *   - a retry-after-timeout re-checks GitHub and short-circuits — no double-post;
  *   - `replyToThread` replies to the thread's FIRST comment;
  *   - `resolveThread` runs the mutation and normalizes the result;
- *   - `addReaction` is shared-and-honest (reads the rollup back).
+ *   - `addReaction` is shared-and-honest (reads the rollup back);
+ *   - every successful write records through the `WriteDecorator` with the
+ *     GitHub id plus its endpoint + PR (the metadata an audit row carries).
  */
 import { describe, expect, test } from 'bun:test'
 import type {
@@ -536,14 +538,29 @@ describe('submitReview — approve gating', () => {
   })
 })
 
+/** A recording decorator: passthrough bodies, every recordWrite captured with its meta. */
+function recordingDecorator(): {
+  decorator: WriteDecorator
+  recorded: { id: number; endpoint: string; pr: number }[]
+} {
+  const recorded: { id: number; endpoint: string; pr: number }[] = []
+  return {
+    recorded,
+    decorator: {
+      decorateBody: (b) => b,
+      recordWrite: (id, meta) => recorded.push({ id, endpoint: meta.endpoint, pr: meta.pr }),
+    },
+  }
+}
+
 describe('submitReview — WriteDecorator seam', () => {
-  test('a stamping decorator stamps every body and records every created id', async () => {
+  test('a stamping decorator stamps every body and records every created id + meta', async () => {
     const store = memStore()
     seedDraft(store, 'head1', [])
-    const recorded: number[] = []
+    const recorded: { id: number; endpoint: string; pr: number }[] = []
     const stamping: WriteDecorator = {
       decorateBody: (b) => (b.length > 0 ? `**Alice** (contractor)\n\n${b}` : b),
-      recordWrite: (id) => recorded.push(id),
+      recordWrite: (id, meta) => recorded.push({ id, endpoint: meta.endpoint, pr: meta.pr }),
     }
     const { client, spy } = fakeClient({ headSha: 'head1', authorLogin: 'someone' })
     const result = await submitReview(
@@ -553,8 +570,30 @@ describe('submitReview — WriteDecorator seam', () => {
     expect(result.status).toBe('ok')
     expect(spy.reviewsPosted[0].body).toContain('**Alice** (contractor)')
     expect(spy.reviewsPosted[0].comments[0].body).toContain('**Alice** (contractor)')
-    // The created review id was recorded.
-    if (result.status === 'ok') expect(recorded).toContain(result.review.id)
+    // The created review id was recorded with the endpoint + PR the audit row carries.
+    if (result.status === 'ok') {
+      expect(recorded).toEqual([{ id: result.review.id, endpoint: 'submitReview', pr: 1 }])
+    }
+  })
+
+  test('the idempotent short-circuit records the already-landed review id too', async () => {
+    const store = memStore()
+    seedDraft(store, 'head1', [])
+    const { decorator, recorded } = recordingDecorator()
+    const { client } = fakeClient({
+      headSha: 'head1',
+      authorLogin: 'someone',
+      existingReviews: [
+        { id: 4242, login: 'alice-gh', commit_id: 'head1', state: 'COMMENTED', body: 'the review body' },
+      ],
+    })
+    const result = await submitReview(
+      deps(client, store, decorator),
+      input({ body: 'the review body' }),
+    )
+    expect(result.status).toBe('ok')
+    // The review landed on the lost first attempt; the retry still journals it.
+    expect(recorded).toEqual([{ id: 4242, endpoint: 'submitReview', pr: 1 }])
   })
 })
 
@@ -607,7 +646,7 @@ describe('resolveThread', () => {
   test('runs the mutation and normalizes the mutated thread', async () => {
     const store = memStore()
     const { client, spy } = fakeClient({ headSha: 'head1', authorLogin: 'someone' })
-    const out = await resolveThread(deps(client, store), 'PRRT_abc', true)
+    const out = await resolveThread(deps(client, store), 1, 'PRRT_abc', true)
     expect(spy.resolutionsRun).toEqual([{ threadId: 'PRRT_abc', resolved: true }])
     expect(out.id).toBe('PRRT_abc')
     expect(out.isResolved).toBe(true)
@@ -617,7 +656,7 @@ describe('resolveThread', () => {
   test('unresolve runs the unresolve mutation', async () => {
     const store = memStore()
     const { client, spy } = fakeClient({ headSha: 'head1', authorLogin: 'someone' })
-    const out = await resolveThread(deps(client, store), 'PRRT_abc', false)
+    const out = await resolveThread(deps(client, store), 1, 'PRRT_abc', false)
     expect(spy.resolutionsRun).toEqual([{ threadId: 'PRRT_abc', resolved: false }])
     expect(out.isResolved).toBe(false)
     expect(out.resolvedBy).toBeNull()
@@ -659,6 +698,90 @@ describe('addReaction', () => {
     await addReaction(deps(client, store), 1, 8001, '+1' as ReactionKey)
     expect(spy.reactionsPosted).toEqual([{ commentId: 8001, reaction: '+1' }])
     expect(spy.issueReactionsPosted).toHaveLength(0)
+  })
+})
+
+describe('every write operation records through the WriteDecorator', () => {
+  test('replyToThread records the created comment id with endpoint + pr', async () => {
+    const store = memStore()
+    const thread: ReviewThread = {
+      id: 'PRRT_abc',
+      isResolved: false,
+      isOutdated: false,
+      path: 'a.ts',
+      line: 3,
+      originalLine: 3,
+      startLine: null,
+      originalStartLine: null,
+      diffSide: 'RIGHT',
+      startDiffSide: null,
+      subjectType: 'LINE',
+      resolvedBy: null,
+      comments: [{ id: 111 } as ReviewComment],
+    }
+    store.putSnapshot(snapshotWithThreads(thread))
+    const { decorator, recorded } = recordingDecorator()
+    const { client } = fakeClient({ headSha: 'head1', authorLogin: 'someone' })
+    await replyToThread(deps(client, store, decorator), 1, 'PRRT_abc', 'thanks')
+    expect(recorded).toEqual([{ id: 7001, endpoint: 'replyToThread', pr: 1 }])
+  })
+
+  test('resolveThread records the thread root comment id with endpoint + pr', async () => {
+    const store = memStore()
+    const { decorator, recorded } = recordingDecorator()
+    const { client } = fakeClient({
+      headSha: 'head1',
+      authorLogin: 'someone',
+      resolveReturns: {
+        id: 'PRRT_abc',
+        isResolved: true,
+        isOutdated: false,
+        path: 'a.ts',
+        line: 3,
+        originalLine: 3,
+        startLine: null,
+        originalStartLine: null,
+        diffSide: 'RIGHT',
+        startDiffSide: null,
+        subjectType: 'LINE',
+        resolvedBy: { login: 'alice-gh' },
+        comments: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              // The GraphQL BigInt id arrives as a string; the normalizer coerces it.
+              fullDatabaseId: '111',
+              path: 'a.ts',
+              diffHunk: '',
+              line: 3,
+              originalLine: 3,
+              startLine: null,
+              originalStartLine: null,
+              subjectType: 'LINE',
+              body: 'root note',
+              createdAt: '',
+              updatedAt: '',
+              author: { login: 'bob-gh' },
+              pullRequestReview: null,
+              replyTo: null,
+              commit: null,
+              originalCommit: null,
+              url: '',
+            },
+          ],
+        },
+      },
+    })
+    await resolveThread(deps(client, store, decorator), 1, 'PRRT_abc', true)
+    expect(recorded).toEqual([{ id: 111, endpoint: 'resolveThread', pr: 1 }])
+  })
+
+  test('addReaction records the reacted-to comment id with endpoint + pr', async () => {
+    const store = memStore()
+    const { decorator, recorded } = recordingDecorator()
+    const { client } = fakeClient({ headSha: 'head1', authorLogin: 'someone' })
+    await addReaction(deps(client, store, decorator), 1, 8001, '+1' as ReactionKey)
+    expect(recorded).toEqual([{ id: 8001, endpoint: 'addReaction', pr: 1 }])
   })
 })
 

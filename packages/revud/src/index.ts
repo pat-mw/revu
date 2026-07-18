@@ -5,7 +5,9 @@ import { startServer } from './server'
 import type { RevuMode } from './api-router'
 import { DirectStartupError, resolveDirectContext } from './direct/context'
 import { createDirectApi } from './direct/direct-api'
+import { resolveBotLogin } from './direct/session'
 import { openDirectStore, resolveDirectDataDir } from './direct/store'
+import { createBrokerWriteDecorator } from './direct/write-decorator'
 import { createFileCredentialTokenSource } from './broker/token-source'
 
 /**
@@ -215,19 +217,27 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
  *      daemon starts anyway; the awaiting state is surfaced per request (as
  *      `broker_unreachable`) instead of stopping the process. Identity resolves
  *      locally from git config (the `Human` — the stable draft/audit key), so the
- *      session is real from boot; `viewerLogin` is absent because a GitHub App
- *      installation token cannot resolve a login via `GET /user` (GitHub answers
- *      403). No GitHub call is made at boot at all.
+ *      session is real from boot; a GitHub App installation token cannot resolve
+ *      its own login via `GET /user` (GitHub answers 403), so the bot's login,
+ *      when writes are enabled, comes from `REVU_BOT_LOGIN` instead. No GitHub
+ *      call is made at boot at all.
  *   3. The server binds `127.0.0.1`, reachable only over loopback inside the
  *      workspace; the host reaches it through a forwarded port.
  *
- * Broker mode is READS-ONLY for now: the router gates the four write endpoints
- * (submit review, reply, resolve/unresolve, react) to `not_implemented`. Correct
- * broker writes — stamp-with-human plus self-identify-as-bot for the guards and
- * the audit log, which read `viewerLogin` — are an interlocking system enabled
- * together with the writes unit, not here. Reads (sync, snapshot, blobs,
- * reconcile) are fully served. The token is never logged: only the resolved repo
- * and data dir appear in the startup line.
+ * Broker WRITES require a configured bot identity. When `REVU_BOT_LOGIN` names
+ * the GitHub App's bot login, the session self-identifies as that bot
+ * (`brokerLogin` = `viewerLogin` = the bot login — which makes the self-approval
+ * guard and the submit idempotency re-check correct: the bot recognizes its own
+ * pull requests and its own prior reviews) and the api is assembled with the
+ * broker `WriteDecorator`: every body is stamped with the human's display name
+ * via the shared prefix, and every confirmed write is journaled to the
+ * append-only audit log under the human's id. When `REVU_BOT_LOGIN` is unset
+ * the daemon is reads-only: the router gates the four write endpoints (submit
+ * review, reply, resolve/unresolve, react) to `not_implemented`, because
+ * without a self-identity a retried submit could double-post and APPROVE would
+ * run without the self-review guard. Reads (sync, snapshot, blobs, reconcile)
+ * are fully served either way. The token is never logged: only the resolved
+ * repo, write configuration, and data dir appear in the startup line.
  */
 async function mainBroker(env: Record<string, string | undefined>): Promise<void> {
   const port = resolvePort(env)
@@ -245,6 +255,16 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
 
   const dataDir = resolveDirectDataDir(env)
   const store = openDirectStore({ dataDir, env })
+  // Writes are enabled exactly when the deployment configured the bot login the
+  // GitHub App posts as. The session (built from the same env) already
+  // self-identifies as that bot, and the stamping + journaling decorator is
+  // injected so every mediated write carries the human's stamped name and lands
+  // one audit_log row. The router gates broker writes on the api's
+  // `brokerWritesEnabled` capability, which only that decorator confers:
+  // without the bot login no decorator is injected, the capability stays
+  // false, and all four write routes answer 501 — the default passthrough is
+  // structurally unreachable by a broker write.
+  const botLogin = resolveBotLogin(env)
   const brokerApi = createDirectApi({
     session: context.session,
     github: context.github,
@@ -252,6 +272,9 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
     store,
     runner: context.runner,
     cwd: context.cwd,
+    ...(botLogin !== null
+      ? { writeDecorator: createBrokerWriteDecorator(context.session, store) }
+      : {}),
   })
 
   const server = startServer({
@@ -279,7 +302,8 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
 
   console.log(
     `revud: serving ${distDir} on http://127.0.0.1:${server.port} ` +
-      `(mode=broker, reads-only, repo=${context.repo.owner}/${context.repo.repo}, ` +
+      `(mode=broker, writes=${botLogin === null ? 'disabled (no REVU_BOT_LOGIN)' : `enabled as ${botLogin}`}, ` +
+      `repo=${context.repo.owner}/${context.repo.repo}, ` +
       `human=${context.session.human.id}, data=${dataDir})`,
   )
 }

@@ -121,8 +121,9 @@ export function createFetchHandler(
  * router (the real session for `getSession`, a `not_implemented` placeholder for
  * the not-yet-built routes) and static files otherwise. The session is fixed for
  * the daemon's lifetime; no request can change it. There is no mock and no dev
- * panel here. `mode` is forwarded to the router so broker mode (reads-only) gates
- * the four write endpoints to `not_implemented` while direct mode serves them.
+ * panel here. `mode` is forwarded to the router so a broker session without a
+ * configured bot identity gates the four write endpoints to `not_implemented`,
+ * while direct mode (and a bot-identified broker) serves them.
  */
 export function createDirectFetchHandler(
   distDir: string,

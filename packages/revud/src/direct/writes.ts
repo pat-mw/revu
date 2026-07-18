@@ -287,7 +287,13 @@ export async function submitReview(
   )
   for (const candidate of candidates) {
     if (await reviewCommentsMatch(github, repo, input.prNumber, candidate.id, comments)) {
-      writeDecorator.recordWrite(candidate.id)
+      // The review DID land (on the lost first attempt), so it is recorded like
+      // a fresh success — the audit journal must cover every write that reached
+      // GitHub, including one whose response was lost.
+      writeDecorator.recordWrite(candidate.id, {
+        endpoint: 'submitReview',
+        pr: input.prNumber,
+      })
       store.deleteDraft(humanId, input.prNumber)
       return { status: 'ok', review: candidate }
     }
@@ -321,9 +327,28 @@ export async function submitReview(
     throw err
   }
 
+  // Broker misconfiguration tripwire. A broker session self-identifies as the
+  // CONFIGURED bot login, but GitHub attributes App writes to the App's ACTUAL
+  // `<slug>[bot]` login. If the two disagree (typo, wrong slug, missing
+  // `[bot]`), the idempotency re-check above can never match on a retry — a
+  // lost response then double-posts — and the approve gate compares against
+  // the wrong login, all silently. The first successful write carries the real
+  // author, so the mismatch is surfaced loudly here. Broker-only (`brokerLogin`
+  // is '' in direct mode, where the viewer authors their own writes) and
+  // side-effect-free beyond the warning; no token or body material is logged.
+  if (session.brokerLogin.length > 0 && viewerLogin.length > 0 && review.user.login !== viewerLogin) {
+    console.warn(
+      `revud: REVU_BOT_LOGIN mismatch — configured "${viewerLogin}" but GitHub ` +
+        `attributed this review to "${review.user.login}". Until it is fixed, a ` +
+        `retried submit will double-post (the idempotency re-check never matches) ` +
+        `and the self-approve guard compares the wrong login. Set REVU_BOT_LOGIN ` +
+        `to "${review.user.login}".`,
+    )
+  }
+
   // Confirmed success: record the write, then delete the draft. Deleting only
   // here is the whole invariant — nothing above this line touches the draft.
-  writeDecorator.recordWrite(review.id)
+  writeDecorator.recordWrite(review.id, { endpoint: 'submitReview', pr: input.prNumber })
   store.deleteDraft(humanId, input.prNumber)
   return { status: 'ok', review }
 }
@@ -335,6 +360,14 @@ export async function submitReview(
  * from the cached snapshot (the snapshot is the source of truth for a thread's
  * shape); a thread absent from the snapshot, or with no comments, is a typed
  * `not_found`. The new comment is normalized and returned; the write is recorded.
+ *
+ * There is deliberately NO idempotency re-check on replies. If recording the
+ * write fails AFTER the reply already posted, the request surfaces
+ * `persist_failed` and a client retry posts the reply again — an accepted
+ * duplicate-on-retry window. A visible duplicate comment is cheap and
+ * recoverable; the alternative (swallowing the journal failure) would leave a
+ * write on GitHub with no audit row — a silently unattributed write, the one
+ * outcome the journaling mode must never produce.
  */
 export async function replyToThread(
   deps: WriteDeps,
@@ -362,7 +395,7 @@ export async function replyToThread(
     decorated,
   )
   const comment = mapReviewComment(raw)
-  writeDecorator.recordWrite(comment.id)
+  writeDecorator.recordWrite(comment.id, { endpoint: 'replyToThread', pr: prNumber })
   return comment
 }
 
@@ -372,14 +405,34 @@ export async function replyToThread(
  * same node shape the read uses and normalized by the one thread normalizer, so
  * a resolve and a sync produce structurally identical threads. `resolvedBy` reads
  * as the authenticated user (the UI already renders that).
+ *
+ * The successful mutation is recorded through the `WriteDecorator` (a no-op in
+ * direct mode). A thread's only REST-numeric identity is its root comment's id —
+ * the same id a reply posts to — so that is what is recorded. When the mutated
+ * thread comes back with NO comments there is no real GitHub id to record, and
+ * the audit append is SKIPPED rather than fabricating a sentinel: the journal's
+ * github id column is NOT NULL and 0 is never a real id, so a fabricated row
+ * would be indistinguishable from corruption to any later integrity check.
+ * Resolve rows are provenance-only — reconciliation of what actually exists on
+ * GitHub works from comments and reviews — so a skipped row loses no ground
+ * truth.
  */
 export async function resolveThread(
   deps: WriteDeps,
+  prNumber: number,
   threadId: string,
   resolved: boolean,
 ): Promise<ReviewThread> {
   const node = await deps.github.setThreadResolution(threadId, resolved)
-  return normalizeReviewThread(node)
+  const thread = normalizeReviewThread(node)
+  const rootCommentId = thread.comments[0]?.id
+  if (rootCommentId !== undefined) {
+    deps.writeDecorator.recordWrite(rootCommentId, {
+      endpoint: 'resolveThread',
+      pr: prNumber,
+    })
+  }
+  return thread
 }
 
 /**
@@ -399,6 +452,10 @@ export async function resolveThread(
  * the snapshot's conversation comments takes the issue endpoints; anything else
  * (thread comments, or a fresh reply the snapshot has not re-synced yet) takes
  * the pull-review-comment endpoints.
+ *
+ * A successful reaction is recorded through the `WriteDecorator` (a no-op in
+ * direct mode), keyed by the id of the comment reacted TO — the stable numeric
+ * identity of what was touched on GitHub.
  */
 export async function addReaction(
   deps: WriteDeps,
@@ -406,19 +463,22 @@ export async function addReaction(
   commentId: number,
   reaction: ReactionKey,
 ): Promise<ReactionRollup> {
-  const { github, repo, store } = deps
+  const { github, repo, store, writeDecorator } = deps
   const snap = store.getSnapshot(prNumber)
   const isIssueComment =
     snap?.mutable.issueComments.some((c) => c.id === commentId) === true
+  if (isIssueComment) {
+    await github.addIssueCommentReaction(repo.owner, repo.repo, commentId, reaction)
+  } else {
+    await github.addReaction(repo.owner, repo.repo, commentId, reaction)
+  }
+  // Recorded the moment the reaction POST is confirmed — BEFORE the rollup
+  // read-back — so a failed read-back cannot lose the journal entry for a
+  // reaction that already landed on GitHub.
+  writeDecorator.recordWrite(commentId, { endpoint: 'addReaction', pr: prNumber })
   const raw = isIssueComment
-    ? await (async () => {
-        await github.addIssueCommentReaction(repo.owner, repo.repo, commentId, reaction)
-        return github.getIssueComment(repo.owner, repo.repo, commentId)
-      })()
-    : await (async () => {
-        await github.addReaction(repo.owner, repo.repo, commentId, reaction)
-        return github.getReviewComment(repo.owner, repo.repo, commentId)
-      })()
+    ? await github.getIssueComment(repo.owner, repo.repo, commentId)
+    : await github.getReviewComment(repo.owner, repo.repo, commentId)
   const c = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
   return mapReactions(c.reactions)
 }

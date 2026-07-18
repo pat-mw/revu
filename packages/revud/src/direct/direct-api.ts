@@ -49,6 +49,18 @@ import {
  * client-supplied value.
  */
 export interface DirectApi {
+  /**
+   * Whether this api may serve BROKER-mode writes: true ONLY when it was
+   * assembled with the broker `WriteDecorator` (stamping + durable audit
+   * journal — the decorator itself declares the capability). The router gates
+   * the broker write routes on THIS flag, never on session shape, so a broker
+   * session that carries a bot identity but sits over a passthrough api stays
+   * reads-only (fail closed) — an unstamped, unjournaled write as the shared
+   * bot cannot be assembled. Direct and mock surfaces report false; their
+   * writes are gated by mode, not by this capability.
+   */
+  readonly brokerWritesEnabled: boolean
+
   /** Run the burst sync and persist; may resolve a `partial` snapshot. */
   syncPull(prNumber: number): Promise<Snapshot>
   /** The cached snapshot, or `null` when the PR was never synced (not an error). */
@@ -150,6 +162,11 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
   }
 
   return {
+    // The capability is read off the decorator actually injected, so it can be
+    // true only when the broker stamping+journaling decorator is present —
+    // never by default, and never from session or env shape.
+    brokerWritesEnabled: writeDecorator.brokerWritesEnabled === true,
+
     async syncPull(prNumber: number): Promise<Snapshot> {
       return runSyncPull(
         {
@@ -239,8 +256,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       threadId: string,
       resolved: boolean,
     ): Promise<ReviewThread> {
-      void prNumber
-      return runResolveThread(writeDeps, threadId, resolved)
+      return runResolveThread(writeDeps, prNumber, threadId, resolved)
     },
 
     addReaction(

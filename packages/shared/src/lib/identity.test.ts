@@ -534,6 +534,68 @@ describe('isOwnComment direct-mode branch (viewer login, no write log)', () => {
   })
 })
 
+describe('isOwnComment broker-shaped ctx (viewerLogin carries the BOT login)', () => {
+  // A write-enabled broker session sets viewerLogin to the BOT's login so the
+  // write self-guards (approve gate, submit idempotency) can self-identify.
+  // But every mediated comment — every human's — is authored by that same bot,
+  // so the login signal must skip bot-authored comments: matching them against
+  // viewerLogin would claim EVERY stamped comment as the session human's own,
+  // the exact cross-human misattribution this product exists to prevent.
+  // Broker snapshots carry no commentAuthors, so these ctxs have none.
+
+  it('does NOT claim another human’s stamped bot comment as own', () => {
+    const comment = reviewComment(BOT_LOGIN, prefixBody(human('Bob'), 'theirs'))
+    expect(
+      isOwnComment(comment, {
+        human: human('Alice'),
+        botLogin: BOT_LOGIN,
+        viewerLogin: BOT_LOGIN,
+      }),
+    ).toBe(false)
+  })
+
+  it('resolves the session human’s own stamped bot comment as own via the name path', () => {
+    const comment = reviewComment(BOT_LOGIN, prefixBody(human('Alice'), 'mine'))
+    expect(
+      isOwnComment(comment, {
+        human: human('Alice'),
+        botLogin: BOT_LOGIN,
+        viewerLogin: BOT_LOGIN,
+      }),
+    ).toBe(true)
+  })
+
+  it('a real org member’s comment is never own under the broker (their login is not the bot’s)', () => {
+    const comment = reviewComment('octocat', 'a genuine github.com review comment')
+    expect(
+      isOwnComment(comment, {
+        human: human('Alice'),
+        botLogin: BOT_LOGIN,
+        viewerLogin: BOT_LOGIN,
+      }),
+    ).toBe(false)
+  })
+
+  it('a direct-shaped ctx (botLogin empty) still matches purely by login, unchanged', () => {
+    // Direct mode: botLogin is '' and no real author login equals '', so the
+    // bot-author exclusion never fires and the login comparison is untouched.
+    expect(
+      isOwnComment(reviewComment('alice-gh', 'plain'), {
+        human: human('Alice'),
+        botLogin: '',
+        viewerLogin: 'alice-gh',
+      }),
+    ).toBe(true)
+    expect(
+      isOwnComment(reviewComment('someone-else', 'plain'), {
+        human: human('Alice'),
+        botLogin: '',
+        viewerLogin: 'alice-gh',
+      }),
+    ).toBe(false)
+  })
+})
+
 describe('isOwnComment survives a Coder username rename', () => {
   it('still resolves via the write log after the human display name changes', () => {
     // Ground truth: Alice authored this comment. The broker stamped her

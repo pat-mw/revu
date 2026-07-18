@@ -42,9 +42,12 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  * (404) — never a fabricated blob.
  *
  * The write path (`submitReview`, `replyToThread`, `resolveThread`,
- * `addReaction`) is served here in direct mode. In broker mode it is gated to
- * `not_implemented` (501) — broker is reads-only for now — before any write runs.
- * Contract semantics enforced on the direct-mode write path:
+ * `addReaction`) is served here in direct mode, and in broker mode ONLY when
+ * the api carries the broker write capability (`api.brokerWritesEnabled` —
+ * conferred solely by the stamping + journaling write decorator, which boot
+ * injects exactly when the bot self-identity is configured); a broker api
+ * without it is reads-only and gates all four to `not_implemented` (501)
+ * before any write runs. Contract semantics enforced on the served write path:
  *   - `submitReview` returns `head_moved`/`forbidden` as a 200-level VALUE, never
  *     an error status — it is an ordinary JSON body.
  *   - A submit that hits a 422 (a comment failed validation despite the guard)
@@ -90,18 +93,24 @@ const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
 ])
 
 /**
- * The four write endpoints, gated to `not_implemented` in BROKER mode only.
- * Broker mode is reads-only for now: correct broker writes need identity-dependent
- * behavior (the self-approval guard, submit idempotency-by-self, own-comment
- * detection) that reads a resolved viewer, and `viewerLogin` is absent under a
- * shared-bot installation token. Executing the write path without it would post
- * unstamped (violating the stamped-human-prefix rule) and could double-post a
- * review on a retry (the idempotency re-check can never match an empty viewer).
- * Those behaviors are enabled together with broker writes in the writes unit; here
- * the routes answer an honest 501 in broker mode, exactly as `listPulls` does.
- * Direct mode serves all four unchanged.
+ * The four write endpoints, gated to `not_implemented` in BROKER mode whenever
+ * the api lacks the broker write capability. Correct broker writes need two
+ * things at once: identity-dependent behavior (the self-approval guard, submit
+ * idempotency-by-self, own-comment detection) that reads a resolved bot login
+ * — a GitHub App installation token cannot resolve its own login from GitHub
+ * (`GET /user` answers 403), so it exists only when the deployment configures
+ * `REVU_BOT_LOGIN` — AND the stamping + journaling `WriteDecorator`, without
+ * which a mediated write would post unstamped as the bare shared bot and leave
+ * no audit row. The gate therefore keys on `api.brokerWritesEnabled`, the
+ * capability only the broker decorator confers (boot injects it exactly when
+ * the bot login is configured): the api structurally cannot be write-enabled
+ * without stamping + journaling, so a session-shape/assembly mismatch fails
+ * CLOSED to an honest 501, exactly as `listPulls` does. A capable broker
+ * serves all four through the same shared write path direct mode uses. Direct
+ * mode serves all four unchanged — its writes are gated by mode, not by this
+ * capability.
  */
-const BROKER_UNIMPLEMENTED_WRITE_ROUTES: readonly {
+const BROKER_GATED_WRITE_ROUTES: readonly {
   method: string
   path: string
 }[] = [
@@ -247,17 +256,22 @@ export async function handleDirectApi(
     return json(session)
   }
 
-  // Broker mode is reads-only: the four write endpoints answer `not_implemented`
-  // (501) before any write executes, the same honest placeholder `listPulls` uses.
-  // This is a mode-level gate at the router, not a change to the engine's write
-  // contract — direct mode falls through and serves all four unchanged.
-  if (mode === 'broker') {
-    for (const route of BROKER_UNIMPLEMENTED_WRITE_ROUTES) {
+  // A broker whose api lacks the broker write capability is reads-only: the
+  // four write endpoints answer `not_implemented` (501) before any write
+  // executes, the same honest placeholder `listPulls` uses. The capability is
+  // conferred only by the stamping + journaling decorator (injected at boot
+  // exactly when the bot identity is configured), so the gate opens only when
+  // every served write is stamped and journaled. Direct mode falls through
+  // unchanged.
+  if (mode === 'broker' && !api.brokerWritesEnabled) {
+    for (const route of BROKER_GATED_WRITE_ROUTES) {
       if (method === route.method && matchRoute(route.path, path)) {
         return json(
           {
             code: 'not_implemented',
-            message: `${method} ${path} is not available in broker mode (reads-only).`,
+            message:
+              `${method} ${path} is not available: this broker has no bot identity ` +
+              '(REVU_BOT_LOGIN) configured, so it is reads-only.',
           },
           501,
         )

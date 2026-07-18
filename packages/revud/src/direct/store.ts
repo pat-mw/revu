@@ -36,6 +36,12 @@ import { DEFAULT_PREFERENCES } from '@revu/shared'
  *     they must survive a version bump and a restart.
  *   - `viewed` — per-human, per-PR per-file viewed state.
  *   - `prefs` — per-human workspace preferences.
+ *   - `audit_log` — the APPEND-ONLY journal of writes that reached GitHub under
+ *     a shared identity: which human (by `human_id`, the lowercased git-config
+ *     email — the email never enters a GitHub body, only this local journal),
+ *     which endpoint, which PR, and the GitHub-assigned id. The store API can
+ *     only append and read it — no update, no delete — so it stays ground truth
+ *     for "who wrote this" even across a workspace-username rename.
  *   - `meta` — the single `store_version` row that drives migrate-in-place.
  *
  * Absent vs unreadable: a genuinely missing row reads back as `null` (never
@@ -47,7 +53,7 @@ import { DEFAULT_PREFERENCES } from '@revu/shared'
  */
 
 /** The on-disk schema version. Bump this and add a migration step when the shape changes. */
-export const STORE_VERSION = 1
+export const STORE_VERSION = 2
 
 /** A stored row could not be read back: the row EXISTS but its JSON is corrupt. */
 export class StoreUnreadableError extends Error {
@@ -131,6 +137,24 @@ interface StoredSnapshotEnvelope {
 }
 
 /**
+ * One journaled write: a GitHub mutation that succeeded under a shared identity,
+ * keyed to the human who performed it. `githubId` is the id GitHub assigned (or
+ * the numeric id of the mutated object), `humanId` the lowercased git-config
+ * email (kept local — it never enters a GitHub body), `endpoint` the write route
+ * that produced it, `pr` the pull request it landed on, and `createdAt` an
+ * ISO-8601 UTC timestamp. Rows are append-only: the journal is ground truth for
+ * "who wrote this", so nothing may rewrite or remove one.
+ */
+export interface AuditEntry {
+  githubId: number
+  humanId: string
+  workspace: string
+  endpoint: string
+  pr: number
+  createdAt: string
+}
+
+/**
  * The durable store surface direct mode reads and writes. Every getter returns
  * a fresh value (JSON round-trips, so nothing aliases internal state) and every
  * setter that touches disk throws `StoreWriteError` on failure rather than
@@ -168,6 +192,22 @@ export interface DirectStore {
   // ——— per-human preferences ———
   getPreferences(humanId: string): HumanPreferences
   setPreferences(humanId: string, patch: Partial<HumanPreferences>): HumanPreferences
+
+  // ——— the append-only write audit journal ———
+  /**
+   * Append one journaled write. Durable and append-only: the row reaches disk
+   * before the call returns or a `StoreWriteError` surfaces (never a silent
+   * success), and there is deliberately NO update or delete counterpart — an
+   * audit row, once written, is permanent.
+   */
+  appendAudit(entry: AuditEntry): void
+  /**
+   * Read journaled writes, oldest → newest (insertion order). `pr` narrows to
+   * one pull request; `sinceIso` keeps entries whose `createdAt` is at or after
+   * the given instant (ISO-8601 UTC strings compare correctly as text). Both
+   * filters combine; omitting the filter returns the whole journal.
+   */
+  listAudit(filter?: { pr?: number; sinceIso?: string }): AuditEntry[]
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -432,11 +472,74 @@ export function openDirectStore(
       return next
     },
 
+    appendAudit(entry: AuditEntry): void {
+      write('audit_log', () => {
+        // A plain INSERT is the ONLY statement that ever touches this table:
+        // no upsert, no UPDATE, no DELETE. The implicit rowid orders entries by
+        // insertion, and since nothing deletes, rowids stay strictly monotonic.
+        db.run(
+          'INSERT INTO audit_log (github_id, human_id, workspace, endpoint, pr, created_at) ' +
+            'VALUES (?, ?, ?, ?, ?, ?)',
+          [entry.githubId, entry.humanId, entry.workspace, entry.endpoint, entry.pr, entry.createdAt],
+        )
+      })
+    },
+
+    listAudit(filter: { pr?: number; sinceIso?: string } = {}): AuditEntry[] {
+      const clauses: string[] = []
+      const params: (string | number)[] = []
+      if (filter.pr !== undefined) {
+        clauses.push('pr = ?')
+        params.push(filter.pr)
+      }
+      if (filter.sinceIso !== undefined) {
+        // ISO-8601 UTC timestamps sort correctly as text, so a plain string
+        // comparison is an honest time filter. Inclusive: an entry stamped
+        // exactly at `sinceIso` is returned.
+        clauses.push('created_at >= ?')
+        params.push(filter.sinceIso)
+      }
+      const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : ''
+      const rows = db
+        .query(
+          'SELECT github_id, human_id, workspace, endpoint, pr, created_at ' +
+            `FROM audit_log${where} ORDER BY rowid ASC`,
+        )
+        .all(...params) as {
+        github_id: number
+        human_id: string
+        workspace: string
+        endpoint: string
+        pr: number
+        created_at: string
+      }[]
+      return rows.map((r) => ({
+        githubId: r.github_id,
+        humanId: r.human_id,
+        workspace: r.workspace,
+        endpoint: r.endpoint,
+        pr: r.pr,
+        createdAt: r.created_at,
+      }))
+    },
+
     close(): void {
       db.close()
     },
   }
 }
+
+/**
+ * The version-2 table: the append-only write audit journal. One statement,
+ * shared by the fresh-file shape and the guarded v1 → v2 in-place step, so the
+ * two paths cannot drift. No UNIQUE constraints beyond the implicit rowid — the
+ * same GitHub id may legitimately journal more than once (an idempotent retry
+ * that short-circuits to an already-created review still records it).
+ */
+const CREATE_AUDIT_LOG =
+  'CREATE TABLE IF NOT EXISTS audit_log (github_id INTEGER NOT NULL, ' +
+  'human_id TEXT NOT NULL, workspace TEXT NOT NULL, endpoint TEXT NOT NULL, ' +
+  'pr INTEGER NOT NULL, created_at TEXT NOT NULL)'
 
 /**
  * Create tables if absent and migrate an older store IN PLACE. Migration never
@@ -477,6 +580,11 @@ function migrate(db: Database): void {
   )
   db.run('CREATE TABLE IF NOT EXISTS prefs (human_id TEXT PRIMARY KEY, data TEXT NOT NULL)')
 
+  // Version 2 shape: the append-only audit journal. Created-when-absent like
+  // every table above, so a fresh file carries it immediately; the guarded
+  // ladder below runs the same statement for an existing version-1 file.
+  db.run(CREATE_AUDIT_LOG)
+
   const row = db.query("SELECT value FROM meta WHERE key = 'store_version'").get() as
     | { value: string }
     | null
@@ -498,9 +606,17 @@ function migrate(db: Database): void {
     return
   }
 
-  // Future additive migration steps go here, oldest → newest, each guarded by
-  // `if (current < N)` and each only creating tables or defaulting columns.
-  // (There are none yet; version 1 is the initial shape.)
+  // Additive migration steps, oldest → newest, each guarded by `if (current < N)`
+  // and each only creating tables or defaulting columns — never dropping,
+  // rewriting, or reseeding a row, so drafts and every other table survive
+  // untouched.
+
+  if (current < 2) {
+    // v1 → v2: add the append-only `audit_log` journal. Purely additive — the
+    // idempotent CREATE (already run above for the current shape) is the entire
+    // step; no existing row is read or rewritten.
+    db.run(CREATE_AUDIT_LOG)
+  }
 
   if (current < STORE_VERSION) {
     db.run("UPDATE meta SET value = ? WHERE key = 'store_version'", [String(STORE_VERSION)])
