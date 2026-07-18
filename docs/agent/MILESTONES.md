@@ -206,13 +206,10 @@ Per guide §4: head-guard then `POST /reviews` with 1:1 `PendingComment` mapping
 - `canApprove` false on App-authored PRs (submit APPROVE rejected upstream and surfaced honestly), true on org-member PRs.
 - The `FileCredentialTokenSource` tolerates ~40min credential rotation, the 60s cold-start gap, and the 401-erase of `~/.git-credentials` (re-read per request, surface a typed "awaiting credential" state, never serialize the token).
 
-**Depends:** M2 (reuses the sync engine + write path in-workspace; the collector wraps drafts/audit, not GitHub calls).
+*Org-dependent validation deferred to M6:* the three criteria that need a real GitHub org with member accounts — the **scratch-org conformance** run, the **org-member interleave**, and **`canApprove` true on org-member PRs** — move with M3.1 to Milestone M6 (a scratch org with member accounts is not stand-up-able off a personal repo). The in-gate portions are complete and gate-green on `main`: in-workspace read/write/reconcile on a file-credential `TokenSource`; stamping + local audit journal + the out-of-band detector; the binding-authorized host store; the collector merge core (injected pull source); the `coder.owner` binding; offboarding retain-audit/purge; audit export; loopback bind. The `canApprove`-false-on-App-PRs half was proven live in M3.4.
 
-### Issue M3.1 — Scratch App + org
-Create GitHub App with grant **byte-identical to the real one**: `contents:write` + `pull_requests:write` + `metadata:read` + `checks:read` (the owner adds `checks:read` to the real App — `CHECKPOINT_2.md` §E.3). **NO webhooks** (poll-only is correct). Install on scratch org mirroring M2.1 scenarios plus one PR opened by a real org-member account.
-- [sub] Per-RevuApi-method → App-permission matrix: verify `pull_requests:write` covers reviews, review-comment replies, resolve mutations, and reactions; confirm PR issue-comment reads (`/issues/{n}/comments`) fit the grant (or note the `issues` permission if not).
-- [sub] Document App creation/permissions as the client-facing runbook for the real installation.
-**Verify:** conformance fails early against any RevuApi call outside the exact grant; the matrix has no unverified rows.
+### Issue M3.1 — Scratch App + org — **DEFERRED to M6**
+Needs a real GitHub organization with ≥2 member accounts — for the org-member interleave, `canApprove`-true-on-org-PRs, and the scratch-org conformance run — which is not stand-up-able off a personal development repo. **Moved to Milestone M6** (on-prem deployment), where the real org + user accounts are created anyway; the App grant, the per-RevuApi-method→permission matrix, and the client-facing runbook ride along there. Linear keeps the stable `M3.1.x` IDs (UZO-575 + .1–.5) under M6. The in-gate M3 work was proven instead against injected conformance fakes + the real `pat-mw/revu-sandbox` repo/App (grant byte-identical, bot login `revu-sandbox-app[bot]`). See **Issue M3.1 (deferred)** under Milestone M6.
 
 ### Issue M3.2 — Token custody (inject-default `FileCredentialTokenSource`)
 `FileCredentialTokenSource` reading `x-access-token` from `~/.git-credentials` (parse `https://x-access-token:<tok>@github.com`), **re-read per request** (never cached for process lifetime). This is the **deployment default**; the proxy-fetch `TokenSource` is kept as an **optional** guide-§5 strategy, not the default. Custody claim is **"revu adds no new credential and never serializes tokens"** — NOT "the workspace never holds a token" (false in this deployment; the workspace holds a live GitHub write token regardless of revu).
@@ -319,6 +316,14 @@ The invariant proof: two contractors (two browser profiles / two workspaces), on
 
 ### Issue M6.5 — Client acceptance
 Walk the client's lead through: org-member review interleave on github.com, approve-on-github workflow for App-authored PRs (guide §2.1 gating), audit export (provenance + the out-of-band-write detector), and the exposure surface (revud loopback-bound, collector push-only, no workspace-callable listener). Sign-off closes the milestone.
+
+### Issue M3.1 (deferred from M3) — Scratch App + org for org-member validation
+Deferred here from M3 because it needs a real GitHub organization with ≥2 member accounts, which cannot be stood up off a personal development repo. Retains the stable `M3.1.x` IDs (Linear: UZO-575 + .1–.5). Its org-member interleave overlaps M6.5 (client acceptance) and its runbook overlaps M5.5 (operator runbook).
+- [sub] Scratch GitHub App with the grant **byte-identical to the real one** (`contents:write` + `pull_requests:write` + `metadata:read` + `checks:read`; **NO webhooks**, poll-only); the sandbox App `revu-sandbox-app[bot]` already carries this grant.
+- [sub] Scratch org + install the App; seed it mirroring the M2.1 scenarios (reuse `scripts/seed-scratch.ts`, idempotent).
+- [sub] One PR opened by a **real org-member account** (distinct from the App) — the org-member interleave / `canApprove` proof.
+- [sub] Per-RevuApi-method → App-permission matrix (verify `pull_requests:write` covers reviews, reply comments, resolve mutations, reactions; confirm issue-comment reads fit the grant) + the client-facing App-creation/permissions runbook.
+**Verify:** on the real org, org-member comments interleave with genuine identity; `canApprove` is true on org-member PRs and false on App-authored ones; conformance passes against the scratch org; the permission matrix has no unverified rows.
 
 ---
 
