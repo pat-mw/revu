@@ -1,11 +1,13 @@
 import type { GithubClient } from './github-client'
 
 /**
- * The write-surface methods of `GithubClient` as throwing stubs, for read-path
- * tests whose fake clients must satisfy the full interface without exercising a
- * write. A read test that spreads these gets an honest failure (never a silent
- * success) if it accidentally reaches the write path, and stays unchanged when a
- * new write method is added — the stub set is the one place they live.
+ * Every `GithubClient` method OUTSIDE the sync read surface — the write surface
+ * plus the host-side audit-reconcile read (`getPullReviewComments`) — as
+ * throwing stubs, for read-path tests whose fake clients must satisfy the full
+ * interface without exercising any of them. A read test that spreads these gets
+ * an honest failure (never a silent success) if it accidentally reaches one,
+ * and stays unchanged when a new such method is added — the stub set is the one
+ * place they live.
  *
  * This is test-support code (imported only by `*.test.ts`), kept out of the
  * production surface: nothing here runs in a live daemon.
@@ -18,11 +20,12 @@ export function unusedWriteMethods(): Pick<
   | 'addIssueCommentReaction'
   | 'getReviewComment'
   | 'getReviewComments'
+  | 'getPullReviewComments'
   | 'getIssueComment'
   | 'setThreadResolution'
 > {
   const notUsed = (name: string): never => {
-    throw new Error(`the read path must not call the write method ${name}`)
+    throw new Error(`the sync read path must not call ${name}`)
   }
   return {
     submitReview: () => notUsed('submitReview'),
@@ -31,6 +34,7 @@ export function unusedWriteMethods(): Pick<
     addIssueCommentReaction: () => notUsed('addIssueCommentReaction'),
     getReviewComment: () => notUsed('getReviewComment'),
     getReviewComments: () => notUsed('getReviewComments'),
+    getPullReviewComments: () => notUsed('getPullReviewComments'),
     getIssueComment: () => notUsed('getIssueComment'),
     setThreadResolution: () => notUsed('setThreadResolution'),
   }

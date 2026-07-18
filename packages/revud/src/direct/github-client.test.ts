@@ -390,6 +390,39 @@ describe('createGithubClient write surface', () => {
     )
   })
 
+  test('getPullReviewComments pages the flat all-review-comments endpoint', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, [{ id: 1, path: 'a.ts' }], captured),
+      baseUrl: 'https://api.github.test',
+    })
+    const page = await client.getPullReviewComments('o', 'r', 5, { page: 1, perPage: 100 })
+    expect(page.items).toHaveLength(1)
+    // The PR-wide list, NOT the per-review one: no review id in the path.
+    expect(captured[0].url).toBe(
+      'https://api.github.test/repos/o/r/pulls/5/comments?per_page=100&page=1',
+    )
+  })
+
+  test('getPullReviewComments reports hasNext from the Link header', async () => {
+    const fetchWithLink: FetchLike = async () =>
+      new Response(JSON.stringify([{ id: 1 }]), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          link: '<https://api.github.test/repos/o/r/pulls/5/comments?page=2>; rel="next"',
+        },
+      })
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fetchWithLink,
+      baseUrl: 'https://api.github.test',
+    })
+    const page = await client.getPullReviewComments('o', 'r', 5, { page: 1, perPage: 100 })
+    expect(page.hasNext).toBe(true)
+  })
+
   test('addIssueCommentReaction POSTs to the ISSUE comment reactions endpoint', async () => {
     const captured: Captured[] = []
     const client = createGithubClient({

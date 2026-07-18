@@ -420,6 +420,22 @@ export interface GithubClient extends GithubViewerClient {
   ): Promise<Page<unknown>>
 
   /**
+   * `GET /repos/{o}/{r}/pulls/{n}/comments` — one page of EVERY review comment
+   * on the pull request, across all reviews and threads, as one flat paginated
+   * list. This is the host-side audit-reconcile read: `getReviewComments`
+   * above can only enumerate the comments of a review whose id is already
+   * known, but a comment posted directly against the PR (bypassing revu)
+   * belongs to no known review — only the flat list is guaranteed to surface
+   * it. A read, not a write; it never runs inside a workspace request path.
+   */
+  getPullReviewComments(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    params: PageParams,
+  ): Promise<Page<unknown>>
+
+  /**
    * `POST /repos/{o}/{r}/issues/comments/{commentId}/reactions` — add a reaction
    * to an ISSUE (conversation-tab) comment. Issue comments live in a different
    * id namespace than PR review comments and take a different reactions
@@ -942,6 +958,15 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
         `/repos/${enc(owner)}/${enc(repo)}/pulls/${prNumber}/reviews/${reviewId}/comments`,
         params,
       )
+    },
+
+    async getPullReviewComments(
+      owner: string,
+      repo: string,
+      prNumber: number,
+      params: PageParams,
+    ): Promise<Page<unknown>> {
+      return getPage(`/repos/${enc(owner)}/${enc(repo)}/pulls/${prNumber}/comments`, params)
     },
 
     async addIssueCommentReaction(
