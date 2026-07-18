@@ -2,6 +2,7 @@ import type {
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  PullListResponse,
   ReactionKey,
   ReactionRollup,
   ReconcileReport,
@@ -60,6 +61,20 @@ export interface DirectApi {
    * writes are gated by mode, not by this capability.
    */
   readonly brokerWritesEnabled: boolean
+
+  /**
+   * The conditional open-pulls list, served LIVE from the broker's ~30s poll
+   * cache (never a per-request GitHub call). `ifNoneMatch` is the client's
+   * `If-None-Match`; when it matches the cache's broker-level ETag the result is
+   * `notModified: true` with empty items (the caller replays its last-known
+   * list per the frozen 304 rule), else the full list. Present only when a poll
+   * loop is wired (broker mode): direct and mock surfaces have no poll loop, so
+   * their implementation throws a typed `not_implemented`, and the router keeps
+   * gating the route to 501 there. Throws `broker_unreachable` when the poll has
+   * no live list yet — a retriable "live data unavailable", never a fabricated
+   * empty list.
+   */
+  listPulls(ifNoneMatch: string | null): PullListResponse
 
   /** Run the burst sync and persist; may resolve a `partial` snapshot. */
   syncPull(prNumber: number): Promise<Snapshot>
@@ -142,6 +157,23 @@ export interface DirectApiDeps {
    * and keeps no audit log; a broker daemon injects the stamping decorator here.
    */
   writeDecorator?: WriteDecorator
+
+  /**
+   * The broker's live pulls-list source, served from the ~30s poll cache. Wired
+   * in broker mode; ABSENT in direct and mock, where `listPulls` has no live
+   * cache and answers `not_implemented`. The api only reads from it — the loop's
+   * lifecycle (start/stop) is owned by broker boot, not by the api.
+   */
+  pullList?: PullListSource
+}
+
+/**
+ * The narrow source `DirectApi.listPulls` reads: the broker poll loop's served
+ * view. Kept as a one-method interface so the api depends only on the read, not
+ * on the loop's timer/lifecycle.
+ */
+export interface PullListSource {
+  listPulls(ifNoneMatch: string | null): PullListResponse
 }
 
 /** Build the direct-mode API surface over an injected client + durable store. */
@@ -166,6 +198,23 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     // true only when the broker stamping+journaling decorator is present —
     // never by default, and never from session or env shape.
     brokerWritesEnabled: writeDecorator.brokerWritesEnabled === true,
+
+    listPulls(ifNoneMatch: string | null): PullListResponse {
+      if (deps.pullList === undefined) {
+        // No poll loop wired: the live list is a broker-only capability. In
+        // direct mode the router never routes GET /api/pulls here at all — it
+        // falls through to the router's own `not_implemented` (501) placeholder —
+        // so this throw is reached ONLY when a broker was assembled without a
+        // pull loop (a misconfiguration). It is a typed `not_found` (404): the
+        // resource is not being served by this instance, not a promise to serve
+        // it later.
+        throw new ApiError(
+          'not_found',
+          'A live pull list is served only in broker mode.',
+        )
+      }
+      return deps.pullList.listPulls(ifNoneMatch)
+    },
 
     async syncPull(prNumber: number): Promise<Snapshot> {
       return runSyncPull(

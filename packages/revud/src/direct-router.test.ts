@@ -43,6 +43,12 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     // These router tests run in direct mode, where writes are gated by mode,
     // not by the broker write capability — so the fake honestly reports false.
     brokerWritesEnabled: false,
+    listPulls() {
+      // Direct mode has no poll loop; the live list is broker-only. The router
+      // never dispatches here in direct mode (it falls through to the 501
+      // placeholder), so this is defensive.
+      throw new ApiError('not_found', 'A live pull list is served only in broker mode.')
+    },
     async syncPull(prNumber: number): Promise<Snapshot> {
       const snap = { prNumber } as Snapshot
       snapshots.set(prNumber, snap)

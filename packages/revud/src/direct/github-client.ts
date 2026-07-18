@@ -1,3 +1,5 @@
+import type { GhUser, PullSummary, RateLimitInfo } from '@revu/shared'
+import { mapUser } from './mappers'
 import type { TokenSource } from './token-source'
 
 /**
@@ -100,6 +102,73 @@ export interface GhPullDetailRaw {
 /** Raw `GET /repos/{o}/{r}/compare/{base}...{head}` — only the merge base is read. */
 export interface GhCompareRaw {
   merge_base_commit: { sha: string }
+}
+
+/**
+ * The result of one conditional open-pulls list read. `items` are the REST list
+ * rows mapped onto the contract's `PullSummary`; `etag` is the ENTITY tag GitHub
+ * returned (or the one echoed back on a 304), which the poll loop stores between
+ * rounds so the next request can be conditional. `notModified` is true when
+ * GitHub answered `304 Not Modified` — a free read against the shared rate
+ * bucket — in which case `items` is EMPTY (the caller keeps its last-known list)
+ * and the poll loop must not refresh anything. `rateLimit` is read from the
+ * response's `x-ratelimit-*` headers so the served list can report live remaining
+ * budget; on a 304 GitHub still returns those headers.
+ */
+export interface PullListPage {
+  items: PullSummary[]
+  etag: string
+  notModified: boolean
+  rateLimit: RateLimitInfo | null
+}
+
+/**
+ * Cheap per-pull facts fetched in ONE batched GraphQL query for the pulls that
+ * changed since the last poll — never the whole list. `unresolvedThreads` is the
+ * count of a PR's review threads that are not resolved (a `reviewThreads`
+ * connection filtered client-side to `isResolved === false`); `commitCount` is
+ * the PR's total commit count (`commits.totalCount`). These feed the served
+ * list's `BrokerPullMeta` without a full sync.
+ */
+export interface PullFacts {
+  unresolvedThreads: number
+  commitCount: number
+}
+
+/**
+ * The narrow client the broker poll loop depends on: a conditional open-pulls
+ * list plus the batched per-pull facts. Kept SEPARATE from `GithubClient` so the
+ * many read/write test fakes that implement `GithubClient` need not grow these
+ * methods, and so the poll loop's dependency surface is exactly the two calls it
+ * makes. `createGithubClient` returns a value that satisfies BOTH interfaces.
+ */
+export interface PullListClient {
+  /**
+   * `GET /repos/{o}/{r}/pulls?state=open&per_page=100` with an optional
+   * `If-None-Match`. Returns the mapped list rows, the response ETag, whether
+   * GitHub answered `304`, and the parsed rate-limit headers. A 304 costs
+   * nothing against the shared bucket, which is what makes idle polling cheap.
+   * Throws `GithubRequestError` on any non-2xx that is not a 304.
+   *
+   * ONE page only: `per_page=100` and NO `Link`-header pagination follow-up, so
+   * an inbox with more than 100 concurrently-open pulls is capped at the first
+   * 100 rows. Accepted for the poll-cache inbox (a review queue that large is out
+   * of scope); a paginated sweep would multiply the per-tick cost this cache
+   * exists to keep flat.
+   */
+  listOpenPulls(owner: string, repo: string, etag: string | null): Promise<PullListPage>
+
+  /**
+   * One batched GraphQL query returning `{ unresolvedThreads, commitCount }` per
+   * requested PR number, for the CHANGED pulls only. The result maps each input
+   * number to its facts; a number GitHub could not resolve is omitted. Throws
+   * `GithubGraphqlError` on a non-2xx or a top-level `errors` array.
+   */
+  getPullFacts(
+    owner: string,
+    repo: string,
+    prNumbers: number[],
+  ): Promise<Record<number, PullFacts>>
 }
 
 /** Raw item from `GET /repos/{o}/{r}/git/trees/{sha}?recursive=1`. */
@@ -642,10 +711,165 @@ function buildBlobObjectsQuery(count: number): string {
 }`
 }
 
+/**
+ * Build a GraphQL query that reads cheap facts for MANY pulls in one request by
+ * aliasing a `pullRequest(number:)` field per PR number. Each pull reads its
+ * `commits.totalCount` and, filtered client-side, the count of unresolved review
+ * threads (GraphQL has no server-side `isResolved` filter on the connection, so
+ * the first page of `reviewThreads` carries `isResolved` and the caller counts
+ * the unresolved ones). The alias is a fixed `p<index>` prefix — never the number
+ * itself spliced into the query — and numbers travel as `$n<index>` variables,
+ * so nothing caller-derived is interpolated into the query string. The
+ * `reviewThreads(first:100)` page covers the overwhelmingly common case; a PR
+ * with more than 100 threads under-counts, which is acceptable for an inbox
+ * badge (a full sync computes the exact set).
+ */
+function buildPullFactsQuery(count: number): string {
+  const varDecls: string[] = ['$owner:String!', '$repo:String!']
+  const fields: string[] = []
+  for (let i = 0; i < count; i++) {
+    varDecls.push(`$n${i}:Int!`)
+    fields.push(
+      `p${i}: pullRequest(number:$n${i}) {\n` +
+        `      commits { totalCount }\n` +
+        `      reviewThreads(first:100) { nodes { isResolved } }\n` +
+        `    }`,
+    )
+  }
+  return `query(${varDecls.join(',')}) {
+  repository(owner:$owner, name:$repo) {
+    ${fields.join('\n    ')}
+  }
+}`
+}
+
+/** Raw shape of one aliased pull node in the batched facts query. */
+interface GhPullFactsNode {
+  commits: { totalCount: number } | null
+  reviewThreads: { nodes: { isResolved: boolean }[] } | null
+}
+
+/**
+ * Parse GitHub's `x-ratelimit-*` response headers into `RateLimitInfo`. Returns
+ * null when the headers are absent (a test double may omit them), so the caller
+ * falls back to its last-known value rather than fabricating a bucket. `reset` is
+ * a unix-epoch SECONDS integer on the wire; it is rendered to the ISO string the
+ * contract carries.
+ */
+function rateLimitFromHeaders(headers: Headers): RateLimitInfo | null {
+  const limit = Number(headers.get('x-ratelimit-limit'))
+  const remaining = Number(headers.get('x-ratelimit-remaining'))
+  const used = Number(headers.get('x-ratelimit-used'))
+  const resetEpoch = Number(headers.get('x-ratelimit-reset'))
+  if (
+    !Number.isFinite(limit) ||
+    !Number.isFinite(remaining) ||
+    !Number.isFinite(resetEpoch)
+  ) {
+    return null
+  }
+  return {
+    limit,
+    remaining,
+    used: Number.isFinite(used) ? used : limit - remaining,
+    reset: new Date(resetEpoch * 1000).toISOString(),
+  }
+}
+
+/**
+ * Map one raw row from `GET /repos/{o}/{r}/pulls` onto the contract's
+ * `PullSummary` — EXACTLY the list-shaped fields, never the detail-only counts a
+ * list read does not carry. Missing/mistyped fields default to their zero value
+ * so a malformed row never throws mid-poll; the served list stays well-typed. The
+ * field set matches the mock oracle's `toSummary`, so the broker's list items are
+ * shape-identical to mock's.
+ */
+function mapPullSummaryRow(raw: unknown): PullSummary {
+  const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const str = (k: string): string => (typeof p[k] === 'string' ? (p[k] as string) : '')
+  const num = (k: string): number => (typeof p[k] === 'number' ? (p[k] as number) : 0)
+  const blankUser: GhUser = {
+    login: '',
+    id: 0,
+    node_id: '',
+    avatar_url: '',
+    html_url: '',
+    type: 'User',
+  }
+  const requestedReviewers = Array.isArray(p.requested_reviewers)
+    ? (p.requested_reviewers as unknown[])
+        .map(mapUser)
+        .filter((u): u is GhUser => u !== null)
+    : []
+  const labels = (rawLabels: unknown): PullSummary['labels'] =>
+    Array.isArray(rawLabels)
+      ? (rawLabels as unknown[])
+          .map((l) => {
+            const lo = (l && typeof l === 'object' ? l : {}) as Record<string, unknown>
+            if (typeof lo.name !== 'string') return null
+            return {
+              id: typeof lo.id === 'number' ? lo.id : 0,
+              name: lo.name,
+              color: typeof lo.color === 'string' ? lo.color : '',
+              description: typeof lo.description === 'string' ? lo.description : null,
+            }
+          })
+          .filter((l): l is NonNullable<typeof l> => l !== null)
+      : []
+  const ref = (side: 'head' | 'base'): PullSummary['head'] => {
+    const s = (p[side] && typeof p[side] === 'object' ? p[side] : {}) as Record<string, unknown>
+    const repo = (s.repo && typeof s.repo === 'object' ? s.repo : {}) as Record<string, unknown>
+    return {
+      ref: typeof s.ref === 'string' ? s.ref : '',
+      sha: typeof s.sha === 'string' ? s.sha : '',
+      label: typeof s.label === 'string' ? s.label : '',
+      repo: {
+        full_name: typeof repo.full_name === 'string' ? repo.full_name : '',
+        default_branch:
+          typeof repo.default_branch === 'string' ? repo.default_branch : '',
+      },
+    }
+  }
+  return {
+    id: num('id'),
+    node_id: str('node_id'),
+    number: num('number'),
+    state: p.state === 'closed' ? 'closed' : 'open',
+    draft: p.draft === true,
+    merged_at: typeof p.merged_at === 'string' ? p.merged_at : null,
+    title: str('title'),
+    body: typeof p.body === 'string' ? p.body : null,
+    user: mapUser(p.user) ?? blankUser,
+    labels: labels(p.labels),
+    requested_reviewers: requestedReviewers,
+    head: ref('head'),
+    base: ref('base'),
+    created_at: str('created_at'),
+    updated_at: str('updated_at'),
+  }
+}
+
 /** Parse a `Link` header for a `rel="next"` relation (GitHub pagination). */
 function hasNextLink(link: string | null): boolean {
   if (!link) return false
   return /;\s*rel="next"/.test(link)
+}
+
+/**
+ * A content-derived ETag for a mapped list, used ONLY when a 200 response
+ * carries no `etag` header. djb2 over `JSON.stringify(items)`, the same weak-ETag
+ * scheme the in-browser mock uses, so the derived tag tracks content: two
+ * DIFFERENT item sets can never share one tag (which would 304 a client onto
+ * stale content), and two IDENTICAL item sets always share one tag (so a
+ * conditional client can still 304 across an unchanged, ETag-less list).
+ */
+function contentEtagForItems(items: PullSummary[]): string {
+  let hash = 5381
+  const input = JSON.stringify(items)
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash + input.charCodeAt(i)) >>> 0
+  }
+  return `W/"${hash.toString(16)}"`
 }
 
 /**
@@ -654,7 +878,7 @@ function hasNextLink(link: string | null): boolean {
  * JSON `Accept`, and a `User-Agent` (GitHub rejects requests without one). The
  * token is read fresh per call and confined to the header.
  */
-export function createGithubClient(opts: GithubClientOptions): GithubClient {
+export function createGithubClient(opts: GithubClientOptions): GithubClient & PullListClient {
   const fetchImpl = opts.fetchImpl ?? fetch
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
   const graphqlUrl = opts.graphqlUrl ?? DEFAULT_GRAPHQL_URL
@@ -681,6 +905,36 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
 
   async function getJson(path: string): Promise<unknown> {
     return (await getRaw(path)).body
+  }
+
+  /**
+   * Issue one authenticated conditional GET. When `etag` is present it is sent as
+   * `If-None-Match`; a `304 Not Modified` is a SUCCESS here (never an error),
+   * returned with `notModified: true` and no body. Any other non-2xx throws
+   * `GithubRequestError` exactly as `getRaw` does. The token stays in the header.
+   */
+  async function getConditional(
+    path: string,
+    etag: string | null,
+  ): Promise<{ body: unknown; res: Response; notModified: boolean }> {
+    const token = await opts.tokenSource.getToken()
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': API_VERSION,
+      'user-agent': USER_AGENT,
+    }
+    if (etag !== null && etag.length > 0) headers['if-none-match'] = etag
+    const res = await fetchImpl(`${baseUrl}${path}`, { method: 'GET', headers })
+    if (res.status === 304) {
+      await res.body?.cancel().catch(() => {})
+      return { body: null, res, notModified: true }
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new GithubRequestError(res.status, path, text.slice(0, 200))
+    }
+    return { body: (await res.json()) as unknown, res, notModified: false }
   }
 
   /**
@@ -761,6 +1015,69 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
         throw new GithubRequestError(200, '/user', 'response missing login/id')
       }
       return { login: body.login, id: body.id }
+    },
+
+    async listOpenPulls(
+      owner: string,
+      repo: string,
+      etag: string | null,
+    ): Promise<PullListPage> {
+      const path = `/repos/${enc(owner)}/${enc(repo)}/pulls?state=open&per_page=100`
+      const { body, res, notModified } = await getConditional(path, etag)
+      const githubEtag = res.headers.get('etag')
+      const rateLimit = rateLimitFromHeaders(res.headers)
+      if (notModified) {
+        // A 304 carries no body: the caller keeps its last-known items. A 304 is
+        // only ever returned when we sent an If-None-Match, so GitHub echoes that
+        // same ETag; fall back to the request tag if the header is somehow absent.
+        return { items: [], etag: githubEtag ?? etag ?? '', notModified: true, rateLimit }
+      }
+      const rows = Array.isArray(body) ? (body as unknown[]) : []
+      const items = rows.map(mapPullSummaryRow)
+      // A 200 with a GitHub ETag uses it (restart-stable: unchanged content yields
+      // the SAME entity tag across a process restart). But a 200 that LACKS an
+      // ETag must NOT reuse the prior/request tag — that would freeze one tag over
+      // rotating content and 304 conditional clients forever onto stale items.
+      // Derive a content-tracking tag from the mapped items instead, so the tag
+      // moves iff the content moves.
+      const responseEtag =
+        githubEtag !== null && githubEtag.length > 0
+          ? githubEtag
+          : contentEtagForItems(items)
+      return {
+        items,
+        etag: responseEtag,
+        notModified: false,
+        rateLimit,
+      }
+    },
+
+    async getPullFacts(
+      owner: string,
+      repo: string,
+      prNumbers: number[],
+    ): Promise<Record<number, PullFacts>> {
+      const out: Record<number, PullFacts> = {}
+      if (prNumbers.length === 0) return out
+      const query = buildPullFactsQuery(prNumbers.length)
+      const variables: Record<string, unknown> = { owner, repo }
+      for (let i = 0; i < prNumbers.length; i++) variables[`n${i}`] = prNumbers[i]
+      const data = await postGraphql<{
+        repository: Record<string, GhPullFactsNode | null> | null
+      }>(query, variables)
+      const repository = data.repository
+      for (let i = 0; i < prNumbers.length; i++) {
+        const node = repository ? repository[`p${i}`] : null
+        if (node === null || node === undefined) continue
+        const unresolvedThreads = (node.reviewThreads?.nodes ?? []).filter(
+          (t) => t.isResolved === false,
+        ).length
+        out[prNumbers[i]] = {
+          unresolvedThreads,
+          commitCount: node.commits?.totalCount ?? 0,
+        }
+      }
+      return out
     },
 
     async getPullDetail(owner: string, repo: string, prNumber: number): Promise<unknown> {

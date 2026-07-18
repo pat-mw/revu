@@ -60,6 +60,9 @@ function stubApi(): DirectApi {
     // No broker write decorator behind this stub, so it honestly lacks the
     // broker write capability; these serve tests exercise reads only.
     brokerWritesEnabled: false,
+    listPulls: () => {
+      throw new Error('not used')
+    },
     syncPull: async () => {
       throw new Error('not used')
     },

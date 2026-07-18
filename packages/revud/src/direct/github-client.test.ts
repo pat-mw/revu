@@ -461,3 +461,121 @@ describe('createGithubClient write surface', () => {
     expect((captured[0].init as RequestInit).body as string).not.toContain('super-secret')
   })
 })
+
+describe('createGithubClient.listOpenPulls (the conditional pulls-list read)', () => {
+  test('sends state=open&per_page=100 and maps rows to PullSummary + ETag + rate limit', async () => {
+    const captured: Captured[] = []
+    const row = {
+      id: 5,
+      node_id: 'PR_5',
+      number: 5,
+      state: 'open',
+      draft: false,
+      merged_at: null,
+      title: 'T',
+      body: null,
+      user: { login: 'a', id: 1, node_id: 'U_1', type: 'User' },
+      labels: [],
+      requested_reviewers: [],
+      head: { ref: 'f', sha: 'HEAD5', label: 'o:f', repo: { full_name: 'o/r', default_branch: 'main' } },
+      base: { ref: 'main', sha: 'BASE5', label: 'o:main', repo: { full_name: 'o/r', default_branch: 'main' } },
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-02T00:00:00.000Z',
+    }
+    const fetchImpl: FetchLike = async (url, init) => {
+      captured.push({ url, ...(init !== undefined ? { init } : {}) })
+      return new Response(JSON.stringify([row]), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          etag: 'W/"gh-etag-1"',
+          'x-ratelimit-limit': '5000',
+          'x-ratelimit-remaining': '4990',
+          'x-ratelimit-used': '10',
+          'x-ratelimit-reset': '1767225600',
+        },
+      })
+    }
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl,
+      baseUrl: 'https://api.github.test',
+    })
+    const page = await client.listOpenPulls('o', 'r', null)
+    expect(captured[0].url).toBe('https://api.github.test/repos/o/r/pulls?state=open&per_page=100')
+    expect(page.notModified).toBe(false)
+    expect(page.etag).toBe('W/"gh-etag-1"')
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].number).toBe(5)
+    expect(page.items[0].head.sha).toBe('HEAD5')
+    expect(page.rateLimit?.limit).toBe(5000)
+    expect(page.rateLimit?.remaining).toBe(4990)
+  })
+
+  test('a 304 is a success with no items and the ETag echoed, and sends If-None-Match', async () => {
+    const captured: Captured[] = []
+    const fetchImpl: FetchLike = async (url, init) => {
+      captured.push({ url, ...(init !== undefined ? { init } : {}) })
+      return new Response(null, { status: 304, headers: { etag: 'W/"gh-etag-1"' } })
+    }
+    const client = createGithubClient({ tokenSource: staticToken('t'), fetchImpl })
+    const page = await client.listOpenPulls('o', 'r', 'W/"gh-etag-1"')
+    const headers = captured[0].init?.headers as Record<string, string>
+    expect(headers['if-none-match']).toBe('W/"gh-etag-1"')
+    expect(page.notModified).toBe(true)
+    expect(page.items).toHaveLength(0)
+    expect(page.etag).toBe('W/"gh-etag-1"')
+  })
+
+  test('a non-304 error status still throws GithubRequestError', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(403, { message: 'forbidden' }, []),
+    })
+    await expect(client.listOpenPulls('o', 'r', null)).rejects.toBeInstanceOf(GithubRequestError)
+  })
+})
+
+describe('createGithubClient.getPullFacts (batched per-pull facts)', () => {
+  test('counts unresolved threads and reads commit totals for each aliased pull', async () => {
+    const captured: Captured[] = []
+    const data = {
+      data: {
+        repository: {
+          p0: {
+            commits: { totalCount: 4 },
+            reviewThreads: { nodes: [{ isResolved: false }, { isResolved: true }, { isResolved: false }] },
+          },
+          p1: { commits: { totalCount: 1 }, reviewThreads: { nodes: [] } },
+        },
+      },
+    }
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, data, captured),
+      graphqlUrl: 'https://api.github.test/graphql',
+    })
+    const facts = await client.getPullFacts('o', 'r', [101, 202])
+    // The numbers travel as variables, never spliced into the query string.
+    const body = JSON.parse((captured[0].init as RequestInit).body as string) as {
+      query: string
+      variables: Record<string, unknown>
+    }
+    expect(body.variables.n0).toBe(101)
+    expect(body.variables.n1).toBe(202)
+    expect(body.query).not.toContain('101')
+    expect(facts[101]).toEqual({ unresolvedThreads: 2, commitCount: 4 })
+    expect(facts[202]).toEqual({ unresolvedThreads: 0, commitCount: 1 })
+  })
+
+  test('an empty number list makes no request', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { data: { repository: {} } }, captured),
+    })
+    const facts = await client.getPullFacts('o', 'r', [])
+    expect(facts).toEqual({})
+    expect(captured).toHaveLength(0)
+  })
+})
