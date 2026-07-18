@@ -471,7 +471,7 @@ describe('RevuApi conformance — broker writes (bot identity configured)', () =
     store.close()
   })
 
-  test('a confirmed submit appends one audit row, and a landed-review retry journals again', async () => {
+  test('a confirmed submit appends the review row plus one row per inline comment, and a landed-review retry journals again', async () => {
     const session = await brokerSession({ REVU_BOT_LOGIN: BOT_LOGIN })
     const state = initialWriteState('org-member')
     const store = openDirectStore({ dataDir })
@@ -482,13 +482,27 @@ describe('RevuApi conformance — broker writes (bot identity configured)', () =
     const firstBody = (await first.json()) as { status: string; review: { id: number } }
     expect(firstBody.status).toBe('ok')
 
-    const rows = store.listAudit()
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toEqual({
+    // The submit journals the REVIEW id (review id-space)…
+    const reviewRows = store.listAudit().filter((r) => r.endpoint === 'submitReview')
+    expect(reviewRows).toHaveLength(1)
+    expect(reviewRows[0]).toEqual({
       githubId: firstBody.review.id,
       humanId: HUMAN_ID,
       workspace: session.workspace,
       endpoint: 'submitReview',
+      pr: WRITE_PR,
+      createdAt: NOW,
+    })
+    // …AND one row per created inline comment (comment id-space), so the author of
+    // each comment the review opened is recoverable for the snapshot's
+    // commentAuthors map. The fake remote assigns inline comment ids from 9000.
+    const commentRows = store.listAudit().filter((r) => r.endpoint === 'submitReviewComment')
+    expect(commentRows).toHaveLength(input.comments.length)
+    expect(commentRows[0]).toEqual({
+      githubId: 9000,
+      humanId: HUMAN_ID,
+      workspace: session.workspace,
+      endpoint: 'submitReviewComment',
       pr: WRITE_PR,
       createdAt: NOW,
     })
@@ -499,13 +513,14 @@ describe('RevuApi conformance — broker writes (bot identity configured)', () =
     const retry = await postReview(session, api, input)
     expect(((await retry.json()) as { status: string }).status).toBe('ok')
     expect(state.postCount).toBe(1)
-    const afterRetry = store.listAudit()
-    expect(afterRetry).toHaveLength(2)
-    expect(afterRetry[1].githubId).toBe(firstBody.review.id)
-    expect(afterRetry[1].humanId).toBe(HUMAN_ID)
+    const afterReview = store.listAudit().filter((r) => r.endpoint === 'submitReview')
+    expect(afterReview).toHaveLength(2)
+    expect(afterReview[1].githubId).toBe(firstBody.review.id)
+    expect(afterReview[1].humanId).toBe(HUMAN_ID)
 
-    // The journal filters compose with the rows just written.
-    expect(store.listAudit({ pr: WRITE_PR })).toHaveLength(2)
+    // The journal filters compose with the rows just written: two submits, each
+    // journaling one review row + one inline-comment row.
+    expect(store.listAudit({ pr: WRITE_PR })).toHaveLength(4)
     expect(store.listAudit({ pr: WRITE_PR + 1 })).toHaveLength(0)
 
     store.close()

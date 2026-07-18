@@ -152,7 +152,12 @@ export interface PullArtifacts {
 export interface JournaledIds {
   /** Review ids journaled by `submitReview` — review-space creations. */
   reviewIds: ReadonlySet<number>
-  /** Comment ids journaled by `replyToThread` — the sole comment-creating endpoint. */
+  /**
+   * Comment ids journaled by `replyToThread` — the only endpoint whose own id
+   * absolves a comment DIRECTLY. (`submitReviewComment` also creates comments,
+   * but each is absolved via its parent review's id, so those ids are
+   * deliberately touch-classified instead — see `splitJournaledIds`.)
+   */
   createdCommentIds: ReadonlySet<number>
   /**
    * Comment ids journaled by touch-only endpoints (`resolveThread`,
@@ -223,9 +228,13 @@ export type AuditJournalRow = Pick<AuditEntry, 'githubId' | 'endpoint'> &
 /**
  * Split raw journal rows by endpoint into id-space AND provenance.
  * `submitReview` is the only review-space (and review-creating) endpoint;
- * `replyToThread` is the only comment-CREATING endpoint. Every other endpoint
- * — `resolveThread`, `addReaction`, and any endpoint unknown to this rule —
- * journals the id of a comment revu merely touched, so it lands in
+ * `replyToThread` is the only comment endpoint whose id absolves a comment
+ * DIRECTLY. `submitReviewComment` (a review's inline-comment creations) is
+ * deliberately touch-classified, NOT creation-classified — each inline comment
+ * is already absolved via its parent review's id, so its own id is kept out of
+ * the absolving set to hold detection to a single absolution path. Every other
+ * endpoint — `resolveThread`, `addReaction`, and any endpoint unknown to this
+ * rule — journals the id of a comment revu merely touched, so it lands in
  * `touchedIds`, which never absolves anything: an unknown endpoint can only
  * widen the informational unmatched report. Journal-write instants are kept
  * per creating row, first row winning (the creation instant), for the edit
@@ -249,6 +258,13 @@ export function splitJournaledIds(entries: readonly AuditJournalRow[]): Journale
         createdCommentJournaledAt.set(entry.githubId, entry.createdAt)
       }
     } else {
+      // `resolveThread`, `addReaction`, `submitReviewComment`, and any unknown
+      // endpoint. `submitReviewComment` (a review's inline-comment creations) is
+      // deliberately here, NOT in `createdCommentIds`: each inline comment is
+      // already absolved via its parent review's id, so keeping its own id out of
+      // the absolving set holds detection to a single absolution path. Never move
+      // it to `createdCommentIds` — that would widen the absolution surface for no
+      // gain (and a laundering risk if the review-id linkage ever changed).
       touchedIds.add(entry.githubId)
     }
   }
