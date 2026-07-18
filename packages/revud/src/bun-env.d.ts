@@ -63,9 +63,19 @@ declare module 'bun' {
  * `get`/`all` return `unknown`.
  */
 declare module 'bun:sqlite' {
+  /**
+   * Mutation counts reported by a completed `run`: `changes` is the number of
+   * rows the statement inserted/updated/deleted (0 when an `INSERT OR IGNORE`
+   * hit a conflict), matching SQLite's `sqlite3_changes`.
+   */
+  export interface Changes {
+    readonly changes: number
+    readonly lastInsertRowid: number | bigint
+  }
+
   /** A prepared statement, run with positional parameters. */
   export interface Statement {
-    run(...params: (string | number | null)[]): void
+    run(...params: (string | number | null)[]): Changes
     get(...params: (string | number | null)[]): unknown
     all(...params: (string | number | null)[]): unknown[]
   }
@@ -73,7 +83,7 @@ declare module 'bun:sqlite' {
   /** A single SQLite database handle over one file (or `:memory:`). */
   export class Database {
     constructor(filename: string)
-    run(sql: string, params?: (string | number | null)[]): void
+    run(sql: string, params?: (string | number | null)[]): Changes
     query(sql: string): Statement
     prepare(sql: string): Statement
     /** Wrap `fn` in a transaction; the returned function commits on success, rolls back on throw. */
