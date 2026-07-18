@@ -1,10 +1,13 @@
 import type {
+  FileBlob,
   FileViewedState,
   HumanPreferences,
   ReviewDraft,
   Session,
   Snapshot,
 } from '@revu/shared'
+import { ApiError } from '@revu/shared'
+import type { CommandRunner } from './command-runner'
 import type { GithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
@@ -32,6 +35,15 @@ export interface DirectApi {
   /** The cached snapshot, or `null` when the PR was never synced (not an error). */
   getSnapshot(prNumber: number): Snapshot | null
 
+  /**
+   * A content-addressed blob from the store. Blob bytes are provisioned during
+   * `syncPull` (local git first, then the API), so a synced PR's blobs are all
+   * present. A SHA absent from the store throws a typed `not_found` `ApiError` —
+   * NEVER a fabricated blob — matching the mock oracle: the client must re-sync,
+   * not render invented bytes.
+   */
+  getBlob(sha: string): FileBlob
+
   getDraft(prNumber: number): ReviewDraft | null
   saveDraft(draft: ReviewDraft): ReviewDraft
   discardDraft(prNumber: number): void
@@ -53,6 +65,10 @@ export interface DirectApiDeps {
   github: GithubClient
   repo: RepoRef
   store: DirectStore
+  /** Runs `git cat-file` for the local-first blob provider. Omit to skip local git. */
+  runner?: CommandRunner
+  /** The git clone directory the blob provider reads from; defaults to the process cwd. */
+  cwd?: string
   /** Timestamp source; injectable for deterministic tests. */
   now?: () => string
 }
@@ -69,6 +85,8 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
           github: deps.github,
           repo: deps.repo,
           store: deps.store,
+          ...(deps.runner !== undefined ? { runner: deps.runner } : {}),
+          ...(deps.cwd !== undefined ? { cwd: deps.cwd } : {}),
           ...(deps.now !== undefined ? { now: deps.now } : {}),
         },
         prNumber,
@@ -77,6 +95,20 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
 
     getSnapshot(prNumber: number): Snapshot | null {
       return deps.store.getSnapshot(prNumber)
+    },
+
+    getBlob(sha: string): FileBlob {
+      const blob = deps.store.getBlob(sha)
+      if (blob === null) {
+        // Never fabricate a blob: a SHA absent from the store means the byte
+        // transfer never provisioned it, so the client must re-sync. This is the
+        // same typed `not_found` the mock answers with.
+        throw new ApiError(
+          'not_found',
+          `Blob ${sha} is not in the local snapshot store — re-sync this pull request to fetch it.`,
+        )
+      }
+      return blob
     },
 
     getDraft(prNumber: number): ReviewDraft | null {

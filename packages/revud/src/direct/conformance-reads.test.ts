@@ -13,7 +13,14 @@
  * `baseAdvanced`. A head-SHA match never short-circuits the mutable fetch.
  */
 import { describe, expect, test } from 'bun:test'
-import type { GhGraphqlPageInfo, GhReviewThreadNode, Page, PageParams } from './github-client'
+import type {
+  GhBlobRaw,
+  GhGraphqlBlobObject,
+  GhGraphqlPageInfo,
+  GhReviewThreadNode,
+  Page,
+  PageParams,
+} from './github-client'
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import { createDirectApi, type DirectApi } from './direct-api'
@@ -85,6 +92,22 @@ function movingBaseClient(state: { mergeBaseSha: string; unresolvedComments: num
     },
     async getTree(): Promise<GhTreeRaw> {
       return { tree: [{ path: 'a.ts', type: 'blob', sha: `base-${state.mergeBaseSha}` }], truncated: false }
+    },
+    async getBlob(_o, _r, sha): Promise<GhBlobRaw> {
+      const text = `content-of-${sha}\n`
+      return {
+        content: Buffer.from(text, 'utf8').toString('base64'),
+        encoding: 'base64',
+        size: Buffer.byteLength(text, 'utf8'),
+      }
+    },
+    async getBlobObjects(_o, _r, shas): Promise<Record<string, GhGraphqlBlobObject | null>> {
+      const out: Record<string, GhGraphqlBlobObject | null> = {}
+      for (const sha of shas) {
+        const text = `content-of-${sha}\n`
+        out[sha] = { isBinary: false, text, byteSize: text.length }
+      }
+      return out
     },
     async graphql<T>(): Promise<T> {
       throw new Error('graphql not used directly in this fake')

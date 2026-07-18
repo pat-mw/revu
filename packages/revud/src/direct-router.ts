@@ -1,6 +1,9 @@
 import type { Session } from '@revu/shared'
 import {
+  ApiError,
+  errorBodyFromApiError,
   ROUTES,
+  statusForApiError,
   ValidationError,
   validateReviewDraft,
   validateSetPreferencesBody,
@@ -26,6 +29,11 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  *   - Mutation bodies are shape-validated with the shared validators before any
  *     write, and a draft PUT must name the same PR in the path and the body — a
  *     malformed or mismatched body is a 400, never a silent write elsewhere.
+ *
+ * `GET /api/blobs/:sha` reads the content-addressed store: a synced PR's blobs
+ * were provisioned during sync (local git first, then the API), so a present SHA
+ * returns its `FileBlob` (HTTP 200) and an absent one is a typed `not_found`
+ * (404) — never a fabricated blob.
  *
  * Routes that belong to the not-yet-built GraphQL thread read and the write path
  * still answer a typed `not_implemented` (501). Unknown API paths 404; non-API
@@ -53,11 +61,11 @@ function errorJson(code: string, message: string, status: number): Response {
  * The routes the not-yet-built parts of the surface own. They stay `501` until
  * the GraphQL thread read (`listReviewThreads`) and the write path
  * (`submitReview`, `replyToThread`, `resolveThread`, `addReaction`,
- * `reconcileDraft`) land. `getBlob`/`getRateLimit` are also not yet answered.
+ * `reconcileDraft`) land. `getRateLimit` is also not yet answered. `getBlob` is
+ * served — it reads the content-addressed store.
  */
 const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
   ROUTES.listPulls.path,
-  ROUTES.getBlob.path,
   ROUTES.listReviewThreads.path,
   ROUTES.replyToThread.path,
   ROUTES.resolveThread.path,
@@ -133,6 +141,12 @@ function envelopeForError(err: unknown): Response {
   if (err instanceof StoreWriteError || err instanceof StoreUnreadableError) {
     return errorJson('persist_failed', err.message, 500)
   }
+  // A typed `ApiError` (e.g. `getBlob` for an absent SHA) already carries the
+  // contract code and message; serialize it to its own status, never a 500.
+  if (err instanceof ApiError) {
+    const body = errorBodyFromApiError(err)
+    return json(body, statusForApiError(err))
+  }
   // A request body that failed shape validation is a CLIENT error (400), using
   // the same bad-request envelope the mock-mode router answers with.
   if (err instanceof ValidationError) {
@@ -196,6 +210,18 @@ export async function handleDirectApi(
         const n = prNumberOf(params)
         if (n === null) return errorJson('not_found', `Bad pull number "${params.n}".`, 404)
         return json(api.getSnapshot(n))
+      }
+    }
+
+    // ——— getBlob: a content-addressed store read. Present → the FileBlob (200);
+    // absent → a typed not_found (404) via the thrown ApiError, never a
+    // fabricated blob. ———
+    if (method === ROUTES.getBlob.method) {
+      const params = matchRoute(ROUTES.getBlob.path, path)
+      if (params) {
+        const sha = params.sha
+        if (sha.length === 0) return errorJson('not_found', 'Bad blob sha.', 404)
+        return json(api.getBlob(sha))
       }
     }
 

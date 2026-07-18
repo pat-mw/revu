@@ -116,6 +116,36 @@ export interface GhTreeRaw {
 }
 
 /**
+ * Raw `GET /repos/{o}/{r}/git/blobs/{sha}` — one blob by its SHA. GitHub returns
+ * the bytes base64-encoded (`encoding: 'base64'`) with the encoded string in
+ * `content` and the decoded byte length in `size`. Only these fields are read;
+ * the caller decodes and applies the binary heuristic.
+ */
+export interface GhBlobRaw {
+  content: string
+  encoding: string
+  size: number
+}
+
+/**
+ * One entry of a GraphQL `object(oid:)` batch: a blob addressed by its git SHA.
+ * `text` is null when GitHub deems the object binary (it does not return text
+ * for binaries) or cannot render it, `isBinary` is null when GitHub could not
+ * determine the encoding, and `isTruncated` is true when the returned `text`
+ * was clipped rather than complete — a caller must never store truncated text
+ * as the whole blob. `byteSize` comes straight from the schema. A batch
+ * requests many of these under aliased `object()` fields in one query.
+ * `isTruncated` is optional so fakes that predate the field stay valid; an
+ * absent value reads as "not truncated".
+ */
+export interface GhGraphqlBlobObject {
+  isBinary: boolean | null
+  text: string | null
+  byteSize: number | null
+  isTruncated?: boolean | null
+}
+
+/**
  * Raw GraphQL nodes for a PR's review threads. These mirror the GraphQL schema's
  * `PullRequestReviewThread` / `PullRequestReviewComment` shapes (only the fields
  * the normalizer reads are named); the normalizer maps them onto the contract's
@@ -233,6 +263,28 @@ export interface GithubClient extends GithubViewerClient {
 
   /** `GET /repos/{o}/{r}/git/trees/{sha}?recursive=1` — the full recursive tree of a commit. */
   getTree(owner: string, repo: string, sha: string): Promise<GhTreeRaw>
+
+  /**
+   * `GET /repos/{o}/{r}/git/blobs/{sha}` — one blob by its SHA, base64-encoded.
+   * The single-blob REST fallback used when local git lacks a SHA and the batch
+   * path is not worth a whole GraphQL round trip. Throws `GithubRequestError` on
+   * a non-2xx exactly as the other REST reads.
+   */
+  getBlob(owner: string, repo: string, sha: string): Promise<GhBlobRaw>
+
+  /**
+   * Batch-fetch many blobs by SHA in ONE GraphQL query via aliased `object(oid:)`
+   * fields (`... on Blob { isBinary text byteSize isTruncated }`). The result maps each input
+   * SHA to its blob object, or to `null` when GitHub could not resolve that oid.
+   * This is the cold-cache fallback: ~30 blobs per request keeps a large cold
+   * sync's API cost low when the local clone is missing the objects. Throws
+   * `GithubGraphqlError` on a non-2xx or a top-level `errors` array.
+   */
+  getBlobObjects(
+    owner: string,
+    repo: string,
+    shas: string[],
+  ): Promise<Record<string, GhGraphqlBlobObject | null>>
 
   /**
    * `POST /graphql` — run one GraphQL query with variables, returning the parsed
@@ -356,6 +408,33 @@ const THREAD_COMMENTS_QUERY = `query($threadId:ID!,$after:String) {
     }
   }
 }`
+
+/**
+ * Build a GraphQL query that fetches many blobs in one request by aliasing a
+ * `object(oid:)` field per SHA. Each object is narrowed with `... on Blob` to
+ * read `isBinary`, `text` (null for binaries), `byteSize`, and `isTruncated`
+ * (whether GitHub clipped the returned text). The alias is a
+ * fixed `b<index>` prefix — never the SHA itself — so a SHA is never
+ * interpolated into the query as a field name (GraphQL aliases must match
+ * `/^[_A-Za-z][_0-9A-Za-z]*$/`, which a hex SHA satisfies but a defensive prefix
+ * guarantees regardless of the oid's shape). SHAs travel as `$o<index>`
+ * variables, never spliced into the query string.
+ */
+function buildBlobObjectsQuery(count: number): string {
+  const varDecls: string[] = []
+  const fields: string[] = []
+  for (let i = 0; i < count; i++) {
+    varDecls.push(`$o${i}:GitObjectID!`)
+    fields.push(
+      `b${i}: object(oid:$o${i}) { ... on Blob { isBinary text byteSize isTruncated } }`,
+    )
+  }
+  return `query($owner:String!,$repo:String!,${varDecls.join(',')}) {
+  repository(owner:$owner, name:$repo) {
+    ${fields.join('\n    ')}
+  }
+}`
+}
 
 /** Parse a `Link` header for a `rel="next"` relation (GitHub pagination). */
 function hasNextLink(link: string | null): boolean {
@@ -520,6 +599,40 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient {
       )) as { tree?: unknown; truncated?: unknown }
       const tree = Array.isArray(body.tree) ? (body.tree as GhTreeEntry[]) : []
       return { tree, truncated: body.truncated === true }
+    },
+
+    async getBlob(owner: string, repo: string, sha: string): Promise<GhBlobRaw> {
+      const body = (await getJson(
+        `/repos/${enc(owner)}/${enc(repo)}/git/blobs/${enc(sha)}`,
+      )) as { content?: unknown; encoding?: unknown; size?: unknown }
+      return {
+        content: typeof body.content === 'string' ? body.content : '',
+        encoding: typeof body.encoding === 'string' ? body.encoding : '',
+        size: typeof body.size === 'number' ? body.size : 0,
+      }
+    },
+
+    async getBlobObjects(
+      owner: string,
+      repo: string,
+      shas: string[],
+    ): Promise<Record<string, GhGraphqlBlobObject | null>> {
+      const result: Record<string, GhGraphqlBlobObject | null> = {}
+      if (shas.length === 0) return result
+      const query = buildBlobObjectsQuery(shas.length)
+      const variables: Record<string, unknown> = { owner, repo }
+      for (let i = 0; i < shas.length; i++) variables[`o${i}`] = shas[i]
+      const data = await postGraphql<{
+        repository: Record<string, GhGraphqlBlobObject | null> | null
+      }>(query, variables)
+      const repository = data.repository
+      for (let i = 0; i < shas.length; i++) {
+        // A blank/absent alias (the oid did not resolve to a Blob) maps to null,
+        // so the caller can fall back rather than mint an empty blob.
+        const obj = repository ? repository[`b${i}`] : null
+        result[shas[i]] = obj ?? null
+      }
+      return result
     },
 
     graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {

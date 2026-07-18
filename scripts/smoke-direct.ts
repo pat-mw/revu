@@ -19,18 +19,24 @@
  *   - that the store persists across a simulated revud restart (reopen the same
  *     data dir and the snapshot + a saved draft are still there).
  *
- * Blob CONTENT bytes are a later concern (local-git `cat-file`), so the reported
- * counts are REST-only; the exit budget of ≤12 for the large PR includes local
- * blob reads that cost zero REST, so a REST-only count under it is expected.
+ * Blob CONTENT bytes are now provisioned by the local-first provider: a cold
+ * sync run against a fresh clone (with `git fetch origin` so both the merge base
+ * and head are local) reads every blob via `git cat-file` at ZERO API cost, so
+ * `blobsFetched` is ~0 and the ≤12-request budget holds with room to spare. The
+ * live blob section below (Section B) proves the free lunch, the binary flagging
+ * of `assets/logo.png`, and that a network-blackholed sync still succeeds when
+ * local git has both SHAs.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDirectTokenSource } from '../packages/revud/src/direct/token-source'
 import { createBunCommandRunner } from '../packages/revud/src/direct/command-runner'
+import type { GithubClient } from '../packages/revud/src/direct/github-client'
 import { createGithubClient } from '../packages/revud/src/direct/github-client'
 import { openDirectStore } from '../packages/revud/src/direct/store'
 import { syncPull } from '../packages/revud/src/direct/sync'
+import type { CommandRunner } from '../packages/revud/src/direct/command-runner'
 import type { RepoRef } from '../packages/revud/src/direct/repo'
 
 const REPO: RepoRef = { owner: 'pat-mw', repo: 'revu-sandbox' }
@@ -180,8 +186,97 @@ async function main(): Promise<void> {
     rmSync(dataDir, { recursive: true, force: true })
   }
 
+  // ——————————————————————————————————————————————————————————————
+  // Section B — the local-first blob provider against a REAL clone.
+  // ——————————————————————————————————————————————————————————————
+  await blobSection(github, runner)
+
   console.log(`\n${failures === 0 ? 'ALL LIVE CHECKS PASSED' : `${failures} LIVE CHECK(S) FAILED`}`)
   process.exit(failures === 0 ? 0 : 1)
+}
+
+/**
+ * Prove the free lunch end to end: clone `pat-mw/revu-sandbox`, `git fetch
+ * origin` so both the merge base and head SHAs are local, then run a cold sync of
+ * the large PR (#2) with the local-first blob provider pointed at the clone. It
+ * reports the total API request count (≤12 with local-git blobs), that
+ * `blobsFetched` is ~0 (the clone had the objects), that the binary asset is
+ * flagged `binary` with a `size`, and that with the network blackholed the sync
+ * still succeeds because local git has both SHAs.
+ */
+async function blobSection(github: GithubClient, runner: CommandRunner): Promise<void> {
+  console.log('\n=== Section B: local-first blob provider (real clone) ===')
+  const cloneParent = mkdtempSync(join(tmpdir(), 'revu-clone-'))
+  const cwd = join(cloneParent, 'revu-sandbox')
+  const dataDir = mkdtempSync(join(tmpdir(), 'revu-blob-'))
+  try {
+    // Clone and fetch so both merge_base and head are present locally.
+    const cloneUrl = `https://github.com/${REPO.owner}/${REPO.repo}.git`
+    const cloned = await runner.run(['git', 'clone', '--quiet', cloneUrl, cwd])
+    if (!cloned.ok) {
+      check('clone the sandbox for local-git blobs', false, cloned.stderr.trim())
+      return
+    }
+    await runner.run(['git', 'fetch', '--quiet', 'origin'], { cwd })
+
+    // Cold sync of PR #2 with the local-first provider pointed at the clone.
+    const store = openDirectStore({ dataDir })
+    const p2 = await syncPull({ github, repo: REPO, store, runner, cwd }, 2)
+    const requests = p2.syncStats?.requests ?? -1
+    const fetched = p2.syncStats?.blobsFetched ?? -1
+    const reused = p2.syncStats?.blobsReused ?? -1
+    console.log(
+      `\nPR #2 COLD with local-git blobs: requests=${requests}, ` +
+        `blobsFetched=${fetched}, blobsReused=${reused}, partial=${p2.partial ? 'yes' : 'no'}`,
+    )
+    check('PR #2 cold sync with local git stays within the ≤12 request budget', requests <= 12, requests)
+    check('PR #2 blobsFetched is ~0 (blobs came from the local clone, not the API)', fetched === 0, fetched)
+    check('PR #2 cold sync is complete (no missing-blob partial)', p2.partial === null, p2.partial)
+
+    // The binary asset (assets/logo.png) is flagged binary with a real size.
+    const binPath = 'assets/logo.png'
+    const binSha = p2.immutable.blobIndex[binPath]?.head ?? p2.immutable.blobIndex[binPath]?.base
+    const binBlob = binSha ? store.getBlob(binSha) : null
+    console.log(
+      `  ${binPath}: sha=${binSha?.slice(0, 8) ?? 'absent'} ` +
+        `binary=${binBlob?.binary} size=${binBlob?.size} contentLen=${binBlob?.content.length}`,
+    )
+    check(`${binPath} is present in the blob index`, binSha !== undefined && binSha !== null, binSha)
+    check(`${binPath} is flagged binary with a size and collapsed content`,
+      binBlob?.binary === true && (binBlob?.size ?? 0) > 0 && binBlob?.content === '',
+      { binary: binBlob?.binary, size: binBlob?.size, contentLen: binBlob?.content.length },
+    )
+    store.close()
+
+    // Offline: the network is blackholed (getBlobObjects/getBlob throw), but a
+    // fresh cold sync into a NEW store still completes because local git supplies
+    // every blob. Only the blob API is blackholed; the sync REST reads still run
+    // (blobs are the offline-capable path this proves).
+    const offlineStore = openDirectStore({ dataDir: mkdtempSync(join(tmpdir(), 'revu-offline-')) })
+    const blackholed: GithubClient = {
+      ...github,
+      async getBlobObjects() {
+        throw new Error('network blackholed (blob API)')
+      },
+      async getBlob() {
+        throw new Error('network blackholed (blob API)')
+      },
+    }
+    const offline = await syncPull({ github: blackholed, repo: REPO, store: offlineStore, runner, cwd }, 2)
+    console.log(
+      `\nPR #2 with blob API blackholed: blobsFetched=${offline.syncStats?.blobsFetched}, ` +
+        `partial=${offline.partial ? 'yes' : 'no'}`,
+    )
+    check(
+      'PR #2 sync succeeds with the blob API blackholed (local git had both SHAs)',
+      offline.partial === null && (offline.syncStats?.blobsFetched ?? -1) === 0,
+      { partial: offline.partial, blobsFetched: offline.syncStats?.blobsFetched },
+    )
+    offlineStore.close()
+  } finally {
+    rmSync(cloneParent, { recursive: true, force: true })
+    rmSync(dataDir, { recursive: true, force: true })
+  }
 }
 
 main().catch((err: unknown) => {

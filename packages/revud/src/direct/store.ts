@@ -287,6 +287,16 @@ export function openDirectStore(
     },
 
     putSnapshot(snapshot: Snapshot): void {
+      // The snapshot's `partial` may be a MERGE of two kinds: the immutable
+      // half's own incompleteness (file cap, truncated merge-base tree — a
+      // function of the compare, so it rides with the immutable row) and a
+      // snapshot-scoped one (missing blob bytes a retry can fix — NOT a function
+      // of the compare). The envelope carries the merged `partial` verbatim (it
+      // is what the client sees); the immutable row must carry ONLY the immutable-
+      // scoped part, or a warm compareKey reuse would resurrect a stale blob-
+      // missing reason after those blobs were provisioned. The immutable row's
+      // own partial was written by `putImmutable` on the cold path, so preserve
+      // whatever it already holds rather than clobbering it with the merged one.
       const envelope: StoredSnapshotEnvelope = {
         prNumber: snapshot.prNumber,
         syncedAt: snapshot.syncedAt,
@@ -295,15 +305,20 @@ export function openDirectStore(
         compareKey: snapshot.immutable.compareKey,
         mutable: snapshot.mutable,
       }
-      // `snapshot.partial` only ever describes the immutable half's own
-      // incompleteness (file cap, truncated merge-base tree), so it rides with
-      // the immutable row and survives a warm compareKey reuse. If a snapshot-
-      // scoped partial (e.g. missing blob bytes a retry can fix) is ever added,
-      // split it out of this row rather than pinning it to the compare.
+      const existingImm = db
+        .query('SELECT data FROM immutables WHERE compare_key = ?')
+        .get(snapshot.immutable.compareKey) as { data: string } | null
+      const immutablePartial: Snapshot['partial'] = existingImm
+        ? (parseRow<StoredImmutable>(
+            'immutables',
+            snapshot.immutable.compareKey,
+            existingImm.data,
+          ).partial ?? null)
+        : null
       const storedImm: StoredImmutable = {
         compareKey: snapshot.immutable.compareKey,
         immutable: snapshot.immutable,
-        partial: snapshot.partial,
+        partial: immutablePartial,
       }
       write('snapshots', () => {
         // The immutable half and the envelope are written in ONE transaction so a

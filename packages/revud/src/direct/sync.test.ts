@@ -17,8 +17,16 @@
  *     and no `commentAuthors`.
  */
 import { describe, expect, test } from 'bun:test'
-import type { GhGraphqlPageInfo, GhReviewThreadNode, Page, PageParams } from './github-client'
+import type {
+  GhBlobRaw,
+  GhGraphqlBlobObject,
+  GhGraphqlPageInfo,
+  GhReviewThreadNode,
+  Page,
+  PageParams,
+} from './github-client'
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
+import type { CommandRunner } from './command-runner'
 import type { RepoRef } from './repo'
 import { openDirectStore, type DirectStore } from './store'
 import { MAX_FILES, syncPull } from './sync'
@@ -36,6 +44,8 @@ interface Calls {
   reviews: number
   checkRuns: number
   reviewThreads: number
+  blobObjects: number
+  blob: number
 }
 
 interface FakeConfig {
@@ -53,6 +63,8 @@ interface FakeConfig {
   checkRuns?: unknown[]
   /** GraphQL review-thread nodes returned as a single page (no next page). */
   reviewThreads?: GhReviewThreadNode[]
+  /** SHAs the API cannot resolve — the batch returns null for them (drives the missing-blob partial). */
+  unresolvableBlobs?: string[]
 }
 
 /** Build a fake GithubClient plus the call counter it increments. */
@@ -67,6 +79,8 @@ function fakeClient(cfg: FakeConfig): { client: GithubClient; calls: Calls } {
     reviews: 0,
     checkRuns: 0,
     reviewThreads: 0,
+    blobObjects: 0,
+    blob: 0,
   }
   const page = <T>(all: T[][], params: PageParams): Page<T> => {
     const idx = params.page - 1
@@ -117,6 +131,34 @@ function fakeClient(cfg: FakeConfig): { client: GithubClient; calls: Calls } {
     async getTree(): Promise<GhTreeRaw> {
       calls.tree += 1
       return { tree: cfg.treeEntries, truncated: cfg.treeTruncated === true }
+    },
+    async getBlob(_o, _r, sha): Promise<GhBlobRaw> {
+      calls.blob += 1
+      // An unresolvable SHA 404s on the REST fallback too (drives missing-blob).
+      if (cfg.unresolvableBlobs?.includes(sha)) {
+        throw new Error(`no rest blob for ${sha}`)
+      }
+      const text = `content-of-${sha}\n`
+      return {
+        content: Buffer.from(text, 'utf8').toString('base64'),
+        encoding: 'base64',
+        size: Buffer.byteLength(text, 'utf8'),
+      }
+    },
+    async getBlobObjects(_o, _r, shas): Promise<Record<string, GhGraphqlBlobObject | null>> {
+      calls.blobObjects += 1
+      const out: Record<string, GhGraphqlBlobObject | null> = {}
+      for (const sha of shas) {
+        // Every SHA resolves to a small text blob unless the config marks it
+        // unresolvable (null), which drives the missing-blob partial path.
+        if (cfg.unresolvableBlobs?.includes(sha)) {
+          out[sha] = null
+          continue
+        }
+        const text = `content-of-${sha}\n`
+        out[sha] = { isBinary: false, text, byteSize: text.length }
+      }
+      return out
     },
     async graphql<T>(): Promise<T> {
       throw new Error('graphql not used directly in this fake')
@@ -430,9 +472,11 @@ describe('syncStats and persistence', () => {
     const { client } = fakeClient(baseConfig())
     const snap = await syncPull({ github: client, repo: REPO, store: store() }, 204)
     // detail(1) + compare(1) + files(1) + tree(1) + commits(1) + issueComments(1)
-    // + reviews(1) + checkRuns(1) + reviewThreads(1) = 9 for this single-page cold
-    // sync — the review-thread GraphQL call is mutable-half cost, counted honestly.
-    expect(snap.syncStats!.requests).toBe(9)
+    // + reviews(1) + checkRuns(1) + reviewThreads(1) = 9 REST/GraphQL sync calls,
+    // + 1 blob batch (no local-git runner injected, so the 4 unique blob SHAs
+    // resolve through ONE GraphQL object() batch) = 10 for this single-page cold
+    // sync. The review-thread and blob-batch GraphQL calls are counted honestly.
+    expect(snap.syncStats!.requests).toBe(10)
   })
 
   test('the synced snapshot is persisted and reads back', async () => {
@@ -442,5 +486,179 @@ describe('syncStats and persistence', () => {
     const read = st.getSnapshot(204)
     expect(read).not.toBeNull()
     expect(read!.immutable.compareKey).toBe('MB1...HEAD1')
+  })
+})
+
+/**
+ * A fake `git cat-file` runner: `objects` maps SHA → its bytes; an absent SHA
+ * reports "not found" (exit 1) so the provider falls through to the API tier.
+ */
+function gitRunner(objects: Record<string, Uint8Array>): CommandRunner {
+  return {
+    async run(args: string[]) {
+      const [, sub, flagOrType, sha] = args
+      if (sub !== 'cat-file') return { ok: false, code: -1, stdout: '', stderr: 'x' }
+      const bytes = sha !== undefined ? objects[sha] : undefined
+      if (flagOrType === '-e') {
+        const present = bytes !== undefined
+        return { ok: present, code: present ? 0 : 1, stdout: '', stderr: '' }
+      }
+      if (flagOrType === '-s') {
+        if (bytes === undefined) return { ok: false, code: 1, stdout: '', stderr: '' }
+        return { ok: true, code: 0, stdout: `${bytes.length}\n`, stderr: '' }
+      }
+      if (flagOrType === 'blob') {
+        if (bytes === undefined) return { ok: false, code: 1, stdout: '', stderr: '' }
+        return { ok: true, code: 0, stdout: new TextDecoder().decode(bytes), stderr: '' }
+      }
+      return { ok: false, code: -1, stdout: '', stderr: 'x' }
+    },
+  }
+}
+
+describe('blob provisioning is wired into syncPull (the free lunch)', () => {
+  test('local git supplies every blob → blobsFetched 0, no blob API call', async () => {
+    const cfg = baseConfig()
+    // The blob index for this config references baseA/blobA/baseB/blobB.
+    const runner = gitRunner({
+      baseA: new TextEncoder().encode('base a\n'),
+      blobA: new TextEncoder().encode('head a\n'),
+      baseB: new TextEncoder().encode('base b\n'),
+      blobB: new TextEncoder().encode('head b\n'),
+    })
+    const { client, calls } = fakeClient(cfg)
+    const snap = await syncPull(
+      { github: client, repo: REPO, store: store(), runner, cwd: '/repo' },
+      204,
+    )
+    // Every blob came from local git: zero fetches, and the blob batch never ran.
+    expect(snap.syncStats!.blobsFetched).toBe(0)
+    expect(snap.syncStats!.blobsReused).toBe(0)
+    expect(calls.blobObjects).toBe(0)
+    // requests == the 9 sync REST/GraphQL calls only (no blob API cost).
+    expect(snap.syncStats!.requests).toBe(9)
+  })
+
+  test('a store hit is reused (blobsReused), a cold sync fetches only the rest', async () => {
+    const st = store()
+    // Pre-seed one head blob so the second sync reuses it from the store.
+    st.putBlobs([{ sha: 'blobA', path: 'a.ts', content: 'head a\n', size: 7, binary: false }])
+    const runner = gitRunner({}) // git has nothing → the rest go to the API
+    const { client } = fakeClient(baseConfig())
+    const snap = await syncPull(
+      { github: client, repo: REPO, store: st, runner, cwd: '/repo' },
+      204,
+    )
+    // blobA reused from the store; baseA/baseB/blobB fetched via the API batch.
+    expect(snap.syncStats!.blobsReused).toBe(1)
+    expect(snap.syncStats!.blobsFetched).toBe(3)
+  })
+
+  test('a binary blob from local git is flagged and collapsed in the store', async () => {
+    const cfg = baseConfig()
+    cfg.filePages = [[{ sha: 'IMG', filename: 'logo.png', status: 'added', additions: 0, deletions: 0, changes: 0 }]]
+    cfg.treeEntries = []
+    const runner = gitRunner({ IMG: new Uint8Array([0x89, 0x50, 0x00, 0x01]) })
+    const { client } = fakeClient(cfg)
+    const st = store()
+    await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    const blob = st.getBlob('IMG')
+    expect(blob?.binary).toBe(true)
+    expect(blob?.content).toBe('')
+    expect(blob?.size).toBe(4)
+  })
+
+  test('a blob no tier can produce marks the snapshot partial, never fabricates it', async () => {
+    const cfg = baseConfig()
+    cfg.unresolvableBlobs = ['baseA', 'blobA', 'baseB', 'blobB']
+    const runner = gitRunner({}) // git has nothing, and the API resolves none
+    const { client } = fakeClient(cfg)
+    const st = store()
+    const snap = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    expect(snap.partial).not.toBeNull()
+    expect(snap.partial!.reason).toContain('blob')
+    expect(snap.partial!.missingBlobShas.length).toBeGreaterThan(0)
+    // Nothing fabricated — the missing SHAs are absent from the store.
+    expect(st.getBlob('baseA')).toBeNull()
+  })
+
+  test('a blob API that THROWS on cold SHAs resolves an honest partial, never a thrown sync', async () => {
+    const cfg = baseConfig()
+    const runner = gitRunner({}) // git has nothing → all four SHAs are cold
+    const { client } = fakeClient(cfg)
+    // Both blob tiers of the API are down; the sync data itself already fetched.
+    client.getBlobObjects = async () => {
+      throw new Error('graphql endpoint down')
+    }
+    client.getBlob = async () => {
+      throw new Error('rest endpoint down')
+    }
+    const st = store()
+    const snap = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    expect(snap.partial).not.toBeNull()
+    expect(snap.partial!.missingBlobShas.sort()).toEqual(['baseA', 'baseB', 'blobA', 'blobB'])
+    // The snapshot itself was still persisted (a retry can fix the blobs).
+    expect(st.getSnapshot(204)).not.toBeNull()
+  })
+
+  test('a stale blob-missing partial does NOT resurrect on a warm re-sync once the blobs provision', async () => {
+    const st = store()
+    const cfg = baseConfig()
+    cfg.unresolvableBlobs = ['baseA', 'blobA', 'baseB', 'blobB']
+    const runner = gitRunner({}) // git never has them; only the API tier matters
+    const { client } = fakeClient(cfg)
+    const cold = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    expect(cold.partial).not.toBeNull()
+    expect(cold.partial!.missingBlobShas.length).toBe(4)
+    // The API recovers (same compare, so the immutable half warm-reuses) and the
+    // blobs now provision. The snapshot-scoped blob-missing reason must clear —
+    // it was never a property of the compare, so it must not ride the immutable
+    // row back into the fresh snapshot.
+    cfg.unresolvableBlobs = []
+    const warm = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    expect(warm.partial).toBeNull()
+    expect(warm.syncStats!.blobsFetched).toBe(4)
+    // The persisted snapshot agrees — nothing stale survives on disk either.
+    expect(st.getSnapshot(204)!.partial).toBeNull()
+  })
+
+  test('an immutable-scoped partial (truncated tree) DOES survive warm reuse while a blob reason clears', async () => {
+    const st = store()
+    const cfg = baseConfig()
+    cfg.treeTruncated = true
+    cfg.unresolvableBlobs = ['baseA', 'blobA', 'baseB', 'blobB']
+    const runner = gitRunner({})
+    const { client } = fakeClient(cfg)
+    const cold = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    // Cold: both incompletenesses are named.
+    expect(cold.partial!.reason).toContain('merge-base tree')
+    expect(cold.partial!.reason).toContain('could not be provisioned')
+    cfg.unresolvableBlobs = []
+    const warm = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    // Warm: the truncated tree is STILL a property of this compare — it stays.
+    // The blob-missing reason was retry-scoped and the retry succeeded — it goes.
+    expect(warm.partial).not.toBeNull()
+    expect(warm.partial!.reason).toContain('merge-base tree')
+    expect(warm.partial!.reason).not.toContain('could not be provisioned')
+  })
+
+  test('offline: with the blob API blackholed, local git alone still completes the sync', async () => {
+    const cfg = baseConfig()
+    const runner = gitRunner({
+      baseA: new TextEncoder().encode('a\n'),
+      blobA: new TextEncoder().encode('a2\n'),
+      baseB: new TextEncoder().encode('b\n'),
+      blobB: new TextEncoder().encode('b2\n'),
+    })
+    const { client } = fakeClient(cfg)
+    // Blackhole the blob API — if the provider touches it, the sync throws.
+    client.getBlobObjects = async () => {
+      throw new Error('network blackholed')
+    }
+    const st = store()
+    const snap = await syncPull({ github: client, repo: REPO, store: st, runner, cwd: '/repo' }, 204)
+    expect(snap.partial).toBeNull()
+    expect(snap.syncStats!.blobsFetched).toBe(0)
+    expect(st.getBlob('blobA')?.content).toBe('a2\n')
   })
 })
