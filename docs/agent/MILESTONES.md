@@ -319,3 +319,77 @@ The invariant proof: two contractors (two browser profiles / two workspaces), on
 
 ### Issue M6.5 — Client acceptance
 Walk the client's lead through: org-member review interleave on github.com, approve-on-github workflow for App-authored PRs (guide §2.1 gating), audit export (provenance + the out-of-band-write detector), and the exposure surface (revud loopback-bound, collector push-only, no workspace-callable listener). Sign-off closes the milestone.
+
+---
+
+## Milestone M7 — Open-source readiness: docs, README + repo cleanup
+
+**Goal:** ready the repo for open-source release once the core product is proven end-to-end. A user-facing documentation pass plus repository hygiene: refresh the README to a modern standard (oil-oil/beautify-github-readme), ship a runnable/deployable Fumadocs docs site, verify every doc against the real implementation, and strip the repo of internal build-tracking and admin-harness artifacts so what remains is coherent for outside contributors and users. Post-implementation — it runs *after* the product works, not alongside it. Distinct from M5.5, which ships the internal/technical direct-mode README + operator runbook + CONTRIBUTING note; M7 is the broader user-facing, public-readiness pass that consumes and polishes that material.
+
+**Exit criteria:**
+- Root `README.md` refreshed to the beautify-github-readme standard (hero → proof → what → why → how → use → detail; badges; real screenshots; accurate to shipped behavior, not the prototype "mockup" framing).
+- A runnable, deployable Fumadocs 16 docs app (run with bun) exists as its own workspace package, isolated from `bun run check` and the CI gate; `docs:dev`/`docs:build` work; the site deploys.
+- User-facing docs cover overview, quickstart, the three run modes, core flows, direct-mode setup, self-hosting revud, architecture, and reference — with imagery to the README's standard.
+- Every documented claim, command, flag, endpoint, and keyboard shortcut verified against the implementation; no doc describes behavior the code doesn't have.
+- Internal build-tracking docs retired (`docs/agent/MILESTONES.md`, `CHECKPOINT_1.md`, `branch-protection.md`); `INTEGRATION_GUIDE.md`/`AGENTS.md`/`DESIGN.md` reworked into public architecture/CONTRIBUTING/design docs; no `/Users/...` home paths remain in tracked files.
+- `.claude/` admin harness removed from the public tree, its durable generally-useful content (product invariants, GitHub/API gotchas) extracted and scrubbed into public docs; session artifacts gitignored.
+- Open-source hygiene in place: LICENSE, CONTRIBUTING, CODE_OF_CONDUCT, SECURITY.md, `.env.example`, CODEOWNERS, issue/PR templates, README badges; a final secrets/personal-info sweep clean.
+
+**Depends:** M5 (implementation proven + hardened — "safe to hand to people who didn't build it"). Independent of M6 (on-prem client deployment). The docs-accuracy and cleanup issues run last: agents rely on the tracking docs and the `.claude/` harness during the build, so M7.5–M7.7 must not begin until the build is finished.
+
+*Scope note:* this milestone is an addition beyond the original integration plan; it is seeded on Linear as milestone M7 (issues UZO-814–UZO-821). M7.6 ultimately retires this document, so treat the M-IDs in code and commit messages as the durable cross-session anchor after the doc is gone.
+
+### Issue M7.1 — Media & screenshot pipeline (shared visual assets)
+The shared visual asset set that both the README (M7.2) and the docs site (M7.4) consume, to the beautify imagery standard. Capture is reproducible because mock mode (`?mock=1`) drives the whole app on deterministic fixtures with a fixed scenario/PR map; `scripts/shots.ts` is the starting point.
+- [sub] Hero/banner SVG (1200-unit viewBox, self-contained background for GitHub light+dark, `<title>`/`<desc>`, system fonts, no `<script>`/`foreignObject`/remote fonts).
+- [sub] Screenshots of the core surfaces on their best scenario PRs (inbox #101/#347, files workbench #204, review-bar draft rail, reconcile #389, conversation/threads #312, checks #362, author queue #347, command palette, dev panel, unified-vs-split, rate-limit chip).
+- [sub] GIFs (opt-in; ~30fps, 4–6s, clean loop) of the comment `c` flow, suggestion-block splice, the full reconcile flow, and identity-switch draft isolation.
+- [sub] Architecture diagram (SVG) of the `RevuApi`/revud/mode-strategy layering; store under one convention (`assets/readme/` or `docs/assets/`), lowercase-hyphenated.
+**Verify:** the asset set is referenced by both README and docs; SVGs pass the beautify checks; screenshots match the shipped UI; GIFs loop within budget; `scripts/shots.ts` (or its successor) regenerates the deterministic screenshots from mock mode.
+
+### Issue M7.2 — Refresh root README.md to the beautify-github-readme standard
+Rewrite `README.md` (143 lines, prototype-framed) to the oil-oil/beautify-github-readme content sequence and visual system. Its "this is a mockup, not a working app" NOTE callout is now behind the code (direct mode talks to GitHub); it lacks a real-tool quickstart, a license, and a contributing pointer, and its architecture section describes only the mock layer. **Depends:** M7.1.
+**Verify:** content order Hero → Proof → What → Why (mechanism: offline snapshot, draft, reconcile) → How it works → How to use (`bun install && bun dev`, then `revud --direct`) → detail → limits/license/contributing; the first-screen test passes; proof before claims; no "mockup" framing contradicting shipped direct mode; badges near the top; images centered `width='100%'` with meaningful alt; renders on GitHub light+dark and on a narrow viewport; every command runs as written.
+
+### Issue M7.3 — Fumadocs 16 docs app (bun), gate-isolated + deployable
+New workspace member `@revu/docs` at `packages/docs` running Fumadocs 16 with bun. Fumadocs 16 is Next.js-based and needs React 19, clashing with the app's React 18.3 — isolation is mandatory, not optional.
+- [sub] Scaffold `@revu/docs` (Fumadocs 16); run/build with bun (`next dev`/`next build`); Next default port 3000.
+- [sub] Gate isolation: own tsconfig NOT in the root `tsc -b` reference set; no `*.test.ts` under it (`bun test` globs the whole repo); add to oxlint ignore (`--deny-warnings`); pin `react`/`react-dom` exactly (bun overrides/nohoist) so React 19 never leaks into the app's Vite resolution.
+- [sub] Deployability: root scripts `docs:dev`/`docs:build` (NOT part of `check`); `.next/`+`out/` gitignored; a deploy target wired/documented (docs is its own Next deployable, not served by revud); optional separate non-required CI job.
+**Verify:** `bun run docs:dev`/`docs:build` work; `bun run check` and CI `check`/`e2e` remain green and unchanged; `bun run build:app` still resolves a single React; the docs site deploys.
+
+### Issue M7.4 — User-facing documentation content (IA + pages)
+Author the docs-site content against the information architecture, reusing existing prose (README "Why this exists" + constraints table; `DESIGN.md` token/palette; `INTEGRATION_GUIDE.md` §5/§6/§3.3; `docs/direct-mode-auth.md`) and the M7.1 imagery. Broker mode is reserved / not yet a boot option — label it, never describe it as shipped. **Depends:** M7.3, M7.1.
+- [sub] Overview + Quickstart; Concepts (offline snapshot + seal, `compareKey`, content-addressed blobs, draft, reconcile, identity models, shared rate budget).
+- [sub] Run modes (Mock/Direct/Broker deep dives); Guides/How-to (first sync, comment+suggest, submit, reconcile a moved head, author walk-the-queue, inbox triage, mark viewed, react).
+- [sub] Keyboard & navigation (full catalog + command palette); Direct-mode setup (`gh` scopes, repo resolution, local SQLite draft store, scratch seeding).
+- [sub] Self-hosting revud (env `REVU_MODE`/`REVU_PORT`/`REVU_REPO`/`REVU_DIST_DIR`/`REVU_DATA_DIR`, serving built `dist/`); Architecture & reference (`RevuApi` route table, `TokenSource`/`WriteDecorator`, sync burst budget, mock-as-oracle) + a Design page.
+**Verify:** each section renders; navigation/search work; imagery displays on light+dark; no reserved (broker) feature is shown as shipped (final accuracy proof is M7.5).
+
+### Issue M7.5 — Verify all docs against the implementation
+Adversarial accuracy pass over the README (M7.2) and the docs site (M7.4): every documented claim, command, flag, env var, route, keyboard shortcut, and mode behavior traced to code and confirmed or corrected. **Depends:** M7.2, M7.4.
+**Verify:** the highest-risk claims hold — direct-mode auth is the `gh` user (not the App); broker mode is reserved; `/api/dev` is mock-only; `submitReview` `head_moved` is a 200 value; `getSnapshot` returns `null`, not 404-as-error; drafts survive everything and are deleted only on confirmed submit success. Each doc statement is tied to a code referent; commands execute as written; the gate is green; a short report lists corrections.
+
+### Issue M7.6 — Retire/rework internal repo docs for open-source
+Once M7.4 has absorbed the valuable technical content, retire the build-tracking and agent-framed docs so the public tree is coherent. **Depends:** M7.4.
+- [sub] Delete `docs/agent/MILESTONES.md`, `docs/agent/CHECKPOINT_1.md`, `docs/branch-protection.md` (fold the one `gh` command into CONTRIBUTING if useful).
+- [sub] Rework `docs/agent/INTEGRATION_GUIDE.md` into a public architecture reference + operator runbook (strip the "for agents / order of work" framing).
+- [sub] Convert `AGENTS.md` → `CONTRIBUTING.md` (keep the TS style, visual-token rules, data rules, and the `bun run check` gate; drop the agent file-ownership model, "complete output only", and the hardcoded `/Users/patmw/...` path on line 12).
+- [sub] Edit `DESIGN.md` (keep the token plan, diff-palette reasoning, and risk; strip the taste-router/agent-convention lines and the `/Users/patmw/...` path on line 6); rewrite `docs/README.md` into a clean index; keep `docs/direct-mode-auth.md` with a reframed title.
+**Verify:** `grep -rn "/Users/patmw" .` is clean across tracked files; no `docs/agent/` tracking artifacts remain; the valuable technical content survives in public form; the gate is green.
+
+### Issue M7.7 — Remove/scrub the .claude/ admin harness for open-source
+`.claude/` is the repo-admin session harness (the `revu` skill, `LINEAR_PROTOCOL.md`, memories), tied to the private Linear workspace, scratch GitHub App coordinates, and agent conventions meaningless to outside contributors. Extract its durable, generally-useful content (scrubbed), then remove it. **Depends:** M7.6.
+- [sub] Extract product invariants (`memories/hard-constraints.md`) → a public architecture-constraints doc (drop the M-/C-IDs and CHECKPOINT references).
+- [sub] Extract GitHub/API + bun-test + e2e gotchas (`memories/known-landmines.md`) → a public gotchas/contributor doc (drop the App id/installation, the scratch-repo guard, and the `UZO-`/CHECKPOINT references).
+- [sub] Remove `.claude/skills/revu/` + memories from the tracked tree (or relocate privately); gitignore transient `.claude/` session artifacts.
+**Verify:** the scrubbed content is present in public docs with no internal Linear URLs, App/installation ids, or tracking ids; the harness no longer ships publicly; `.claude/` transient artifacts are gitignored; the gate is green.
+
+### Issue M7.8 — Open-source hygiene scaffolding + final secrets sweep
+Add the standard open-source files the repo currently lacks, then run a final sweep.
+- [sub] LICENSE (owner-chosen) + a README license badge/section.
+- [sub] CONTRIBUTING.md (from M7.6 if produced there), CODE_OF_CONDUCT.md, SECURITY.md (disclosure policy + contact).
+- [sub] `.env.example` documenting every referenced env var (`VITE_REVU_API`, `REVU_DATA_DIR`, `REVU_DIST_DIR`, `REVU_PORT`, `REVU_REPO`, `REVU_MODE`, `GH_TOKEN`, `GITHUB_TOKEN`, `E2E_CHROME_PATH`).
+- [sub] CODEOWNERS, `.github/ISSUE_TEMPLATE/*`, a PR template; a README CI-status badge.
+- [sub] Final secrets/personal-info sweep (only fake `gho_*` test fixtures expected; no `/Users/...` paths; no personal email in tracked files).
+**Verify:** all hygiene files are present and linked from the README; `.env.example` covers every env var read by code/tests; the sweep is documented clean; the templates render in the GitHub UI; the gate is green.
