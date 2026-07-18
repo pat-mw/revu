@@ -121,9 +121,12 @@ export function createMapCoderOwnerResolver(
     }
     const emailClash = ownerByEmail.get(email)
     if (emailClash !== undefined) {
+      // Name the two owner keys (host-config coordinates), NOT the email: this
+      // message can reach operator logs via the host-CLI config loader, and the
+      // colliding email is a person's address — the keys alone locate the fix.
       throw new Error(
         `identity-binding map: two coder.owner keys map to one email (identity merge): ` +
-          `${emailClash}, ${coderOwner} -> ${email}`,
+          `${emailClash}, ${coderOwner}`,
       )
     }
     const rawName = entry.displayName
