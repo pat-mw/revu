@@ -160,9 +160,11 @@ describe('buildBrokerSession', () => {
     // Broker mode takes NO github client: a GitHub App installation token cannot
     // resolve a login via `GET /user`, so the viewer is never probed. Identity is
     // fully local, so the session builds whether a credential is present, absent,
-    // or would 403 — there is simply no request that could fail.
+    // or would 403 — there is simply no request that could fail. The explicit
+    // empty env keeps the reads-only assertions independent of any REVU_BOT_LOGIN
+    // set in the test process's real environment.
     const runner = gitConfigRunner({ 'user.name': 'Bot Wrangler', 'user.email': 'ops@shared.co' })
-    const session = await buildBrokerSession({ runner, repo: { owner: 'acme', repo: 'revu' } })
+    const session = await buildBrokerSession({ runner, repo: { owner: 'acme', repo: 'revu' }, env: {} })
     expect(session.human.id).toBe('ops@shared.co')
     expect(session.brokerLogin).toBe('')
     expect(session.viewerLogin).toBeUndefined()
@@ -170,10 +172,38 @@ describe('buildBrokerSession', () => {
     expect(session.workspace).toContain('revu')
   })
 
+  test('REVU_BOT_LOGIN sets brokerLogin AND viewerLogin to the bot — the broker self-identifies as its App', async () => {
+    // Deliberately the OPPOSITE of the direct-mode rule (brokerLogin must not
+    // echo the viewer): every mediated write is authored by the one bot, so a
+    // bot-authored comment must route into the prefix parser (brokerLogin) and
+    // the write guards must self-identify as the bot (viewerLogin).
+    const runner = gitConfigRunner({ 'user.name': 'Bot Wrangler', 'user.email': 'ops@shared.co' })
+    const session = await buildBrokerSession({
+      runner,
+      repo: { owner: 'acme', repo: 'revu' },
+      env: { REVU_BOT_LOGIN: 'revu-app[bot]' },
+    })
+    expect(session.brokerLogin).toBe('revu-app[bot]')
+    expect(session.viewerLogin).toBe('revu-app[bot]')
+    // The human identity is untouched by the bot login.
+    expect(session.human.id).toBe('ops@shared.co')
+  })
+
+  test('a blank REVU_BOT_LOGIN reads as unset — the reads-only session shape', async () => {
+    const runner = gitConfigRunner({ 'user.name': 'Bot Wrangler', 'user.email': 'ops@shared.co' })
+    const session = await buildBrokerSession({
+      runner,
+      repo: { owner: 'acme', repo: 'revu' },
+      env: { REVU_BOT_LOGIN: '   ' },
+    })
+    expect(session.brokerLogin).toBe('')
+    expect(session.viewerLogin).toBeUndefined()
+  })
+
   test('propagates a missing git identity — the local-only source is still required', async () => {
     const runner = gitConfigRunner({ 'user.email': 'ops@shared.co' })
     await expect(
-      buildBrokerSession({ runner, repo: { owner: 'acme', repo: 'revu' } }),
+      buildBrokerSession({ runner, repo: { owner: 'acme', repo: 'revu' }, env: {} }),
     ).rejects.toBeInstanceOf(MissingGitIdentityError)
   })
 })

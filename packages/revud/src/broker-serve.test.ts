@@ -57,6 +57,9 @@ function makeStubDist(): string {
 /** A minimal read/persist surface — enough to answer preferences and route. */
 function stubApi(): DirectApi {
   return {
+    // No broker write decorator behind this stub, so it honestly lacks the
+    // broker write capability; these serve tests exercise reads only.
+    brokerWritesEnabled: false,
     syncPull: async () => {
       throw new Error('not used')
     },

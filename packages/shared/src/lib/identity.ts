@@ -150,11 +150,15 @@ export interface OwnCommentContext {
    * absent or silent on a comment, detection falls back to the smuggled name.
    */
   commentAuthors?: Record<number, string>
-  /** The bot login the broker writes as — needed only for the name fallback. */
+  /** The bot login the broker writes as; also excludes bot comments from the login match. */
   botLogin: string
   /**
-   * The viewer's own GitHub login in direct mode (no broker, no write log).
-   * When set, a comment is yours iff its real author login equals it.
+   * The login this session self-identifies as. Direct mode: the viewer's own
+   * GitHub login — a comment is yours iff its real author login equals it.
+   * Broker mode: the BOT's login (the session carries it for the write
+   * self-guards), which must NOT be login-matched against bot-authored
+   * comments — every human's mediated comment shares that author, so those
+   * resolve via the write log or the smuggled name instead.
    */
   viewerLogin?: string
 }
@@ -167,12 +171,20 @@ export interface OwnCommentContext {
  *    truth: it keys on `Human.id`, so it stays correct across a Coder username
  *    rename or a reused username — the failures display-name matching cannot
  *    survive. Consulted first, and only when it actually names this comment.
- * 2. Direct mode (`viewerLogin` set, no write log for this comment): GitHub is
- *    talked to directly, so the comment's real author login is trustworthy —
- *    yours iff `comment.user.login === viewerLogin`.
- * 3. Name fallback: with no write-log entry and no direct-mode login, the only
- *    remaining signal is the name the broker smuggled into the body. This is
- *    the legacy behavior, kept so non-broker-logged comments still resolve.
+ * 2. Login match (`viewerLogin` set, no write-log entry, and the comment NOT
+ *    authored by the bot): yours iff `comment.user.login === viewerLogin`. In
+ *    direct mode `botLogin` is `''` — no real author login equals it — so every
+ *    comment takes this branch, and the real author login is trustworthy
+ *    because GitHub is talked to directly. In broker mode the session carries
+ *    the BOT's login as `viewerLogin` (the write self-guards need a self
+ *    identity), while every mediated comment — EVERY human's — is also
+ *    authored by that same bot; a login match there would claim every stamped
+ *    comment as the session human's own. So bot-authored comments skip this
+ *    signal entirely and fall through to 3, where the smuggled name is the
+ *    only thing that distinguishes the humans behind the shared login.
+ * 3. Name fallback: with no write-log entry and no login signal, the remaining
+ *    signal is the name the broker smuggled into the body. This is the legacy
+ *    behavior, kept so non-broker-logged comments still resolve.
  *
  * The write log wins whenever it names the comment, so a stale smuggled name
  * never overrides it.
@@ -185,7 +197,11 @@ export function isOwnComment(
   if (loggedAuthor !== undefined) {
     return loggedAuthor === ctx.human.id
   }
-  if (ctx.viewerLogin !== undefined && ctx.viewerLogin !== '') {
+  if (
+    ctx.viewerLogin !== undefined &&
+    ctx.viewerLogin !== '' &&
+    comment.user.login !== ctx.botLogin
+  ) {
     return comment.user.login === ctx.viewerLogin
   }
   const { identity } = parseCommentIdentity(comment, ctx.botLogin)

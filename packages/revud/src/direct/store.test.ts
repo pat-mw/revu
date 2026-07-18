@@ -23,6 +23,7 @@ import {
   StoreUnreadableError,
   StoreWriteError,
   STORE_VERSION,
+  type AuditEntry,
   type DirectStore,
 } from './store'
 
@@ -76,6 +77,18 @@ function snapshot(prNumber: number, compareKey: string): Snapshot {
       reviews: [],
       checks: [],
     },
+  }
+}
+
+function auditEntry(over: Partial<AuditEntry>): AuditEntry {
+  return {
+    githubId: 9001,
+    humanId: 'alice@x.io',
+    workspace: 'ws-o-r',
+    endpoint: 'submitReview',
+    pr: 204,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    ...over,
   }
 }
 
@@ -280,6 +293,33 @@ describe('STORE_VERSION migrates in place, preserving drafts', () => {
     check.close()
   })
 
+  test('a version-1 file gains audit_log in place WITHOUT wiping drafts', () => {
+    // Recreate a genuine v1 file: current shape minus the audit_log table, meta
+    // stamped at 1 — exactly what a version-1 build left on disk.
+    const store = open()
+    store.putDraft(draft('h1', 204, 'v1 work that must survive'))
+    store.close()
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run('DROP TABLE audit_log')
+    raw.run("UPDATE meta SET value = '1' WHERE key = 'store_version'")
+    raw.close()
+
+    // Reopening runs the guarded v1 → v2 step: the table is added, nothing is
+    // reseeded, and the journal is immediately usable.
+    const reopened = open()
+    expect(reopened.getDraft('h1', 204)!.body).toBe('v1 work that must survive')
+    reopened.appendAudit(auditEntry({ githubId: 1 }))
+    expect(reopened.listAudit()).toHaveLength(1)
+    reopened.close()
+
+    const check = new Database(join(dir, 'direct.sqlite'))
+    const after = check.query("SELECT value FROM meta WHERE key = 'store_version'").get() as {
+      value: string
+    }
+    expect(Number(after.value)).toBe(STORE_VERSION)
+    check.close()
+  })
+
   test('a store from a NEWER build is left untouched, not downgraded or reseeded', () => {
     const store = open()
     store.putDraft(draft('h1', 204, 'from the future'))
@@ -297,5 +337,85 @@ describe('STORE_VERSION migrates in place, preserving drafts', () => {
     }
     expect(after.value).toBe('999')
     check.close()
+  })
+})
+
+describe('the append-only audit journal', () => {
+  test('appendAudit persists a row that survives a reopen, fields intact', () => {
+    const store = open()
+    store.appendAudit(auditEntry({ githubId: 4242, endpoint: 'replyToThread', pr: 7 }))
+    store.close()
+    const reopened = open()
+    const entries = reopened.listAudit()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toEqual({
+      githubId: 4242,
+      humanId: 'alice@x.io',
+      workspace: 'ws-o-r',
+      endpoint: 'replyToThread',
+      pr: 7,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    })
+    reopened.close()
+  })
+
+  test('listAudit returns entries oldest → newest in insertion order', () => {
+    const store = open()
+    store.appendAudit(auditEntry({ githubId: 1, createdAt: '2026-01-03T00:00:00.000Z' }))
+    store.appendAudit(auditEntry({ githubId: 2, createdAt: '2026-01-01T00:00:00.000Z' }))
+    store.appendAudit(auditEntry({ githubId: 3, createdAt: '2026-01-02T00:00:00.000Z' }))
+    // Insertion order, NOT timestamp order: the journal reads back as written.
+    expect(store.listAudit().map((e) => e.githubId)).toEqual([1, 2, 3])
+    store.close()
+  })
+
+  test('listAudit filters by pr', () => {
+    const store = open()
+    store.appendAudit(auditEntry({ githubId: 1, pr: 7 }))
+    store.appendAudit(auditEntry({ githubId: 2, pr: 8 }))
+    store.appendAudit(auditEntry({ githubId: 3, pr: 7 }))
+    expect(store.listAudit({ pr: 7 }).map((e) => e.githubId)).toEqual([1, 3])
+    expect(store.listAudit({ pr: 999 })).toEqual([])
+    store.close()
+  })
+
+  test('listAudit filters by sinceIso (inclusive) and combines with pr', () => {
+    const store = open()
+    store.appendAudit(auditEntry({ githubId: 1, pr: 7, createdAt: '2026-01-01T00:00:00.000Z' }))
+    store.appendAudit(auditEntry({ githubId: 2, pr: 7, createdAt: '2026-01-02T00:00:00.000Z' }))
+    store.appendAudit(auditEntry({ githubId: 3, pr: 8, createdAt: '2026-01-03T00:00:00.000Z' }))
+    // Inclusive: the entry stamped exactly at sinceIso is returned.
+    expect(
+      store.listAudit({ sinceIso: '2026-01-02T00:00:00.000Z' }).map((e) => e.githubId),
+    ).toEqual([2, 3])
+    expect(
+      store.listAudit({ pr: 7, sinceIso: '2026-01-02T00:00:00.000Z' }).map((e) => e.githubId),
+    ).toEqual([2])
+    store.close()
+  })
+
+  test('the same github id may journal more than once (an idempotent retry re-records)', () => {
+    const store = open()
+    store.appendAudit(auditEntry({ githubId: 4242 }))
+    store.appendAudit(auditEntry({ githubId: 4242 }))
+    expect(store.listAudit()).toHaveLength(2)
+    store.close()
+  })
+
+  test('the store surface is append-only: no update or delete for audit rows', () => {
+    const store = open()
+    store.appendAudit(auditEntry({ githubId: 1 }))
+    // No method on the surface can mutate or remove a journaled row.
+    const auditMethods = Object.keys(store).filter((k) => k.toLowerCase().includes('audit'))
+    expect(auditMethods.sort()).toEqual(['appendAudit', 'listAudit'])
+    // And nothing that ran so far removed the row.
+    expect(store.listAudit()).toHaveLength(1)
+    store.close()
+  })
+
+  test('a failed append surfaces StoreWriteError, never a silent success', () => {
+    const store = open()
+    store.close()
+    expect(() => store.appendAudit(auditEntry({}))).toThrow(StoreWriteError)
   })
 })

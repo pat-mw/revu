@@ -40,6 +40,9 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
   const blobs = new Map<string, FileBlob>()
   let prefs: HumanPreferences = { ...DEFAULT_PREFERENCES }
   return {
+    // These router tests run in direct mode, where writes are gated by mode,
+    // not by the broker write capability — so the fake honestly reports false.
+    brokerWritesEnabled: false,
     async syncPull(prNumber: number): Promise<Snapshot> {
       const snap = { prNumber } as Snapshot
       snapshots.set(prNumber, snap)

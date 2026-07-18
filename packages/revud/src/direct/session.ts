@@ -123,6 +123,25 @@ export async function buildDirectSession(args: {
 }
 
 /**
+ * Read the broker's bot login from the environment (`REVU_BOT_LOGIN`): the
+ * GitHub App's own login — typically the App slug plus `[bot]` — that every
+ * broker-mediated write is authored as on GitHub. This is deployment
+ * configuration, never hardcoded: each deployment installs its own App under its
+ * own name. Returns `null` when the variable is unset or blank, which is the
+ * reads-only broker configuration — without a bot self-identity the write
+ * guards (the self-approval gate and the submit idempotency re-check) cannot
+ * run safely, so broker writes stay disabled.
+ */
+export function resolveBotLogin(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const raw = env.REVU_BOT_LOGIN
+  if (raw === undefined) return null
+  const trimmed = raw.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+/**
  * Build the broker-mode `Session`. Identity is resolved entirely locally from git
  * config (`buildHuman` — no token needed), so the `Human` — the stable key for
  * drafts, viewed state, and the audit log — is real from boot regardless of
@@ -132,11 +151,23 @@ export async function buildDirectSession(args: {
  * GitHub App installation token, which cannot resolve a login that way — GitHub
  * answers `GET /user` with 403 "Resource not accessible by integration". Probing
  * it would make boot fail exactly when the credential is present (the steady
- * state). So `viewerLogin` is left absent — the shared-bot session shape. That is
- * correct here: the identity-dependent write behaviors that would read
- * `viewerLogin` (the self-approval guard, submit idempotency-by-self, own-comment
- * detection) are enabled together with broker writes in the writes unit, not at
- * boot, so an absent viewer changes no behavior a read-only broker exposes.
+ * state). The bot's own login instead comes from configuration: `REVU_BOT_LOGIN`
+ * (read via `resolveBotLogin`).
+ *
+ * When the bot login is configured, BOTH `brokerLogin` AND `viewerLogin` carry
+ * it. That deliberately INVERTS the direct-mode rule (where `brokerLogin` must
+ * NOT echo the viewer): under the broker every mediated write really is authored
+ * by the one bot, so a bot-authored comment must route into the stamped-prefix
+ * parser (`brokerLogin` = bot) AND the write guards must self-identify as the
+ * bot (`viewerLogin` = bot). The approve gate then correctly rejects APPROVE on
+ * a PR the bot itself opened while allowing it on an org member's PR, and the
+ * submit idempotency re-check can recognize the bot's OWN prior review instead
+ * of double-posting after a lost response.
+ *
+ * When the bot login is NOT configured, `viewerLogin` stays absent and
+ * `brokerLogin` stays the empty "no bot" sentinel: with no self-identity the
+ * write guards cannot run safely, so the router keeps the broker's write routes
+ * gated to `not_implemented` and the session is the reads-only shape.
  */
 export async function buildBrokerSession(args: {
   runner: CommandRunner
@@ -144,14 +175,17 @@ export async function buildBrokerSession(args: {
   cwd?: string
   env?: Record<string, string | undefined>
 }): Promise<Session> {
+  const env = args.env ?? process.env
   const human = await buildHuman(args.runner, {
     ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
-    ...(args.env !== undefined ? { env: args.env } : {}),
+    env,
   })
+  const botLogin = resolveBotLogin(env)
 
   return {
     human,
-    brokerLogin: '',
+    brokerLogin: botLogin ?? '',
     workspace: `direct-${args.repo.owner}-${args.repo.repo}`,
+    ...(botLogin !== null ? { viewerLogin: botLogin } : {}),
   }
 }

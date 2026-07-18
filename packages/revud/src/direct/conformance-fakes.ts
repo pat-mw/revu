@@ -13,6 +13,7 @@ import type {
 } from './github-client'
 import type { RepoRef } from './repo'
 import type { DirectApi } from './direct-api'
+import type { TokenSource } from './token-source'
 import { unusedWriteMethods } from './github-write-stubs'
 
 /**
@@ -39,6 +40,33 @@ export const CONFORMANCE_SESSION: Session = {
 /** One-page helper: page 1 carries the items, every later page is empty. */
 function page<T>(items: T[], params: PageParams): Page<T> {
   return params.page === 1 ? { items, hasNext: false } : { items: [], hasNext: false }
+}
+
+/**
+ * Wrap a fake `GithubClient` so every call first resolves a token through the
+ * injected source — the same ordering the real client uses (`getToken()` then
+ * the request). This routes a fake's data through the broker's actual
+ * credential-custody path, so a broker conformance run proves the engine and
+ * the file-credential surface compose. When the credential file is empty the
+ * source throws `AwaitingCredentialError` from the first wrapped method a
+ * request reaches; on the top-level paths that propagates to the router as
+ * `broker_unreachable` (502). Note the blob-provision tier catches per-blob
+ * fetch failures and folds a missing blob into a 200 `partial` snapshot
+ * instead, so an absent credential reached only through that broad catch
+ * surfaces as `partial`, not a 502 — the two are exercised separately.
+ */
+export function tokenGated(client: GithubClient, tokenSource: TokenSource): GithubClient {
+  const gate =
+    <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      await tokenSource.getToken()
+      return fn(...args)
+    }
+  const out = {} as Record<string, unknown>
+  for (const [name, value] of Object.entries(client) as [string, unknown][]) {
+    out[name] = typeof value === 'function' ? gate(value.bind(client) as never) : value
+  }
+  return out as unknown as GithubClient
 }
 
 // ————————————————————————————————————————————————————————————————

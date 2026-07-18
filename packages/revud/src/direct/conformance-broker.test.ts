@@ -17,19 +17,20 @@
  *     which the router maps to `broker_unreachable` (502) rather than a crash —
  *     the transient "credential not injected yet" state, surfaced per request.
  *
- * Broker mode is READS-ONLY for now: the router gates the four write endpoints to
- * `not_implemented` (501). So this suite covers only the read/persist scenarios
- * the engine owns — baseline, baseAdvanced, mutableDrift, partialSync, and
- * reconcile (both LEFT and RIGHT sides, with preview/report parity) — plus the
- * restart survival check and a check that a write route answers 501, all driven
- * through the broker assembly. There is no submit/head_moved assertion here: the
- * write path is not served in broker mode.
+ * A broker WITHOUT a configured bot identity is reads-only: the router gates the
+ * four write endpoints to `not_implemented` (501). This suite covers the
+ * read/persist scenarios the engine owns — baseline, baseAdvanced, mutableDrift,
+ * partialSync, and reconcile (both LEFT and RIGHT sides, with preview/report
+ * parity) — plus the restart survival check and a check that a write route on an
+ * identity-less broker answers 501, all driven through the broker assembly. The
+ * write-ENABLED broker (bot identity configured, stamping + audit journal) has
+ * its own conformance suite in `conformance-broker-writes.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AnchorResult } from '@revu/shared'
+import type { AnchorResult, Session } from '@revu/shared'
 import {
   blobContentToLines,
   classifyPendingComment,
@@ -52,6 +53,7 @@ import {
   partialBlobClient,
   RECONCILE_PR,
   seedForcePushed,
+  tokenGated,
 } from './conformance-fakes'
 
 /** A fake token the credential file carries; never a real secret. */
@@ -63,28 +65,16 @@ function credentialLine(token: string): string {
 }
 
 /**
- * Wrap a fake `GithubClient` so every call first resolves a token through the
- * injected source — the same ordering the real client uses (`getToken()` then the
- * request). This routes the fake's data through the broker's actual custody path.
- * When the credential file is empty the source throws `AwaitingCredentialError`
- * from a wrapped method; on the top-level read paths (sync, snapshot) that
- * propagates to the router as `broker_unreachable` (502). Note the blob-provision
- * tier catches per-blob fetch failures and folds a missing blob into a 200
- * `partial` snapshot instead, so an absent credential reached only through that
- * broad catch surfaces as `partial`, not a 502 — the two are exercised separately.
+ * The reads-only broker session shape: no bot identity configured, so
+ * `viewerLogin` is ABSENT and `brokerLogin` is the empty "no bot" sentinel —
+ * exactly what `buildBrokerSession` yields without `REVU_BOT_LOGIN`. The
+ * router's write gate keys on that absent self-identity, so this is the session
+ * the gating check below must drive.
  */
-function tokenGated(client: GithubClient, tokenSource: TokenSource): GithubClient {
-  const gate =
-    <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
-    async (...args: A): Promise<R> => {
-      await tokenSource.getToken()
-      return fn(...args)
-    }
-  const out = {} as Record<string, unknown>
-  for (const [name, value] of Object.entries(client) as [string, unknown][]) {
-    out[name] = typeof value === 'function' ? gate(value.bind(client) as never) : value
-  }
-  return out as unknown as GithubClient
+const READS_ONLY_BROKER_SESSION: Session = {
+  human: CONFORMANCE_SESSION.human,
+  brokerLogin: '',
+  workspace: CONFORMANCE_SESSION.workspace,
 }
 
 let dataDir: string
@@ -265,16 +255,17 @@ describe('RevuApi conformance — broker (file-credential engine, reads-only)', 
   })
 })
 
-describe('broker mode gates writes to not_implemented (reads-only)', () => {
+describe('broker without a bot identity gates writes to not_implemented (reads-only)', () => {
   test('POST submit review returns 501 not_implemented, and the write path never runs', async () => {
-    // The api's submitReview must never be reached in broker mode: assert it by
-    // wiring an api that would throw if the router dispatched the write.
+    // The api's submitReview must never be reached when the broker session has
+    // no bot self-identity: assert it by wiring an api that would throw if the
+    // router dispatched the write.
     const store = openDirectStore({ dataDir })
     const api = buildBrokerApi(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }), store)
     const guarded: DirectApi = {
       ...api,
       submitReview: async () => {
-        throw new Error('broker must not dispatch submitReview')
+        throw new Error('an identity-less broker must not dispatch submitReview')
       },
     }
 
@@ -289,7 +280,7 @@ describe('broker mode gates writes to not_implemented (reads-only)', () => {
         comments: [],
       }),
     })
-    const res = await handleDirectApi(req, CONFORMANCE_SESSION, guarded, 'broker')
+    const res = await handleDirectApi(req, READS_ONLY_BROKER_SESSION, guarded, 'broker')
     expect(res).not.toBeNull()
     expect(res!.status).toBe(501)
     const body = (await res!.json()) as { code: string; message: string }

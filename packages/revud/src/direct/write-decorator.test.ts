@@ -25,7 +25,7 @@ describe('createDirectWriteDecorator (passthrough)', () => {
 
   test('recordWrite is a no-op that does not throw', () => {
     const d = createDirectWriteDecorator(HUMAN)
-    expect(() => d.recordWrite(12345)).not.toThrow()
+    expect(() => d.recordWrite(12345, { endpoint: 'submitReview', pr: 1 })).not.toThrow()
   })
 })
 
@@ -44,10 +44,12 @@ describe('createStampingWriteDecorator (broker counterpart)', () => {
     expect(d.decorateBody('   ')).toBe('   ')
   })
 
-  test('recordWrite forwards the GitHub id to the sink', () => {
-    const recorded: number[] = []
-    const d = createStampingWriteDecorator(HUMAN, (id) => recorded.push(id))
-    d.recordWrite(2054417)
-    expect(recorded).toEqual([2054417])
+  test('recordWrite forwards the GitHub id AND its endpoint/pr meta to the sink', () => {
+    const recorded: { id: number; endpoint: string; pr: number }[] = []
+    const d = createStampingWriteDecorator(HUMAN, (id, meta) =>
+      recorded.push({ id, endpoint: meta.endpoint, pr: meta.pr }),
+    )
+    d.recordWrite(2054417, { endpoint: 'replyToThread', pr: 204 })
+    expect(recorded).toEqual([{ id: 2054417, endpoint: 'replyToThread', pr: 204 }])
   })
 })

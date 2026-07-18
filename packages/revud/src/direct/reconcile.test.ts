@@ -114,6 +114,8 @@ function fakeStore(opts: {
     setViewed: unexpected('setViewed'),
     getPreferences: unexpected('getPreferences'),
     setPreferences: unexpected('setPreferences'),
+    appendAudit: unexpected('appendAudit'),
+    listAudit: unexpected('listAudit'),
     close: () => {},
   }
 }

@@ -239,12 +239,23 @@ export interface Session {
   brokerLogin: string
   workspace: string
   /**
-   * The viewer's own GitHub login, present only when the client talks to GitHub
-   * directly rather than through the broker. In broker mode every write posts as
-   * the shared bot, so own-comment detection reads the broker's write log
-   * (`SnapshotMutable.commentAuthors`) instead; in direct mode there is no write
-   * log, so "yours" is `comment.user.login === viewerLogin`. Absent under the
-   * broker, where it would be meaningless.
+   * The GitHub login this session self-identifies as for login-based checks.
+   *
+   * Direct mode: the viewer's OWN login (from `GET /user`). There is no broker
+   * and no write log, so "yours" is `comment.user.login === viewerLogin`.
+   *
+   * Broker mode with a configured bot identity: carries the BOT login (the
+   * same value as `brokerLogin`) so the write self-guards can run — the
+   * approve gate must reject APPROVE on a PR the bot itself opened, and the
+   * submit idempotency re-check must recognize the bot's own prior review
+   * after a lost response. Because every mediated comment is authored by that
+   * one bot on behalf of MANY humans, own-comment detection deliberately
+   * SKIPS login matching for bot-authored comments and resolves them via the
+   * broker's write log (`SnapshotMutable.commentAuthors`) or the stamped-name
+   * path instead — a login match would misattribute every human's comment to
+   * the session human.
+   *
+   * Absent when the broker has no configured bot identity (reads-only).
    */
   viewerLogin?: string
 }

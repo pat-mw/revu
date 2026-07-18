@@ -138,8 +138,9 @@ export async function resolveDirectContext(
     // work and the full session (with `viewerLogin` from `GET /user`) is built.
     // Broker mode (validation skipped) does NOT probe the viewer at all: its
     // GitHub App installation token cannot resolve a login via `GET /user`
-    // (GitHub answers 403), so `viewerLogin` is absent by design and identity
-    // comes from git config alone — boot never depends on a present credential.
+    // (GitHub answers 403). Identity comes from git config, and the bot's own
+    // login — when the deployment configures one — from the environment, so
+    // boot never depends on a present credential.
     session = validateToken
       ? await buildDirectSession({
           runner,
