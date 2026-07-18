@@ -116,6 +116,8 @@ function fakeStore(opts: {
     setPreferences: unexpected('setPreferences'),
     appendAudit: unexpected('appendAudit'),
     listAudit: unexpected('listAudit'),
+    recordPrAuthor: unexpected('recordPrAuthor'),
+    getPrAuthor: unexpected('getPrAuthor'),
     close: () => {},
   }
 }

@@ -11,6 +11,10 @@ import { openDirectStore, resolveDirectDataDir } from './direct/store'
 import { createBrokerWriteDecorator } from './direct/write-decorator'
 import { createFileCredentialTokenSource } from './broker/token-source'
 import { createPollLoop } from './broker/poll-loop'
+import {
+  createReviewerAssignments,
+  resolveReviewersFile,
+} from './broker/reviewer-assignment'
 
 /**
  * Entry point for the revu daemon. One Bun process serves the built frontend
@@ -258,29 +262,44 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
   const dataDir = resolveDirectDataDir(env)
   const store = openDirectStore({ dataDir, env })
 
+  // The bot login the App posts as (deployment config; `null` when reads-only).
+  // Resolved before the poll loop because the loop derives `canApprove` from it.
+  const botLogin = resolveBotLogin(env)
+
+  // The host-side reviewers file (assignments + the login→human map), read from
+  // alongside the SQLite store so it survives a workspace rebuild. The poll loop
+  // re-reads it each tick, so a lead's edit takes effect without a restart.
+  const reviewers = createReviewerAssignments(resolveReviewersFile(dataDir, env))
+
   // The live pulls-list poll loop: a dedicated client over the SAME injected
   // credential source (stateless — it re-reads the file per request, so a second
   // client shares no mutable state with the sync client). It issues one
   // conditional list every ~30s and serves `/v1/pulls` from an in-memory cache;
   // a 304 round is free against the shared bucket. The loop tolerates an
-  // awaiting credential per tick without crashing.
+  // awaiting credential per tick without crashing. The author / reviewer /
+  // approvability annotations ride on each pull's meta: `authorHumanId` from the
+  // durable `pr_author` store (host-populated by the collector; a narrow
+  // `getPrAuthor` read seam is all the loop needs), `assignedReviewerHumanIds`
+  // from the reviewers file, and `canApprove` from the bot login.
   const pollClient = createGithubClient({ tokenSource: context.tokenSource })
   const pollLoop = createPollLoop({
     client: pollClient,
     facts: { getPullFacts: pollClient.getPullFacts, getCompare: pollClient.getCompare },
     repo: context.repo,
+    prAuthor: { getPrAuthor: (pr) => store.getPrAuthor(pr) },
+    reviewers,
+    botLogin,
   })
 
   // Writes are enabled exactly when the deployment configured the bot login the
-  // GitHub App posts as. The session (built from the same env) already
-  // self-identifies as that bot, and the stamping + journaling decorator is
-  // injected so every mediated write carries the human's stamped name and lands
-  // one audit_log row. The router gates broker writes on the api's
-  // `brokerWritesEnabled` capability, which only that decorator confers:
-  // without the bot login no decorator is injected, the capability stays
-  // false, and all four write routes answer 501 — the default passthrough is
-  // structurally unreachable by a broker write.
-  const botLogin = resolveBotLogin(env)
+  // GitHub App posts as (resolved above as `botLogin`). The session (built from
+  // the same env) already self-identifies as that bot, and the stamping +
+  // journaling decorator is injected so every mediated write carries the human's
+  // stamped name and lands one audit_log row. The router gates broker writes on
+  // the api's `brokerWritesEnabled` capability, which only that decorator
+  // confers: without the bot login no decorator is injected, the capability
+  // stays false, and all four write routes answer 501 — the default passthrough
+  // is structurally unreachable by a broker write.
   const brokerApi = createDirectApi({
     session: context.session,
     github: context.github,

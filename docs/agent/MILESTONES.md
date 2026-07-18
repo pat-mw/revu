@@ -256,6 +256,8 @@ On workspace delete (offboarding), the host store **retains audit rows** (compli
 - `commentAuthors` present in broker-mode snapshots; M1.3's id-path exercised end-to-end.
 - Reviewer assignment visible in inbox sections.
 
+*CHECKPOINT_2 correction — `authorHumanId` is collector-populated:* revu does not create PRs (no `openPull`/`createPull`; contractors open PRs directly as the App via the injected token), so `authorHumanId` cannot come from a broker PR-creation log. M4.2 ships the in-workspace **seam** (a durable `pr_author` store + resolution into the poll meta); **population rides M6** (the collector, via the `coder.owner`↔PR correlation). `canApprove` derives independently from the bot login (`pull.user.login !== botLogin`) and needs no author join.
+
 **Depends:** M3.
 
 ### Issue M4.1 — Poll loop
@@ -263,8 +265,10 @@ On workspace delete (offboarding), the host store **retains audit rows** (compli
 **Verify:** an hour of idle polling costs ≤ a handful of non-304 requests (log-verified).
 
 ### Issue M4.2 — `BrokerPullMeta` completion
-`authorHumanId` from the broker's PR-creation log; `canApprove` derivation; `assignedReviewerHumanIds` via minimal assignment mechanism (YAML file or admin endpoint — smallest thing the lead will actually use; decide and note in-issue).
-**Verify:** inbox sections (yours-with-comments / assigned-to-you) populate correctly for two different humans against the same broker.
+Completes the three list-level annotations on `BrokerPullMeta`: `authorHumanId`, `canApprove`, `assignedReviewerHumanIds`.
+
+*CHECKPOINT_2 correction — revu does not create PRs:* the original premise ("`authorHumanId` from the broker's PR-creation log") is invalid under the inject model. revu is a review client — it has no `openPull`/`createPull` and never mediates PR creation; contractors open PRs directly as the App via the ambient injected token. PR-author attribution is therefore a **host-side collector concern** (only the M6 `docker exec` tick has the `coder.owner`↔PR correlation). So `authorHumanId` **population is deferred to M6**: M4.2 ships the in-workspace **seam** — a durable, first-write-wins `pr_author` store table (keyed by PR, `human_id` nullable for "org member opened it"), resolved into the poll meta through a narrow `getPrAuthor` read seam — proven in-gate with injected fake records; the collector populates it host-side via the `coder.owner`↔PR correlation. `canApprove` is derived **now, independently of any author join**, straight from the bot login: `canApprove = pull.user.login !== botLogin` (App-authored PR → the author login is the App bot login → `false`; org-member PR → `true`). This also lands the fix for M4.1's `canApprove` `true` placeholder. `assignedReviewerHumanIds` comes from a host-side `reviewers.yaml` (`REVU_REVIEWERS_FILE`, default alongside the SQLite store so it survives a workspace rebuild), re-read each poll tick so a lead's edit takes effect without a restart; a read/parse failure keeps the last-good map and logs a token-free warning (never echoing file bytes). The loader IS the record — there is no in-gate mutation API (the broker has no authenticated admin surface; an admin endpoint is out of scope).
+**Verify (in-gate simulation):** inbox sections (yours-with-comments / assigned-to-you) populate correctly and disjointly for two different humans reading the same poll result — "yours" driven by `authorHumanId` (seeded via `recordPrAuthor`), "assigned-to-you" by `assignedReviewerHumanIds` (seeded via a temp `reviewers.yaml`). Truly-live two-human confirmation rides M6 (the collector); it is not claimed live-verified here.
 
 ### Issue M4.3 — `commentAuthors` in sync payload
 Assemble from audit log during broker-side sync, merged into `SnapshotMutable`.

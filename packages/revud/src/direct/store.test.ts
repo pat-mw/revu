@@ -419,3 +419,84 @@ describe('the append-only audit journal', () => {
     expect(() => store.appendAudit(auditEntry({}))).toThrow(StoreWriteError)
   })
 })
+
+describe('the pull-request author attribution seam', () => {
+  test('an unrecorded PR reads back undefined (never observed), distinct from a recorded null', () => {
+    const store = open()
+    // No row: the three-way read reports `undefined`, which the poll loop maps
+    // to a `null` authorHumanId but is NOT the same settled fact as a recorded
+    // org-member open.
+    expect(store.getPrAuthor(347)).toBeUndefined()
+    store.recordPrAuthor(347, null)
+    // A recorded org-member open is `null`, not `undefined`.
+    expect(store.getPrAuthor(347)).toBeNull()
+    store.close()
+  })
+
+  test('a recorded driver reads back and survives a reopen', () => {
+    const store = open()
+    store.recordPrAuthor(355, 'h-priya')
+    store.close()
+    const reopened = open()
+    expect(reopened.getPrAuthor(355)).toBe('h-priya')
+    reopened.close()
+  })
+
+  test('FIRST-WRITE-WINS: a later record never overwrites the original driver', () => {
+    const store = open()
+    store.recordPrAuthor(360, 'h-priya')
+    // A later re-observation (the collector re-seeing the same PR) is a no-op.
+    store.recordPrAuthor(360, 'h-marcus')
+    expect(store.getPrAuthor(360)).toBe('h-priya')
+    // Even a later record that would flip it to org-member (`null`) is ignored:
+    // the first write at open time is permanent.
+    store.recordPrAuthor(360, null)
+    expect(store.getPrAuthor(360)).toBe('h-priya')
+    store.close()
+  })
+
+  test('FIRST-WRITE-WINS holds when the original record was a null org-member open', () => {
+    const store = open()
+    store.recordPrAuthor(361, null)
+    store.recordPrAuthor(361, 'h-priya')
+    // The first write recorded an org-member open; it stays `null`.
+    expect(store.getPrAuthor(361)).toBeNull()
+    store.close()
+  })
+
+  test('a failed record surfaces StoreWriteError, never a silent success', () => {
+    const store = open()
+    store.close()
+    expect(() => store.recordPrAuthor(1, 'h-priya')).toThrow(StoreWriteError)
+  })
+
+  test('a version-2 file gains pr_author in place WITHOUT wiping drafts or audit rows', () => {
+    // Recreate a genuine v2 file: current shape minus the pr_author table, meta
+    // stamped at 2 — exactly what a version-2 build left on disk.
+    const store = open()
+    store.putDraft(draft('h1', 204, 'v2 work that must survive'))
+    store.appendAudit(auditEntry({ githubId: 77, pr: 204 }))
+    store.close()
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run('DROP TABLE pr_author')
+    raw.run("UPDATE meta SET value = '2' WHERE key = 'store_version'")
+    raw.close()
+
+    // Reopening runs the guarded v2 → v3 step: the table is added, nothing is
+    // reseeded, and drafts + the audit journal survive untouched.
+    const reopened = open()
+    expect(reopened.getDraft('h1', 204)!.body).toBe('v2 work that must survive')
+    expect(reopened.listAudit()).toHaveLength(1)
+    // The new seam is immediately usable.
+    reopened.recordPrAuthor(204, 'h-priya')
+    expect(reopened.getPrAuthor(204)).toBe('h-priya')
+    reopened.close()
+
+    const check = new Database(join(dir, 'direct.sqlite'))
+    const after = check.query("SELECT value FROM meta WHERE key = 'store_version'").get() as {
+      value: string
+    }
+    expect(Number(after.value)).toBe(STORE_VERSION)
+    check.close()
+  })
+})

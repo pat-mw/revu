@@ -469,6 +469,12 @@ export interface FakePull {
   commitCount: number
   /** Merge base the compare fake reports; the compareKey is `${mergeBase}...${headSha}`. */
   mergeBaseSha: string
+  /**
+   * The PR author's github login. Defaults to `'author'` (an org member) when
+   * omitted; set it to the broker bot login to model an App-authored PR, which
+   * drives the `canApprove` annotation (a bot-authored PR is not self-approvable).
+   */
+  authorLogin?: string
 }
 
 /** Build a `PullSummary` from a `FakePull` row — the fields a REST list carries. */
@@ -482,7 +488,14 @@ function summaryFromFake(p: FakePull): PullSummary {
     merged_at: null,
     title: `PR #${p.number}`,
     body: null,
-    user: { login: 'author', id: 2, node_id: 'U_2', avatar_url: '', html_url: '', type: 'User' },
+    user: {
+      login: p.authorLogin ?? 'author',
+      id: 2,
+      node_id: 'U_2',
+      avatar_url: '',
+      html_url: '',
+      type: 'User',
+    },
     labels: [],
     requested_reviewers: [],
     head: { ref: 'feature', sha: p.headSha, label: 'o:feature', repo: { full_name: 'o/r', default_branch: 'main' } },
