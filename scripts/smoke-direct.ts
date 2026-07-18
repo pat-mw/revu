@@ -11,7 +11,9 @@
  *   - the cold-sync REST request count for the large PR (#2),
  *   - that a warm re-sync of an unchanged PR skips the immutable half
  *     (the request count drops by the immutable-half calls),
- *   - that a base-advance PR (#4) produces a NEW compareKey when its base moves,
+ *   - that a base-advance PR (#4) is keyed by merge_base…head (reported cold; the
+ *     live base-advance move — the compareKey shifting under a fixed head when the
+ *     base fast-forwards onto a head ancestor — is proven in Section E),
  *   - that a mid-review PR (#3) normalizes its GraphQL review threads onto the
  *     REST shape: the `PRRT_` thread ids, `isResolved`/`isOutdated`, `side` from
  *     the thread `diffSide`, `diff_hunk` present, and REST-numeric comment ids
@@ -205,6 +207,12 @@ async function main(): Promise<void> {
   // ——————————————————————————————————————————————————————————————
   await reconcileSection(github)
 
+  // ——————————————————————————————————————————————————————————————
+  // Section E — a base advance moves the compareKey under a FIXED head, LIVE,
+  // against sandbox PR #4. Mutates the sandbox base branch, then resets it.
+  // ——————————————————————————————————————————————————————————————
+  await baseAdvanceSection(github, runner)
+
   console.log(`\n${failures === 0 ? 'ALL LIVE CHECKS PASSED' : `${failures} LIVE CHECK(S) FAILED`}`)
   process.exit(failures === 0 ? 0 : 1)
 }
@@ -391,6 +399,169 @@ async function reconcileSection(github: GithubClient): Promise<void> {
       if (JSON.stringify(preview) !== JSON.stringify(reported)) parity = false
     }
     check('step 4: the client-side preview matches the reconcile report for every comment', parity)
+
+    store.close()
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true })
+  }
+}
+
+/** The base-advance fixture's branches and the commit the base advances onto. */
+const BASE_ADVANCE = {
+  prNumber: 4,
+  baseBranch: 'fixture/base-advances-target',
+  headBranch: 'fixture/base-advances',
+} as const
+
+/**
+ * Move a branch ref to `sha`. `force` allows a non-fast-forward reset (used to
+ * put the base branch back at the fork after the advance). Returns the tip.
+ */
+async function moveBranch(
+  runner: CommandRunner,
+  branch: string,
+  sha: string,
+  force: boolean,
+): Promise<string> {
+  const res = await runner.run([
+    'gh',
+    'api',
+    '-X',
+    'PATCH',
+    `repos/${REPO.owner}/${REPO.repo}/git/refs/heads/${branch}`,
+    '-f',
+    `sha=${sha}`,
+    '-F',
+    `force=${force}`,
+    '--jq',
+    '.object.sha',
+  ])
+  if (!res.ok) throw new Error(`move ${branch} -> ${sha.slice(0, 8)} failed: ${res.stderr.trim()}`)
+  return res.stdout.trim()
+}
+
+/**
+ * Nudge a pull request so its stored `base.sha` recomputes from the live base
+ * branch tip. GitHub does NOT refresh a pull's `base.sha` when the base ref is
+ * moved by a bare ref update — it snapshots that field and only recomputes it on
+ * a pull "synchronize". Re-setting the base to the SAME branch forces the
+ * recompute, so a subsequent sync (which keys off `pull.base.sha`) sees the
+ * moved base. Without this, the sync would keep reading the pre-advance base.
+ */
+async function refreshPullBase(runner: CommandRunner, prNumber: number, branch: string): Promise<void> {
+  const res = await runner.run([
+    'gh',
+    'pr',
+    'edit',
+    '-R',
+    `${REPO.owner}/${REPO.repo}`,
+    String(prNumber),
+    '--base',
+    branch,
+  ])
+  if (!res.ok) throw new Error(`refresh pull #${prNumber} base failed: ${res.stderr.trim()}`)
+}
+
+/**
+ * A base advance moves the compareKey under a FIXED head, LIVE, against sandbox
+ * PR #4 (base-advances). The head branch is fork+h1+h2; the base branch sits at
+ * the fork. Advancing the base onto h1 — a commit the head already contains —
+ * moves the three-dot merge base from fork to h1 while the head SHA stays fixed,
+ * so the diff shrinks to h2's file alone. This is the two-half cache-keying
+ * regression: a head-only cache would wrongly reuse the pre-advance diff.
+ *
+ *   1. Sync PR #4 — record compareKey_A (fork…head) and the head SHA, and the
+ *      pre-advance file set.
+ *   2. Advance the base branch onto h1 (the head's first commit off the fork,
+ *      read live from the compare of head against the fork) and refresh the
+ *      pull's base.sha so the sync sees the moved base.
+ *   3. Re-sync PR #4 into the SAME store — record compareKey_B (h1…head). Assert
+ *      compareKey_B differs, the head SHA is UNCHANGED, the merge base moved to
+ *      h1, and the immutable half was REBUILT (not served from compareKey_A: the
+ *      files diff shrank to h2's file alone).
+ *   4. Reset the base branch back to the fork and refresh the pull, so the
+ *      fixture is re-runnable from the pre-advance state.
+ *
+ * The head is never touched; only the base branch moves and is put back.
+ */
+async function baseAdvanceSection(github: GithubClient, runner: CommandRunner): Promise<void> {
+  console.log('\n=== Section E: base advance moves the compareKey (LIVE, sandbox PR #4) ===')
+  const dataDir = mkdtempSync(join(tmpdir(), 'revu-base-advance-'))
+
+  // The fork the base branch must be restored to (its pre-advance tip).
+  const forkTip = (
+    await ghApi(runner, `repos/${REPO.owner}/${REPO.repo}/git/ref/heads/${BASE_ADVANCE.baseBranch}`)
+  ) as { object: { sha: string } }
+  const forkSha = forkTip.object.sha
+
+  try {
+    const store = openDirectStore({ dataDir })
+
+    // 1. Sync PR #4 at the pre-advance state — compareKey_A = fork…head.
+    const before = await syncPull({ github, repo: REPO, store }, BASE_ADVANCE.prNumber)
+    const compareKeyA = before.immutable.compareKey
+    const headA = before.immutable.headSha
+    const filesA = before.immutable.files.map((f) => f.filename).sort()
+    console.log(
+      `  step 1 — synced PR #4: compareKey_A=${compareKeyA}, ` +
+        `head=${headA.slice(0, 8)}, mergeBase=${before.immutable.mergeBaseSha.slice(0, 8)}, ` +
+        `files=[${filesA.join(', ')}]`,
+    )
+    check('step 1: compareKey_A is merge_base(fork)…head', compareKeyA === `${forkSha}...${headA}`)
+
+    // h1 — the head's FIRST commit off the fork — read live from the compare of
+    // the head branch against the fork. Advancing the base onto it moves the
+    // merge base while the head stays fixed.
+    const headVsFork = (await ghApi(
+      runner,
+      `repos/${REPO.owner}/${REPO.repo}/compare/${forkSha}...${BASE_ADVANCE.headBranch}`,
+    )) as { commits: Array<{ sha: string }> }
+    const h1Sha = headVsFork.commits[0]?.sha
+    check('step 1: the head has a first commit off the fork (h1)', typeof h1Sha === 'string' && h1Sha.length > 0, h1Sha)
+    if (h1Sha === undefined) return
+
+    // 2. Advance the base branch onto h1 (a real fast-forward onto a head
+    //    ancestor) and refresh the pull so its base.sha catches up.
+    const advancedTip = await moveBranch(runner, BASE_ADVANCE.baseBranch, h1Sha, false)
+    await refreshPullBase(runner, BASE_ADVANCE.prNumber, BASE_ADVANCE.baseBranch)
+    console.log(`  step 2 — advanced base ${BASE_ADVANCE.baseBranch} onto h1=${advancedTip.slice(0, 8)}`)
+
+    try {
+      // 3. Re-sync into the SAME store — compareKey_B = h1…head. A moved compare
+      //    key forces the immutable half to be rebuilt (no compareKey_A reuse).
+      const after = await syncPull({ github, repo: REPO, store }, BASE_ADVANCE.prNumber)
+      const compareKeyB = after.immutable.compareKey
+      const headB = after.immutable.headSha
+      const filesB = after.immutable.files.map((f) => f.filename).sort()
+      console.log(
+        `  step 3 — re-synced PR #4: compareKey_B=${compareKeyB}, ` +
+          `head=${headB.slice(0, 8)}, mergeBase=${after.immutable.mergeBaseSha.slice(0, 8)}, ` +
+          `files=[${filesB.join(', ')}]`,
+      )
+      check('step 3: the compareKey MOVED (compareKey_B !== compareKey_A)', compareKeyB !== compareKeyA, {
+        a: compareKeyA,
+        b: compareKeyB,
+      })
+      check('step 3: the head SHA is UNCHANGED across the advance', headB === headA, { a: headA, b: headB })
+      check('step 3: compareKey_B is merge_base(h1)…head', compareKeyB === `${h1Sha}...${headB}`)
+      check('step 3: the merge base moved to h1', after.immutable.mergeBaseSha === h1Sha, {
+        was: before.immutable.mergeBaseSha,
+        now: after.immutable.mergeBaseSha,
+      })
+      // The immutable half was rebuilt, NOT served from the compareKey_A cache:
+      // the three-dot diff shrank to h2's file alone (h1's file left the diff).
+      check(
+        'step 3: the immutable half was REBUILT (files diff changed, not reused from compareKey_A cache)',
+        JSON.stringify(filesB) !== JSON.stringify(filesA) && filesB.length < filesA.length,
+        { before: filesA, after: filesB },
+      )
+    } finally {
+      // 4. Reset the base branch to the fork and refresh the pull, so the
+      //    fixture is back at the pre-advance state for the next run.
+      await moveBranch(runner, BASE_ADVANCE.baseBranch, forkSha, true)
+      await refreshPullBase(runner, BASE_ADVANCE.prNumber, BASE_ADVANCE.baseBranch)
+      console.log(`  step 4 — reset base ${BASE_ADVANCE.baseBranch} back to fork=${forkSha.slice(0, 8)}`)
+    }
 
     store.close()
   } finally {
