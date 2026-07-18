@@ -193,43 +193,60 @@ Per guide §4: head-guard then `POST /reviews` with 1:1 `PendingComment` mapping
 
 ---
 
-## Milestone M3 — Broker service
+## Milestone M3 — Broker mode: in-workspace engine + host-side collector
 
-**Goal:** the broker grows the revu API from guide §2 on a scratch GitHub App + scratch org, run as a localhost process. Token custody, stamping, audit, durable per-human state. No sandbox hardware involved.
+**Goal:** revu's shared-identity mode, corrected for the real sandbox topology (`docs/agent/CHECKPOINT_2.md`). The deployment is **MINT-AND-INJECT, not proxy**: the host token broker pushes a ~1h repo-scoped installation token into each container's `~/.git-credentials` over `docker exec`; there is no listening socket and no inbound service a workspace can call. So "broker mode" is **not a GitHub proxy** — it is the M2 direct engine running IN the workspace against the ambient injected token (via a file-credential `TokenSource`), plus a thin host-side **revu collector** (beside the token broker) that rides the existing 60s tick to pull each container's drafts + local audit journal (bound to the `coder.owner` label = channel-authentic), runs the out-of-band-write detector, and holds the durable per-human store. **No workspace-callable inbound surface** — this preserves the sandbox's zero-inbound invariant. Built on a scratch GitHub App + scratch org first; no sandbox hardware involved. See `CHECKPOINT_2.md` §F for the full per-ticket rationale and §E for the 7 owner decisions that drive it.
 
 **Exit criteria:**
-- revud in `REVU_MODE=broker` against localhost broker passes the conformance suite on the scratch org.
+- revud in `REVU_MODE=broker` (inject-default) passes the conformance suite on the scratch org, reading + writing + reconciling in-workspace against a file-credential `TokenSource`.
 - Every write on github.com shows the stamped prefix; parser round-trips it; org-member comments interleave with genuine identity.
-- Draft written via one revud instance survives that instance's deletion and reappears via a fresh one (simulated workspace rebuild).
-- Audit log contains `{human_email, workspace, endpoint, pr, github_id, timestamp}` for every write, with GitHub-assigned ids.
+- A draft written via one revud instance is pulled to the host collector and reappears via a fresh instance (simulated workspace rebuild + cross-workspace).
+- The audit journal + host store contain `{human_email, workspace, endpoint, pr, github_id, timestamp}` for every mediated write, with GitHub-assigned ids; the out-of-band detector flags an App-authored comment posted directly (bypassing revud) as absent from every journal.
+- Audit identity binds to `coder.owner` (host-authenticated), never to workspace-claimed identity; draft access is authorized by that binding, not by a path `:email` parameter.
 - `canApprove` false on App-authored PRs (submit APPROVE rejected upstream and surfaced honestly), true on org-member PRs.
+- The `FileCredentialTokenSource` tolerates ~40min credential rotation, the 60s cold-start gap, and the 401-erase of `~/.git-credentials` (re-read per request, surface a typed "awaiting credential" state, never serialize the token).
 
-**Depends:** M2 (reuses sync engine and write path; broker wraps them).
+**Depends:** M2 (reuses the sync engine + write path in-workspace; the collector wraps drafts/audit, not GitHub calls).
 
 ### Issue M3.1 — Scratch App + org
-Create GitHub App (PR read/write, contents read, checks read), install on scratch org mirroring M2.1 scenarios plus one PR opened by a real org-member account.
+Create GitHub App with grant **byte-identical to the real one**: `contents:write` + `pull_requests:write` + `metadata:read` + `checks:read` (the owner adds `checks:read` to the real App — `CHECKPOINT_2.md` §E.3). **NO webhooks** (poll-only is correct). Install on scratch org mirroring M2.1 scenarios plus one PR opened by a real org-member account.
+- [sub] Per-RevuApi-method → App-permission matrix: verify `pull_requests:write` covers reviews, review-comment replies, resolve mutations, and reactions; confirm PR issue-comment reads (`/issues/{n}/comments`) fit the grant (or note the `issues` permission if not).
 - [sub] Document App creation/permissions as the client-facing runbook for the real installation.
+**Verify:** conformance fails early against any RevuApi call outside the exact grant; the matrix has no unverified rows.
 
-### Issue M3.2 — Token custody
-Broker: App JWT → installation token mint, refresh before expiry, in-memory only, never serialized to responses or logs. revud broker-mode `TokenSource` = "ask broker to execute", i.e. **no token endpoint exists** — GitHub-bound calls are forwarded, per guide §2 topology.
-**Verify:** grep broker logs/responses for `ghs_` finds nothing.
+### Issue M3.2 — Token custody (inject-default `FileCredentialTokenSource`)
+`FileCredentialTokenSource` reading `x-access-token` from `~/.git-credentials` (parse `https://x-access-token:<tok>@github.com`), **re-read per request** (never cached for process lifetime). This is the **deployment default**; the proxy-fetch `TokenSource` is kept as an **optional** guide-§5 strategy, not the default. Custody claim is **"revu adds no new credential and never serializes tokens"** — NOT "the workspace never holds a token" (false in this deployment; the workspace holds a live GitHub write token regardless of revu).
+- [sub] Tolerate the externally-rotated credential: on 401 re-read-then-backoff; surface a typed "awaiting credential" state for the 60s cold gap + the 401-erase-of-the-file (`error-copy.ts` `broker_unreachable` semantics reusable). Conformance scenario: rotate the credential file mid-sync.
+**Verify:** grep revud logs/responses for `ghs_` finds nothing; a mid-sync credential rotation does not fail the sync; a zero-byte credential surfaces "awaiting credential", not a crash.
 
-### Issue M3.3 — Broker endpoints: reads + caches
-`/v1/pulls`, `/v1/pulls/:n/sync`, `/v1/blobs/:sha`, `/v1/rate-limit` — sync executes the M2 engine broker-side; shared content-addressed blob cache; snapshot cache serving warm re-syncs to any workspace.
-**Verify:** two revud instances syncing the same PR: second sync's `blobsReused` equals blob count, request count ≤ mutable-refresh budget.
+### Issue M3.3 — Reads in-workspace (host cache de-prioritized)
+Reads run **in-workspace** on the ambient token — the M2 engine + local-git blobs, cheapest path in this topology. The host shared blob/snapshot cache is **de-prioritized** (its value shrinks to cross-workspace warm-sync); if built at all it MUST be **scope-partitioned by `repos.map`** so workspace A never receives a blob from a repo only B is scoped to.
+**Verify:** an in-workspace cold sync stays within the M2 request budget; if a host cache exists, a cross-scope blob request is refused.
 
-### Issue M3.4 — Broker endpoints: writes with stamping + audit
-`WriteDecorator` broker implementation: `prefixBody(human)` on every outbound body, append-only audit log (SQLite) with GitHub response ids, per exit criteria. Reply/resolve/react/submit forwarded from revud with human identity from the request context.
-- [sub] Audit log export command (`broker audit --pr 42 --since …`) for the client conversation.
-**Verify:** exit criteria 2, 4.
+### Issue M3.4 — Writes in-workspace + local audit journal + out-of-band detector
+Writes run **in-workspace**: revud posts on the ambient token, stamps the body via `WriteDecorator` (`prefixBody(human)`), and appends to a **local audit journal**. The host collector pulls journals (`coder.owner`-bound) and runs the **out-of-band-write detector**: reconcile App-authored comment/review ids on GitHub against the journals; any id absent from every journal = an out-of-band write. Audit = **provenance** of mediated writes + **detection** of out-of-band. **NO permission split** — the injected token keeps `pull_requests:write`; contractors keep direct `gh` (`CHECKPOINT_2.md` §E.2). Audit is therefore **detection, not prevention**.
+- [sub] Audit export command (`revu audit --pr 42 --since …`) over the host store for the client conversation.
+**Verify:** exit criteria 2, 4 — a comment posted by revud appears in the journal with its GitHub id; a comment posted by a direct `curl` on the ambient token is flagged by the detector as absent from every journal.
 
-### Issue M3.5 — Durable per-human state
-`/v1/drafts/:email/:n`, `/v1/viewed/:email/:n` on broker SQLite; revud broker-mode delegates draft/viewed/prefs storage here instead of local.
-**Verify:** exit criterion 3.
+### Issue M3.5 — Durable per-human state (host store, channel-keyed)
+Host-side store keyed by the **channel-derived email** — a host-side `coder.owner`→email map (or Coder API at provision time), **never** workspace-claimed. `/home/coder` persists across stop/start (the volume covers rebuild); the host store covers **offboarding** + cross-workspace. Draft/viewed/prefs access is authorized by the **`coder.owner` binding**, NOT by a path `:email` parameter — drop the authorize-by-path shape (it lets any workspace read any human's drafts). At-rest/backup = ops-owned dependency (`CHECKPOINT_2.md` §E.4, §G), not a revu ticket.
+**Verify:** exit criteria 3, 5 — a request for another human's drafts is refused on the `coder.owner` mismatch; a draft survives a simulated workspace rebuild via the host store.
 
-### Issue M3.6 — Workspace→broker authentication
-Requests carry workspace identity from the transport channel (tailnet source / mTLS / per-workspace bearer minted at provision time — decide with what the existing token-injection channel already provides), mapped broker-side to the audit `workspace` field. Git-config identity remains the display layer; channel identity is the audit layer. Document the trust boundary as in guide §1.
-**Verify:** a request with a forged `X-` identity header still audits under the channel-derived workspace.
+### Issue M3.6 — Identity binding (push-only; no workspace→broker auth)
+Re-framed for the push-only topology: there are **no** workspace→broker calls to authenticate. Identity = **`coder.owner` per container** (channel-authentic via the collector tick — the host knows which container it pulled from). **DROP** tailnet-source and mTLS (infeasible: workspaces are not tailnet nodes; Lima/Docker NAT collapses all workspaces to one source address; mTLS has no provisioning path). No inbound bearer needed. Git-config identity remains display-only; the `coder.owner` binding is the audit layer. Document the trust boundary as in guide §1 and `CHECKPOINT_2.md` §B.
+**Verify:** the audit `workspace`/human field derives from the container the collector pulled from (`coder.owner`), never from any workspace-reported header or git config.
+
+### Issue M3.7 — Host-side revu collector
+The sandbox **adapter** (revu core stays generic): a host-side component beside the token broker that rides the existing 60s `docker exec` tick to pull each managed container's drafts + audit journal (`coder.owner`-bound), holds the `coder.owner`→email binding, owns the durable store, and drives the out-of-band-write detector. No listening socket; no workspace-callable surface.
+**Verify:** the collector pulls a draft written in a container and lands it in the host store keyed by the channel-derived email; adding a container to the tick requires zero workspace-side revu configuration.
+
+### Issue M3.8 — revud loopback bind + one-port serve + system-path packaging
+revud binds **`127.0.0.1`** inside the container (the port-forward agent is co-resident, so loopback suffices; removes revu from the cross-container threat class on the shared docker bridge). Serve the SPA + API on **one** port reached via `coder port-forward --tcp` (path-based `coder_app` is broken for SPAs; port 3000 collides with Coder). Bake revud + built dist at a **system path** (`/opt/revu`) in the image — home-volume seeding happens once and never propagates updates; no revu state under `/home/coder` is authoritative.
+**Verify:** an e2e assertion that revud is unreachable from a second container over the bridge; `coder port-forward --tcp` serves the SPA + API end-to-end on one mapping.
+
+### Issue M3.9 — Offboarding retention/purge hook
+On workspace delete (offboarding), the host store **retains audit rows** (compliance) and **purges drafts/viewed** (`CHECKPOINT_2.md` §E.5). Aligns host-side revu state with the operating agreement's wipe clause rather than the workspace lifecycle.
+**Verify:** after an offboarding run for a human, their drafts/viewed are gone from the host store and their audit rows remain.
 
 ---
 
@@ -274,7 +291,7 @@ Scripted, each with asserted UI copy per `error-copy.ts`: broker down mid-draft-
 Large-PR fixture (2,000+ lines) and its scratch twin: sync wall-time budget, virtualized scroll jank check, Shiki worker not blocking first paint, warm-cache re-sync latency.
 
 ### Issue M5.4 — Security review
-Token custody paths; audit-log integrity (append-only, workspace-channel binding from M3.6); what a hostile workspace can and cannot do — written up as one page for the client. Confirm: browser never sees a token; broker never trusts workspace-claimed identity for audit; drafts of human A unreadable via human B's session.
+Token custody paths; audit-log integrity (append-only, `coder.owner` channel binding from M3.6); what a hostile workspace can and cannot do — written up as one page for the client. Confirm (all HOLD under the corrected inject model — `CHECKPOINT_2.md` §F/M5.4): browser never sees a token (revud keeps it server-side in-workspace); audit identity binds to `coder.owner`, never workspace-claimed; drafts of human A unreadable via human B's session (authorized by the `coder.owner` binding, not a `:email` path param). **ADD the honest statement:** the ambient injected token carries `pull_requests:write`, so a contractor can post bot-identity comments directly, bypassing revu — the audit layer is **detection (the out-of-band-write detector), not prevention**.
 
 ### Issue M5.5 — Docs
 Direct-mode README for general users (`bunx revud` quickstart); operator runbook (broker install, App creation from M3.1 sub-doc, audit export); CONTRIBUTING note that the mock is the permanent oracle.
@@ -283,21 +300,22 @@ Direct-mode README for general users (`bunx revud` quickstart); operator runbook
 
 ## Milestone M6 — On-prem deployment
 
-**Goal:** the sandbox specifics that cannot be proven off-prem (guide's deferral list). Executed on-site as a checklist; every technical unknown was retired in M2–M5.
+**Goal:** the sandbox specifics that cannot be proven off-prem (guide's deferral list), corrected to the real MINT-AND-INJECT topology (`docs/agent/CHECKPOINT_2.md` §B, §F). Executed on-site as a checklist; every technical unknown was retired in M2–M5.
 
 **Depends:** M5.
 
-### Issue M6.1 — Broker deployment on the macOS host
-Real App credentials (client runbook from M3.1), launchd service, broker SQLite location + backup for audit/drafts.
+### Issue M6.1 — Host-side revu collector deployment
+Deploy the M3.7 collector beside the real token broker on the macOS host: launchd service, host SQLite location for audit/drafts. **At-rest/backup/FileVault are an ops-owned dependency** (`CHECKPOINT_2.md` §E.4, §G) — confirm the operator's backup + encryption plan for the audit log; it is not a revu deliverable.
 
-### Issue M6.2 — Lima + tailnet path
-Workspace revud → host broker across the VM boundary; tailnet ACL for the broker port; document the address workspaces use.
+### Issue M6.2 — Collector on the existing push tick (NO tailnet broker)
+Wire the collector into the existing 60s `docker exec` tick to pull drafts + audit journals from each managed container (`coder.owner`-bound). **DROP the tailnet broker path entirely** — no `REVU_BROKER_URL=broker.tail<net>.ts.net`, no tailnet ACL for a broker port: workspace containers are NOT tailnet nodes (the tailnet terminates at the Mac) and container→host is Lima/Docker NAT that collapses all workspaces to one source address. There is no workspace→host listener; the collector reaches into containers from outside the VM, exactly like the token broker.
+**Verify:** the collector pulls state from a container with no inbound surface exposed on the host; no workspace-callable revu port exists anywhere.
 
-### Issue M6.3 — Coder template wiring
-Startup build + revud launch per guide §6 (serve `dist/`, never `vite dev`); port 4780 as a named Coder app; alias; confirm injected git identities parse (M1.2 charset) with the real username population.
+### Issue M6.3 — Coder template + image wiring
+Bake revud + built dist at **`/opt/revu`** (system path — home-volume seeding never propagates updates); startup launches revud (serve `dist/`, never `vite dev`) **bound to `127.0.0.1`**; access via `coder port-forward --tcp` on one port (NOT a named `coder_app` — path-apps are broken for SPAs, no wildcard TLS; port 3000 collides with Coder). Confirm injected git identities parse (M1.2 charset) with the real username population.
 
 ### Issue M6.4 — Two-human end-to-end
 The invariant proof: two contractors (two browser profiles / two workspaces), one PR, independent drafts, both submit, both stamped correctly, audit log distinguishes them, drafts survived a mid-test workspace rebuild for one of them.
 
 ### Issue M6.5 — Client acceptance
-Walk the client's lead through: org-member review interleave on github.com, approve-on-github workflow for App-authored PRs (guide §2.1 gating), audit export, tailnet exposure surface. Sign-off closes the milestone.
+Walk the client's lead through: org-member review interleave on github.com, approve-on-github workflow for App-authored PRs (guide §2.1 gating), audit export (provenance + the out-of-band-write detector), and the exposure surface (revud loopback-bound, collector push-only, no workspace-callable listener). Sign-off closes the milestone.
