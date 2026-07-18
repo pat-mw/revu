@@ -7,7 +7,7 @@ import type { RepoRef } from './repo'
 import { resolveRepo } from './repo'
 import type { TokenSource } from './token-source'
 import { createDirectTokenSource, NoTokenError } from './token-source'
-import { buildDirectSession } from './session'
+import { buildBrokerSession, buildDirectSession } from './session'
 
 /**
  * The direct-mode bring-up: resolve the target repo, prove a GitHub token is
@@ -55,6 +55,22 @@ export interface DirectResolveOptions {
   cwd?: string
   /** Explicit `owner/name` override (from `--repo` or `REVU_REPO`). */
   repoOverride?: string
+  /**
+   * The credential strategy the GitHub client authenticates with. When omitted,
+   * the `gh`-backed direct source is built from the runner and env. Supplying one
+   * is how the same engine is brought up against a different custody surface (an
+   * ambient host-injected credential) without duplicating any of the assembly.
+   */
+  tokenSource?: TokenSource
+  /**
+   * Whether to prove a token is obtainable at startup by fetching one once.
+   * Defaults to `true`, so an unauthenticated direct setup fails at boot rather
+   * than on the first request. Set `false` when the credential is injected
+   * asynchronously by an external host and may legitimately be absent for a short
+   * window at container start: boot then proceeds and the absent-credential state
+   * is surfaced per request instead of stopping the daemon.
+   */
+  validateToken?: boolean
 }
 
 /**
@@ -89,16 +105,24 @@ export async function resolveDirectContext(
   }
   const repo = resolution.repo
 
-  // 2. Token custody — build the source and prove a token is obtainable now, so
-  //    an unauthenticated setup fails at startup rather than on the first call.
-  const tokenSource = createDirectTokenSource(runner, env)
-  try {
-    await tokenSource.getToken()
-  } catch (err) {
-    if (err instanceof NoTokenError) {
-      throw new DirectStartupError(err.message)
+  // 2. Token custody — build (or accept) the source. The default is the
+  //    `gh`-backed direct source; an injected source swaps the custody surface
+  //    (e.g. a host-injected ambient credential) while every other assembly step
+  //    stays identical. By default a token is fetched once to prove the setup is
+  //    authenticated, so an unauthenticated direct setup fails at startup rather
+  //    than on the first call. Validation is skipped when the credential is
+  //    injected asynchronously and may be absent at boot for a short window.
+  const tokenSource = opts.tokenSource ?? createDirectTokenSource(runner, env)
+  const validateToken = opts.validateToken ?? true
+  if (validateToken) {
+    try {
+      await tokenSource.getToken()
+    } catch (err) {
+      if (err instanceof NoTokenError) {
+        throw new DirectStartupError(err.message)
+      }
+      throw err
     }
-    throw err
   }
 
   // 3. Session build — git-config identity plus the viewer's own login.
@@ -110,16 +134,29 @@ export async function resolveDirectContext(
 
   let session: Session
   try {
-    session = await buildDirectSession({
-      runner,
-      github,
-      repo,
-      ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-      env,
-    })
+    // Direct mode validates the token at boot, so the viewer fetch is proven to
+    // work and the full session (with `viewerLogin` from `GET /user`) is built.
+    // Broker mode (validation skipped) does NOT probe the viewer at all: its
+    // GitHub App installation token cannot resolve a login via `GET /user`
+    // (GitHub answers 403), so `viewerLogin` is absent by design and identity
+    // comes from git config alone — boot never depends on a present credential.
+    session = validateToken
+      ? await buildDirectSession({
+          runner,
+          github,
+          repo,
+          ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+          env,
+        })
+      : await buildBrokerSession({
+          runner,
+          repo,
+          ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+          env,
+        })
   } catch (err) {
-    // Git-config identity errors and GitHub viewer errors both stop startup with
-    // their own already-actionable messages.
+    // Git-config identity errors stop startup with their own already-actionable
+    // messages (broker mode makes no GitHub call here, so no viewer error arises).
     throw new DirectStartupError(err instanceof Error ? err.message : String(err))
   }
 

@@ -1,0 +1,415 @@
+import { expect } from 'bun:test'
+import type { PendingComment, ReviewDraft, Session } from '@revu/shared'
+import type {
+  GhBlobRaw,
+  GhCompareRaw,
+  GhGraphqlBlobObject,
+  GhGraphqlPageInfo,
+  GhReviewThreadNode,
+  GhTreeRaw,
+  GithubClient,
+  Page,
+  PageParams,
+} from './github-client'
+import type { RepoRef } from './repo'
+import type { DirectApi } from './direct-api'
+import { unusedWriteMethods } from './github-write-stubs'
+
+/**
+ * Fake `GithubClient`s and fixtures shared by every network-free conformance run
+ * of the shared read/persist engine — the direct-adapter read and reconcile
+ * suites, and the broker-adapter suite (the same engine brought up against a
+ * host-injected credential). Keeping the fakes in one place means every mode is
+ * held to the same contract from one set of fixtures, and a fixture change lands
+ * once. Test-support code: imported only by `*.test.ts`, nothing here runs in a
+ * live daemon.
+ */
+
+/** The repo every conformance fake serves. */
+export const CONFORMANCE_REPO: RepoRef = { owner: 'o', repo: 'r' }
+
+/** The session every conformance fake keys per-human state against. */
+export const CONFORMANCE_SESSION: Session = {
+  human: { id: 'h@x.io', name: 'H', role: 'contractor', email: 'h@x.io' },
+  brokerLogin: '',
+  workspace: 'direct-o-r',
+  viewerLogin: 'h-gh',
+}
+
+/** One-page helper: page 1 carries the items, every later page is empty. */
+function page<T>(items: T[], params: PageParams): Page<T> {
+  return params.page === 1 ? { items, hasNext: false } : { items: [], hasNext: false }
+}
+
+// ————————————————————————————————————————————————————————————————
+// The base-moved read fake (drives baseline + baseAdvanced + mutableDrift)
+// ————————————————————————————————————————————————————————————————
+
+/** PR number the base-moved read fake answers for. */
+export const MOVING_BASE_PR = 204
+
+/** A mutable fake whose head is fixed but whose merge base can be advanced between syncs. */
+export function movingBaseClient(state: {
+  mergeBaseSha: string
+  unresolvedComments: number
+}): GithubClient {
+  return {
+    async getViewer() {
+      return { login: 'h-gh', id: 1 }
+    },
+    async getPullDetail() {
+      return {
+        number: MOVING_BASE_PR,
+        state: 'open',
+        user: { login: 'author', id: 2, type: 'User' },
+        head: { sha: 'HEAD-FIXED' },
+        base: { sha: 'BRANCH' },
+      }
+    },
+    async getCompare(): Promise<GhCompareRaw> {
+      return { merge_base_commit: { sha: state.mergeBaseSha } }
+    },
+    async getPullFiles(_o, _r, _n, params): Promise<Page<unknown>> {
+      return page(
+        [
+          {
+            sha: 'blobHead',
+            filename: 'a.ts',
+            status: 'modified',
+            additions: 1,
+            deletions: 0,
+            changes: 1,
+            patch: '@@ -1 +1 @@',
+          },
+        ],
+        params,
+      )
+    },
+    async getIssueComments(_o, _r, _n, params): Promise<Page<unknown>> {
+      // The mutable half reflects however many comments exist NOW — this is what
+      // proves a head-unchanged re-sync still refreshes the mutable half.
+      const items = Array.from({ length: state.unresolvedComments }, (_v, i) => ({
+        id: i + 1,
+        body: 'c',
+        user: { login: 'x', id: 9, type: 'User' },
+      }))
+      return page(items, params)
+    },
+    async getPullReviews(_o, _r, _n, params): Promise<Page<unknown>> {
+      return page([], params)
+    },
+    async getPullCommits(_o, _r, _n, params): Promise<Page<unknown>> {
+      return page([{ sha: 'c1', commit: { message: 'm', author: { date: '2026-01-01' } } }], params)
+    },
+    async getCheckRuns() {
+      return { check_runs: [] }
+    },
+    async getTree(): Promise<GhTreeRaw> {
+      return { tree: [{ path: 'a.ts', type: 'blob', sha: `base-${state.mergeBaseSha}` }], truncated: false }
+    },
+    async getBlob(_o, _r, sha): Promise<GhBlobRaw> {
+      const text = `content-of-${sha}\n`
+      return {
+        content: Buffer.from(text, 'utf8').toString('base64'),
+        encoding: 'base64',
+        size: Buffer.byteLength(text, 'utf8'),
+      }
+    },
+    async getBlobObjects(_o, _r, shas): Promise<Record<string, GhGraphqlBlobObject | null>> {
+      const out: Record<string, GhGraphqlBlobObject | null> = {}
+      for (const sha of shas) {
+        const text = `content-of-${sha}\n`
+        out[sha] = { isBinary: false, text, byteSize: text.length }
+      }
+      return out
+    },
+    async graphql<T>(): Promise<T> {
+      throw new Error('graphql not used directly in this fake')
+    },
+    async getReviewThreads(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+    },
+    async getThreadComments(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: never[] }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+    },
+    ...unusedWriteMethods(),
+  }
+}
+
+/**
+ * The head blob SHA `movingBaseClient` reports for its single changed file. The
+ * partial fake below withholds exactly this SHA from every provisioning tier.
+ */
+export const MOVING_BASE_HEAD_BLOB_SHA = 'blobHead'
+
+/**
+ * A base-moved fake that CANNOT provision the head blob's bytes from any tier:
+ * the GraphQL batch nulls that SHA and the single-blob straggler fails for it, so
+ * the sync keeps the snapshot with an honest `partial` naming the missing SHA
+ * rather than throwing. Every other blob is provisioned normally. This drives the
+ * `partial`-tolerating sync path — an absent credential is a DIFFERENT thing (it
+ * throws `AwaitingCredentialError`), so the two must not be conflated.
+ */
+export function partialBlobClient(state: {
+  mergeBaseSha: string
+  unresolvedComments: number
+}): GithubClient {
+  const base = movingBaseClient(state)
+  return {
+    ...base,
+    async getBlob(owner, repo, sha): Promise<GhBlobRaw> {
+      // The straggler fallback also fails for the withheld head SHA, so no tier
+      // can produce it and it lands in `partial`.
+      if (sha === MOVING_BASE_HEAD_BLOB_SHA) {
+        throw new Error(`fake: blob ${sha} withheld to drive a partial`)
+      }
+      return base.getBlob(owner, repo, sha)
+    },
+    async getBlobObjects(owner, repo, shas): Promise<Record<string, GhGraphqlBlobObject | null>> {
+      const out = await base.getBlobObjects(owner, repo, shas)
+      if (MOVING_BASE_HEAD_BLOB_SHA in out) out[MOVING_BASE_HEAD_BLOB_SHA] = null
+      return out
+    },
+  }
+}
+
+// ————————————————————————————————————————————————————————————————
+// The force-push reconcile fake (drives the reconcile scenario)
+// ————————————————————————————————————————————————————————————————
+
+/** PR number the reconcile fake answers for. */
+export const RECONCILE_PR = 5
+/** File path the reconcile fake's single changed file lives at. */
+export const RECONCILE_PATH = 'src/a.ts'
+
+/** The base blob is FIXED across the force-push; a LEFT anchor reads it. */
+const BASE_SHA = 'blob-base'
+const BASE_LINES = ['base head', 'deleted base line', 'base tail']
+
+/** The head blob is REWRITTEN by the force-push: SHA and content both change. */
+const HEAD_SHA_OLD = 'blob-head-old'
+const HEAD_LINES_OLD = ['clean anchor', 'drift anchor', 'lost anchor', 'tail one']
+const HEAD_SHA_NEW = 'blob-head-new'
+// Two lines inserted above 'drift anchor' (→ +2), 'lost anchor' deleted.
+const HEAD_LINES_NEW = [
+  'clean anchor',
+  'inserted A',
+  'inserted B',
+  'drift anchor',
+  'tail one',
+  'tail two',
+]
+
+const BLOB_CONTENT: Record<string, string[]> = {
+  [BASE_SHA]: BASE_LINES,
+  [HEAD_SHA_OLD]: HEAD_LINES_OLD,
+  [HEAD_SHA_NEW]: HEAD_LINES_NEW,
+}
+
+/** The mutable head SHA and commit list the fake advances on the force-push. */
+export interface RemoteState {
+  headSha: string
+  headBlobSha: string
+  commits: { sha: string; date: string }[]
+}
+
+export function initialReconcileState(): RemoteState {
+  return {
+    headSha: 'HEAD-OLD',
+    headBlobSha: HEAD_SHA_OLD,
+    commits: [
+      { sha: 'C0', date: '2026-01-10T00:00:00.000Z' },
+      { sha: 'HEAD-OLD', date: '2026-01-14T00:00:00.000Z' },
+    ],
+  }
+}
+
+/** Advance the remote as a force-push would: new head + head blob, three commits added. */
+export function forcePush(state: RemoteState): void {
+  state.headSha = 'HEAD-NEW'
+  state.headBlobSha = HEAD_SHA_NEW
+  state.commits = [
+    ...state.commits,
+    { sha: 'C2', date: '2026-01-16T00:00:00.000Z' },
+    { sha: 'C3', date: '2026-01-17T00:00:00.000Z' },
+    { sha: 'HEAD-NEW', date: '2026-01-18T00:00:00.000Z' },
+  ]
+}
+
+/** A fake whose head, head blob, and commit list advance when `forcePush` runs. */
+export function movingHeadClient(state: RemoteState): GithubClient {
+  return {
+    async getViewer() {
+      return { login: 'h-gh', id: 1 }
+    },
+    async getPullDetail() {
+      return {
+        number: RECONCILE_PR,
+        state: 'open',
+        user: { login: 'author', id: 2, type: 'User' },
+        head: { sha: state.headSha },
+        base: { sha: 'BRANCH' },
+      }
+    },
+    async getCompare(): Promise<GhCompareRaw> {
+      return { merge_base_commit: { sha: 'MB' } }
+    },
+    async getPullFiles(_o, _r, _n, params): Promise<Page<unknown>> {
+      return page(
+        [
+          {
+            sha: state.headBlobSha,
+            filename: RECONCILE_PATH,
+            status: 'modified',
+            additions: 1,
+            deletions: 0,
+            changes: 1,
+            patch: '@@ -1 +1 @@',
+          },
+        ],
+        params,
+      )
+    },
+    async getIssueComments(_o, _r, _n, params): Promise<Page<unknown>> {
+      return page([], params)
+    },
+    async getPullReviews(_o, _r, _n, params): Promise<Page<unknown>> {
+      return page([], params)
+    },
+    async getPullCommits(_o, _r, _n, params): Promise<Page<unknown>> {
+      const items = state.commits.map((c) => ({
+        sha: c.sha,
+        commit: { message: `commit ${c.sha}`, author: { name: 'A', email: 'a@x.io', date: c.date } },
+      }))
+      return page(items, params)
+    },
+    async getCheckRuns() {
+      return { check_runs: [] }
+    },
+    async getTree(): Promise<GhTreeRaw> {
+      // Merge base is fixed → the base blob SHA never changes.
+      return { tree: [{ path: RECONCILE_PATH, type: 'blob', sha: BASE_SHA }], truncated: false }
+    },
+    async getBlob(_o, _r, sha): Promise<GhBlobRaw> {
+      const lines = BLOB_CONTENT[sha] ?? []
+      const text = lines.length === 0 ? '' : lines.join('\n') + '\n'
+      return {
+        content: Buffer.from(text, 'utf8').toString('base64'),
+        encoding: 'base64',
+        size: Buffer.byteLength(text, 'utf8'),
+      }
+    },
+    async getBlobObjects(_o, _r, shas): Promise<Record<string, GhGraphqlBlobObject | null>> {
+      const out: Record<string, GhGraphqlBlobObject | null> = {}
+      for (const sha of shas) {
+        const lines = BLOB_CONTENT[sha] ?? []
+        const text = lines.length === 0 ? '' : lines.join('\n') + '\n'
+        out[sha] = { isBinary: false, text, byteSize: Buffer.byteLength(text, 'utf8') }
+      }
+      return out
+    },
+    async graphql<T>(): Promise<T> {
+      throw new Error('graphql not used directly in this fake')
+    },
+    async getReviewThreads(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+    },
+    async getThreadComments(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: never[] }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+    },
+    ...unusedWriteMethods(),
+  }
+}
+
+/** The draft's pending comments — a RIGHT clean/drift/lost trio and a LEFT clean. */
+export function reconcileDraftComments(): PendingComment[] {
+  return [
+    {
+      key: 'c-clean',
+      path: RECONCILE_PATH,
+      side: 'RIGHT',
+      start_side: null,
+      line: 1,
+      start_line: null,
+      body: 'clean note',
+      createdAt: '2026-01-15T00:00:00.000Z',
+      updatedAt: '2026-01-15T00:00:00.000Z',
+      anchor: { lineText: 'clean anchor', contextBefore: [], contextAfter: ['drift anchor'] },
+    },
+    {
+      key: 'c-drift',
+      path: RECONCILE_PATH,
+      side: 'RIGHT',
+      start_side: null,
+      line: 2,
+      start_line: null,
+      body: 'drift note',
+      createdAt: '2026-01-15T00:00:00.000Z',
+      updatedAt: '2026-01-15T00:00:00.000Z',
+      anchor: {
+        lineText: 'drift anchor',
+        contextBefore: ['clean anchor'],
+        contextAfter: ['tail one'],
+      },
+    },
+    {
+      key: 'c-lost',
+      path: RECONCILE_PATH,
+      side: 'RIGHT',
+      start_side: null,
+      line: 3,
+      start_line: null,
+      body: 'lost note',
+      createdAt: '2026-01-15T00:00:00.000Z',
+      updatedAt: '2026-01-15T00:00:00.000Z',
+      anchor: { lineText: 'lost anchor', contextBefore: [], contextAfter: [] },
+    },
+    {
+      key: 'c-left',
+      path: RECONCILE_PATH,
+      side: 'LEFT',
+      start_side: null,
+      line: 2,
+      start_line: null,
+      body: 'left note',
+      createdAt: '2026-01-15T00:00:00.000Z',
+      updatedAt: '2026-01-15T00:00:00.000Z',
+      anchor: {
+        lineText: 'deleted base line',
+        contextBefore: ['base head'],
+        contextAfter: ['base tail'],
+      },
+    },
+  ]
+}
+
+/**
+ * Sync the reconcile PR, seed a draft against that (soon-to-be-stale) head,
+ * force-push, and re-sync — leaving the adapter ready for a reconcile against the
+ * fresh snapshot. Returns the draft as it was seeded (against the OLD head).
+ */
+export async function seedForcePushed(api: DirectApi, state: RemoteState): Promise<ReviewDraft> {
+  const first = await api.syncPull(RECONCILE_PR)
+  // The draft is seeded against the OLD head; assert the fixture actually starts
+  // there so a broken fixture fails precisely here at seed time, not later with a
+  // confusing reconcile mismatch.
+  expect(first.immutable.headSha).toBe('HEAD-OLD')
+
+  const draft = api.saveDraft({
+    humanId: CONFORMANCE_SESSION.human.id,
+    prNumber: RECONCILE_PR,
+    headSha: first.immutable.headSha,
+    compareKey: first.immutable.compareKey,
+    body: 'review body',
+    event: 'COMMENT',
+    comments: reconcileDraftComments(),
+    createdAt: '2026-01-15T00:00:00.000Z',
+    updatedAt: '2026-01-15T00:00:00.000Z',
+  })
+
+  forcePush(state)
+  const second = await api.syncPull(RECONCILE_PR)
+  // The re-sync must observe the force-pushed head — the whole point of the seed.
+  expect(second.immutable.headSha).toBe('HEAD-NEW')
+  return draft
+}

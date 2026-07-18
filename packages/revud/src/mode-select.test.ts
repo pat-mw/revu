@@ -29,9 +29,22 @@ describe('resolveMode', () => {
     expect(resolveMode([], { REVU_MODE: 'mock' })).toBe('mock')
   })
 
-  test('a bogus mode throws a clear error', () => {
-    expect(() => resolveMode([], { REVU_MODE: 'broker' })).toThrow()
+  test('REVU_MODE=broker selects broker mode', () => {
+    expect(resolveMode([], { REVU_MODE: 'broker' })).toBe('broker')
+  })
+
+  test('a bogus mode throws a clear error listing all three modes', () => {
     expect(() => resolveMode([], { REVU_MODE: 'nonsense' })).toThrow()
+    // The message names every accepted mode so a mistype is self-correcting.
+    let message = ''
+    try {
+      resolveMode([], { REVU_MODE: 'nonsense' })
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err)
+    }
+    expect(message).toContain('mock')
+    expect(message).toContain('direct')
+    expect(message).toContain('broker')
   })
 })
 

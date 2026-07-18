@@ -10,7 +10,7 @@ import { describe, expect, test } from 'bun:test'
 import { isOwnComment, parseCommentIdentity } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import type { GithubViewer, GithubViewerClient } from './github-client'
-import { buildDirectSession, buildHuman, MissingGitIdentityError } from './session'
+import { buildBrokerSession, buildDirectSession, buildHuman, MissingGitIdentityError } from './session'
 
 /** A CommandRunner answering `git config <key>` from a map; anything else fails. */
 function gitConfigRunner(config: Record<string, string>): CommandRunner {
@@ -152,5 +152,28 @@ describe('buildDirectSession', () => {
       ['brokerLogin', 'human', 'viewerLogin', 'workspace'].sort(),
     )
     expect(Object.keys(session.human).sort()).toEqual(['email', 'id', 'name', 'role'].sort())
+  })
+})
+
+describe('buildBrokerSession', () => {
+  test('builds identity from git config and omits viewerLogin — no GitHub call at all', async () => {
+    // Broker mode takes NO github client: a GitHub App installation token cannot
+    // resolve a login via `GET /user`, so the viewer is never probed. Identity is
+    // fully local, so the session builds whether a credential is present, absent,
+    // or would 403 — there is simply no request that could fail.
+    const runner = gitConfigRunner({ 'user.name': 'Bot Wrangler', 'user.email': 'ops@shared.co' })
+    const session = await buildBrokerSession({ runner, repo: { owner: 'acme', repo: 'revu' } })
+    expect(session.human.id).toBe('ops@shared.co')
+    expect(session.brokerLogin).toBe('')
+    expect(session.viewerLogin).toBeUndefined()
+    expect(session.workspace).toContain('acme')
+    expect(session.workspace).toContain('revu')
+  })
+
+  test('propagates a missing git identity — the local-only source is still required', async () => {
+    const runner = gitConfigRunner({ 'user.email': 'ops@shared.co' })
+    await expect(
+      buildBrokerSession({ runner, repo: { owner: 'acme', repo: 'revu' } }),
+    ).rejects.toBeInstanceOf(MissingGitIdentityError)
   })
 })

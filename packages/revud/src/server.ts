@@ -47,6 +47,14 @@ export interface ServeOptions {
    * dev routes are provably unreachable in any other mode.
    */
   mode: RevuMode
+  /**
+   * The interface to bind. Omitted for mock/direct, where the default binds all
+   * interfaces (a developer reaches the daemon from the host). Broker mode sets
+   * `'127.0.0.1'` so the daemon is reachable only over loopback inside its
+   * disposable workspace and the host reaches it exclusively through a forwarded
+   * port — the injected credential never rides an interface anyone else can dial.
+   */
+  hostname?: string
 }
 
 /**
@@ -109,21 +117,23 @@ export function createFetchHandler(
 }
 
 /**
- * Build the direct-mode request handler. Serves `/api/*` from the direct router
- * (the real session for `getSession`, a `not_implemented` placeholder for the
- * not-yet-built routes) and static files otherwise. The session is
- * fixed for the daemon's lifetime; no request can change it. There is no mock
- * and no dev panel in direct mode.
+ * Build the direct/broker request handler. Serves `/api/*` from the shared direct
+ * router (the real session for `getSession`, a `not_implemented` placeholder for
+ * the not-yet-built routes) and static files otherwise. The session is fixed for
+ * the daemon's lifetime; no request can change it. There is no mock and no dev
+ * panel here. `mode` is forwarded to the router so broker mode (reads-only) gates
+ * the four write endpoints to `not_implemented` while direct mode serves them.
  */
 export function createDirectFetchHandler(
   distDir: string,
   session: Session,
   api: DirectApi,
+  mode: RevuMode = 'direct',
 ): (req: Request) => Promise<Response> {
   const indexPath = join(distDir, 'index.html')
 
   return async function fetch(req: Request): Promise<Response> {
-    const apiResponse = await handleDirectApi(req, session, api)
+    const apiResponse = await handleDirectApi(req, session, api, mode)
     if (apiResponse) return apiResponse
     return serveStatic(distDir, indexPath, req)
   }
@@ -144,19 +154,28 @@ export function startServer(opts: ServeOptions): Server {
   }
 
   let fetch: (req: Request) => Promise<Response>
-  if (opts.mode === 'direct') {
+  if (opts.mode === 'direct' || opts.mode === 'broker') {
+    // Broker mode runs the SAME engine as direct — the only difference is upstream
+    // (the injected credential source and the loopback bind), so the request
+    // surface, session, and read/persist API are assembled identically and served
+    // by the same handler. The one broker-only per-request behavior (an absent
+    // credential mapping to `broker_unreachable`) lives in the shared router.
     if (opts.directSession === undefined) {
-      throw new Error('revud: direct mode requires a resolved session.')
+      throw new Error(`revud: ${opts.mode} mode requires a resolved session.`)
     }
     if (opts.directApi === undefined) {
-      throw new Error('revud: direct mode requires a resolved read/persist surface.')
+      throw new Error(`revud: ${opts.mode} mode requires a resolved read/persist surface.`)
     }
-    fetch = createDirectFetchHandler(opts.distDir, opts.directSession, opts.directApi)
+    fetch = createDirectFetchHandler(opts.distDir, opts.directSession, opts.directApi, opts.mode)
   } else {
     if (opts.mock === undefined) {
       throw new Error(`revud: ${opts.mode} mode requires the mock bundle.`)
     }
     fetch = createFetchHandler(opts.distDir, opts.mock, opts.mode)
   }
-  return Bun.serve({ port: opts.port, fetch })
+  return Bun.serve({
+    port: opts.port,
+    fetch,
+    ...(opts.hostname !== undefined ? { hostname: opts.hostname } : {}),
+  })
 }

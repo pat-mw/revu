@@ -6,6 +6,7 @@ import type { RevuMode } from './api-router'
 import { DirectStartupError, resolveDirectContext } from './direct/context'
 import { createDirectApi } from './direct/direct-api'
 import { openDirectStore, resolveDirectDataDir } from './direct/store'
+import { createFileCredentialTokenSource } from './broker/token-source'
 
 /**
  * Entry point for the revu daemon. One Bun process serves the built frontend
@@ -39,14 +40,16 @@ export function resolveDistDir(env: Record<string, string | undefined> = process
   return join(process.cwd(), 'packages', 'app', 'dist')
 }
 
-/** The transport modes the daemon can boot into today. `broker` is reserved. */
-export type BootMode = Extract<RevuMode, 'mock' | 'direct'>
+/** The transport modes the daemon can boot into. */
+export type BootMode = Extract<RevuMode, 'mock' | 'direct' | 'broker'>
 
 /**
  * Resolve the boot mode from CLI args and the environment. `--direct` (or
- * `REVU_MODE=direct`) selects direct mode; anything else defaults to mock, which
- * keeps the daemon's historical behavior exactly. `broker` is not yet a boot
- * option and is rejected with a clear message so a mistyped mode fails loudly.
+ * `REVU_MODE=direct`) selects direct mode; `REVU_MODE=broker` selects broker
+ * mode (the same engine against a host-injected ambient credential, bound to
+ * loopback); anything else defaults to mock, which keeps the daemon's historical
+ * behavior exactly. An unrecognized mode is rejected with a clear message so a
+ * mistyped mode fails loudly.
  */
 export function resolveMode(
   argv: string[] = process.argv.slice(2),
@@ -54,9 +57,9 @@ export function resolveMode(
 ): BootMode {
   const flaggedDirect = argv.includes('--direct')
   const mode = flaggedDirect ? 'direct' : (env.REVU_MODE ?? 'mock')
-  if (mode === 'mock' || mode === 'direct') return mode
+  if (mode === 'mock' || mode === 'direct' || mode === 'broker') return mode
   throw new Error(
-    `REVU_MODE="${mode}" is not supported — use "mock" (default) or "direct" (or pass --direct).`,
+    `REVU_MODE="${mode}" is not supported — use "mock" (default), "direct" (or pass --direct), or "broker".`,
   )
 }
 
@@ -89,6 +92,10 @@ export async function main(
   const mode = resolveMode(process.argv.slice(2), env)
   if (mode === 'direct') {
     await mainDirect(env)
+    return
+  }
+  if (mode === 'broker') {
+    await mainBroker(env)
     return
   }
   await mainMock(env)
@@ -189,6 +196,91 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
     `revud: serving ${distDir} on http://localhost:${server.port} ` +
       `(mode=direct, repo=${context.repo.owner}/${context.repo.repo}, ` +
       `viewer=${context.session.viewerLogin ?? '?'}, data=${dataDir})`,
+  )
+}
+
+/**
+ * Broker-mode boot: the SAME engine as direct, run in a disposable workspace
+ * against a GitHub credential an external host injects into the workspace's
+ * credential file, and bound to loopback. It differs from direct mode in exactly
+ * three ways, and reuses everything else:
+ *
+ *   1. The `TokenSource` is `createFileCredentialTokenSource(...)` — it reads the
+ *      injected `~/.git-credentials` (or `REVU_CREDENTIALS_FILE`) fresh on every
+ *      request rather than shelling out to `gh`.
+ *   2. Boot tolerates an absent credential and never probes the viewer. The host
+ *      writes and refreshes the file on its own schedule, so it may legitimately
+ *      be missing for a short window at container start. `validateToken: false`
+ *      skips the boot-time token probe that direct mode uses to fail fast, so the
+ *      daemon starts anyway; the awaiting state is surfaced per request (as
+ *      `broker_unreachable`) instead of stopping the process. Identity resolves
+ *      locally from git config (the `Human` — the stable draft/audit key), so the
+ *      session is real from boot; `viewerLogin` is absent because a GitHub App
+ *      installation token cannot resolve a login via `GET /user` (GitHub answers
+ *      403). No GitHub call is made at boot at all.
+ *   3. The server binds `127.0.0.1`, reachable only over loopback inside the
+ *      workspace; the host reaches it through a forwarded port.
+ *
+ * Broker mode is READS-ONLY for now: the router gates the four write endpoints
+ * (submit review, reply, resolve/unresolve, react) to `not_implemented`. Correct
+ * broker writes — stamp-with-human plus self-identify-as-bot for the guards and
+ * the audit log, which read `viewerLogin` — are an interlocking system enabled
+ * together with the writes unit, not here. Reads (sync, snapshot, blobs,
+ * reconcile) are fully served. The token is never logged: only the resolved repo
+ * and data dir appear in the startup line.
+ */
+async function mainBroker(env: Record<string, string | undefined>): Promise<void> {
+  const port = resolvePort(env)
+  const distDir = resolveDistDir(env)
+  const repoOverride = resolveRepoOverride(process.argv.slice(2), env)
+
+  const context = await resolveDirectContext({
+    env,
+    // Read the ambient host-injected credential rather than shelling out to `gh`.
+    tokenSource: createFileCredentialTokenSource({ env }),
+    // The credential may not be present yet at boot; do not halt on its absence.
+    validateToken: false,
+    ...(repoOverride !== undefined ? { repoOverride } : {}),
+  })
+
+  const dataDir = resolveDirectDataDir(env)
+  const store = openDirectStore({ dataDir, env })
+  const brokerApi = createDirectApi({
+    session: context.session,
+    github: context.github,
+    repo: context.repo,
+    store,
+    runner: context.runner,
+    cwd: context.cwd,
+  })
+
+  const server = startServer({
+    port,
+    distDir,
+    directSession: context.session,
+    directApi: brokerApi,
+    mode: 'broker',
+    // Loopback only: the injected credential never rides an interface anyone
+    // outside the workspace can reach.
+    hostname: '127.0.0.1',
+  })
+
+  const shutdown = (signal: string): void => {
+    try {
+      store.close()
+    } finally {
+      server.stop(true)
+      console.log(`revud: ${signal} received, stopped.`)
+      process.exit(0)
+    }
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+  process.on('SIGINT', () => shutdown('SIGINT'))
+
+  console.log(
+    `revud: serving ${distDir} on http://127.0.0.1:${server.port} ` +
+      `(mode=broker, reads-only, repo=${context.repo.owner}/${context.repo.repo}, ` +
+      `human=${context.session.human.id}, data=${dataDir})`,
   )
 }
 
