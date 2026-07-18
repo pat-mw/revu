@@ -26,6 +26,7 @@ import type {
   PageParams,
 } from './github-client'
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
+import { GithubRequestError } from './github-client'
 import type { CommandRunner } from './command-runner'
 import type { RepoRef } from './repo'
 import { unusedWriteMethods } from './github-write-stubs'
@@ -248,6 +249,34 @@ describe('Snapshot assembly matches the contract shape', () => {
     expect(snap.mutable.threads).toEqual([])
     // commentAuthors is broker-only and must be absent in direct mode.
     expect(snap.mutable.commentAuthors).toBeUndefined()
+  })
+
+  test('a 403 on check-runs (no checks:read) degrades to empty checks, not an aborted sync', async () => {
+    const { client } = fakeClient(baseConfig())
+    const gated: GithubClient = {
+      ...client,
+      async getCheckRuns(): Promise<unknown> {
+        throw new GithubRequestError(403, '/check-runs', 'Resource not accessible by integration')
+      },
+    }
+    const snap = await syncPull({ github: gated, repo: REPO, store: store() }, 204)
+    expect(snap.mutable.checks).toEqual([])
+    // The rest of the mutable half still loaded — the sync was not aborted.
+    expect(snap.mutable.pull.number).toBe(204)
+    expect(snap.mutable.reviews).toHaveLength(1)
+  })
+
+  test('a non-403 check-runs failure still propagates (not swallowed)', async () => {
+    const { client } = fakeClient(baseConfig())
+    const broken: GithubClient = {
+      ...client,
+      async getCheckRuns(): Promise<unknown> {
+        throw new GithubRequestError(500, '/check-runs', 'server error')
+      },
+    }
+    await expect(
+      syncPull({ github: broken, repo: REPO, store: store() }, 204),
+    ).rejects.toBeInstanceOf(GithubRequestError)
   })
 
   test('mutable half normalizes GraphQL threads onto the REST ReviewThread shape', async () => {
