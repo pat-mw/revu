@@ -13,7 +13,7 @@
  * `baseAdvanced`. A head-SHA match never short-circuits the mutable fetch.
  */
 import { describe, expect, test } from 'bun:test'
-import type { Page, PageParams } from './github-client'
+import type { GhGraphqlPageInfo, GhReviewThreadNode, Page, PageParams } from './github-client'
 import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import { createDirectApi, type DirectApi } from './direct-api'
@@ -85,6 +85,15 @@ function movingBaseClient(state: { mergeBaseSha: string; unresolvedComments: num
     },
     async getTree(): Promise<GhTreeRaw> {
       return { tree: [{ path: 'a.ts', type: 'blob', sha: `base-${state.mergeBaseSha}` }], truncated: false }
+    },
+    async graphql<T>(): Promise<T> {
+      throw new Error('graphql not used directly in this fake')
+    },
+    async getReviewThreads(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+    },
+    async getThreadComments(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: never[] }> {
+      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
     },
   }
 }

@@ -12,6 +12,10 @@
  *   - that a warm re-sync of an unchanged PR skips the immutable half
  *     (the request count drops by the immutable-half calls),
  *   - that a base-advance PR (#4) produces a NEW compareKey when its base moves,
+ *   - that a mid-review PR (#3) normalizes its GraphQL review threads onto the
+ *     REST shape: the `PRRT_` thread ids, `isResolved`/`isOutdated`, `side` from
+ *     the thread `diffSide`, `diff_hunk` present, and REST-numeric comment ids
+ *     from `fullDatabaseId`,
  *   - that the store persists across a simulated revud restart (reopen the same
  *     data dir and the snapshot + a saved draft are still there).
  *
@@ -103,6 +107,44 @@ async function main(): Promise<void> {
         `head=${p4.immutable.headSha.slice(0, 8)}, mergeBase=${p4.immutable.mergeBaseSha.slice(0, 8)}`,
     )
     check('PR #4 keyed by merge_base...head (base-moved keying)', p4.immutable.compareKey === `${p4.immutable.mergeBaseSha}...${p4.immutable.headSha}`)
+
+    // ——— PR #3: mid-review (1 resolved + 1 outdated thread) — the GraphQL
+    // thread normalizer end to end. Report the normalized threads and confirm
+    // `fullDatabaseId` resolved to REST-numeric comment ids. ———
+    const p3 = await syncPull({ github, repo: REPO, store }, 3)
+    const threads = p3.mutable.threads
+    console.log(`\nPR #3 (mid-review): ${threads.length} normalized thread(s)`)
+    for (const t of threads) {
+      const c0 = t.comments[0]
+      console.log(
+        `  ${t.id}  isResolved=${t.isResolved} isOutdated=${t.isOutdated} ` +
+          `side=${c0?.side} resolvedBy=${t.resolvedBy?.login ?? 'null'}`,
+      )
+      console.log(
+        `    comment[0] id=${c0?.id} (numeric=${typeof c0?.id === 'number'}) ` +
+          `diff_hunk=${c0 && c0.diff_hunk.length > 0 ? 'present' : 'MISSING'}`,
+      )
+    }
+    check('PR #3 has at least one review thread', threads.length >= 1, threads.length)
+    check(
+      'PR #3 thread ids are GraphQL PRRT_ node ids',
+      threads.every((t) => t.id.startsWith('PRRT_')),
+    )
+    check(
+      'PR #3 comment ids are REST-numeric (from fullDatabaseId), non-zero',
+      threads.every((t) => t.comments.every((c) => typeof c.id === 'number' && c.id > 0)),
+    )
+    check(
+      'PR #3 comments carry a diff_hunk and a LEFT/RIGHT side',
+      threads.every((t) =>
+        t.comments.every((c) => c.diff_hunk.length > 0 && (c.side === 'LEFT' || c.side === 'RIGHT')),
+      ),
+    )
+    check(
+      'PR #3 has one resolved and one outdated thread (the mid-review shape)',
+      threads.some((t) => t.isResolved) && threads.some((t) => t.isOutdated),
+      threads.map((t) => ({ resolved: t.isResolved, outdated: t.isOutdated })),
+    )
 
     // ——— Persistence across a simulated revud restart. ———
     // Save a draft, close the store, reopen the SAME data dir, and re-read.
