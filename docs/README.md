@@ -10,5 +10,6 @@ Reference documentation for **revu**. These files are the repo half of the hybri
 | [../AGENTS.md](../AGENTS.md) | Binding conventions for any agent writing code here (style, tokens, data rules) |
 | [../README.md](../README.md) | Project front page — what the prototype is and what it proves |
 | [branch-protection.md](./branch-protection.md) | Enabling the required CI `check` on `main` — the `gh` command and when to run it |
+| [direct-mode-auth.md](./direct-mode-auth.md) | The `gh` scopes/permissions direct mode needs — seeding the scratch repo and driving a review as a real user |
 | `shots/` | Screenshots used by the README |
 | `hero.svg` · `palette.svg` | README artwork / design-language palette |
