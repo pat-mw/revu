@@ -1,4 +1,5 @@
 import type {
+  CheckRun,
   CommitInfo,
   IssueComment,
   PullDetail,
@@ -10,6 +11,7 @@ import type {
 } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import type { GithubClient, GhTreeEntry, Page, PageParams } from './github-client'
+import { GithubRequestError } from './github-client'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
 import { provisionBlobs } from './blobs'
@@ -277,9 +279,20 @@ async function fetchMutable(
   )
   const reviews: ReviewSummary[] = rawReviews.map(mapReview)
 
-  const checkRunsRaw = await github.getCheckRuns(repo.owner, repo.repo, headSha)
+  // Check runs are auxiliary CI status, and reading them needs the `checks:read`
+  // permission. A token without it (a grant that never included checks, or one
+  // reduced on rotation) answers 403 "Resource not accessible by integration".
+  // That must not abort the whole sync — CI status degrades to "no checks" while
+  // the rest of the mutable half loads. Any other failure (network, rate limit, a
+  // real server error) still propagates.
+  let checks: CheckRun[] = []
+  try {
+    const checkRunsRaw = await github.getCheckRuns(repo.owner, repo.repo, headSha)
+    checks = mapCheckRuns(checkRunsRaw)
+  } catch (err) {
+    if (!(err instanceof GithubRequestError && err.status === 403)) throw err
+  }
   counter.bump()
-  const checks = mapCheckRuns(checkRunsRaw)
 
   // Threads come from the GraphQL `reviewThreads` connection, normalized to the
   // REST `ReviewThread`/`ReviewComment` shape. Each GraphQL page is counted in
