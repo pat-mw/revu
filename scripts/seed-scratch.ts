@@ -564,6 +564,13 @@ interface Seeded {
   number: number
   url: string
   shape: string
+  /**
+   * Extra scenario coordinates a live check needs. For base-advances this
+   * carries the SHA of the head's FIRST commit off the fork (`h1`): an ancestor
+   * of the head that a live check can fast-forward the base branch onto to move
+   * the merge base under a fixed head.
+   */
+  detail?: Record<string, string>
 }
 
 /** Scenario: a clean, small PR with a single obvious inline-comment target. */
@@ -781,21 +788,35 @@ function seedMidReview(ctx: Ctx, baseSha: string): Seeded {
 }
 
 /**
- * Scenario: base advances after the PR opens, so the merge base moves. Built by
- * opening a PR against a dedicated base branch, then landing a new commit on
- * that base branch (which the PR does not contain), moving the merge base.
+ * Scenario: the base branch advances after the PR opens so the MERGE BASE moves
+ * under a FIXED head — the two-half cache-keying regression. GitHub's three-dot
+ * PR diff (`merge_base…head`) only changes when the merge base moves, so the
+ * base must advance onto a commit the head already contains, not diverge on an
+ * independent commit.
+ *
+ * Construction (all off the default-branch fork `forkSha`):
+ *   - head branch = fork + h1 + h2 (TWO commits; h1 adds src/feature.ts, h2 adds
+ *     src/feature-extra.ts). The head SHA is fixed at h2.
+ *   - base branch = fork (the PRE-advance state; NOT pre-advanced with an
+ *     independent commit).
+ * The PR is base=base@fork, head=head@(fork+h1+h2), so merge_base = fork and the
+ * three-dot diff spans both h1 and h2.
+ *
+ * Fast-forwarding the base branch onto h1 (an ANCESTOR of the head) then moves
+ * merge_base from fork → h1 while the head SHA stays h2, and the three-dot diff
+ * shrinks to just h2's file — same head, moved compareKey. This seeder leaves
+ * the base at the PRE-advance fork and exposes h1's SHA so a live check can
+ * perform that advance and reset it back afterwards.
+ *
+ * Idempotent: a re-run resets the head to fork+h1+h2 (stable SHAs) and the base
+ * back to the fork, converging to the same PR #4 and the same pre-advance state.
  */
 function seedBaseAdvances(ctx: Ctx, baseSha: string): Seeded {
   const baseBranch = `${BRANCH_PREFIX}base-advances-target`
   const headBranch = `${BRANCH_PREFIX}base-advances`
 
-  // Create/refresh the dedicated base branch from the default branch tip.
-  git(ctx.dir, ['checkout', '-B', baseBranch, baseSha])
-  pushForce(ctx, baseBranch)
-  const baseStartSha = currentSha(ctx, baseBranch)
-
-  // Head branch: a change off that base branch.
-  const headFiles: FileSpec[] = [
+  // Head branch, first commit (h1): add src/feature.ts off the fork.
+  const h1Files: FileSpec[] = [
     {
       path: 'src/feature.ts',
       content: [
@@ -806,40 +827,61 @@ function seedBaseAdvances(ctx: Ctx, baseSha: string): Seeded {
       ].join('\n'),
     },
   ]
-  resetBranchTo(ctx, headBranch, baseStartSha, headFiles, 'feat: add feature toggle')
+  resetBranchTo(ctx, headBranch, baseSha, h1Files, 'feat: add feature toggle')
+  const h1Sha = currentSha(ctx, headBranch)
+
+  // Head branch, second commit (h2): add src/feature-extra.ts on top of h1. This
+  // is the only change that survives once the base advances onto h1, so the
+  // post-advance three-dot diff is exactly this file.
+  writeFiles(ctx.dir, [
+    {
+      path: 'src/feature-extra.ts',
+      content: [
+        "import { feature } from './feature'",
+        '',
+        'export function featureLabel(flag: boolean): string {',
+        '  return `feature is ${feature(flag)}`',
+        '}',
+        '',
+      ].join('\n'),
+    },
+  ])
+  git(ctx.dir, ['add', '-A'])
+  commit(ctx, 'feat: add featureLabel wrapper')
   pushForce(ctx, headBranch)
+  const headSha = currentSha(ctx, headBranch)
+
+  // Base branch: the PRE-advance state — the fork itself, NOT pre-advanced with
+  // an independent commit. Reset it to the fork on every run so the pre-advance
+  // state is reproducible (a live check advances it, then resets it back here).
+  git(ctx.dir, ['checkout', '-B', baseBranch, baseSha])
+  pushForce(ctx, baseBranch)
+  const baseSha_ = currentSha(ctx, baseBranch)
 
   const pr = ensurePr(ctx, {
     branch: headBranch,
     base: baseBranch,
     title: `${TITLE_MARKER} base-advances PR (merge base moves)`,
-    body: 'Open against a dedicated base branch. A commit lands on the base branch after opening, moving the merge base — the two-half cache regression case.',
+    body:
+      'Open against a dedicated base branch sitting at the fork. The head carries ' +
+      'two commits (h1, h2). Fast-forwarding the base onto h1 — a commit the head ' +
+      'already contains — moves the merge base under a FIXED head, so the three-dot ' +
+      'diff shrinks to h2 alone. That is the two-half cache-keying regression.',
   })
-
-  // Advance the base branch with a commit the PR does not contain. Idempotent:
-  // only add the advance commit if the base branch has no advance marker yet.
-  git(ctx.dir, ['fetch', 'origin', baseBranch])
-  git(ctx.dir, ['checkout', '-B', baseBranch, `origin/${baseBranch}`])
-  const advanceMarker = 'FIXTURE-base-advance'
-  const logHasAdvance = git(ctx.dir, ['log', '--format=%s']).stdout.includes(advanceMarker)
-  if (!logHasAdvance) {
-    writeFiles(ctx.dir, [
-      {
-        path: 'BASE_NOTES.md',
-        content: `# Base branch notes\n\n${advanceMarker}: this commit lands on the base after the PR opened.\n`,
-      },
-    ])
-    git(ctx.dir, ['add', '-A'])
-    commit(ctx, `chore: ${advanceMarker} advance base branch after PR opened`)
-    pushForce(ctx, baseBranch)
-  }
-  const baseNowSha = currentSha(ctx, baseBranch)
 
   return {
     scenario: 'base-advances',
     number: pr.number,
     url: pr.url,
-    shape: `base branch ${baseBranch} moved ${baseStartSha.slice(0, 7)} -> ${baseNowSha.slice(0, 7)} after open (merge base advances)`,
+    shape:
+      `base ${baseBranch}@${baseSha_.slice(0, 7)} (fork), ` +
+      `head ${headBranch}@${headSha.slice(0, 7)} (fork+h1+h2); ` +
+      `merge base = fork. Advancing base onto h1 ${h1Sha.slice(0, 7)} moves the merge ` +
+      `base under a fixed head`,
+    // h1 is the head's first commit off the fork — an ancestor of the head. A
+    // live base-advance check fast-forwards the base onto this SHA to move the
+    // merge base while the head SHA stays fixed.
+    detail: { headSha, h1Sha, forkSha: baseSha },
   }
 }
 
