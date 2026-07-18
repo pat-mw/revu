@@ -13,6 +13,8 @@ import {
   validateSetViewedBody,
   validateSubmitReviewInput,
 } from '@revu/shared'
+import type { RevuMode } from './api-router'
+import { AwaitingCredentialError } from './broker/token-source'
 import type { DirectApi } from './direct/direct-api'
 import { GithubGraphqlError, GithubRequestError } from './direct/github-client'
 import { StoreUnreadableError, StoreWriteError } from './direct/store'
@@ -40,7 +42,9 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  * (404) — never a fabricated blob.
  *
  * The write path (`submitReview`, `replyToThread`, `resolveThread`,
- * `addReaction`) is served here. Contract semantics enforced on it:
+ * `addReaction`) is served here in direct mode. In broker mode it is gated to
+ * `not_implemented` (501) — broker is reads-only for now — before any write runs.
+ * Contract semantics enforced on the direct-mode write path:
  *   - `submitReview` returns `head_moved`/`forbidden` as a 200-level VALUE, never
  *     an error status — it is an ordinary JSON body.
  *   - A submit that hits a 422 (a comment failed validation despite the guard)
@@ -84,6 +88,28 @@ const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
   ROUTES.listReviewThreads.path,
   ROUTES.getRateLimit.path,
 ])
+
+/**
+ * The four write endpoints, gated to `not_implemented` in BROKER mode only.
+ * Broker mode is reads-only for now: correct broker writes need identity-dependent
+ * behavior (the self-approval guard, submit idempotency-by-self, own-comment
+ * detection) that reads a resolved viewer, and `viewerLogin` is absent under a
+ * shared-bot installation token. Executing the write path without it would post
+ * unstamped (violating the stamped-human-prefix rule) and could double-post a
+ * review on a retry (the idempotency re-check can never match an empty viewer).
+ * Those behaviors are enabled together with broker writes in the writes unit; here
+ * the routes answer an honest 501 in broker mode, exactly as `listPulls` does.
+ * Direct mode serves all four unchanged.
+ */
+const BROKER_UNIMPLEMENTED_WRITE_ROUTES: readonly {
+  method: string
+  path: string
+}[] = [
+  ROUTES.submitReview,
+  ROUTES.replyToThread,
+  ROUTES.resolveThread,
+  ROUTES.addReaction,
+]
 
 /**
  * Match a request path against a route template, returning captured `:param`
@@ -162,6 +188,17 @@ function envelopeForError(err: unknown): Response {
   if (err instanceof ValidationError) {
     return errorJson('not_found', err.message, 400)
   }
+  // No GitHub credential is present RIGHT NOW: an external host injects it into
+  // the workspace asynchronously and may transiently truncate or not-yet-write it.
+  // This propagates up from the GitHub client when it tries to build the Bearer
+  // header. It is upstream-unavailable, not a client or server bug — surface it as
+  // `broker_unreachable` (502, the same "retry shortly" semantics an unreachable
+  // upstream gets) so the request fails cleanly and is retriable, never a 500 or a
+  // crash. The error carries no token material by contract, so its message is safe
+  // to serialize.
+  if (err instanceof AwaitingCredentialError) {
+    return errorJson('broker_unreachable', err.message, 502)
+  }
   if (err instanceof GithubRequestError) {
     if (err.status === 404) return errorJson('not_found', err.message, 404)
     if (err.status === 403) return errorJson('forbidden', err.message, 403)
@@ -198,6 +235,7 @@ export async function handleDirectApi(
   req: Request,
   session: Session,
   api: DirectApi,
+  mode: RevuMode = 'direct',
 ): Promise<Response | null> {
   const url = new URL(req.url)
   if (url.pathname !== '/api' && !url.pathname.startsWith('/api/')) return null
@@ -207,6 +245,24 @@ export async function handleDirectApi(
   // getSession — the real session built at startup.
   if (method === ROUTES.getSession.method && path === ROUTES.getSession.path) {
     return json(session)
+  }
+
+  // Broker mode is reads-only: the four write endpoints answer `not_implemented`
+  // (501) before any write executes, the same honest placeholder `listPulls` uses.
+  // This is a mode-level gate at the router, not a change to the engine's write
+  // contract — direct mode falls through and serves all four unchanged.
+  if (mode === 'broker') {
+    for (const route of BROKER_UNIMPLEMENTED_WRITE_ROUTES) {
+      if (method === route.method && matchRoute(route.path, path)) {
+        return json(
+          {
+            code: 'not_implemented',
+            message: `${method} ${path} is not available in broker mode (reads-only).`,
+          },
+          501,
+        )
+      }
+    }
   }
 
   try {

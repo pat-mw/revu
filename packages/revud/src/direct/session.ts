@@ -121,3 +121,37 @@ export async function buildDirectSession(args: {
     viewerLogin: viewer.login,
   }
 }
+
+/**
+ * Build the broker-mode `Session`. Identity is resolved entirely locally from git
+ * config (`buildHuman` — no token needed), so the `Human` — the stable key for
+ * drafts, viewed state, and the audit log — is real from boot regardless of
+ * whether a GitHub credential is present, absent, or would be rejected.
+ *
+ * There is deliberately NO `GET /user` probe: broker mode authenticates with a
+ * GitHub App installation token, which cannot resolve a login that way — GitHub
+ * answers `GET /user` with 403 "Resource not accessible by integration". Probing
+ * it would make boot fail exactly when the credential is present (the steady
+ * state). So `viewerLogin` is left absent — the shared-bot session shape. That is
+ * correct here: the identity-dependent write behaviors that would read
+ * `viewerLogin` (the self-approval guard, submit idempotency-by-self, own-comment
+ * detection) are enabled together with broker writes in the writes unit, not at
+ * boot, so an absent viewer changes no behavior a read-only broker exposes.
+ */
+export async function buildBrokerSession(args: {
+  runner: CommandRunner
+  repo: RepoRef
+  cwd?: string
+  env?: Record<string, string | undefined>
+}): Promise<Session> {
+  const human = await buildHuman(args.runner, {
+    ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
+    ...(args.env !== undefined ? { env: args.env } : {}),
+  })
+
+  return {
+    human,
+    brokerLogin: '',
+    workspace: `direct-${args.repo.owner}-${args.repo.repo}`,
+  }
+}

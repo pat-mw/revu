@@ -13,118 +13,18 @@
  * `baseAdvanced`. A head-SHA match never short-circuits the mutable fetch.
  */
 import { describe, expect, test } from 'bun:test'
-import type {
-  GhBlobRaw,
-  GhGraphqlBlobObject,
-  GhGraphqlPageInfo,
-  GhReviewThreadNode,
-  Page,
-  PageParams,
-} from './github-client'
-import type { GhCompareRaw, GhTreeRaw, GithubClient } from './github-client'
-import type { RepoRef } from './repo'
+import type { GithubClient } from './github-client'
 import { createDirectApi, type DirectApi } from './direct-api'
-import { unusedWriteMethods } from './github-write-stubs'
 import { openDirectStore, type DirectStore } from './store'
-import type { Session } from '@revu/shared'
-
-const REPO: RepoRef = { owner: 'o', repo: 'r' }
-const SESSION: Session = {
-  human: { id: 'h@x.io', name: 'H', role: 'contractor', email: 'h@x.io' },
-  brokerLogin: '',
-  workspace: 'direct-o-r',
-  viewerLogin: 'h-gh',
-}
-
-/** A mutable fake whose head is fixed but whose merge base can be advanced between syncs. */
-function movingBaseClient(state: { mergeBaseSha: string; unresolvedComments: number }): GithubClient {
-  const page = <T>(items: T[], params: PageParams): Page<T> =>
-    params.page === 1 ? { items, hasNext: false } : { items: [], hasNext: false }
-  return {
-    async getViewer() {
-      return { login: 'h-gh', id: 1 }
-    },
-    async getPullDetail() {
-      return {
-        number: 204,
-        state: 'open',
-        user: { login: 'author', id: 2, type: 'User' },
-        head: { sha: 'HEAD-FIXED' },
-        base: { sha: 'BRANCH' },
-      }
-    },
-    async getCompare(): Promise<GhCompareRaw> {
-      return { merge_base_commit: { sha: state.mergeBaseSha } }
-    },
-    async getPullFiles(_o, _r, _n, params): Promise<Page<unknown>> {
-      return page(
-        [
-          {
-            sha: 'blobHead',
-            filename: 'a.ts',
-            status: 'modified',
-            additions: 1,
-            deletions: 0,
-            changes: 1,
-            patch: '@@ -1 +1 @@',
-          },
-        ],
-        params,
-      )
-    },
-    async getIssueComments(_o, _r, _n, params): Promise<Page<unknown>> {
-      // The mutable half reflects however many comments exist NOW — this is what
-      // proves a head-unchanged re-sync still refreshes the mutable half.
-      const items = Array.from({ length: state.unresolvedComments }, (_v, i) => ({
-        id: i + 1,
-        body: 'c',
-        user: { login: 'x', id: 9, type: 'User' },
-      }))
-      return page(items, params)
-    },
-    async getPullReviews(_o, _r, _n, params): Promise<Page<unknown>> {
-      return page([], params)
-    },
-    async getPullCommits(_o, _r, _n, params): Promise<Page<unknown>> {
-      return page([{ sha: 'c1', commit: { message: 'm', author: { date: '2026-01-01' } } }], params)
-    },
-    async getCheckRuns() {
-      return { check_runs: [] }
-    },
-    async getTree(): Promise<GhTreeRaw> {
-      return { tree: [{ path: 'a.ts', type: 'blob', sha: `base-${state.mergeBaseSha}` }], truncated: false }
-    },
-    async getBlob(_o, _r, sha): Promise<GhBlobRaw> {
-      const text = `content-of-${sha}\n`
-      return {
-        content: Buffer.from(text, 'utf8').toString('base64'),
-        encoding: 'base64',
-        size: Buffer.byteLength(text, 'utf8'),
-      }
-    },
-    async getBlobObjects(_o, _r, shas): Promise<Record<string, GhGraphqlBlobObject | null>> {
-      const out: Record<string, GhGraphqlBlobObject | null> = {}
-      for (const sha of shas) {
-        const text = `content-of-${sha}\n`
-        out[sha] = { isBinary: false, text, byteSize: text.length }
-      }
-      return out
-    },
-    async graphql<T>(): Promise<T> {
-      throw new Error('graphql not used directly in this fake')
-    },
-    async getReviewThreads(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: GhReviewThreadNode[] }> {
-      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
-    },
-    async getThreadComments(): Promise<{ pageInfo: GhGraphqlPageInfo; nodes: never[] }> {
-      return { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
-    },
-    ...unusedWriteMethods(),
-  }
-}
+import { CONFORMANCE_REPO, CONFORMANCE_SESSION, movingBaseClient } from './conformance-fakes'
 
 function build(client: GithubClient, store: DirectStore): DirectApi {
-  return createDirectApi({ session: SESSION, github: client, repo: REPO, store })
+  return createDirectApi({
+    session: CONFORMANCE_SESSION,
+    github: client,
+    repo: CONFORMANCE_REPO,
+    store,
+  })
 }
 
 describe('direct read path — contract conformance (reads subset)', () => {
