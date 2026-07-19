@@ -42,6 +42,15 @@ import { DEFAULT_PREFERENCES } from '@revu/shared'
  *     which endpoint, which PR, and the GitHub-assigned id. The store API can
  *     only append and read it — no update, no delete — so it stays ground truth
  *     for "who wrote this" even across a workspace-username rename.
+ *   - `pr_author` — which human drove the shared bot when a pull request was
+ *     opened, keyed by PR number. FIRST-WRITE-WINS: the first record for a PR is
+ *     permanent, so a later re-observation never rewrites the original driver.
+ *     A `human_id` of NULL records that a real org member opened the PR (not the
+ *     bot). Population is a HOST-SIDE concern: revu is a review client and does
+ *     not open pull requests, so nothing in the workspace calls `recordPrAuthor`
+ *     during normal operation — the host-side collector correlates the workspace
+ *     that opened each PR to its driving human and writes this row. The store
+ *     surface is the durable seam the poll loop reads through.
  *   - `meta` — the single `store_version` row that drives migrate-in-place.
  *
  * Absent vs unreadable: a genuinely missing row reads back as `null` (never
@@ -53,7 +62,7 @@ import { DEFAULT_PREFERENCES } from '@revu/shared'
  */
 
 /** The on-disk schema version. Bump this and add a migration step when the shape changes. */
-export const STORE_VERSION = 2
+export const STORE_VERSION = 3
 
 /** A stored row could not be read back: the row EXISTS but its JSON is corrupt. */
 export class StoreUnreadableError extends Error {
@@ -208,6 +217,32 @@ export interface DirectStore {
    * filters combine; omitting the filter returns the whole journal.
    */
   listAudit(filter?: { pr?: number; sinceIso?: string }): AuditEntry[]
+
+  // ——— the pull-request author attribution seam ———
+  /**
+   * Record which human drove the shared bot when a pull request was opened, or
+   * `null` to record that a real org member (not the bot) opened it.
+   * FIRST-WRITE-WINS: the first record for a PR is permanent, so a later call
+   * with the same PR is a no-op and never rewrites the original driver — the
+   * driver at open time is ground truth and a re-observation must not overwrite
+   * it. Durable and typed like every other write: the row reaches disk before the
+   * call returns or a `StoreWriteError` surfaces.
+   *
+   * Population is host-side: revu is a review client and does not open pull
+   * requests, so no in-workspace caller records an author during normal
+   * operation — the host-side collector correlates each PR to its driving human
+   * and writes this row.
+   */
+  recordPrAuthor(pr: number, humanId: string | null): void
+  /**
+   * The recorded author attribution for a PR: the driving human's id, `null`
+   * when the row records a real org member opened it, or `undefined` when NO row
+   * exists yet (never observed). The three-way answer lets the poll loop tell
+   * "org member opened it" (`null`) apart from "not yet attributed" (`undefined`)
+   * — both surface as a `null` `authorHumanId`, but only the former is a settled
+   * fact.
+   */
+  getPrAuthor(pr: number): string | null | undefined
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -523,6 +558,31 @@ export function openDirectStore(
       }))
     },
 
+    recordPrAuthor(pr: number, humanId: string | null): void {
+      write('pr_author', () => {
+        // FIRST-WRITE-WINS: `ON CONFLICT(pr) DO NOTHING` means the earliest
+        // record for a PR is permanent. A later call — the collector
+        // re-observing the same PR — is silently a no-op, so the original driver
+        // recorded at open time is never rewritten.
+        db.run(
+          'INSERT INTO pr_author (pr, human_id, recorded_at) VALUES (?, ?, ?) ' +
+            'ON CONFLICT(pr) DO NOTHING',
+          [pr, humanId, new Date().toISOString()],
+        )
+      })
+    },
+
+    getPrAuthor(pr: number): string | null | undefined {
+      const row = db
+        .query('SELECT human_id FROM pr_author WHERE pr = ?')
+        .get(pr) as { human_id: string | null } | null
+      // No row: never attributed — `undefined`, distinct from a recorded `null`
+      // (an org member opened it). SQLite hands back a JS `null` for a NULL cell,
+      // so a present row with a NULL author reads back as `null`, not `undefined`.
+      if (!row) return undefined
+      return row.human_id
+    },
+
     close(): void {
       db.close()
     },
@@ -540,6 +600,18 @@ const CREATE_AUDIT_LOG =
   'CREATE TABLE IF NOT EXISTS audit_log (github_id INTEGER NOT NULL, ' +
   'human_id TEXT NOT NULL, workspace TEXT NOT NULL, endpoint TEXT NOT NULL, ' +
   'pr INTEGER NOT NULL, created_at TEXT NOT NULL)'
+
+/**
+ * The version-3 table: the pull-request author attribution seam. One statement,
+ * shared by the fresh-file shape and the guarded v2 → v3 in-place step, so the
+ * two paths cannot drift. `pr` is the primary key (one attribution per PR, which
+ * is what makes the first-write-wins upsert land), `human_id` is nullable (NULL
+ * records "a real org member opened it", NOT the absent-row "never observed"
+ * state), and `recorded_at` stamps when the attribution was first written.
+ */
+const CREATE_PR_AUTHOR =
+  'CREATE TABLE IF NOT EXISTS pr_author (pr INTEGER PRIMARY KEY, ' +
+  'human_id TEXT, recorded_at TEXT NOT NULL)'
 
 /**
  * Create tables if absent and migrate an older store IN PLACE. Migration never
@@ -585,6 +657,11 @@ function migrate(db: Database): void {
   // ladder below runs the same statement for an existing version-1 file.
   db.run(CREATE_AUDIT_LOG)
 
+  // Version 3 shape: the pull-request author attribution seam. Created-when-
+  // absent like every table above; the guarded ladder below runs the same
+  // statement for an existing version-1 or version-2 file.
+  db.run(CREATE_PR_AUTHOR)
+
   const row = db.query("SELECT value FROM meta WHERE key = 'store_version'").get() as
     | { value: string }
     | null
@@ -616,6 +693,14 @@ function migrate(db: Database): void {
     // idempotent CREATE (already run above for the current shape) is the entire
     // step; no existing row is read or rewritten.
     db.run(CREATE_AUDIT_LOG)
+  }
+
+  if (current < 3) {
+    // v2 → v3: add the `pr_author` attribution table. Purely additive — the
+    // idempotent CREATE (already run above for the current shape) is the entire
+    // step; no existing row is read or rewritten, so drafts, viewed state, and
+    // the audit journal survive untouched.
+    db.run(CREATE_PR_AUTHOR)
   }
 
   if (current < STORE_VERSION) {

@@ -68,7 +68,16 @@ import {
   seedForcePushed,
   tokenGated,
 } from './conformance-fakes'
-import { createPollLoop, type PollFactsSource, type PollLoop } from '../broker/poll-loop'
+import {
+  createPollLoop,
+  type PollFactsSource,
+  type PollLoop,
+  type PrAuthorResolver,
+} from '../broker/poll-loop'
+import {
+  createReviewerAssignments,
+  resolveReviewersFile,
+} from '../broker/reviewer-assignment'
 
 /** A fake token the credential file carries; never a real secret. */
 const FAKE_TOKEN = 'ghs_broker_conformance_fake'
@@ -1062,5 +1071,344 @@ describe('M4.1.5 — idle-polling cost budget (IN-GATE SIMULATION, not live-veri
     expect(state.nonNotModified).toBe(1)
     // The served list is intact after an hour of idle polling.
     expect(loop.listPulls(null).items).toHaveLength(2)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// M4.2 — the BrokerPullMeta author / reviewer / approvability annotations.
+// Additive block: the poll loop layers `authorHumanId` (the durable pr_author
+// seam), `assignedReviewerHumanIds` (the reviewers file), and `canApprove` (the
+// bot login) onto each pull's meta. Every scenario is network-free.
+// ————————————————————————————————————————————————————————————————
+
+/** The bot login the App posts as in the annotation scenarios below. */
+const M42_BOT_LOGIN = 'revu-app[bot]'
+
+/** A `PrAuthorResolver` over an in-memory map — the narrow read seam the loop uses. */
+function fakePrAuthor(records: Map<number, string | null>): PrAuthorResolver {
+  return { getPrAuthor: (pr) => (records.has(pr) ? records.get(pr) ?? null : undefined) }
+}
+
+describe('M4.2.1 — authorHumanId from the pr_author seam', () => {
+  test('a recorded driver surfaces as authorHumanId; an unrecorded PR carries null', async () => {
+    // #101 has a recorded driver; #202 has no record at all.
+    const state = initialPollState(initialPollPulls())
+    const { client, facts } = fakePollSources(state)
+    const records = new Map<number, string | null>([[101, 'h-priya']])
+    const loop = createPollLoop({
+      client,
+      facts,
+      repo: CONFORMANCE_REPO,
+      prAuthor: fakePrAuthor(records),
+    })
+    await loop.pollOnce()
+
+    const items = loop.listPulls(null).items
+    expect(items.find((it) => it.pull.number === 101)!.broker.authorHumanId).toBe('h-priya')
+    // Unrecorded (undefined from the seam) surfaces as null.
+    expect(items.find((it) => it.pull.number === 202)!.broker.authorHumanId).toBeNull()
+  })
+
+  test('a recorded org-member open (null) also surfaces as null authorHumanId', async () => {
+    const state = initialPollState(initialPollPulls())
+    const { client, facts } = fakePollSources(state)
+    const records = new Map<number, string | null>([[101, null]])
+    const loop = createPollLoop({
+      client,
+      facts,
+      repo: CONFORMANCE_REPO,
+      prAuthor: fakePrAuthor(records),
+    })
+    await loop.pollOnce()
+    expect(
+      loop.listPulls(null).items.find((it) => it.pull.number === 101)!.broker.authorHumanId,
+    ).toBeNull()
+  })
+
+  test('the seam is read live: a driver recorded AFTER the first tick surfaces on the next tick, even without an upstream change', async () => {
+    // The store is populated host-side by the collector at any time; the loop must
+    // pick up a late record on a plain 304 tick (no upstream list change).
+    const state = initialPollState(initialPollPulls())
+    const { client, facts } = fakePollSources(state)
+    const records = new Map<number, string | null>()
+    const loop = createPollLoop({
+      client,
+      facts,
+      repo: CONFORMANCE_REPO,
+      prAuthor: fakePrAuthor(records),
+    })
+    await loop.pollOnce()
+    expect(
+      loop.listPulls(null).items.find((it) => it.pull.number === 101)!.broker.authorHumanId,
+    ).toBeNull()
+
+    // The collector records the driver; the next tick is a free 304 (no upstream
+    // change), yet the annotation refreshes off the seam.
+    records.set(101, 'h-priya')
+    await loop.pollOnce()
+    expect(state.nonNotModified).toBe(1) // the second tick was a 304, not a 200
+    expect(
+      loop.listPulls(null).items.find((it) => it.pull.number === 101)!.broker.authorHumanId,
+    ).toBe('h-priya')
+  })
+})
+
+describe('M4.2.2 — canApprove from the bot login', () => {
+  test('canApprove is false for an App-authored (bot-login) PR, true for an org-member PR', async () => {
+    // #101 is authored by the bot (App-authored → not self-approvable); #202 by an
+    // org member (approvable).
+    const pulls = initialPollPulls()
+    pulls.find((p) => p.number === 101)!.authorLogin = M42_BOT_LOGIN
+    const state = initialPollState(pulls)
+    const { client, facts } = fakePollSources(state)
+    const loop = createPollLoop({
+      client,
+      facts,
+      repo: CONFORMANCE_REPO,
+      botLogin: M42_BOT_LOGIN,
+    })
+    await loop.pollOnce()
+
+    const items = loop.listPulls(null).items
+    expect(items.find((it) => it.pull.number === 101)!.broker.canApprove).toBe(false)
+    expect(items.find((it) => it.pull.number === 202)!.broker.canApprove).toBe(true)
+  })
+
+  test('with no bot login configured (reads-only broker) canApprove stays true', async () => {
+    const pulls = initialPollPulls()
+    pulls.find((p) => p.number === 101)!.authorLogin = M42_BOT_LOGIN
+    const state = initialPollState(pulls)
+    const { client, facts } = fakePollSources(state)
+    // No botLogin: the field is inconsequential (writes are disabled) and stays true.
+    const loop = createPollLoop({ client, facts, repo: CONFORMANCE_REPO })
+    await loop.pollOnce()
+    expect(
+      loop.listPulls(null).items.find((it) => it.pull.number === 101)!.broker.canApprove,
+    ).toBe(true)
+  })
+})
+
+describe('M4.2.4 — assignedReviewerHumanIds from the reviewers file', () => {
+  test('reviewer assignments surface in the meta and default to [] when unassigned', async () => {
+    const dir2 = mkdtempSync(join(tmpdir(), 'revud-reviewers-'))
+    const reviewersFile = join(dir2, 'reviewers.yaml')
+    writeFileSync(reviewersFile, 'assignments:\n  101: [h-priya, h-marcus]\n', 'utf8')
+    const reviewers = createReviewerAssignments(reviewersFile, () => {})
+
+    const state = initialPollState(initialPollPulls())
+    const { client, facts } = fakePollSources(state)
+    const loop = createPollLoop({ client, facts, repo: CONFORMANCE_REPO, reviewers })
+    await loop.pollOnce()
+
+    const items = loop.listPulls(null).items
+    expect(items.find((it) => it.pull.number === 101)!.broker.assignedReviewerHumanIds).toEqual([
+      'h-priya',
+      'h-marcus',
+    ])
+    // #202 is unassigned → [].
+    expect(
+      items.find((it) => it.pull.number === 202)!.broker.assignedReviewerHumanIds,
+    ).toEqual([])
+
+    // A lead edit is read back WITHOUT a restart, on the next tick (a free 304).
+    writeFileSync(reviewersFile, 'assignments:\n  101: [h-priya]\n  202: [h-marcus]\n', 'utf8')
+    await loop.pollOnce()
+    const after = loop.listPulls(null).items
+    expect(after.find((it) => it.pull.number === 101)!.broker.assignedReviewerHumanIds).toEqual([
+      'h-priya',
+    ])
+    expect(after.find((it) => it.pull.number === 202)!.broker.assignedReviewerHumanIds).toEqual([
+      'h-marcus',
+    ])
+    rmSync(dir2, { recursive: true, force: true })
+  })
+})
+
+describe('M4.2 — a meta-only change flips the broker ETag through an upstream-304 tick', () => {
+  test('a reviewers-file edit during an upstream 304 makes the SAME conditional GET a fresh 200 carrying the new meta', async () => {
+    // The broker ETag must reflect BOTH the upstream list AND the served meta.
+    // A reviewers-file edit leaves the upstream list unchanged (the next tick is
+    // an upstream 304), so if the ETag derived from the list ETag alone the
+    // frontend would keep stale items behind a matching ETag and never see the new
+    // `assignedReviewerHumanIds`. Establish an ETag, edit the file, tick (upstream
+    // 304), and the SAME conditional GET must now return 200 with the new meta.
+    const dir2 = mkdtempSync(join(tmpdir(), 'revud-reviewers-'))
+    const reviewersFile = resolveReviewersFile(dir2, {})
+    writeFileSync(reviewersFile, 'assignments:\n  101: [h-priya]\n', 'utf8')
+    const reviewers = createReviewerAssignments(reviewersFile, () => {})
+
+    const state = initialPollState(initialPollPulls())
+    const { client, facts } = fakePollSources(state)
+    const loop = createPollLoop({ client, facts, repo: CONFORMANCE_REPO, reviewers })
+    const store = openDirectStore({ dataDir })
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: tokenGated(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }), brokerTokenSource()),
+      repo: CONFORMANCE_REPO,
+      store,
+      pullList: loop,
+    })
+    await loop.pollOnce()
+
+    // The frontend's first poll: a 200 it caches the ETag from.
+    const first = await handleDirectApi(
+      new Request('http://127.0.0.1/api/pulls', { method: 'GET' }),
+      CONFORMANCE_SESSION,
+      api,
+      'broker',
+    )
+    expect(first!.status).toBe(200)
+    const etag = first!.headers.get('etag') as string
+
+    // The same conditional GET while nothing has changed: a bodiless 304.
+    const idle = await handleDirectApi(
+      new Request('http://127.0.0.1/api/pulls', { method: 'GET', headers: { 'if-none-match': etag } }),
+      CONFORMANCE_SESSION,
+      api,
+      'broker',
+    )
+    expect(idle!.status).toBe(304)
+
+    // A lead edits reviewers.yaml: a META-ONLY change (the upstream list is
+    // untouched, so the next tick is an upstream 304).
+    writeFileSync(reviewersFile, 'assignments:\n  101: [h-priya, h-marcus]\n', 'utf8')
+    await loop.pollOnce()
+    expect(state.nonNotModified).toBe(1) // the second tick was an upstream 304, not a 200
+
+    // The SAME conditional GET must now be a fresh 200 carrying the new meta — the
+    // meta-only change flipped the served ETag even though upstream 304'd.
+    const live = await handleDirectApi(
+      new Request('http://127.0.0.1/api/pulls', { method: 'GET', headers: { 'if-none-match': etag } }),
+      CONFORMANCE_SESSION,
+      api,
+      'broker',
+    )
+    expect(live!.status).toBe(200)
+    expect(live!.headers.get('etag')).not.toBe(etag)
+    const liveBody = (await live!.json()) as {
+      items: { pull: { number: number }; broker: { assignedReviewerHumanIds: string[] } }[]
+    }
+    const pr101 = liveBody.items.find((it) => it.pull.number === 101)!
+    expect(pr101.broker.assignedReviewerHumanIds).toEqual(['h-priya', 'h-marcus'])
+
+    rmSync(dir2, { recursive: true, force: true })
+    store.close()
+  })
+
+  test('the broker ETag stays restart-stable when the durable meta is identical (composition adds a stable term, not drift)', async () => {
+    // The M4.1 restart-stability guarantee must hold with the new composition:
+    // identical upstream + identical durable meta ⇒ identical ETag across a fresh
+    // process. Two loops over identical state and an identical reviewers file must
+    // serve byte-identical ETags, and the restarted loop must 304 the first's ETag.
+    const dir2 = mkdtempSync(join(tmpdir(), 'revud-reviewers-'))
+    const reviewersFile = resolveReviewersFile(dir2, {})
+    writeFileSync(reviewersFile, 'assignments:\n  101: [h-priya]\n', 'utf8')
+
+    const stateA = initialPollState(initialPollPulls())
+    const loopA = createPollLoop({
+      ...fakePollSources(stateA),
+      repo: CONFORMANCE_REPO,
+      reviewers: createReviewerAssignments(reviewersFile, () => {}),
+    })
+    await loopA.pollOnce()
+    const etagA = loopA.listPulls(null).etag
+
+    const stateB = initialPollState(initialPollPulls())
+    const loopB = createPollLoop({
+      ...fakePollSources(stateB),
+      repo: CONFORMANCE_REPO,
+      reviewers: createReviewerAssignments(reviewersFile, () => {}),
+    })
+    await loopB.pollOnce()
+    const etagB = loopB.listPulls(null).etag
+
+    expect(etagB).toBe(etagA)
+    const conditional = loopB.listPulls(etagA)
+    expect(conditional.notModified).toBe(true)
+
+    rmSync(dir2, { recursive: true, force: true })
+  })
+})
+
+describe('M4.2.5 — two humans get DISJOINT inbox sections (IN-GATE SIMULATION, not live-verified)', () => {
+  // IN-GATE SIMULATION: two `Human.id`s read the SAME poll result over one fake
+  // broker. The "yours (authored)" section is driven by `authorHumanId` (seeded
+  // via the pr_author seam, the analog of the collector's host-side record), and
+  // the "assigned-to-you" section by `assignedReviewerHumanIds` (seeded via a temp
+  // reviewers.yaml, mirroring how the harness seeds a temp .git-credentials).
+  // Truly-live two-human confirmation rides a later milestone (the collector) and
+  // is NOT claimed here — this bounds the SIMULATED inbox partition.
+  test('yours-with-comments / assigned-to-you populate correctly and disjointly for both humans', async () => {
+    const PRIYA = 'h-priya'
+    const MARCUS = 'h-marcus'
+
+    // Four open pulls model the inbox facets:
+    //   #101 driven by Priya, has unresolved comments → Priya's "yours-with-comments".
+    //   #202 driven by Marcus, assigned to Priya → Priya's "assigned-to-you".
+    //   #303 driven by Priya, assigned to Marcus → Marcus's "assigned-to-you".
+    //   #404 driven by Marcus, has unresolved comments → Marcus's "yours-with-comments".
+    const pulls: FakePull[] = [
+      { number: 101, headSha: 'H101', baseSha: 'B101', updatedAt: '2026-02-01T00:00:00.000Z', unresolvedThreads: 2, commitCount: 1, mergeBaseSha: 'MB101' },
+      { number: 202, headSha: 'H202', baseSha: 'B202', updatedAt: '2026-02-02T00:00:00.000Z', unresolvedThreads: 0, commitCount: 1, mergeBaseSha: 'MB202' },
+      { number: 303, headSha: 'H303', baseSha: 'B303', updatedAt: '2026-02-03T00:00:00.000Z', unresolvedThreads: 0, commitCount: 1, mergeBaseSha: 'MB303' },
+      { number: 404, headSha: 'H404', baseSha: 'B404', updatedAt: '2026-02-04T00:00:00.000Z', unresolvedThreads: 3, commitCount: 1, mergeBaseSha: 'MB404' },
+    ]
+    const state = initialPollState(pulls)
+    const { client, facts } = fakePollSources(state)
+
+    // The author seam (the collector's host-side record, simulated in-gate).
+    const records = new Map<number, string | null>([
+      [101, PRIYA],
+      [202, MARCUS],
+      [303, PRIYA],
+      [404, MARCUS],
+    ])
+
+    // The reviewers file (a lead's assignment, in a temp file mirroring the temp
+    // .git-credentials the broker harness seeds).
+    const dir2 = mkdtempSync(join(tmpdir(), 'revud-reviewers-'))
+    const reviewersFile = resolveReviewersFile(dir2, {})
+    writeFileSync(reviewersFile, 'assignments:\n  202: [h-priya]\n  303: [h-marcus]\n', 'utf8')
+    const reviewers = createReviewerAssignments(reviewersFile, () => {})
+
+    const loop = createPollLoop({
+      client,
+      facts,
+      repo: CONFORMANCE_REPO,
+      prAuthor: fakePrAuthor(records),
+      reviewers,
+    })
+    await loop.pollOnce()
+
+    // ONE poll result, read by two humans through the same section logic the
+    // frontend inbox applies.
+    const items = loop.listPulls(null).items
+
+    const yoursWithComments = (human: string): number[] =>
+      items
+        .filter((it) => it.broker.authorHumanId === human && it.broker.unresolvedThreads > 0)
+        .map((it) => it.pull.number)
+    const assignedToYou = (human: string): number[] =>
+      items
+        .filter(
+          (it) =>
+            it.broker.authorHumanId !== human &&
+            it.broker.assignedReviewerHumanIds.includes(human),
+        )
+        .map((it) => it.pull.number)
+
+    // Priya: authored #101 (has comments) and is assigned #202.
+    expect(yoursWithComments(PRIYA)).toEqual([101])
+    expect(assignedToYou(PRIYA)).toEqual([202])
+    // Marcus: authored #404 (has comments) and is assigned #303.
+    expect(yoursWithComments(MARCUS)).toEqual([404])
+    expect(assignedToYou(MARCUS)).toEqual([303])
+
+    // The two humans' sections are DISJOINT — no PR is in both humans' "yours".
+    const priyaYours = new Set([...yoursWithComments(PRIYA), ...assignedToYou(PRIYA)])
+    const marcusYours = new Set([...yoursWithComments(MARCUS), ...assignedToYou(MARCUS)])
+    for (const n of priyaYours) expect(marcusYours.has(n)).toBe(false)
+
+    rmSync(dir2, { recursive: true, force: true })
   })
 })

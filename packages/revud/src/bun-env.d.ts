@@ -42,11 +42,21 @@ interface BunSpawnOptions {
   stderr?: 'pipe' | 'inherit' | 'ignore'
 }
 
+/**
+ * Bun's built-in YAML surface. `parse` returns `unknown` because the parsed
+ * shape is untrusted host input the caller validates; it throws on syntactically
+ * invalid YAML.
+ */
+interface BunYaml {
+  parse(text: string): unknown
+}
+
 interface BunNamespace {
   serve(options: BunServeOptions): BunServer
   file(path: string): BunFile
   sleep(ms: number): Promise<void>
   spawn(cmd: string[], options?: BunSpawnOptions): BunSubprocess
+  readonly YAML: BunYaml
 }
 
 declare const Bun: BunNamespace

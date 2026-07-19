@@ -7,6 +7,7 @@ import type {
 } from '@revu/shared'
 import type { PullListClient } from '../direct/github-client'
 import type { RepoRef } from '../direct/repo'
+import type { ReviewerAssignments } from './reviewer-assignment'
 import { AwaitingCredentialError } from './token-source'
 
 /**
@@ -22,15 +23,27 @@ import { AwaitingCredentialError } from './token-source'
  * last-known rate limit — all IN MEMORY (volatile poll metadata; nothing here is
  * persisted, so no schema or migration exists for it).
  *
- * The broker-level ETag is DERIVED from GitHub's list ETag rather than hashed
- * from the item bodies, so it is deterministic across a graceful restart with no
- * upstream change: a fresh process re-fetches the list (its first tick has no
- * stored ETag, so it is a 200), but GitHub returns the SAME entity tag for
- * unchanged content, so the broker ETag it computes is byte-identical to the one
- * the previous process served. The frontend's stored `If-None-Match` therefore
- * still matches and the very first `/v1/pulls` after a restart can 304, instead
- * of a re-hash whose field order or float formatting could drift and force a 200
- * every restart.
+ * The broker-level ETag is DERIVED from GitHub's list ETag COMPOSED with a hash
+ * of the served per-pull meta annotations (author / approvability / assigned
+ * reviewers) rather than hashed from the full item bodies. The GitHub pull
+ * objects are NOT hashed — their field order or float formatting could drift and
+ * force a 200 every restart — only the list ETag (a stable upstream property) and
+ * the meta annotations (simple scalars/arrays under this process's control) feed
+ * the ETag.
+ *
+ * This keeps it restart-stable AND meta-sensitive:
+ *   - Restart-stable: a fresh process re-fetches the list (its first tick has no
+ *     stored ETag, so it is a 200), but GitHub returns the SAME entity tag for
+ *     unchanged content and the durable meta inputs (the `pr_author` table, the
+ *     reviewers file, `REVU_BOT_LOGIN`) are identical, so the composed ETag is
+ *     byte-identical to the one the previous process served — the frontend's
+ *     stored `If-None-Match` still 304s.
+ *   - Meta-sensitive: a reviewers-file edit or a late `pr_author` record changes
+ *     the served `assignedReviewerHumanIds` / `authorHumanId` WITHOUT moving the
+ *     upstream list (the list still 304s). Because the meta hash is folded into
+ *     the ETag and RECOMPUTED on 304 ticks too, the served ETag flips and the
+ *     frontend's next conditional GET is a fresh 200 carrying the new meta,
+ *     rather than silently keeping the stale items behind a matching ETag.
  *
  * Single repo/scope only: this cache serves ONE repo. A cross-scope cache is a
  * later concern; this module deliberately holds exactly one scope's list.
@@ -76,14 +89,39 @@ function djb2Hex(input: string): string {
 }
 
 /**
- * Derive the broker-level ETag from GitHub's list ETag. Deterministic and
- * restart-stable: the same upstream ETag always yields the same broker ETag, and
- * the upstream ETag is a property of GitHub's response, not of this process. An
- * empty upstream ETag (a test double that omits one) still yields a stable value
- * keyed on the empty string, so a 304 loop can still form.
+ * A DETERMINISTIC serialization of the served per-pull meta annotations — the
+ * `pr → {authorHumanId, canApprove, assignedReviewerHumanIds}` projection, sorted
+ * by PR number so item order never affects the result. Only these annotation
+ * scalars/arrays are serialized (never the GitHub pull objects, whose float/field
+ * -order drift is the reason the list ETag — not a body hash — anchors the ETag).
+ * The reviewer ids are left in their file order (a lead's list order is a durable
+ * property of the file); the object shape is fixed so key order is stable.
  */
-export function brokerEtagFromListEtag(listEtag: string): string {
-  return `W/"pulls:${djb2Hex(listEtag)}"`
+function serializeAnnotations(items: PullListItem[]): string {
+  const rows = items
+    .map((it) => ({
+      pr: it.pull.number,
+      authorHumanId: it.broker.authorHumanId,
+      canApprove: it.broker.canApprove,
+      assignedReviewerHumanIds: it.broker.assignedReviewerHumanIds,
+    }))
+    .sort((a, b) => a.pr - b.pr)
+  return JSON.stringify(rows)
+}
+
+/**
+ * Compose the broker-level ETag from GitHub's list ETag AND a hash of the served
+ * meta annotations. Deterministic and restart-stable: the same upstream ETag over
+ * the same durable meta always yields the same broker ETag, because every input
+ * is durable (the upstream ETag is a property of GitHub's response; the meta comes
+ * from the `pr_author` table, the reviewers file, and `REVU_BOT_LOGIN`). It is
+ * also meta-sensitive: a reviewers-file / author-record change moves the meta hash
+ * even when the list ETag is unchanged, so the served ETag flips on a meta-only
+ * change. An empty upstream ETag (a test double that omits one) still yields a
+ * stable value keyed on the empty string, so a 304 loop can still form.
+ */
+export function brokerEtag(listEtag: string, items: PullListItem[]): string {
+  return `W/"pulls:${djb2Hex(listEtag)}:${djb2Hex(serializeAnnotations(items))}"`
 }
 
 /**
@@ -96,7 +134,12 @@ interface CacheState {
   items: PullListItem[]
   /** GitHub's REST list ETag — the `If-None-Match` value for the next tick. */
   listEtag: string
-  /** The deterministic broker-level ETag served on `/v1/pulls`. */
+  /**
+   * The deterministic broker-level ETag served on `/v1/pulls`, composed from the
+   * list ETag AND a hash of the served meta annotations. Recomputed whenever the
+   * served items or their annotations change — including on a meta-only 304 tick —
+   * so a reviewers-file / author-record edit flips it even when upstream 304s.
+   */
   brokerEtag: string
   rateLimit: RateLimitInfo
 }
@@ -108,18 +151,38 @@ function unknownRateLimit(): RateLimitInfo {
 
 /**
  * A per-pull broker-meta refresh: the live facts a changed pull needs. The
- * loop composes this into `BrokerPullMeta`. The list-level author/reviewer
- * annotations (`authorHumanId`, `assignedReviewerHumanIds`, `canApprove`) are
- * NOT derived here — a poll with no write-log join has no login→human mapping —
- * so they carry NEUTRAL DEFAULTS that are completed by the BrokerPullMeta
- * author/approve join in the stacked change. A `null` `authorHumanId` here means
- * only "no write-log author join was applied", NOT "an org member opened it".
+ * loop composes this into `BrokerPullMeta`, layering in the per-pull author /
+ * reviewer / approvability annotations from the annotation resolver.
  */
 interface PullMetaFacts {
   unresolvedThreads: number
   commitCount: number
   /** `${mergeBaseSha}...${headSha}` — the same compare key a full sync computes. */
   compareKey: string
+}
+
+/**
+ * The per-pull author / reviewer / approvability annotations layered onto a
+ * pull's meta. Resolved from the two host-side seams (the durable `pr_author`
+ * store and the reviewers file) plus the bot login — never derived from the
+ * pull's live diff facts, so they attach identically to a freshly-refreshed pull
+ * and one carried forward unchanged.
+ */
+interface PullAnnotations {
+  authorHumanId: string | null
+  canApprove: boolean
+  assignedReviewerHumanIds: string[]
+}
+
+/**
+ * How the poll loop reads pull-author attribution: the durable `pr_author`
+ * store's `getPrAuthor` narrowed to exactly what the loop needs. `undefined`
+ * means no attribution row exists yet (the field surfaces as `null`); a recorded
+ * `null` means a real org member opened the PR (also surfaces as `null`). Kept a
+ * one-method seam so the whole store never has to be handed to the loop.
+ */
+export interface PrAuthorResolver {
+  getPrAuthor(pr: number): string | null | undefined
 }
 
 /**
@@ -146,43 +209,61 @@ export interface PollLoopDeps {
   intervalMs?: number
   /** Consecutive-failure tolerance before the cache is treated as unavailable. */
   maxStaleTicks?: number
+  /**
+   * A narrow read seam over the durable `pr_author` store. When present, a pull's
+   * `authorHumanId` is `getPrAuthor(pr) ?? null`; absent, it is always `null`.
+   * Only the resolver is threaded — the loop never holds the whole store.
+   */
+  prAuthor?: PrAuthorResolver
+  /**
+   * The reviewers file surface. Re-read (`load()`) at the top of each tick so a
+   * lead's edit takes effect without a restart; `assignmentsFor(pr)` fills
+   * `assignedReviewerHumanIds`. Absent, every pull's assignment list is `[]`.
+   */
+  reviewers?: ReviewerAssignments
+  /**
+   * The configured bot login (the broker session's `viewerLogin`, sourced from
+   * `REVU_BOT_LOGIN`). `canApprove` compares `pull.user.login` to `botLogin`
+   * case-insensitively (GitHub logins are case-insensitive): a PR the App authored
+   * (author login === the bot login) is NOT self-approvable, an org member's PR
+   * is. Absent / blank (a reads-only broker with no bot identity), `canApprove`
+   * stays `true` — the field is only consequential where writes are enabled, which
+   * requires the bot login.
+   */
+  botLogin?: string | null
 }
 
 /**
  * A default `BrokerPullMeta` for a pull whose live facts have not (yet) been
  * refreshed — used before the first facts fetch resolves so the list is always
  * well-typed. The counts are zero and the compare key is the base-tip fallback,
- * which is corrected to the true merge base on the next facts refresh.
- *
- * `authorHumanId: null` / `canApprove: true` are NEUTRAL PLACEHOLDERS, completed
- * by the BrokerPullMeta author/approve join in the stacked change (which owns the
- * write-log login→human mapping). A poll with no write-log join carries these
- * neutral defaults; the two fields are type-coupled, so they are populated
- * together there, not partially here.
+ * which is corrected to the true merge base on the next facts refresh. The
+ * author / reviewer / approvability annotations are always current (they come
+ * from the host-side seams, not the diff facts), so they are filled here too.
  */
-function defaultMeta(pull: PullSummary): BrokerPullMeta {
+function defaultMeta(pull: PullSummary, annotations: PullAnnotations): BrokerPullMeta {
   return {
-    authorHumanId: null,
-    canApprove: true,
+    authorHumanId: annotations.authorHumanId,
+    canApprove: annotations.canApprove,
     unresolvedThreads: 0,
-    assignedReviewerHumanIds: [],
+    assignedReviewerHumanIds: annotations.assignedReviewerHumanIds,
     compareKey: `${pull.base.sha}...${pull.head.sha}`,
     commitCount: 0,
   }
 }
 
 /**
- * Compose a full `BrokerPullMeta` from live facts. As in `defaultMeta`,
- * `authorHumanId: null` / `canApprove: true` are neutral placeholders completed
- * by the BrokerPullMeta author/approve join in the stacked change; a poll with no
- * write-log join carries these neutral defaults rather than a partial guess.
+ * Compose a full `BrokerPullMeta` from live facts plus the current author /
+ * reviewer / approvability annotations. The facts drive the diff-derived fields;
+ * the annotations drive `authorHumanId`, `canApprove`, and
+ * `assignedReviewerHumanIds`.
  */
-function metaFromFacts(facts: PullMetaFacts): BrokerPullMeta {
+function metaFromFacts(facts: PullMetaFacts, annotations: PullAnnotations): BrokerPullMeta {
   return {
-    authorHumanId: null,
-    canApprove: true,
+    authorHumanId: annotations.authorHumanId,
+    canApprove: annotations.canApprove,
     unresolvedThreads: facts.unresolvedThreads,
-    assignedReviewerHumanIds: [],
+    assignedReviewerHumanIds: annotations.assignedReviewerHumanIds,
     compareKey: facts.compareKey,
     commitCount: facts.commitCount,
   }
@@ -232,6 +313,39 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
   const intervalMs = deps.intervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const maxStaleTicks = deps.maxStaleTicks ?? DEFAULT_MAX_STALE_TICKS
   const { owner, repo } = deps.repo
+  const botLogin = deps.botLogin ?? null
+
+  /**
+   * The current author / reviewer / approvability annotations for a pull, from
+   * the host-side seams. Re-evaluated for EVERY pull on every tick (not just
+   * changed ones), because a lead's reviewers-file edit or a late author record
+   * can change these without moving the pull's diff facts — so they attach to a
+   * carried-forward meta just as freshly as to a refreshed one.
+   *
+   * `authorHumanId` is the recorded driver (`undefined` "never observed", a
+   * recorded `null` "org member opened it", AND a recorded empty string all
+   * collapse to `null` — an empty id is not a real human, so it must not surface
+   * as a non-null author).
+   * `canApprove` compares the author login to the bot login CASE-INSENSITIVELY
+   * (GitHub logins are case-insensitive) — the App refuses to review its own PR,
+   * so a bot-authored PR (author login === bot login) is not self-approvable.
+   * With no bot login configured (reads-only broker) it stays `true`, which is
+   * inconsequential because writes are disabled there.
+   * `assignedReviewerHumanIds` is the reviewers file's list for the PR (`[]`
+   * when none).
+   */
+  function annotationsFor(pull: PullSummary): PullAnnotations {
+    const recorded = deps.prAuthor?.getPrAuthor(pull.number)
+    return {
+      authorHumanId: recorded !== undefined && recorded !== null && recorded.length > 0
+        ? recorded
+        : null,
+      canApprove: botLogin === null || botLogin.length === 0
+        ? true
+        : pull.user.login.toLowerCase() !== botLogin.toLowerCase(),
+      assignedReviewerHumanIds: deps.reviewers?.assignmentsFor(pull.number) ?? [],
+    }
+  }
 
   let cache: CacheState | null = null
   let consecutiveFailures = 0
@@ -326,13 +440,33 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
     if (inFlight) return
     inFlight = true
     try {
+      // Re-read the reviewers file at the top of every tick so a lead's edit takes
+      // effect without a restart — even on an otherwise-idle 304 tick, where the
+      // annotations are re-applied to the cached items below. A read/parse failure
+      // keeps the last-good map inside `load()`; it is not expected to throw, but
+      // it is INSIDE the try so a hostile throw can never wedge `inFlight` true
+      // forever nor escape `void pollOnce()` as an unhandled rejection — it counts
+      // as a failed tick like any other, and `finally` always clears the flag.
+      deps.reviewers?.load()
       const page = await deps.client.listOpenPulls(owner, repo, cache?.listEtag ?? null)
 
       if (page.notModified) {
         if (cache !== null) {
-          // Unchanged upstream: refresh only the rate limit (its headers ride the
-          // 304); items and both ETags stay exactly as they were. A 304 IS a
-          // successful tick, so it clears the failure streak.
+          // Unchanged upstream: the diff-derived fields (counts, compareKey) stay
+          // as they were, but the host-side annotations (author, reviewers,
+          // approvability) may have moved independently of the diff — so
+          // re-annotate the cached items in place. Also refresh the rate limit
+          // (its headers ride the 304). A 304 IS a successful tick, so it clears
+          // the failure streak.
+          cache.items = cache.items.map((it) => ({
+            pull: it.pull,
+            broker: { ...it.broker, ...annotationsFor(it.pull) },
+          }))
+          // Recompute the broker ETag from the (unchanged) list ETag AND the
+          // freshly re-applied annotations: a meta-only change during an
+          // upstream-304 tick MUST flip the served ETag, or the frontend keeps
+          // stale items behind a matching ETag and never sees the new meta.
+          cache.brokerEtag = brokerEtag(cache.listEtag, cache.items)
           if (page.rateLimit !== null) cache.rateLimit = page.rateLimit
           consecutiveFailures = 0
         }
@@ -356,16 +490,25 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
       )
 
       const items: PullListItem[] = page.items.map((pull) => {
+        // The host-side annotations (author, reviewers, approvability) are
+        // re-resolved for every pull each tick, so a carried-forward meta picks
+        // up a reviewers-file or author-record change even when the diff facts
+        // did not move.
+        const annotations = annotationsFor(pull)
         const fresh = facts.get(pull.number)
-        if (fresh !== undefined) return { pull, broker: metaFromFacts(fresh) }
+        if (fresh !== undefined) return { pull, broker: metaFromFacts(fresh, annotations) }
         const carried = priorMetaByNumber.get(pull.number)
-        return { pull, broker: carried ?? defaultMeta(pull) }
+        if (carried !== undefined) {
+          return { pull, broker: { ...carried, ...annotations } }
+        }
+        return { pull, broker: defaultMeta(pull, annotations) }
       })
 
+      const sortedItems = sortItems(items)
       cache = {
-        items: sortItems(items),
+        items: sortedItems,
         listEtag: page.etag,
-        brokerEtag: brokerEtagFromListEtag(page.etag),
+        brokerEtag: brokerEtag(page.etag, sortedItems),
         rateLimit: page.rateLimit ?? cache?.rateLimit ?? unknownRateLimit(),
       }
       // ONLY a fully-successful tick — the list read AND the facts phase both
