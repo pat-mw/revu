@@ -1,0 +1,104 @@
+---
+title: Scenario map
+description: The fixture pull requests and the hard case each one makes concrete, from a first sync to the full reconcile flow.
+---
+
+revu ships with a set of fixture pull requests, and each one exists to make a
+single hard case concrete. Together they are the demo, the acceptance tests for
+the sync-and-reconcile pipeline, and the scenarios the cross-transport
+conformance suite drives. Nothing here is filler: every PR is a case the design
+had to get right.
+
+The demo scenario, the company, and every person in the fixtures are fictional.
+
+## The fixture pull requests
+
+Reach them from the [dev panel](#the-dev-panel) — it links every scenario — or
+force mock mode with `?mock=1` and open the inbox.
+
+| PR | Demonstrates |
+|---|---|
+| **#101** | First sync — the happy path, with honest request-cost copy. |
+| **#204** | A 2,400-line diff: virtualization, lockfile + big-file collapse, a binary, a rename. |
+| **#312** | Mid-review: resolved / outdated threads, a suggestion block, reactions, a deep reply chain, a seeded draft. |
+| **#347** | You authored it — author banner + walk-the-queue mode. |
+| **#355** | An org-member PR — the one place Approve actually works. |
+| **#362** | Failing checks (full log excerpt) + a merge conflict. |
+| **#389** | Stale snapshot + a draft against an old head → the full reconcile flow (clean / drifted / lost). |
+| **#401** | A sync that dies partway — a partial snapshot that names what's missing; the retry fetches only that. |
+| **#410** | The base branch advanced, head didn't — the diff still changed, and the seal says so. |
+| **#415** | A thread resolved elsewhere since sync, zero new commits — re-sync reuses every blob. |
+
+![The inbox — sections driven by what needs doing today; the unresolved count on your own PRs is the loudest number on screen](/assets/screenshots/inbox.png)
+
+## What each one proves
+
+- **#101 — the baseline.** A never-synced PR, then a first sync. It is the
+  reference for a well-formed snapshot: `partial` is null, at least one blob is
+  fetched, the immutable half is populated, and `getSnapshot` on the un-synced
+  PR reads back as `null`, not an error.
+- **#204 — the large diff.** 2,400 lines with a virtualized viewer, a collapsed
+  lockfile and big file, a binary that is collapsed rather than fetched, and a
+  rename. It is the proof that a big PR stays cheap because blobs come from the
+  local git store.
+- **#312 — mid-review.** Resolved and outdated threads, a suggestion block,
+  reactions, a deep reply chain, and a **seeded draft** — the head-guard target.
+  Submitting against a wrong head SHA here must return `head_moved` as a value
+  and leave the draft untouched.
+- **#347 — you authored it.** The author banner and walk-the-queue mode for
+  working through your own PR's unresolved threads.
+- **#355 — the org-member PR.** The one PR the shared identity did not open, so
+  Approve is actually live. Everywhere else it is gated.
+- **#362 — things are broken.** A failing check run with a full log excerpt, plus
+  a merge conflict — because checks and mergeability refetch on every sync,
+  unconditionally.
+- **#389 — reconcile.** A stale snapshot with a pending draft against an old
+  head, three new commits landed. Re-syncing and submitting routes through the
+  full [reconcile](/docs/concepts/reconcile) flow: some comments re-anchor clean,
+  one drifts, one is lost. Nothing is silently discarded.
+- **#401 — partial sync.** The first sync dies mid-burst; revu keeps the partial
+  it managed to fetch and names the missing blobs. The retry fetches exactly
+  those and completes with `partial: null`.
+- **#410 — the base moved.** Head is unchanged but the base branch advanced, so
+  the three-dot diff changed. The [compare key](/docs/concepts/compare-key)
+  moves even though head didn't, and the seal goes gold to say so.
+- **#415 — resolved elsewhere.** A thread was resolved on github.com with zero
+  new commits. A re-sync refetches the mutable half and reuses **every** blob,
+  because the immutable half is content-addressed and nothing about it changed.
+
+![Reconcile — the branch moved mid-review; every pending comment gets an explicit decision, and nothing is ever silently discarded](/assets/screenshots/reconcile.png)
+
+## The conformance mapping
+
+Six of these fixtures are the scenarios the cross-transport conformance suite
+runs against every adapter — the in-process mock and the daemon over HTTP — to
+prove they honor the identical contract. The suite names each scenario by role;
+the fixtures fill those roles:
+
+| Scenario | Fixture PR | The invariant it pins |
+|---|---|---|
+| `baseline` | **#101** | A never-synced pull reads back `null`; a first sync produces a well-formed snapshot that fetches blobs. |
+| `seededDraft` | **#312** | `submitReview` against a stale head returns `head_moved` as a value and leaves the draft untouched. |
+| `baseAdvanced` | **#410** | Head unchanged but `compareKey` moved; re-sync rebuilds the immutable half. |
+| `mutableDrift` | **#415** | The mutable half refetches; re-sync reuses every blob (zero refetched). |
+| `partialSync` | **#401** | The first sync throws `network` and keeps a partial; the retry fetches only the missing blobs. |
+| `reconcile` | **#389** | After re-sync, reconcile yields clean / drifted / lost, and the client-side preview matches the report for every comment. |
+
+Because the assertions live in the shared package and run against both
+transports, these fixtures are what let anyone touch the sync engine later with
+confidence. See [Architecture](/docs/reference/architecture) for how the suite is
+wired.
+
+## The dev panel
+
+The dev panel (avatar menu → *Dev panel…*, mock mode only) switches identity
+between the fictional contractors, simulates latency and failure modes, shows the
+shared rate budget, and links every scenario above.
+
+![The dev panel — switch identity between fictional contractors, simulate latency and failure modes, and jump to any fixture scenario](/assets/screenshots/dev-panel.png)
+
+## Related
+
+- [Mock mode](/docs/run-modes/mock) — the in-browser demo these fixtures drive.
+- [Reconcile](/docs/concepts/reconcile) — the flow #389 walks through.
+- [Compare key](/docs/concepts/compare-key) — why #410 and #415 behave differently.

@@ -1,0 +1,43 @@
+---
+title: Reference
+description: The technical reference — architecture, the RevuApi contract and its routes, the wire types and error codes, the fixture scenario map, and the design system.
+---
+
+The reference section is the ground truth for how revu is built: the contract
+the UI talks to, the daemon that serves it, the shapes on the wire, and the
+design tokens that render it. Every page here is grounded in the code, not in a
+description of it — the `RevuApi` interface, the shared route table, and the wire
+types are the source of truth, and this section documents them as they are.
+
+If you are getting revu running, start with [run modes](/docs/run-modes) and the
+[quickstart](/docs/quickstart). If you are reasoning about *why* it is shaped
+this way, read the [concepts](/docs/concepts). This section is for the mechanics.
+
+## What's here
+
+| Page | Covers |
+|---|---|
+| [Architecture](/docs/reference/architecture) | The one-contract layering — `RevuApi` → `revud` → a `TokenSource`/`WriteDecorator` pair over one shared core — and mock-as-oracle conformance. |
+| [API & routes](/docs/reference/api-and-routes) | The `RevuApi` methods and the HTTP route table they map onto, one route per method. |
+| [Types & errors](/docs/reference/types-and-errors) | The snapshot, draft, and thread wire types, and the `ApiErrorCode` set — including the non-error semantics (`head_moved` as a value, `getSnapshot` null, partial snapshots). |
+| [Scenario map](/docs/reference/scenario-map) | The fixture pull requests, and the one hard case each makes concrete. |
+| [Design](/docs/reference/design) | The dark-only, dense, keyboard-first design system — the diff palette, draft violet, stale gold, and the snapshot seal. |
+
+## The one contract, stated once
+
+Everything in this section orbits a single interface. The React app reads and
+writes through exactly one boundary — `RevuApi`. In the browser that boundary
+binds an in-process mock; over HTTP it reaches **`revud`**, a single Bun daemon
+that serves the built app and the API on one loopback port. A run mode is a pair
+of small strategies plugged in around one shared core; it never forks the core.
+
+Three run modes exist, and this section describes all three honestly:
+
+- **[Mock](/docs/run-modes/mock)** — in-browser fixtures, forced with `?mock=1`.
+  Shipped. The permanent demo and the semantics oracle.
+- **[Direct](/docs/run-modes/direct)** — `bun run revud --direct` (or
+  `REVU_MODE=direct`). Shipped. Talks to real GitHub authenticated as the `gh`
+  user, with drafts and snapshots in a local SQLite store.
+- **[Broker](/docs/run-modes/broker)** — the shared-identity deployment for
+  teams in disposable workspaces. **Reserved: designed and documented, not a
+  shipped boot option.** Only mock and direct modes boot today.

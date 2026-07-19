@@ -1,0 +1,13 @@
+{
+  "title": "Guides",
+  "pages": [
+    "index",
+    "first-sync",
+    "commenting",
+    "submitting",
+    "reconcile-a-moved-head",
+    "author-queue",
+    "inbox-triage",
+    "viewed-and-reactions"
+  ]
+}

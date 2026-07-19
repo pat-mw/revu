@@ -1,0 +1,133 @@
+---
+title: Broker mode
+description: The reserved shared-identity deployment for teams in disposable workspaces — designed and documented, not yet a shipped boot option.
+---
+
+<Callout type="warn" title="Broker mode is reserved — not a shipped boot option">
+Broker mode is designed and documented, but it is **not yet a shipped, runnable
+boot option.** Only [mock](/docs/run-modes/mock) and
+[direct](/docs/run-modes/direct) modes boot today. This page describes the
+intended design so it can be reasoned about and built against — do not read any
+command here as something you can rely on running in a released build.
+</Callout>
+
+Broker mode is the shared-identity deployment revu was originally shaped for:
+teams of contractors reviewing a client's private repositories from disposable
+cloud workspaces, where every GitHub call authenticates as one shared GitHub App
+and there is no github.com to fall back to. The constraints of that setting are
+the reason the general-purpose tool is built the way it is — the snapshot, the
+durable draft store, and reconcile all come out of it. Broker mode is where that
+machinery, inert in [direct mode](/docs/run-modes/direct), is meant to switch on.
+
+## The intended shape
+
+In the design, the daemon runs inside a disposable workspace container. It never
+mints credentials of its own: a GitHub App installation token is injected from
+the host into the workspace and the daemon reads it fresh on every request. The
+HTTP server binds loopback (`127.0.0.1`) only, so the injected credential is
+never reachable from outside the workspace — the host reaches the daemon through
+a forwarded port. This is structural, not a configuration option: the injected
+credential must never be reachable from outside the workspace.
+
+How the design differs from direct mode:
+
+1. The token source reads a credential file fresh on every request instead of
+   shelling out to `gh`.
+2. Boot tolerates an absent credential — the file may be missing for a short
+   window at container start — and surfaces a `broker_unreachable` state per
+   request until the credential lands, rather than failing to start.
+3. The server binds `127.0.0.1`, not `0.0.0.0`.
+
+## Host-injected, short-lived App token
+
+The host-side broker mints a **short-lived** GitHub App installation token and
+writes it into the workspace container's credential file in
+`git-credential-store` format:
+
+```
+https://x-access-token:<token>@github.com
+```
+
+The daemon's token source reads this file fresh on every API call, preferring an
+`x-access-token` entry over any other `github.com` entry. The file is
+**replaced** on rotation, never appended, so the daemon always reads the current
+token and never caches a stale one. The credential file location is meant to be
+`~/.git-credentials` by default, overridable via `REVU_CREDENTIALS_FILE`.
+
+## Identity stamping
+
+Because every write reaches GitHub as one shared bot, the individual human has to
+be recovered some other way. In the design, writes are only enabled when the
+deployment configures the App's bot login. Without it the daemon starts
+reads-only and the write endpoints return `501`. When it is configured, every
+write is:
+
+- **stamped** — the human's display name is prepended as a prefix in the comment
+  body, and parsed back out defensively on read so each reviewer's comments
+  render under their real name; and
+- **journaled** — appended to an append-only audit journal keyed by the human's
+  id (the lowercased git-config email).
+
+The human's *email* never goes into a comment body — only the name-based display
+prefix does — because comment bodies are visible to the whole org on github.com.
+Org members who have their own GitHub identity keep it; the stamping machinery is
+only for the shared identity.
+
+<Callout title="Display identity and audit identity are separate systems">
+git config is workspace-writable, so the display prefix is convention, not
+authentication — a workspace could claim another name. The audit layer is
+deliberately independent: the host records which workspace a write came from
+based on the channel the request arrived on, not on anything the workspace
+claims. Only the audit layer needs to be tamper-proof, and it is the one kept
+authoritative.
+</Callout>
+
+## The append-only audit journal
+
+The audit journal is the permanent, append-only record of every write that
+reached GitHub under the shared bot identity: which human (by binding email),
+which workspace, which endpoint, which PR, the GitHub-assigned id, and when. In
+the workspace it is written to the local store under the human's id. The host's
+own audit journal is populated separately, when the host collector pulls each
+workspace's local store and merges the rows without overwriting existing ones —
+so a query against the host journal sees no rows until at least one collector
+tick has pulled that workspace.
+
+The audit journal is designed as the compliance record and is never deleted.
+When a human departs, the intended offboarding purges their working state
+(drafts and per-PR viewed rows) from the host store while retaining every audit
+row.
+
+## The host collector
+
+The host-side collector is the surface that holds per-human durable state pulled
+from the workspace containers — drafts, viewed state, and the merged audit
+journal. It is designed to live in a separate store from any workspace's own, so
+it never shares a file with a workspace's direct-mode store. It is keyed
+exclusively by the workspace label — not by any identity the workspace claims —
+and every operator command resolves that label through an owner map to the
+canonical email key.
+
+Two operator surfaces round out the design: an audit export that reads the host
+journal (scopable by workspace, PR, and time), and an offboard step that purges a
+departed human's working state while keeping their audit rows. A reviewer-
+assignment file — YAML the lead edits, re-read on a roughly 30-second poll so an
+edit takes effect without a daemon restart — maps PR numbers to the humans
+assigned to review them, since GitHub only ever sees the one bot.
+
+## Why it isn't a boot option yet
+
+Everything above is the intended design, documented so the rest of the system
+can be built to fit it. The token custody, stamping, audit journal, reviewer
+assignment, and host collector are described in the operator runbook, but broker
+mode is **not** a boot mode you can depend on in a shipped build. The general-
+purpose tool that is shipped today is [direct mode](/docs/run-modes/direct); the
+permanent demo and oracle is [mock mode](/docs/run-modes/mock).
+
+## Where to go next
+
+- [Direct mode](/docs/run-modes/direct) — the shipped, general-purpose tool that
+  shares the same core.
+- [Mock mode](/docs/run-modes/mock) — the in-browser demo and test oracle.
+- [Run modes overview](/docs/run-modes) — how the mode is selected and what the
+  three modes share.

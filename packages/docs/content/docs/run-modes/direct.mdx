@@ -1,0 +1,180 @@
+---
+title: Direct mode
+description: revud --direct talks to real GitHub as the gh user, with drafts and snapshots in a local SQLite store.
+---
+
+Direct mode runs revu against a GitHub repository as the real authenticated
+user. No shared bot identity is involved: every review comment, reply, and
+thread resolution posts to GitHub under your own account. It is the
+general-purpose, local-first tool — the same offline-snapshot review pipeline as
+the shared-identity deployment, without the multi-tenancy machinery.
+
+## Starting the daemon
+
+From inside a clone of the repository you want to review, with
+[Bun](https://bun.sh) installed and the [`gh` CLI](https://cli.github.com)
+authenticated:
+
+```bash
+bun run revud --direct
+```
+
+The `--direct` flag and `REVU_MODE=direct` are equivalent:
+
+```bash
+REVU_MODE=direct bun run revud
+```
+
+The daemon reads the target repository from the `origin` remote
+(`git remote get-url origin`), resolves and validates a GitHub token, and starts
+an HTTP server on port `4780`. Open the URL it prints to begin reviewing.
+
+Override the port with `REVU_PORT`:
+
+```bash
+REVU_MODE=direct REVU_PORT=5000 bun run revud
+```
+
+If the `origin` remote is not the repository you want to review, pass
+`--repo owner/name` or set `REVU_REPO`. The flag wins over the env var; a
+trailing `.git` is tolerated and stripped:
+
+```bash
+bun run revud --direct --repo octocat/hello-world
+# or
+REVU_MODE=direct REVU_REPO=octocat/hello-world bun run revud
+```
+
+## Identity: authenticated as you
+
+The token comes from the `gh` credential chain, resolved in this order — the
+first source that produces a non-empty token wins:
+
+1. `GH_TOKEN` environment variable.
+2. `GITHUB_TOKEN` environment variable.
+3. `gh auth token` — the credential stored by the GitHub CLI.
+
+If none of these produce a token, startup fails with a clear message.
+Authenticate the CLI first if you haven't:
+
+```bash
+gh auth login
+```
+
+The token needs `repo` scope (or the fine-grained equivalent: Contents read,
+Pull requests read/write, Metadata read). The review daemon itself never pushes
+commits or refs, so for reviewing alone it needs only **Contents: read**. The
+token is never logged and never sent to the browser.
+
+Verify your auth without printing the token:
+
+```bash
+gh auth status          # shows account + token scopes; never echo the token
+```
+
+Your display identity is read from git config, and both fields must be set:
+
+```bash
+git config user.name
+git config user.email
+```
+
+The lowercased email is the stable key for drafts and viewed state; the name is
+the display layer. If either is missing, startup fails with an actionable
+message. In direct mode this identity is cosmetic where GitHub is concerned —
+GitHub authenticates the human for real — and your email never appears in any
+comment body; only your real GitHub login is visible to other reviewers.
+
+Role defaults to `contractor`. To start as a lead:
+
+```bash
+REVU_ROLE=lead bun run revud --direct
+```
+
+## Drafts in local SQLite
+
+Your review is a **local draft**, not a GitHub-native pending review. Drafts,
+snapshots, blobs, viewed state, and preferences persist to a SQLite file under
+`${XDG_DATA_HOME:-~/.local/share}/revu`. Override the directory with
+`REVU_DATA_DIR`:
+
+```bash
+REVU_MODE=direct REVU_DATA_DIR=/tmp/my-revu-data bun run revud
+```
+
+A restart loses nothing: the daemon re-reads the store and every draft survives.
+Drafts save automatically as you type — debounced at 600ms, with a flush on tab
+hide. A hard crash inside the debounce window can lose up to the last 600ms of
+typing, and a draft is deleted from disk only on confirmed submit success.
+
+![An inline review thread open against a diff line — read, reply, and resolve inline; drafts save as you type and survive a restart](/assets/screenshots/files-thread.png)
+
+## The review loop
+
+1. **Sync** — click a pull request in the list. The daemon fetches the PR's
+   diff, files, threads, and commits from GitHub REST + GraphQL and stores them
+   locally.
+2. **Comment** — open a file, select lines, and write inline comments. The draft
+   saves automatically as you type and survives a restart.
+3. **Submit** — submit the draft as a `COMMENT`, `APPROVE`, or `REQUEST_CHANGES`
+   review. The draft is deleted from disk only on confirmed success. A
+   `head_moved` response (the PR was force-pushed between sync and submit)
+   surfaces as a conflict and keeps the draft intact so you can re-sync and
+   resubmit.
+4. **Reply** — reply to a review thread. Replies post as single inline comments
+   on the existing thread.
+5. **Resolve / unresolve** — mark a review thread resolved or reopen it, via the
+   GitHub GraphQL `resolveReviewThread` / `unresolveReviewThread` mutations.
+
+![The review bar — submit a draft as Comment, Approve, or Request changes; Approve is gated to where it actually works](/assets/screenshots/review-bar.png)
+
+### Approve gating
+
+**Comment** is the primary action. Approve and Request-changes are gated per-PR
+and are only live where they actually work — in direct mode, when the PR was not
+opened by you. When approval isn't available, the UI says what to do instead of
+graying out a dead end.
+
+## Rate budget and the snapshot
+
+A PR is a **snapshot**: one sync burst, then fully-local review. Context
+expansion, thread reading, and file jumping all work with the network gone,
+because immutable content is fetched once and reused across syncs. Reviewing
+needs the repository cloned locally — blob reads come from your git object store,
+which is what keeps a large-PR sync cheap. Threads, checks, and mergeability
+refetch on every sync, unconditionally, so a thread resolved elsewhere with zero
+new commits still shows up. Only the PR list polls, and it is free on ETag 304
+responses.
+
+![Checks — check runs and mergeability refetch on every sync, unconditionally, shown here with a failing check run and a log excerpt](/assets/screenshots/checks.png)
+
+## Environment variables
+
+Direct mode's environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `REVU_MODE` | `mock` | `mock`, `direct`, or `broker` (reserved). |
+| `REVU_PORT` | `4780` | HTTP server port. |
+| `REVU_REPO` | origin remote | Repository override (`owner/name`); a `--repo` flag wins over it. |
+| `REVU_DATA_DIR` | `~/.local/share/revu` | Durable SQLite store (drafts, snapshots, blobs, viewed state). |
+| `REVU_ROLE` | `contractor` | Session role; `lead` to start as a lead. |
+| `REVU_DIST_DIR` | `packages/app/dist` | Directory of the built frontend the daemon serves. |
+| `GH_TOKEN` | — | Token override, ahead of `GITHUB_TOKEN` and `gh auth token`. |
+| `GITHUB_TOKEN` | — | Token override, ahead of `gh auth token`. |
+
+## The full check gate
+
+Before any change is ready, run the local gate — lint, typecheck, `bun test`,
+and the app build, in order. All four must pass:
+
+```bash
+bun run check
+```
+
+## Where to go next
+
+- [Mock mode](/docs/run-modes/mock) — the in-browser demo and test oracle.
+- [Broker mode](/docs/run-modes/broker) — the reserved shared-identity design.
+- [Run modes overview](/docs/run-modes) — how the mode is selected and what the
+  three modes share.

@@ -1,0 +1,66 @@
+---
+title: Snapshot
+description: A PR pulled down in one sync burst — diff, files, threads, commits, checks — then reviewed fully locally.
+---
+
+A pull request in revu is a **snapshot**: one sync burst pulls everything you need to
+review — the diff, files, review threads, commits, and check runs — down from GitHub, and
+after that the whole review works with the network gone. Expanding context, reading threads,
+jumping between files, and writing inline comments are all local operations against the
+snapshot in your durable store. The network is spent once, on purpose. That is what
+[the rate budget](/docs/concepts/rate-budget) buys, and it is why review keeps working when
+the connection is flaky.
+
+## What a sync pulls
+
+A cold sync of a PR is a bounded burst of GitHub REST and GraphQL calls — the PR detail and
+merge base, the changed files with their patches, the review threads with their comments and
+resolved/outdated state, the issue comments, reviews, commits, and the head commit's check
+runs. Blobs are the one thing a sync tries hard *not* to fetch: they come from your local git
+object store instead (see [compare key](/docs/concepts/compare-key)).
+
+The snapshot has two halves that are refetched on different schedules:
+
+| Half | Contents | Refetched |
+| --- | --- | --- |
+| **Immutable** | The diff, file patches, and blobs for this `merge_base...head` | Only when the compare key changes |
+| **Mutable** | Threads, checks, mergeability, review state | Every sync, unconditionally |
+
+Because the mutable half is always refetched, a thread someone resolved elsewhere — with
+**zero new commits** — still shows up after a re-sync. Nothing about a stale head lets revu
+skip the mutable fetch.
+
+<img src="/assets/screenshots/files-diff.png" alt="The Files screen: a virtualized, syntax-highlighted diff with the snapshot seal in the PR header dating everything on screen" />
+
+## The snapshot seal
+
+Every PR header carries a **snapshot seal** — the offline-first contract made visible. It
+stamps, in mono, the head SHA it synced and how long ago. The seal is the answer to the
+question every offline review tool has to answer honestly: *how old is what I am looking at?*
+
+The seal has two states:
+
+- **Fresh** — quiet and structural. A hairline-bordered mono stamp; nothing is asking for
+  your attention because nothing changed.
+- **Stale (gold)** — the world moved under you since you synced. The seal turns gold and
+  grows a re-sync action, and it names *what* moved in words, never color alone — for
+  example, new commits since your sync, or a base branch that advanced. Staleness is always
+  glyph plus text, so it reads for someone who can't see the color at all.
+
+Gold is reserved across the whole app for one meaning: **time moved under you**. When the
+seal is gold, re-syncing pulls a fresh snapshot. If you have a pending [draft](/docs/concepts/drafts)
+against the old head, submitting or re-syncing routes you through
+[reconcile](/docs/concepts/reconcile) rather than throwing your work away.
+
+## Partial snapshots
+
+A sync can die partway — the connection drops mid-burst. When that happens revu keeps the
+**partial** snapshot it did manage to fetch and names what is missing, rather than discarding
+the whole thing and starting over. A retry fetches only the missing pieces. A never-synced PR
+has no snapshot at all, which the tool represents as an explicit empty state, not an error.
+
+## Related
+
+- [Compare key](/docs/concepts/compare-key) — how the immutable half is keyed and shared.
+- [Rate budget](/docs/concepts/rate-budget) — why the burst-then-local shape exists.
+- [Reconcile](/docs/concepts/reconcile) — what happens to a draft when the seal goes gold.

@@ -1,0 +1,9 @@
+{
+  "title": "Run modes",
+  "pages": [
+    "index",
+    "mock",
+    "direct",
+    "broker"
+  ]
+}

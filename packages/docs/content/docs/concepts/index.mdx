@@ -1,0 +1,38 @@
+---
+title: Concepts
+description: The core ideas that make revu what it is — snapshot, compare key, drafts, reconcile, identity, and the rate budget.
+---
+
+revu was built for the hardest version of PR review: contractors reviewing a client's
+private repos from disposable cloud workspaces, where every API call authenticates as one
+shared GitHub App and there is no github.com tab to fall back to. The constraints that came
+out of that setting are encoded in the product rather than smoothed over, and they turn out
+to make the general-purpose tool better too.
+
+Six ideas carry the whole design. Each has a page:
+
+- **[Snapshot](/docs/concepts/snapshot)** — a PR is pulled down in one sync burst — diff,
+  files, threads, commits, checks — then reviewed fully locally. The **snapshot seal** on
+  every PR header dates what you are looking at: quiet when fresh, gold when the world moved
+  under you.
+- **[Compare key](/docs/concepts/compare-key)** — immutable content is keyed
+  `merge_base...head`, never head alone. Blobs are content-addressed and reused across
+  syncs, and read from your local git object store, which is what keeps a large-PR sync
+  cheap.
+- **[Drafts](/docs/concepts/drafts)** — your review is a durable local draft, saved as you
+  type and keyed to you. A restart loses nothing; a draft is deleted from disk only on
+  confirmed submit success.
+- **[Reconcile](/docs/concepts/reconcile)** — when the branch moves under a pending draft,
+  every comment is classified **clean**, **drifted**, or **lost**, and you decide each one
+  explicitly. Nothing is ever silently discarded.
+- **[Identity](/docs/concepts/identity)** — in direct mode GitHub authenticates you for
+  real. The shared-identity broker model — one GitHub App with per-human name stamping — is
+  reserved, not shipped.
+- **[Rate budget](/docs/concepts/rate-budget)** — the snapshot spends the shared GitHub rate
+  budget once, in a burst, then review is local. Only the PR list keeps polling, and that is
+  free on ETag `304`s.
+
+These ideas connect. A snapshot is keyed by its compare key; a draft outlives its snapshot;
+when a newer snapshot arrives with a different head, reconcile is how the draft crosses over.
+The rate budget is the reason the snapshot exists at all, and identity is what a stamped
+write carries. Read them in order, or jump to whichever surfaced a question.

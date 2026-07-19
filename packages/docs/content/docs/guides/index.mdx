@@ -1,0 +1,62 @@
+---
+title: Guides
+description: Task-oriented how-tos for the everyday review loop — sync, comment, submit, reconcile, and triage.
+---
+
+These are task-focused walkthroughs of the everyday review loop. Each one starts
+from a concrete situation, uses a fixture pull request so you can follow along in
+the demo, and points at the exact keys and commands involved.
+
+## The review loop
+
+The core path is short and always the same, in every run mode:
+
+1. **[Triage the inbox](/docs/guides/inbox-triage)** — the list sorts by what
+   needs doing today, loudest first: unresolved threads on your own PRs.
+2. **[Sync a pull request](/docs/guides/first-sync)** — one burst pulls the PR
+   down as a snapshot; from then on you review offline.
+3. **[Write inline comments](/docs/guides/commenting)** — select lines, type into
+   a local draft that saves as you go, and drop suggestion blocks.
+4. **[Submit the review](/docs/guides/submitting)** — send the draft as Comment,
+   Approve, or Request changes.
+5. **[Reconcile a moved head](/docs/guides/reconcile-a-moved-head)** — if the
+   branch was force-pushed between sync and submit, decide what happens to every
+   pending comment instead of losing your work.
+
+## Also here
+
+- **[The author queue](/docs/guides/author-queue)** — when *you* opened the PR:
+  the author banner and walk-the-queue mode for working through incoming feedback.
+- **[Viewed state and reactions](/docs/guides/viewed-and-reactions)** — mark files
+  viewed to track progress across a large diff, and react to comments.
+
+## Try it without any setup
+
+Every example below works in **mock mode** — in-browser fixtures with no daemon,
+no GitHub token, and no network. Run the frontend and it loads mock mode by
+default:
+
+```bash
+bun install
+bun dev        # http://localhost:5173
+```
+
+Append `?mock=1` to any URL to force mock mode regardless of configuration. The
+fixture PRs referenced throughout (`#101`, `#204`, `#312`, `#347`, `#355`,
+`#362`, `#389`, `#401`, `#410`, `#415`) all live there.
+
+To review a real repository as yourself, see the
+[direct-mode setup](/docs/direct-mode-setup). **Broker mode** — the
+shared-identity deployment for teams in disposable workspaces — is designed and
+reserved, but **not a shipped boot option**; it is not runnable today.
+
+## Keyboard first
+
+revu is keyboard-driven. Press `?` anywhere for the full sheet. The keys used
+across these guides:
+
+```
+⌘K  command palette      j / k  files            c  comment      u  unified / split
+g i inbox                n / p  threads          r  reply        ⇧R re-sync
+g f files · g c checks   x  resolve · v  viewed
+```

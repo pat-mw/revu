@@ -1,0 +1,11 @@
+{
+  "title": "Reference",
+  "pages": [
+    "index",
+    "architecture",
+    "api-and-routes",
+    "types-and-errors",
+    "scenario-map",
+    "design"
+  ]
+}

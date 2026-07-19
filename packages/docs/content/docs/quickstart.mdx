@@ -1,0 +1,138 @@
+---
+title: Quickstart
+description: Install Bun, run the in-browser mock, then point revud at a real repository in direct mode.
+---
+
+Two paths, both fast. Run the in-browser **mock** to see the whole tool with no daemon and
+no token, then start **direct mode** to review a real repository as your own GitHub
+identity. The whole thing takes under five minutes.
+
+## Prerequisites
+
+- [Bun](https://bun.sh) installed.
+- For direct mode: [GitHub CLI (`gh`)](https://cli.github.com) installed and authenticated,
+  or `GH_TOKEN` / `GITHUB_TOKEN` set to a valid personal-access token.
+- For direct mode: a cloned GitHub repository whose `origin` remote points to the
+  repository you want to review.
+
+Mock mode needs none of the GitHub prerequisites — just Bun.
+
+## 1. Install
+
+From the repo root:
+
+```bash
+bun install
+```
+
+## 2. Run the mock (frontend only)
+
+```bash
+bun run dev
+```
+
+This starts the Vite dev server and loads the browser UI against the in-browser **mock**
+adapter — no daemon, no GitHub token, no network. Open it at:
+
+```
+http://localhost:5173
+```
+
+It is the fastest way to see the whole tool. Every fixture PR exists to make one hard case
+concrete, and the dev panel (avatar menu → *Dev panel…*) switches identity, simulates
+latency and failure, and links every scenario. You can force mock mode from any URL by
+appending `?mock=1`, regardless of configuration.
+
+![Inbox — the first screen the mock lands on](/assets/screenshots/inbox.png)
+
+## 3. Run direct mode against a real repository
+
+From inside a clone of the repository you want to review:
+
+```bash
+bun run revud --direct
+```
+
+Or use the environment variable instead of the flag — both forms are equivalent:
+
+```bash
+REVU_MODE=direct bun run revud
+```
+
+The daemon reads the target repository from the `origin` remote
+(`git remote get-url origin`), resolves and validates a GitHub token, and starts an HTTP
+server on port **4780**. Open the URL it prints to begin reviewing.
+
+If you have not authenticated the GitHub CLI yet:
+
+```bash
+gh auth login
+```
+
+The daemon resolves a token in this order: `GH_TOKEN`, then `GITHUB_TOKEN`, then
+`gh auth token`. If none produce a token, startup fails with a clear message. The token is
+never logged and never sent to the browser. Every comment, reply, and thread resolution
+posts to GitHub as your real account.
+
+The daemon also reads your identity from git config — both `git config user.name` and
+`git config user.email` must be set — and uses the lowercased email as the stable key for
+drafts and viewed state. If either is missing, startup fails with an actionable message.
+
+![Files — virtualized, syntax-highlighted diff with inline threads](/assets/screenshots/files-diff.png)
+
+## 4. Review
+
+The loop, once the daemon is up:
+
+1. **Sync** — click a pull request in the list. The daemon fetches its diff, files, threads,
+   and commits from GitHub and stores them locally.
+2. **Comment** — open a file, select lines, write inline comments. The draft saves
+   automatically as you type and survives a restart.
+3. **Submit** — submit the draft as a `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` review. The
+   draft is deleted from disk only on confirmed success. If the PR was force-pushed between
+   sync and submit, that surfaces as a conflict and keeps the draft intact so you can
+   re-sync and resubmit.
+4. **Reply** — reply to a review thread; replies post as single inline comments.
+5. **Resolve / unresolve** — mark a thread resolved or reopen it.
+
+Your email never appears in any GitHub comment body — only your real `gh` identity is
+visible to other reviewers.
+
+![Review bar — submit a draft as Comment, Approve, or Request changes](/assets/screenshots/review-bar.png)
+
+## Common overrides
+
+Direct mode reads a handful of environment variables. The most common at first run:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `REVU_PORT` | `4780` | HTTP server port. |
+| `REVU_REPO` | origin remote | Repository override (`owner/name`); a `--repo` flag wins over it. |
+| `REVU_DATA_DIR` | `~/.local/share/revu` | Durable SQLite store (drafts, snapshots, blobs, viewed state). |
+| `REVU_ROLE` | `contractor` | Session role; `lead` to start as a lead. |
+
+For example, to review a repository other than the one `origin` points at:
+
+```bash
+bun run revud --direct --repo octocat/hello-world
+```
+
+The full set of variables, token scopes, and the durable data directory are covered in
+[Direct mode setup](./direct-mode-setup).
+
+## Run the check gate
+
+Before any change is ready, the local gate must pass — lint, typecheck, `bun test`, and the
+app build, in order:
+
+```bash
+bun run check
+```
+
+## Next steps
+
+- **[Overview](./index)** — what revu is and the design behind it.
+- **[Direct mode setup](./direct-mode-setup)** — every environment variable, token scopes, and the data directory in full.
+- **[Run modes](./run-modes)** — mock, direct, and the reserved broker mode.
+- **[Concepts](./concepts)** — snapshots, drafts, reconcile, the compare key, the rate budget, and identity.
+- **[Keyboard map](./keyboard)** — the shortcuts; press `?` in-app for the full sheet.

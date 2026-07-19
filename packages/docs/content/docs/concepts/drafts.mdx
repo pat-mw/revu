@@ -1,0 +1,62 @@
+---
+title: Drafts
+description: The local review draft — saved as you type, keyed to the human, and durable across a restart until submit succeeds.
+---
+
+Your review in revu is a **local draft**, not a server-side pending review. As you write
+inline comments and a review summary, the draft is saved to a durable local store — and it
+stays there, keyed to you, until you submit it successfully. A restart loses nothing. This is
+the app's whole thesis rendered as behavior: the draft is *the work GitHub cannot see*, and
+the design gives it the one loud color — violet — reserved for exactly that.
+
+<img src="/assets/screenshots/files-thread.png" alt="An inline review thread open against a diff line, with a draft comment in progress" />
+
+## Saved as you type
+
+The draft is written to disk automatically while you type — debounced at 600ms, with an
+immediate flush when the browser tab is hidden. You do not save a draft; it is always already
+saved. There is exactly one honest limit here, and the tool states it plainly: a hard crash
+*inside* the debounce window can lose up to the last 600ms of typing. Everything flushed
+before that survives.
+
+## Keyed to the human, durable across a restart
+
+Drafts persist in a local SQLite store, keyed by the human — specifically the lowercased
+git-config email, the same stable [identity](/docs/concepts/identity) key used for viewed
+state. In [direct mode](/docs/run-modes/direct) that store lives under the durable data
+directory:
+
+```
+${XDG_DATA_HOME:-~/.local/share}/revu
+```
+
+Override it with `REVU_DATA_DIR`. Because the draft is keyed to the human and written to a
+durable store rather than `localStorage`, closing the tab, restarting the daemon, or coming
+back tomorrow all recover the exact draft you left. The UI treats that persistence as quietly
+load-bearing — you are meant to trust it enough to stop thinking about it.
+
+## Deleted only on confirmed submit success
+
+The invariant that makes all of this safe: **a draft is deleted from disk only on confirmed
+submit success.** Nothing else removes it.
+
+- You submit; GitHub accepts the review; the draft is deleted and the created review is
+  returned.
+- You submit, but the branch moved between your last sync and the submit — GitHub reports the
+  head moved. The draft is kept intact so you can re-sync and route through
+  [reconcile](/docs/concepts/reconcile).
+- A comment fails server-side validation after the head guard passed (a force-push in the
+  narrow window between guard and post) — the draft is **not** deleted; the conflict surfaces
+  and the draft survives to be reconciled and resubmitted.
+
+The draft survives everything until it lands. You submit a draft as one of three reviews —
+Comment, Approve, or Request changes — from the review bar; Comment is the primary action,
+and Approve is gated to where it actually works (see [identity](/docs/concepts/identity)).
+
+<img src="/assets/screenshots/review-bar.png" alt="The review bar: submit a draft as Comment, Approve, or Request changes; Approve is gated to where it applies" />
+
+## Related
+
+- [Reconcile](/docs/concepts/reconcile) — what a draft does when the branch moves under it.
+- [Snapshot](/docs/concepts/snapshot) — the snapshot the draft is anchored against.
+- [Identity](/docs/concepts/identity) — the git-config email that keys the draft.

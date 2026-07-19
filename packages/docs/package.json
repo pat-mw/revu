@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "copy-assets": "node scripts/copy-assets.mjs",
+    "dev": "bun run copy-assets && next dev",
+    "build": "bun run copy-assets && next build",
     "start": "next start",
     "postinstall": "fumadocs-mdx",
     "types:check": "fumadocs-mdx && next typegen && tsc --noEmit"
