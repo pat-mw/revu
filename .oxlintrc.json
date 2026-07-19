@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "plugins": ["react", "typescript", "oxc"],
+  "ignorePatterns": ["packages/docs"],
   "rules": {
     "react/rules-of-hooks": "error",
     // Off by design: this only flags a React Fast Refresh (HMR) hint when a file
