@@ -1,0 +1,12 @@
+{
+  "title": "Concepts",
+  "pages": [
+    "index",
+    "snapshot",
+    "compare-key",
+    "drafts",
+    "reconcile",
+    "identity",
+    "rate-budget"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "title": "revu",
+  "pages": [
+    "index",
+    "quickstart",
+    "concepts",
+    "run-modes",
+    "guides",
+    "keyboard",
+    "direct-mode-setup",
+    "self-hosting",
+    "reference"
+  ]
+}

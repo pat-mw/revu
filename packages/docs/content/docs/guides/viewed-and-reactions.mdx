@@ -1,0 +1,63 @@
+---
+title: Viewed state and reactions
+description: Mark files viewed to track progress across a large diff, and add reactions to comments.
+---
+
+Two small features carry more weight than they look. **Viewed state** is how you
+keep your place across a large diff, and **reactions** are the lightest way to
+acknowledge a comment without writing a reply. Both persist, and reactions behave
+differently depending on the run mode — worth knowing before you rely on them.
+
+Follow along in mock mode with fixture **#204** (a 2,400-line diff, where viewed
+state earns its keep) and **#312** (existing threads and reactions).
+
+## Mark files viewed
+
+On the **Files** screen, each file has a **viewed** checkbox. Toggle it on the
+focused file with `v`, or click the checkbox in the file header or tree.
+
+![The Files screen with per-file viewed checkboxes in the file tree and file headers; several files are already checked as viewed](/assets/screenshots/files-diff.png)
+
+- Viewed is **per file, per PR** — a way to mark "I have read this one" so a big
+  diff doesn't blur together.
+- It **persists**. In direct mode viewed state is written to your local SQLite
+  store keyed to your git-config email, so it survives a restart. In the reserved
+  broker mode it would persist per human on the host and survive a workspace
+  rebuild; broker mode is not runnable today.
+- On a large PR like **#204**, ticking files off as you go is the difference
+  between finishing a review and losing your place halfway.
+
+## Add a reaction
+
+Reactions are quick acknowledgments on a comment — the same emoji reactions GitHub
+supports. Add one from a comment's reaction control, in a thread or in the
+Conversation timeline.
+
+![The Conversation timeline for a PR: a comment carrying a thumbs-up reaction with a count, among the review discussion](/assets/screenshots/conversation.png)
+
+In **direct mode** a reaction is yours: it posts to GitHub under your account,
+exactly like reacting on github.com.
+
+## Reactions in broker mode are shared — and honest
+
+This is the one place the reserved broker mode changes the meaning of a reaction,
+so it is called out explicitly.
+
+Reactions on GitHub are per GitHub user. In broker mode there is only **one**
+GitHub user — the shared bot identity. So a reaction is not attributable to an
+individual human the way a stamped comment body is: two people's 👍 are the same
+👍, and if one person removes theirs, it is removed for everyone. revu ships this
+as **shared and honest** — the reaction rollup is real data, it just reflects the
+shared identity rather than simulating a per-human reaction for the least
+important control on the page.
+
+Comments and replies do not have this limitation: in broker mode their bodies are
+stamped with the human's name, so authorship stays legible. Reactions are the one
+signal that collapses to the shared identity. (Broker mode is designed and
+reserved but not a shipped boot option — see [run modes](/docs/run-modes).)
+
+## Next
+
+- Track progress on a real diff: [Your first sync](/docs/guides/first-sync).
+- Understand who a comment is attributed to across modes:
+  [Identity](/docs/concepts/identity).

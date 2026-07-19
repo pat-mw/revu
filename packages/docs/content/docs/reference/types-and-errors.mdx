@@ -1,0 +1,161 @@
+---
+title: Types & errors
+description: The wire types and the ApiErrorCode set — including head_moved as a value, not an error, and null-not-404 semantics.
+---
+
+The wire types live in `packages/shared/src/api/types.ts`, and they are
+deliberately split into two vocabularies. This page documents the shapes the
+contract exchanges and the small set of error and non-error semantics the UI is
+expected to name honestly. Where a comment on a type and a value elsewhere ever
+disagree, the type is the source of truth.
+
+## Two vocabularies, kept apart
+
+- **GitHub-shaped types** (`GhUser`, `PullSummary`, `PullDetail`, `PullFile`,
+  `ReviewComment`, `ReviewThread`, `CheckRun`, `ReactionRollup`, …) — field names
+  and shapes match real GitHub REST/GraphQL responses exactly, so the mock
+  adapter and a real adapter serialize identically. No convenience fields are
+  added to these.
+- **Broker-shaped types** (`Session`, `Snapshot`, `ReviewDraft`,
+  `BrokerPullMeta`, `FileViewedState`, `HumanPreferences`, …) — state that
+  cannot live on GitHub because, in the shared-identity design, every call
+  authenticates as one GitHub App. These are keyed by the human, not by any
+  GitHub login.
+
+## The snapshot: two halves, cached differently
+
+A `Snapshot` is a PR pulled down whole. It has two halves that are refetched on
+different schedules — the distinction is load-bearing, not cosmetic.
+
+- **`SnapshotImmutable`** — the diff. Content-addressed by `compareKey`, which is
+  `${mergeBaseSha}...${headSha}` — **never head alone.** GitHub PR diffs are
+  three-dot compares, so the diff changes when the base branch advances even
+  though head did not. This half is never invalidated and has no TTL. It carries
+  `files`, a `blobIndex` (path → base/head blob SHAs), and `commits`.
+- **`SnapshotMutable`** — everything that is *not* a function of head SHA:
+  `threads`, `issueComments`, `reviews`, `checks`, and the PR `pull` detail. A
+  thread can be resolved on github.com with zero commits landing, so this half is
+  refetched on **every sync, unconditionally.**
+
+The `Snapshot` wrapper adds `partial` (non-null when a sync died partway — it
+names the `missingBlobShas` and a `reason`) and `syncStats`
+(`blobsFetched` / `blobsReused` / `requests`, so the burst cost is honest;
+`blobsReused` counts content-addressed cache hits). `FileBlob` is addressed by
+git blob SHA — identical SHA means identical bytes, cache forever — and carries
+`binary` and `size`.
+
+See [snapshot](/docs/concepts/snapshot) and [compare key](/docs/concepts/compare-key)
+for the reasoning behind the two-half split.
+
+## Identity and the list
+
+`Session` is injected at startup and has no `viewer` field by default — in the
+shared-identity design GitHub does not know who you are. It carries a `human`, a
+`brokerLogin`, a `workspace`, and an optional `viewerLogin` (the login used for
+login-based checks; in direct mode it is the viewer's own login from
+`GET /user`).
+
+Each list item pairs a pure GitHub `PullSummary` with `BrokerPullMeta` — the
+annotations that cannot come from GitHub because it only sees one identity:
+
+| `BrokerPullMeta` field | Meaning |
+|---|---|
+| `authorHumanId` | Which human drove the App when the PR was opened; `null` if a real org member opened it. |
+| `canApprove` | `false` when the App authored the PR (GitHub refuses self-review). |
+| `unresolvedThreads` | Unresolved thread count, from the poll loop. |
+| `assignedReviewerHumanIds` | Humans assigned as reviewers (GitHub sees only the bot). |
+| `compareKey` | Current `merge_base...head` key — lets the client detect a base advance without spending a sync. |
+| `commitCount` | Total commits right now; the snapshot delta gives "N new commits". |
+
+In direct mode this degrades gracefully — `authorHumanId` is `null`, `canApprove`
+is `pull.user.login !== viewer.login`, and the machinery is inert because GitHub
+authenticates the human for real.
+
+## The draft: invisible to GitHub until one atomic submit
+
+A `ReviewDraft` is per-human, per-PR, and broker-side. It records the `headSha`
+and `compareKey` it was written against (submit checks the head), an `event`
+(`COMMENT` / `APPROVE` / `REQUEST_CHANGES`), a `body`, and a list of
+`PendingComment`s. Each `PendingComment` carries its diff anchors (`line`,
+`start_line`, `side`, `start_side`) and — crucially — an `anchor` snapshot of the
+surrounding text (`lineText`, `contextBefore`, `contextAfter`, and
+`startLineText` for a ranged comment) captured at write time so
+[reconcile](/docs/concepts/reconcile) can re-anchor it after the head moves.
+
+`FileViewedState` maps path → `{ viewed, blobSha, at }` (the `blobSha` records
+which version was viewed). `HumanPreferences` is per-human, not scoped to any PR;
+its one field today is `diffMode` (`'unified' | 'split'`), and `DEFAULT_PREFERENCES`
+supplies the fallback. See [drafts](/docs/concepts/drafts).
+
+## Submit and reconcile
+
+`submitReview` takes a `SubmitReviewInput` (the `prNumber`, an `expectedHeadSha`
+guard, the `event`, `body`, and `comments`) and returns a `SubmitResult`, which
+is a union — the head-guard rejection is a **value**, not a thrown error:
+
+```ts
+type SubmitResult =
+  | { status: 'ok'; review: ReviewSummary }
+  | { status: 'head_moved'; currentHeadSha: string; newCommits: number }
+  | { status: 'forbidden'; reason: string }
+```
+
+`reconcileDraft` returns a `ReconcileReport` — the `newCommits` since the draft's
+head, and a `results` array of `AnchorResult`, one per pending comment:
+
+```ts
+type AnchorResult =
+  | { kind: 'clean'; comment: PendingComment }
+  | { kind: 'drifted'; comment: PendingComment; newLine: number;
+      newStartLine: number | null; delta: number; startLineUncertain?: boolean }
+  | { kind: 'lost'; comment: PendingComment;
+      reason: 'line-deleted' | 'file-deleted' | 'file-renamed' | 'file-added' }
+```
+
+`clean` re-anchors exactly; `drifted` shifted by `delta` lines (with
+`startLineUncertain` flagging a ranged comment whose start could not be confirmed
+at the shifted position); `lost` no longer has a home and needs an explicit
+decision. The reconcile dialog previews each comment by running the **same shared
+classifier** the server-side report runs, so the preview and the report can never
+diverge — the whole point of a single scorer.
+
+## The error envelope
+
+Every error response is a JSON body `{ code, message, resetAt? }`. `resetAt` (an
+ISO timestamp) is carried only for `rate_limited`. The app's error copy switches
+on `code` directly. The typed error the UI catches is `ApiError`, carrying the
+same `code` and optional `resetAt`.
+
+## Error codes and their statuses
+
+| `ApiErrorCode` | HTTP status | When |
+|---|---|---|
+| `rate_limited` | `429` | The shared bucket is spent; `resetAt` says when it refills. |
+| `broker_unreachable` | `502` | An upstream (the broker, or a credential not yet injected) is unavailable — retriable. |
+| `conflict` | `409` | A write collided — e.g. a comment failed server-side validation despite the head guard (a force-push in the guard-to-post window). The draft is **not** discarded. |
+| `not_found` | `404` | A genuinely missing resource — e.g. `getBlob` for an absent SHA. |
+| `forbidden` | `403` | The operation is not permitted for this identity. |
+| `persist_failed` | `500` | The mutation was applied in memory but could not be written to disk (disk full, permissions, read-only FS). Nothing you wrote is lost; it did not reach disk, so the server refuses to answer with a success. Server-emitted only. |
+| `network` | *(none — client-side only)* | Synthesized by the adapter when `fetch` itself rejects and no HTTP response arrived. It never appears on the wire and has no status. |
+
+`network` is the one code with no HTTP status: it is client-side only. The mock
+reuses it in-process to model a dropped connection during a sync or a write; the
+daemon has no real socket to drop, so it surfaces that in-process throw as an
+enveloped 5xx carrying the `network` code, and the fetch adapter reconstructs
+`ApiError('network')` from either that body or a genuine `fetch` reject. The
+durable outcome — a kept partial, a retained write — is the same either way.
+
+## The three non-error semantics, restated
+
+Because they are the most consequential shapes in the app, they bear repeating:
+
+- `submitReview` → `head_moved` is a **200 value**, never an error status.
+- `syncPull` may resolve with `partial` non-null — a **200** body, not an error.
+- `getSnapshot` → `null` for a never-synced PR is a **200** body, never
+  404-as-error.
+
+## Related
+
+- [API & routes](/docs/reference/api-and-routes) — the methods and their HTTP mapping.
+- [Architecture](/docs/reference/architecture) — the contract and the conformance suite.
+- [Reconcile](/docs/concepts/reconcile) — the clean / drifted / lost flow in depth.

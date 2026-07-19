@@ -1,0 +1,59 @@
+---
+title: Reconcile
+description: When the branch moves under a pending draft, every comment is classified clean, drifted, or lost and decided explicitly.
+---
+
+A review comment anchors to a specific commit and a specific line. That commit can move: the
+PR gets force-pushed, the base advances, the head changes between the moment you
+[synced](/docs/concepts/snapshot) and the moment you submit. Most tools handle this by
+failing — they reject the submit and, too often, lose the work. revu handles it with
+**reconcile**: when you submit a [draft](/docs/concepts/drafts) against a head that has moved,
+every pending comment is classified and you decide each one explicitly. Nothing is ever
+silently discarded.
+
+<img src="/assets/screenshots/reconcile.png" alt="The reconcile screen: the branch moved mid-review, and every pending comment gets an explicit decision" />
+
+## The three classifications
+
+When submit detects a moved head, it does not post anything. Instead each pending comment is
+scored against the new head and lands in one of three buckets:
+
+| Class | Meaning | The default decision |
+| --- | --- | --- |
+| **Clean** | The line the comment anchors to is unchanged at the new head | Accept — the comment re-anchors cleanly and posts as written |
+| **Drifted** | The anchored content still exists but has moved to a different line | Re-anchor to its new location, or drop it |
+| **Lost** | The anchored content is gone at the new head — the lines were changed or deleted | Decide explicitly — keep it as an out-of-line note, or drop it |
+
+"Drifted" is a staleness state, so it wears the same gold the [snapshot seal](/docs/concepts/snapshot)
+uses for time that moved under you.
+
+## An explicit decision per comment
+
+Reconcile is a screen you walk, not a thing that happens to you. For each comment you
+**accept**, **re-anchor**, or **drop** — deliberately. The draft survives the entire flow;
+nothing is posted until you finish reconciling and resubmit, and nothing is removed from your
+draft store without your having chosen to drop it. That is the guarantee: the branch can move
+as many times as it likes, and your review is never quietly thrown away.
+
+The scorer that classifies comments is the same pure re-anchor logic the submit path runs, so
+what the reconcile screen previews is exactly what submitting does — the preview and the
+action cannot diverge.
+
+## Where it fits in submit
+
+1. You submit a draft. revu guards first by checking the current head against the head you
+   synced.
+2. **Head matches** — the review posts, and the draft is deleted on confirmed success.
+3. **Head moved** — nothing posts; you are routed into reconcile with every comment
+   classified clean / drifted / lost.
+4. You decide each comment, then resubmit against the fresh head. The draft is intact the
+   whole time and is only deleted once the resubmit confirms.
+
+Even a force-push in the narrow window *after* the guard passes but *before* the post
+completes keeps the draft: the failed comment surfaces as a conflict and reconcile runs again.
+
+## Related
+
+- [Drafts](/docs/concepts/drafts) — the draft that reconcile protects.
+- [Snapshot](/docs/concepts/snapshot) — the seal that warns you the head moved.
+- [Compare key](/docs/concepts/compare-key) — why a moved base changes the diff at all.

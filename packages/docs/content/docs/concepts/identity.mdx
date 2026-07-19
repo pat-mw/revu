@@ -1,0 +1,79 @@
+---
+title: Identity
+description: How revu keys work to a human — the lowercased git-config email as the stable id — and how identity is stamped across modes.
+---
+
+Identity in revu answers two different questions that most tools conflate: **who keys my local
+state** (drafts, viewed state) and **who does GitHub see as the author** of a comment. The
+first is always your git-config email; the second depends on the run mode.
+
+## The stable key: your git-config email
+
+The daemon reads your identity from git config at startup:
+
+```bash
+git config user.name
+git config user.email
+```
+
+Both must be set, or startup fails with an actionable message. The **lowercased email** is the
+stable key for your [drafts](/docs/concepts/drafts) and viewed state; the name is the display
+layer only.
+
+Email is the key for a reason. Display names are unique only per deployment at a point in time
+— a username can be renamed, and a departed person's username can be re-registered, at which
+point name-keyed history would silently reattribute to the wrong person. An email is stable, so
+it keys everything durable while the name stays cosmetic.
+
+## Direct mode: you are you
+
+In [direct mode](/docs/run-modes/direct), GitHub authenticates you for real, through the `gh`
+CLI's stored credentials. There is no shared bot, no name smuggling, and no `[bot]` suffix:
+
+- Every comment, reply, and thread resolution posts under **your real GitHub account**.
+- Your email never appears in any comment body — only your authenticated GitHub login is
+  visible to other reviewers.
+- **Approve** and **Request changes** are live, gated only by whether the PR is one you can
+  actually approve (you cannot approve your own PR). Where Approve does not apply, the review
+  bar says what to do instead of graying out a dead end.
+
+The token that authenticates you is resolved in this order and never logged or sent to the
+browser:
+
+```
+GH_TOKEN  →  GITHUB_TOKEN  →  gh auth token
+```
+
+See [direct mode](/docs/run-modes/direct) for the full setup.
+
+## Broker mode: one shared identity — reserved, not shipped
+
+Broker mode is the shared-identity model revu was originally designed for: teams of
+contractors in disposable cloud workspaces, where every GitHub call authenticates as **one
+shared GitHub App**. Because GitHub sees a single bot account for everyone, the design smuggles
+each human's display name through a prefix on the comment body and parses it back out
+defensively on the way in; org members who have their own GitHub access keep their real
+identity. The audit layer — which human performed which write — is kept separate and
+authoritative, keyed by the binding email rather than anything a workspace claims.
+
+**Broker mode is reserved. It is designed and documented but is not a shipped, runnable boot
+option** — only [mock](/docs/run-modes/mock) and [direct](/docs/run-modes/direct) modes boot
+today. In direct mode the name-stamping machinery is inert: GitHub authenticates the human for
+real, so there is nothing to smuggle. See [broker mode](/docs/run-modes/broker) for the
+reserved design.
+
+## Two identity systems, summarized
+
+| | Keys local state | GitHub sees |
+| --- | --- | --- |
+| **Direct** (shipped) | Lowercased git-config email | Your real GitHub login |
+| **Broker** (reserved) | Lowercased git-config email | One shared GitHub App; human name stamped into the body |
+
+The left column never changes across modes — your durable state is always keyed to your email.
+Only the right column, the author GitHub records, differs.
+
+## Related
+
+- [Direct mode](/docs/run-modes/direct) — real GitHub identity, the shipped path.
+- [Broker mode](/docs/run-modes/broker) — the reserved shared-identity design.
+- [Drafts](/docs/concepts/drafts) — the state your email keys.

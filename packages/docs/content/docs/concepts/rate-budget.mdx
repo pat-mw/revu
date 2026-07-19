@@ -1,0 +1,64 @@
+---
+title: Rate budget
+description: The shared GitHub rate budget, why a snapshot spends it once, and how the PR list polls free on ETag 304s.
+---
+
+GitHub's API rate limit is a **shared budget**. In the setting revu was built for — a team of
+reviewers all authenticating as one shared GitHub App — every reviewer draws from the same
+bucket, so a review tool that hits the API casually multiplies its cost by the number of
+people using it. That constraint shaped the whole read path, and the result is a tool that is
+frugal with the network even when you are the only person using it.
+
+## Snapshot burst, then local
+
+The core move is that a PR is a [snapshot](/docs/concepts/snapshot): the network is spent
+**once**, in a bounded sync burst, and then review is fully local. Expanding context, reading
+threads, jumping files, and writing [drafts](/docs/concepts/drafts) all happen against the
+snapshot in your durable store — the rate budget is untouched by any of it.
+
+The burst itself is deliberately small. A cold sync is a bounded set of REST and GraphQL calls
+for the PR detail, files, threads, comments, reviews, commits, and check runs. A warm re-sync
+that only needs the mutable half is cheaper still. And blobs — the part that would dominate a
+naive implementation — are the cheapest of all.
+
+## Blobs cost nothing when the clone is local
+
+Reviewing requires the repository cloned locally, and that is what keeps a large PR cheap.
+After a fetch, the merge base and head commits are almost always already in your local git
+object store, so every blob the snapshot needs is a local object read — **zero API requests**,
+zero budget spend, working even when the network is flaky. A big PR that would otherwise cost
+hundreds of blob requests costs only the bounded metadata calls. Blobs are also
+content-addressed and reused across syncs, so bytes are never fetched twice
+(see [compare key](/docs/concepts/compare-key)). The snapshot reports blobs fetched versus
+blobs reused so the real cost of a sync is never hidden.
+
+## PR-list polling is free on ETag 304s
+
+The one thing that keeps polling in the background is the PR list. That is made nearly free
+with conditional requests: the list is fetched with an `If-None-Match` header, and when
+nothing changed GitHub answers `304 Not Modified`.
+
+A `304` does **not** count against the rate budget. This is what makes the shared-budget case
+survivable: the number of reviewers no longer multiplies read cost, because an unchanged list
+poll is free no matter how often it runs. Only when the list actually changes does revu spend a
+request to refresh the cheap per-PR facts.
+
+## The shape, in one table
+
+| Activity | Rate-budget cost |
+| --- | --- |
+| Cold sync of a PR | A bounded burst of REST + GraphQL calls |
+| Warm re-sync (mutable half only) | Cheaper — immutable half reused |
+| Reading, expanding, jumping, drafting | Zero — fully local against the snapshot |
+| Blob reads with the repo cloned locally | Zero — served from the git object store |
+| PR-list poll, nothing changed | Zero — `304 Not Modified` |
+| PR-list poll, something changed | One request to refresh cheap facts |
+
+The demo's dev panel shows the shared rate budget live, and the first-sync scenario carries
+honest request-cost copy so the burst's real price is visible rather than glossed over.
+
+## Related
+
+- [Snapshot](/docs/concepts/snapshot) — burst once, then review offline.
+- [Compare key](/docs/concepts/compare-key) — content-addressed blobs and local git reads.
+- [Identity](/docs/concepts/identity) — why the budget is shared in the first place.

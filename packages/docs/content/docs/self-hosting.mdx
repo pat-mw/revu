@@ -1,0 +1,228 @@
+---
+title: Self-hosting revud
+description: Run the revud daemon yourself — configuration, serving the built frontend, the durable data directory, and the workspace deployment shape.
+---
+
+`revud` is a single [Bun](https://bun.sh) process. It serves the built frontend
+as static files and the `RevuApi` over HTTP on one loopback port — no separate
+web server, no CORS, no reverse proxy required. This page is the operator's view:
+how to configure the daemon, serve a production build, keep its durable state,
+and lay it out inside a disposable workspace. If you only want to review a
+repository as yourself on your own machine, [direct mode](/docs/run-modes/direct)
+and [direct-mode setup](/docs/direct-mode-setup) are the shorter path.
+
+## What ships, and what does not
+
+The daemon boots into one of three modes, selected by `REVU_MODE` (default
+`mock`) or an equivalent flag. Only two of them are runnable today.
+
+| Mode | Status | Boot |
+|---|---|---|
+| **Mock** | Shipped | Default. In-browser fixtures — the permanent demo and semantics oracle, forced with `?mock=1` and present in any build. |
+| **Direct** | Shipped | `bun run revud --direct` or `REVU_MODE=direct`. Talks to real GitHub as the `gh` user; drafts and snapshots persist to a local SQLite store. |
+| **Broker** | Reserved | The shared-identity workspace deployment. Designed and documented, **not yet a shipped boot option** — see below. |
+
+<Callout type="warn" title="Broker mode is reserved — not a shipped boot option">
+Broker mode is designed and documented, but it is **not** a runnable boot mode in
+a released build. Nothing in the [broker section](#the-workspace-deployment-shape-reserved)
+below is a command you can depend on running today. Self-host either mock or
+direct mode; treat the broker material as the intended deployment shape, not a
+runbook you can execute.
+</Callout>
+
+## Running the daemon
+
+The `revud` script is defined in the repo's `package.json`. From the repo root:
+
+```bash
+bun run revud            # mock mode (default) — no GitHub token, no network
+bun run revud --direct   # direct mode — real GitHub as the gh user
+```
+
+`--direct` and `REVU_MODE=direct` are equivalent. The daemon reads its target
+repository from the clone's `origin` remote (`git remote get-url origin`),
+resolves and validates a token, and starts an HTTP server on port `4780`. It
+prints the URL it is serving and the directory it is serving from:
+
+```
+revud: serving <dist-dir> on http://localhost:4780 …
+```
+
+Open that URL to review. Everything about direct-mode auth, identity, the token
+chain, and the review loop lives in [direct mode](/docs/run-modes/direct); this
+page covers the deployment-facing configuration around it.
+
+## Serving the built frontend
+
+`revud` does not run a Vite dev server. It statically serves a **built** copy of
+the app. For any real deployment, build the frontend first and point the daemon
+at the output.
+
+Build the app:
+
+```bash
+bun run build:app
+```
+
+That runs the app package's `build` and writes the bundle to `packages/app/dist`,
+which is exactly where the daemon looks by default. Override the location with
+`REVU_DIST_DIR`:
+
+```bash
+REVU_DIST_DIR=/srv/revu/dist REVU_MODE=direct bun run revud
+```
+
+### Which transport the build binds
+
+The frontend picks its transport **at build time** from `VITE_REVU_API`. When it
+is set, the app binds the HTTP adapter and talks to `revud`; when it is unset,
+the app binds the in-browser mock. To build an app that talks to the daemon on
+the same origin it is served from, set `VITE_REVU_API=/`:
+
+```bash
+VITE_REVU_API=/ bun run build:app
+```
+
+The repo wires this as the `build:e2e` script, and `dev:e2e` builds that way and
+then launches the daemon in one step:
+
+```bash
+bun run build:e2e   # VITE_REVU_API=/ bun run build:app
+bun run dev:e2e     # build the HTTP-bound app, then start revud
+```
+
+<Callout title="Keep mock reachable in production builds">
+Even an HTTP-bound build should keep the mock reachable behind `?mock=1`. It is
+the permanent demo and the fastest way to bisect whether a bug lives in the
+frontend or the transport. It is present in any build and is never deleted — see
+[mock mode](/docs/run-modes/mock).
+</Callout>
+
+## Configuration
+
+Every knob is an environment variable; there are no config files for the daemon
+itself. In direct mode the ones that matter for an operator are:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `REVU_MODE` | `mock` | `mock`, `direct`, or `broker` (reserved). |
+| `REVU_PORT` | `4780` | HTTP server port. |
+| `REVU_REPO` | origin remote | Repository override (`owner/name`); a `--repo` flag wins over it. A trailing `.git` is tolerated and stripped. |
+| `REVU_DATA_DIR` | `~/.local/share/revu` | Durable SQLite store — drafts, snapshots, blobs, viewed state, preferences. |
+| `REVU_DIST_DIR` | `packages/app/dist` | Directory of the built frontend the daemon serves. |
+| `REVU_ROLE` | `contractor` | Session role; `lead` to start as a lead. |
+| `GH_TOKEN` | — | Token override, ahead of `GITHUB_TOKEN` and `gh auth token`. |
+| `GITHUB_TOKEN` | — | Token override, ahead of `gh auth token`. |
+
+Port and repository overrides compose the way you would expect:
+
+```bash
+REVU_MODE=direct REVU_PORT=5000 REVU_REPO=octocat/hello-world bun run revud
+```
+
+The token is never logged and never sent to the browser. See
+[direct-mode setup](/docs/direct-mode-setup#token-scopes) for the exact `gh` scopes a review
+session needs (`repo`, or the fine-grained Contents read / Pull requests
+read+write / Metadata read equivalent — reviewing alone needs only Contents:
+read, since the daemon never pushes commits or refs).
+
+## The durable data directory
+
+The one piece of state you must think about operationally is the SQLite store.
+Drafts, snapshots, content-addressed blobs, viewed state, and preferences all
+live in a single directory under `${XDG_DATA_HOME:-~/.local/share}/revu`,
+overridable with `REVU_DATA_DIR`:
+
+```bash
+REVU_MODE=direct REVU_DATA_DIR=/var/lib/revu bun run revud
+```
+
+This store is what makes the tool offline-first and restart-safe: a restart
+re-reads it and every draft survives, and warm re-syncs reuse content-addressed
+blobs instead of refetching them. Two consequences for whoever runs the daemon:
+
+- **A draft is deleted from disk only on confirmed submit success.** It survives
+  restarts, force-pushes, and reconcile — it is intentionally durable. See
+  [drafts](/docs/concepts/drafts).
+- **The store is keyed to the human** — the stable key is the lowercased
+  git-config email. If you relocate `REVU_DATA_DIR`, move the whole directory so
+  drafts and viewed state travel with it.
+
+Because blob reads come from your local git object store, the target repository
+must be **cloned locally** — that is what keeps a large-PR sync cheap. See the
+[rate budget](/docs/concepts/rate-budget) and [snapshot](/docs/concepts/snapshot)
+concepts for why the store is shaped this way.
+
+![Files screen — virtualized, syntax-highlighted diffs; the snapshot seal dates everything you're looking at, all served locally from the durable store](/assets/screenshots/files-diff.png)
+
+## A minimal self-hosted deployment
+
+Putting the pieces together — build the HTTP-bound app once, then run the daemon
+against a local clone with a durable data directory:
+
+```bash
+# once, from the repo root
+bun install
+VITE_REVU_API=/ bun run build:app
+
+# from inside a clone of the repository to review
+REVU_MODE=direct \
+  REVU_DATA_DIR=/var/lib/revu \
+  REVU_DIST_DIR=/srv/revu/dist \
+  bun run revud
+```
+
+The daemon binds loopback and prints its URL. Reach it directly, or front it with
+whatever port-forwarding your host already provides — the token stays inside the
+process either way.
+
+## The workspace deployment shape (reserved)
+
+<Callout type="warn" title="Reserved — not a shipped boot option">
+The multi-tenant workspace deployment below is **broker mode**, which is designed
+and documented but not runnable in a shipped build. It is described here so the
+deployment shape can be reasoned about, not so it can be executed. The runnable
+self-hosted modes are mock and direct, above.
+</Callout>
+
+Broker mode is the shared-identity deployment revu was originally shaped for:
+teams of contractors reviewing a client's private repositories from **disposable
+cloud workspaces**, where every GitHub call authenticates as one shared GitHub
+App and there is no github.com to fall back to. Several properties of that setting
+carry straight into how a self-hosted workspace image is meant to be laid out,
+and they hold for direct mode too:
+
+- **Serve the built app, not a dev server.** A workspace re-spins often; paying
+  Vite's dev-server startup and on-demand transform on every spin-up is the cost
+  the architecture exists to avoid. `revud` statically serves `dist/` — build the
+  app in the image, launch the daemon against the output.
+- **One process, one loopback port.** The daemon serves the frontend and the API
+  on the same port. In the reserved broker design that port is bound to
+  `127.0.0.1` and reached through a host-forwarded channel, so the injected
+  credential is never reachable from outside the workspace. Registering that port
+  as a named app in the workspace platform (for example, a Coder template) gives a
+  one-click entry alongside the IDE.
+- **Durable state lives outside the disposable workspace.** In the reserved design
+  drafts and viewed state persist on the host collector, keyed by the human's
+  email, so a rebuilt workspace loses nothing and re-syncs warm. In direct mode the
+  same guarantee is local: put `REVU_DATA_DIR` on a volume that outlives the
+  container.
+
+The reserved broker deployment adds a host-injected short-lived App token, per-
+human identity stamping and an append-only audit journal, a reviewer-assignment
+file, and a host-side collector. That whole surface — including the environment
+variables it introduces (`REVU_BOT_LOGIN`, `REVU_CREDENTIALS_FILE`,
+`REVU_REVIEWERS_FILE`, `REVU_HOST_DATA_DIR`, `REVU_OWNER_MAP_FILE`) and the
+operator scripts around it — is written up as design in the operator runbook and
+summarized on the [broker mode](/docs/run-modes/broker) page. None of it is a boot
+mode you can rely on in a released build.
+
+## Where to go next
+
+- [Direct mode](/docs/run-modes/direct) — the shipped, general-purpose tool this
+  page deploys.
+- [Direct-mode setup](/docs/direct-mode-setup) — authenticate `gh`, resolve a
+  token, and start reviewing.
+- [Broker mode](/docs/run-modes/broker) — the reserved shared-identity design.
+- [Run modes overview](/docs/run-modes) — how the mode is selected and what all
+  three modes share.

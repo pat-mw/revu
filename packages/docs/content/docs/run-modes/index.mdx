@@ -1,0 +1,69 @@
+---
+title: Run modes
+description: The three run modes — mock, direct, and broker — all serve the same frontend against the same RevuApi contract.
+---
+
+revu ships one frontend and one API contract. What changes between run modes is
+only where the GitHub token comes from and how identity is stamped on the way
+out — everything else is shared. The React app reads and writes through exactly
+one interface, `RevuApi`; a run mode is just a pair of injected strategies
+(a token source and a write decorator) plugged in around a single shared core of
+sync engine, snapshot store, draft store, and re-anchor logic. The core never
+forks per mode.
+
+## The three modes
+
+| Mode | Status | What it is |
+|---|---|---|
+| **[Mock](/docs/run-modes/mock)** | Shipped | In-browser fixtures shaped exactly like GitHub REST/GraphQL. The permanent demo mode and semantics oracle — forced with `?mock=1`, always available in any build, never deleted. |
+| **[Direct](/docs/run-modes/direct)** | Shipped | `revud --direct` (or `REVU_MODE=direct`). Talks to real GitHub authenticated as the `gh` user; drafts, snapshots, and viewed state persist to a local SQLite store. The general-purpose, local-first tool. |
+| **[Broker](/docs/run-modes/broker)** | Reserved | The shared-identity deployment for teams in disposable workspaces: a host injects a short-lived GitHub App token, writes are stamped and journaled per human. Designed and documented — **not yet a shipped boot option.** |
+
+<Callout type="warn" title="Broker mode is reserved">
+Broker mode is planned, not runnable. Only mock and direct modes boot today.
+The design is written up on the [broker page](/docs/run-modes/broker) and in the
+operator runbook, but there is no `REVU_MODE=broker` boot you can rely on
+shipping yet.
+</Callout>
+
+## How the mode is selected
+
+The daemon, `revud`, reads its mode from the `REVU_MODE` environment variable.
+`REVU_MODE` defaults to `mock`. Direct mode also has an equivalent `--direct`
+flag:
+
+```bash
+# Direct mode — env var or flag, both equivalent
+REVU_MODE=direct bun run revud
+bun run revud --direct
+```
+
+The frontend on its own — `bun run dev` — always runs against the in-browser
+mock adapter; no daemon and no GitHub token are involved. Appending `?mock=1` to
+any URL forces mock mode regardless of how the rest of the environment is
+configured, which is what makes the mock a reliable demo and a reliable test
+oracle in any build.
+
+## One contract, one core
+
+All three modes serve the same built frontend and answer the same `RevuApi`
+methods. Inside `revud`, the shared core is wrapped by two injected strategies:
+
+- a **token source** — where the GitHub token comes from (in-process fixtures
+  for mock, the `gh` credential chain for direct, a host-injected credential
+  file for broker), and
+- a **write decorator** — how identity is stamped and journaled on the way out,
+  if at all (a passthrough in direct mode, since GitHub authenticates the human
+  for real; stamping plus an append-only audit journal in broker mode).
+
+Because the core is shared, a cross-transport conformance suite holds every
+adapter — mock, direct, and broker — to identical `RevuApi` semantics. The mock
+is not a stub that gets deleted once the real transports land; it stays the
+oracle the other adapters are checked against.
+
+## Where to go next
+
+- [Mock mode](/docs/run-modes/mock) — the fixtures, `?mock=1`, and the oracle role.
+- [Direct mode](/docs/run-modes/direct) — the `gh`-user identity, local SQLite
+  drafts, approve gating, and the full environment-variable reference.
+- [Broker mode](/docs/run-modes/broker) — the reserved shared-identity design.

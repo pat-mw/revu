@@ -1,0 +1,137 @@
+---
+title: Architecture
+description: One RevuApi contract, one shared core in revud, and mode strategies plugged in around it — mock, direct, and broker.
+---
+
+revu has one architectural rule that everything else follows from: the UI reads
+and writes through exactly one interface, and a run mode is a small pair of
+strategies plugged in around one shared core. The core is never forked per mode.
+
+![revu architecture — the React app talks only to the RevuApi contract; in-browser it binds the mock, over HTTP it reaches the revud daemon, which wraps one shared core in an injected TokenSource and WriteDecorator; three mode strategy pairs plug in: mock, direct, and broker](/assets/architecture.svg)
+
+## The one boundary
+
+The React frontend talks to exactly one interface — `RevuApi`
+(`packages/shared/src/api/client.ts`). It is the sole boundary between the UI and
+any transport. The app never imports a GitHub client, never holds a token, and
+never branches on which mode it is running in; it calls `syncPull`, `getDraft`,
+`submitReview` and the rest, and something on the other side of the interface
+honors them.
+
+Two things bind that interface at runtime:
+
+- **In the browser**, it binds an in-process **mock** adapter backed by
+  fixtures. No daemon, no token, no network.
+- **Over HTTP**, it reaches **`revud`** — a single Bun daemon that serves the
+  built app as static files *and* the API under `/api/`, on one loopback port
+  (default `4780`). One port, no CORS.
+
+Because the app depends only on the contract, adding a real transport is a
+sibling of the mock and nothing else in the UI changes.
+
+## `revud`: one shared core, two injected strategies
+
+Inside `revud`, one **shared core** does the actual work — the sync engine, the
+snapshot store, the draft store, and the re-anchor (reconcile) logic. That core
+is almost all of the code. Wrapped around it are two small injected strategies
+that are the *only* thing a run mode changes:
+
+- **`TokenSource`** — where the GitHub token comes from. In direct mode it is
+  the `gh` credential chain (`GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`); in
+  the reserved broker design it reads a host-injected credential file fresh on
+  every request.
+- **`WriteDecorator`** — how identity is stamped and journaled on the way out,
+  if at all. In direct mode it is a passthrough: comments post as the real `gh`
+  user, unstamped. In the reserved broker design it prepends the author's name
+  and appends an audit-log row per write.
+
+A run mode is precisely that pair of strategies plugged in around the core. The
+core does not know which mode it is in; it asks the `TokenSource` for a token and
+hands each write to the `WriteDecorator`. This is why direct mode and the broker
+design share one sync engine, one snapshot store, one draft model, one reconcile
+scorer — and therefore one set of bugs to fix rather than three.
+
+## The three modes as strategy pairs
+
+| Mode | `TokenSource` | `WriteDecorator` | Status |
+|---|---|---|---|
+| **Mock** | none — fixtures, in-process | none — the mock store *is* the write | Shipped |
+| **Direct** | `gh` credential chain | passthrough (posts as the real user) | Shipped |
+| **Broker** | host-injected credential file | stamp author name + append audit row | Reserved |
+
+<Callout type="warn" title="Broker mode is reserved — not a shipped boot option">
+Broker mode is designed and documented, but it is **not yet a shipped, runnable
+boot option.** Only [mock](/docs/run-modes/mock) and
+[direct](/docs/run-modes/direct) modes boot today. The broker strategy pair,
+the host collector, and the audit journal are described so they can be reasoned
+about and built against — see [Broker mode](/docs/run-modes/broker) — not as
+something you can rely on running in a released build.
+</Callout>
+
+## Why a daemon at all
+
+The browser cannot do three things the contract needs, and all three apply in
+every real mode:
+
+1. **The token never enters the browser.** It lives in `revud`, is never logged,
+   and is never sent to the client.
+2. **The snapshot cache and draft store need somewhere durable** that is not
+   `localStorage` — a SQLite file that survives a restart, and, in the broker
+   design, a workspace rebuild.
+3. **Blob reads can come from the local git clone.** After `git fetch`, the base
+   and head blobs a snapshot needs are usually already on disk, a `git cat-file`
+   away — zero API requests. A browser cannot read your git object store;
+   `revud` can. This is what keeps a large-PR sync cheap. See
+   [the rate budget](/docs/concepts/rate-budget) and
+   [compare key](/docs/concepts/compare-key).
+
+## The mock is the oracle, not a stub
+
+The mock is not scaffolding to be deleted once a real transport exists. It is
+permanent, and it is load-bearing in two ways:
+
+- **`revud`'s own mock mode reuses the app's mock adapter over HTTP.** The same
+  fixtures the browser demo runs against are served by the daemon, which is how
+  the transport seam is proven with zero GitHub risk — the UI cannot tell the
+  difference, which is the point.
+- **A cross-transport conformance suite holds every adapter to the identical
+  contract.** The suite (`packages/shared/conformance`) is parameterized over
+  any `RevuApi` implementation and asserts the contract's hard invariants once,
+  then runs them against the in-process mock *and* against the daemon over HTTP.
+  The assertions are the property of the contract, so they live in the shared
+  package, not in any one transport.
+
+The invariants the suite pins down are exactly the ones that look like failures
+but are not:
+
+- `submitReview` returns `head_moved` as a **200-level value** and never throws
+  for it, so the UI can route into [reconcile](/docs/concepts/reconcile) instead
+  of failing.
+- `syncPull` that dies mid-transfer keeps a **partial** snapshot (surfacing the
+  drop as a `network` error) and the retry completes with `partial: null`,
+  fetching only the missing blobs.
+- `getSnapshot` answers `null` — never a thrown 404 — for a pull that was never
+  synced.
+
+Every adapter must uphold all three. See
+[Types & errors](/docs/reference/types-and-errors) for the exact shapes, and
+[the scenario map](/docs/reference/scenario-map) for the fixture pulls the suite
+drives.
+
+## Where the code lives
+
+The workspace is a Bun monorepo; the core is UI-free and shared across every
+mode.
+
+| Package | What lives here |
+|---|---|
+| `packages/app` | The React frontend and the in-browser **mock** adapter. |
+| `packages/shared` | The `RevuApi` contract, the wire types, the HTTP route table, the re-anchor and identity libraries, and the cross-transport **conformance** suite. |
+| `packages/revud` | The `revud` daemon — the shared core plus the direct, broker, and mock strategy wiring. |
+| `packages/docs` | This documentation site. |
+
+## Related
+
+- [API & routes](/docs/reference/api-and-routes) — the methods and their HTTP mapping.
+- [Types & errors](/docs/reference/types-and-errors) — the wire shapes and error codes.
+- [Run modes](/docs/run-modes) — how the mode is selected and what the three share.

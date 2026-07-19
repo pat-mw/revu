@@ -1,0 +1,63 @@
+---
+title: Compare key
+description: Why immutable content is keyed merge_base...head, never head alone, and how blobs are reused across syncs.
+---
+
+A PR diff is a **three-dot compare**: what changed on the branch relative to where it forked
+from the base, not the raw difference between two commit tips. revu keys the immutable half
+of a [snapshot](/docs/concepts/snapshot) by that comparison, and gets it right by keying on
+both ends.
+
+## `merge_base...head`, never head alone
+
+The compare key is:
+
+```
+compareKey = merge_base_sha...head_sha
+```
+
+Keying on the head SHA alone would be wrong, and subtly so. The same head commit can present
+a **different diff** depending on where the base branch is: if the base advances but the head
+does not, the three-dot compare changes even though the head SHA is identical. A head-only key
+would treat that as unchanged content and serve you a stale diff. Keying on
+`merge_base...head` makes the immutable content self-identifying — two syncs share immutable
+data only when both the merge base and the head match, which is exactly when the diff is
+genuinely the same.
+
+The rule follows from that:
+
+- **Never** let a head-SHA match short-circuit the mutable fetch. Threads, checks, and
+  mergeability are refetched every sync regardless (see [snapshot](/docs/concepts/snapshot)).
+- The immutable store has **no TTL**. Content addressed by a compare key does not expire — it
+  either matches, in which case it is reused, or it does not, in which case it is refetched.
+
+Two scenarios in the demo exist purely to catch this: a PR where the base branch advanced but
+the head did not — the diff still changed, and the seal says so — and a PR where a thread was
+resolved elsewhere with zero new commits, so a re-sync reuses every blob and only the mutable
+half moves.
+
+## Content-addressed blobs, reused across syncs
+
+Below the compare key, individual file blobs are **content-addressed** by their git SHA. A
+blob SHA identifies its bytes exactly, so once revu has a blob it never needs to fetch that
+same content again — across files, across PRs, across syncs. A re-sync that only changes the
+mutable half reuses **every** blob. The snapshot's own sync stats surface this honestly as
+blobs fetched versus blobs reused, so the cost of a sync is never hidden.
+
+## Blobs from local git — the free lunch
+
+Reviewing requires the repository cloned locally, and that is the point. After a fetch, both
+the merge base and head commits are almost always already in your local git object store, so
+every blob the snapshot needs is a local object read — zero API requests, zero rate-budget
+spend, and it works even when the network is flaky. This is what keeps a **large-PR sync
+cheap**: a big PR that would otherwise cost hundreds of blob requests costs a small, bounded
+number of metadata calls instead, because the bytes come from disk.
+
+Binary files are detected the same way git detects them (a NUL byte early in the content) and
+collapsed rather than fetched — the tool does not pull binary content it will only ever render
+as "binary file."
+
+## Related
+
+- [Snapshot](/docs/concepts/snapshot) — the two halves and the seal.
+- [Rate budget](/docs/concepts/rate-budget) — why local blob reads matter for the budget.

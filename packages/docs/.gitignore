@@ -11,6 +11,9 @@
 *.tsbuildinfo
 next-env.d.ts
 
+# build-time mirror of the repo's canonical docs/assets (see scripts/copy-assets.mjs)
+/public/assets
+
 # misc
 .DS_Store
 .env*.local

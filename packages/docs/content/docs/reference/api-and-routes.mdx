@@ -1,0 +1,121 @@
+---
+title: API & routes
+description: The RevuApi methods and their HTTP routes — how the contract maps mechanically onto the revud daemon.
+---
+
+The `RevuApi` interface is the one boundary the UI talks through, and it maps
+mechanically onto HTTP: one route per method. The route table lives once, in the
+shared package (`packages/shared/src/http.ts`), and both `revud` (which serves
+the contract) and the fetch adapter (which consumes it) import it — so the wire
+mapping is defined exactly once and the two ends cannot diverge.
+
+## The methods
+
+`RevuApi` (`packages/shared/src/api/client.ts`) is the full surface. Reads are
+the shared cost; writes are cheap — one call per review, regardless of how many
+comments it carries.
+
+| Method | What it does |
+|---|---|
+| `getSession()` | The app's own session — identity injected at startup, not GitHub's. |
+| `listPulls({ etag? })` | The live PR list. The only surface safe to poll: a 304 is free against the shared rate bucket. |
+| `syncPull(prNumber, { signal? })` | One burst: pull the PR down whole and cache it. May resolve `partial`. |
+| `getSnapshot(prNumber)` | The cached snapshot, no network. `null` if the PR was never synced. |
+| `getBlob(sha)` | A content-addressed blob from the snapshot store. No network for a synced PR. |
+| `listReviewThreads(prNumber)` | Threads from the cached snapshot's mutable half. |
+| `replyToThread(prNumber, threadId, body)` | A single-comment reply — an immediate write, not drafted. |
+| `resolveThread(prNumber, threadId, resolved)` | The GraphQL resolve/unresolve mutation. |
+| `addReaction(prNumber, commentId, reaction)` | Add a reaction; returns the updated rollup. |
+| `submitReview(input)` | The atomic submit: one call carrying every pending comment. Returns `head_moved` as a value, never throws for it. |
+| `reconcileDraft(prNumber)` | Classify each pending comment against the fresh snapshot: clean / drifted / lost. A pure read. |
+| `getDraft` / `saveDraft` / `discardDraft` | The per-human draft — broker-side, invisible to GitHub, survives a reload and a rebuild. |
+| `getFileViewed` / `setFileViewed` | Per-human, per-PR viewed state. |
+| `getPreferences` / `setPreferences` | Per-human workspace preferences (not scoped to any PR). `setPreferences` merges a partial patch. |
+| `getRateLimit()` | Current shared-bucket status, for honest error copy. |
+
+The [types & errors](/docs/reference/types-and-errors) page has the exact shapes
+of the arguments and results.
+
+## The HTTP route table
+
+Every method maps to exactly one route, keyed by method name in `ROUTES`
+(`packages/shared/src/http.ts`). Path segments prefixed with `:` are parameters:
+`:n` (pull number), `:sha` (blob SHA), `:threadId`, and `:id` (comment id).
+Bodies are JSON; casing follows the wire types unchanged.
+
+| `RevuApi` method | Method | Path | Body |
+|---|---|---|---|
+| `getSession` | `GET` | `/api/session` | — |
+| `listPulls` | `GET` | `/api/pulls` | — (conditional; see below) |
+| `syncPull` | `POST` | `/api/pulls/:n/sync` | — |
+| `getSnapshot` | `GET` | `/api/pulls/:n/snapshot` | — |
+| `getBlob` | `GET` | `/api/blobs/:sha` | — |
+| `listReviewThreads` | `GET` | `/api/pulls/:n/threads` | — |
+| `replyToThread` | `POST` | `/api/pulls/:n/threads/:threadId/reply` | `{ body }` |
+| `resolveThread` | `POST` | `/api/pulls/:n/threads/:threadId/resolve` | `{ resolved }` |
+| `addReaction` | `POST` | `/api/comments/:id/reactions` | `{ reaction }` |
+| `submitReview` | `POST` | `/api/pulls/:n/review` | `SubmitReviewInput` |
+| `reconcileDraft` | `GET` | `/api/pulls/:n/reconcile` | — |
+| `getDraft` | `GET` | `/api/pulls/:n/draft` | — |
+| `saveDraft` | `PUT` | `/api/pulls/:n/draft` | `ReviewDraft` |
+| `discardDraft` | `DELETE` | `/api/pulls/:n/draft` | — |
+| `getFileViewed` | `GET` | `/api/pulls/:n/viewed` | — |
+| `setFileViewed` | `PUT` | `/api/pulls/:n/viewed` | `{ path, viewed, blobSha }` |
+| `getPreferences` | `GET` | `/api/preferences` | — |
+| `setPreferences` | `PUT` | `/api/preferences` | partial `HumanPreferences` (e.g. `{ diffMode }`) |
+| `getRateLimit` | `GET` | `/api/rate-limit` | — |
+
+`addReaction`'s route carries only the comment id, so the owning pull rides as a
+`?pr=<n>` query param (or a `prNumber` field in the body) — the path contract is
+unchanged.
+
+## The one conditional route
+
+`listPulls` is the *only* conditional surface, and the only genuinely live read
+in the app. The client sends `If-None-Match`; the server emits an `ETag` on the
+`200` response and replies `304 Not Modified` when the header matches. A `304`
+costs nothing against the shared rate bucket, which is why the PR list is safe to
+poll while everything else is local. See [the rate budget](/docs/concepts/rate-budget).
+
+A `304` carries **no body**. On a `304` the client resolves a `PullListResponse`
+reconstructed from its last-known items with `notModified: true` and the echoed
+ETag. The mock has no real HTTP layer, so it returns a full body with
+`notModified: true` directly; the HTTP transport realizes the same
+`PullListResponse` via the `304` path. Either way the app sees one shape.
+
+## Non-error semantics that look like failures
+
+Three responses look like errors but are not. Every implementation must preserve
+them verbatim, and the client must never treat them as error statuses:
+
+1. `submitReview` returns `{ status: 'head_moved', currentHeadSha, newCommits }`
+   as an **HTTP 200 value**, never an error status. The review bar routes into
+   [reconcile](/docs/concepts/reconcile) on it instead of failing.
+2. `syncPull` may resolve with `Snapshot.partial` non-null — a sync that died
+   partway names what is missing. That is a **200** body, not an error.
+3. `getSnapshot` returns **HTTP 200 with a JSON `null` body** for a never-synced
+   PR — never 404-as-error.
+
+These are pinned by the [conformance suite](/docs/reference/architecture#the-mock-is-the-oracle-not-a-stub)
+against every adapter. Full detail on the error envelope and codes is on the
+[types & errors](/docs/reference/types-and-errors) page.
+
+## What direct mode serves today
+
+Direct mode's router serves the read-and-persist surface — `getSession`,
+`syncPull`, `getSnapshot`, `getBlob`, drafts, viewed, preferences,
+`reconcileDraft` — plus the full write path (`submitReview`, `replyToThread`,
+`resolveThread`, `addReaction`). Two routes are honest placeholders that answer
+`501 not_implemented` in direct mode: `listPulls` (it has no poll loop) and
+`getRateLimit`, plus the GraphQL thread read `listReviewThreads`. These behave
+fully in mock mode. The dev-panel routes (`GET`/`PUT /api/dev`,
+`POST /api/dev/reset`) exist **only** in mock mode and are deliberately absent
+from the route table and refused in any other mode — identity must come from the
+channel, never from a client-settable value, and no unauthenticated route may
+wipe stored drafts.
+
+## Related
+
+- [Architecture](/docs/reference/architecture) — how the daemon wraps the shared core.
+- [Types & errors](/docs/reference/types-and-errors) — the wire shapes and the `ApiErrorCode` set.
+- [Scenario map](/docs/reference/scenario-map) — the fixtures the conformance suite drives.
