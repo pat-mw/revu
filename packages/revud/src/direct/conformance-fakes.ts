@@ -1,5 +1,11 @@
 import { expect } from 'bun:test'
-import type { PendingComment, ReviewDraft, Session } from '@revu/shared'
+import type {
+  PendingComment,
+  PullSummary,
+  RateLimitInfo,
+  ReviewDraft,
+  Session,
+} from '@revu/shared'
 import type {
   GhBlobRaw,
   GhCompareRaw,
@@ -10,7 +16,11 @@ import type {
   GithubClient,
   Page,
   PageParams,
+  PullFacts,
+  PullListClient,
+  PullListPage,
 } from './github-client'
+import type { PollFactsSource } from '../broker/poll-loop'
 import type { RepoRef } from './repo'
 import type { DirectApi } from './direct-api'
 import type { TokenSource } from './token-source'
@@ -440,4 +450,120 @@ export async function seedForcePushed(api: DirectApi, state: RemoteState): Promi
   // The re-sync must observe the force-pushed head — the whole point of the seed.
   expect(second.immutable.headSha).toBe('HEAD-NEW')
   return draft
+}
+
+// ————————————————————————————————————————————————————————————————
+// Broker pulls-list poll fakes (drive the M4.1 poll-loop scenarios).
+// Additive block: everything below is used only by the M4.1 poll-loop
+// scenarios in conformance-broker.test.ts. It does not touch the fixtures above.
+// ————————————————————————————————————————————————————————————————
+
+/** A minimal open-pull row the poll fake serves; enough for `PullSummary` mapping. */
+export interface FakePull {
+  number: number
+  headSha: string
+  baseSha: string
+  updatedAt: string
+  /** Live facts the batched-GraphQL fake reports for this pull. */
+  unresolvedThreads: number
+  commitCount: number
+  /** Merge base the compare fake reports; the compareKey is `${mergeBase}...${headSha}`. */
+  mergeBaseSha: string
+}
+
+/** Build a `PullSummary` from a `FakePull` row — the fields a REST list carries. */
+function summaryFromFake(p: FakePull): PullSummary {
+  return {
+    id: p.number,
+    node_id: `PR_${p.number}`,
+    number: p.number,
+    state: 'open',
+    draft: false,
+    merged_at: null,
+    title: `PR #${p.number}`,
+    body: null,
+    user: { login: 'author', id: 2, node_id: 'U_2', avatar_url: '', html_url: '', type: 'User' },
+    labels: [],
+    requested_reviewers: [],
+    head: { ref: 'feature', sha: p.headSha, label: 'o:feature', repo: { full_name: 'o/r', default_branch: 'main' } },
+    base: { ref: 'main', sha: p.baseSha, label: 'o:main', repo: { full_name: 'o/r', default_branch: 'main' } },
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: p.updatedAt,
+  }
+}
+
+/** A steady rate limit the poll fake reports on every response (200 and 304). */
+function fakeRateLimit(): RateLimitInfo {
+  return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T01:00:00.000Z' }
+}
+
+/**
+ * The mutable state the poll fake serves. `pulls` is the current open list;
+ * `etagSeq` bumps whenever the list content changes so the conditional read can
+ * answer 304 while unchanged and 200 on a change. `nonNotModified` counts the
+ * responses that were NOT 304 — the cost-budget metric the idle-polling scenario
+ * asserts on.
+ */
+export interface PollFakeState {
+  pulls: FakePull[]
+  /** Bumped by `mutatePulls` to force the next conditional read to be a 200. */
+  etagSeq: number
+  /** Requests answered with a 200 (a real cost); a 304 does not increment this. */
+  nonNotModified: number
+}
+
+export function initialPollState(pulls: FakePull[]): PollFakeState {
+  return { pulls, etagSeq: 1, nonNotModified: 0 }
+}
+
+/** Apply a change and bump the ETag sequence so the next poll observes a 200. */
+export function mutatePulls(state: PollFakeState, mutate: (pulls: FakePull[]) => void): void {
+  mutate(state.pulls)
+  state.etagSeq += 1
+}
+
+/**
+ * A `PullListClient` + `PollFactsSource` over a mutable list state, with real
+ * conditional-ETag semantics: the ETag is the current sequence, so a request
+ * whose `If-None-Match` equals it answers 304 (free), and any content change
+ * bumps the sequence so the next request is a 200. Every non-304 response is
+ * counted, so a test can prove idle polling costs one non-304 then only 304s.
+ */
+export function fakePollSources(state: PollFakeState): {
+  client: PullListClient
+  facts: PollFactsSource
+} {
+  const currentEtag = (): string => `gh-list-etag-${state.etagSeq}`
+  const client: PullListClient = {
+    async listOpenPulls(_owner, _repo, etag): Promise<PullListPage> {
+      const responseEtag = currentEtag()
+      if (etag !== null && etag === responseEtag) {
+        // Unchanged upstream: a free 304, no body, rate headers still returned.
+        return { items: [], etag: responseEtag, notModified: true, rateLimit: fakeRateLimit() }
+      }
+      state.nonNotModified += 1
+      return {
+        items: state.pulls.map(summaryFromFake),
+        etag: responseEtag,
+        notModified: false,
+        rateLimit: fakeRateLimit(),
+      }
+    },
+    async getPullFacts(_owner, _repo, prNumbers): Promise<Record<number, PullFacts>> {
+      const out: Record<number, PullFacts> = {}
+      for (const n of prNumbers) {
+        const p = state.pulls.find((x) => x.number === n)
+        if (p) out[n] = { unresolvedThreads: p.unresolvedThreads, commitCount: p.commitCount }
+      }
+      return out
+    },
+  }
+  const facts: PollFactsSource = {
+    getPullFacts: client.getPullFacts,
+    async getCompare(_owner, _repo, _base, head): Promise<GhCompareRaw> {
+      const p = state.pulls.find((x) => x.headSha === head)
+      return { merge_base_commit: { sha: p?.mergeBaseSha ?? 'UNKNOWN' } }
+    },
+  }
+  return { client, facts }
 }

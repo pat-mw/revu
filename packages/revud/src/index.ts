@@ -6,9 +6,11 @@ import type { RevuMode } from './api-router'
 import { DirectStartupError, resolveDirectContext } from './direct/context'
 import { createDirectApi } from './direct/direct-api'
 import { resolveBotLogin } from './direct/session'
+import { createGithubClient } from './direct/github-client'
 import { openDirectStore, resolveDirectDataDir } from './direct/store'
 import { createBrokerWriteDecorator } from './direct/write-decorator'
 import { createFileCredentialTokenSource } from './broker/token-source'
+import { createPollLoop } from './broker/poll-loop'
 
 /**
  * Entry point for the revu daemon. One Bun process serves the built frontend
@@ -255,6 +257,20 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
 
   const dataDir = resolveDirectDataDir(env)
   const store = openDirectStore({ dataDir, env })
+
+  // The live pulls-list poll loop: a dedicated client over the SAME injected
+  // credential source (stateless — it re-reads the file per request, so a second
+  // client shares no mutable state with the sync client). It issues one
+  // conditional list every ~30s and serves `/v1/pulls` from an in-memory cache;
+  // a 304 round is free against the shared bucket. The loop tolerates an
+  // awaiting credential per tick without crashing.
+  const pollClient = createGithubClient({ tokenSource: context.tokenSource })
+  const pollLoop = createPollLoop({
+    client: pollClient,
+    facts: { getPullFacts: pollClient.getPullFacts, getCompare: pollClient.getCompare },
+    repo: context.repo,
+  })
+
   // Writes are enabled exactly when the deployment configured the bot login the
   // GitHub App posts as. The session (built from the same env) already
   // self-identifies as that bot, and the stamping + journaling decorator is
@@ -272,10 +288,15 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
     store,
     runner: context.runner,
     cwd: context.cwd,
+    // Serve `/v1/pulls` LIVE from the poll cache.
+    pullList: pollLoop,
     ...(botLogin !== null
       ? { writeDecorator: createBrokerWriteDecorator(context.session, store) }
       : {}),
   })
+
+  // Warm the cache and begin the ~30s cadence now that the api is assembled.
+  pollLoop.start()
 
   const server = startServer({
     port,
@@ -290,6 +311,7 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
 
   const shutdown = (signal: string): void => {
     try {
+      pollLoop.stop()
       store.close()
     } finally {
       server.stop(true)

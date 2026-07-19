@@ -14,6 +14,7 @@ import {
   validateSubmitReviewInput,
 } from '@revu/shared'
 import type { RevuMode } from './api-router'
+import { PollUnavailableError } from './broker/poll-loop'
 import { AwaitingCredentialError } from './broker/token-source'
 import type { DirectApi } from './direct/direct-api'
 import { GithubGraphqlError, GithubRequestError } from './direct/github-client'
@@ -85,9 +86,10 @@ function errorJson(code: string, message: string, status: number): Response {
  * (`getRateLimit`) land. The write path (submitReview, replyToThread,
  * resolveThread, addReaction), `getBlob` (a content-addressed store read), and
  * `reconcileDraft` (a pure read of snapshot + draft state) are all served below.
+ * `listPulls` is served LIVE from the poll cache in broker mode; in direct mode
+ * it has no poll loop and falls through to the honest 501 placeholder below.
  */
 const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
-  ROUTES.listPulls.path,
   ROUTES.listReviewThreads.path,
   ROUTES.getRateLimit.path,
 ])
@@ -208,6 +210,12 @@ function envelopeForError(err: unknown): Response {
   if (err instanceof AwaitingCredentialError) {
     return errorJson('broker_unreachable', err.message, 502)
   }
+  // The broker poll loop has no live pull list yet (never warmed, or stale past
+  // its failure threshold). This is "live data unavailable", the same retriable
+  // semantics an unreachable upstream gets — never a fabricated empty list.
+  if (err instanceof PollUnavailableError) {
+    return errorJson('broker_unreachable', err.message, 502)
+  }
   if (err instanceof GithubRequestError) {
     if (err.status === 404) return errorJson('not_found', err.message, 404)
     if (err.status === 403) return errorJson('forbidden', err.message, 403)
@@ -280,6 +288,32 @@ export async function handleDirectApi(
   }
 
   try {
+    // ——— listPulls: GET /api/pulls, conditional, served from the broker poll
+    // cache. Honors CONDITIONAL_LIST_304_RULE: the client sends If-None-Match,
+    // the server emits an ETag on the 200 and replies a bodiless 304 when the
+    // ETag matches. Served ONLY in broker mode (direct mode has no poll loop, so
+    // the route falls through to the 501 placeholder below). ———
+    if (
+      mode === 'broker' &&
+      method === ROUTES.listPulls.method &&
+      path === ROUTES.listPulls.path
+    ) {
+      const ifNoneMatch = req.headers.get('if-none-match')
+      const result = api.listPulls(ifNoneMatch)
+      if (result.notModified) {
+        // A 304 carries NO body; the ETag is echoed so the client can keep
+        // conditioning on it. The client replays its last-known items.
+        return new Response(null, { status: 304, headers: { etag: result.etag } })
+      }
+      return new Response(JSON.stringify(result), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          etag: result.etag,
+        },
+      })
+    }
+
     // ——— syncPull ———
     if (method === ROUTES.syncPull.method) {
       const params = matchRoute(ROUTES.syncPull.path, path)

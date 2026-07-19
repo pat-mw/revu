@@ -53,16 +53,22 @@ import { createBrokerWriteDecorator } from './write-decorator'
 import {
   CONFORMANCE_REPO,
   CONFORMANCE_SESSION,
+  fakePollSources,
+  type FakePull,
+  initialPollState,
   initialReconcileState,
   MOVING_BASE_HEAD_BLOB_SHA,
   MOVING_BASE_PR,
   movingBaseClient,
   movingHeadClient,
+  mutatePulls,
   partialBlobClient,
+  type PollFakeState,
   RECONCILE_PR,
   seedForcePushed,
   tokenGated,
 } from './conformance-fakes'
+import { createPollLoop, type PollFactsSource, type PollLoop } from '../broker/poll-loop'
 
 /** A fake token the credential file carries; never a real secret. */
 const FAKE_TOKEN = 'ghs_broker_conformance_fake'
@@ -559,5 +565,502 @@ describe('commentAuthors ground truth (broker-authored comment detected as OWN)'
     ).toBe(false)
 
     store.close()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+
+// M4.1 — broker poll loop: the live pulls list served from a ~30s conditional
+// poll cache. Additive block (does not reorganize the scenarios above). Every
+// scenario is network-free: the fake `PullListClient` implements real
+// conditional-ETag semantics (200 first, then 304 while unchanged) over a mutable
+// list state, and the fake facts source refreshes changed pulls only.
+// ————————————————————————————————————————————————————————————————
+
+/** Two open pulls the poll fakes start with — distinct heads, bases, and facts. */
+function initialPollPulls(): FakePull[] {
+  return [
+    {
+      number: 101,
+      headSha: 'HEAD-101-a',
+      baseSha: 'BASE-101',
+      updatedAt: '2026-02-01T00:00:00.000Z',
+      unresolvedThreads: 2,
+      commitCount: 3,
+      mergeBaseSha: 'MB-101',
+    },
+    {
+      number: 202,
+      headSha: 'HEAD-202-a',
+      baseSha: 'BASE-202',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+      unresolvedThreads: 0,
+      commitCount: 1,
+      mergeBaseSha: 'MB-202',
+    },
+  ]
+}
+
+/** Build a poll loop over a fresh fake state; the loop is not started (ticked by hand). */
+function buildPollLoop(state: PollFakeState): PollLoop {
+  const { client, facts } = fakePollSources(state)
+  return createPollLoop({ client, facts, repo: CONFORMANCE_REPO })
+}
+
+describe('M4.1 poll loop — conditional list, change refresh, and broker ETag', () => {
+  test('M4.1.1: unchanged upstream yields a 304 round after round; only a real change is a 200', async () => {
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+
+    // First tick: a 200 warms the cache and computes the broker ETag.
+    await loop.pollOnce()
+    expect(state.nonNotModified).toBe(1)
+    const first = loop.listPulls(null)
+    expect(first.notModified).toBe(false)
+    expect(first.items).toHaveLength(2)
+
+    // Several idle ticks: each is a free 304 against the shared bucket — the
+    // non-304 count does not move and the served list is unchanged.
+    for (let i = 0; i < 4; i++) await loop.pollOnce()
+    expect(state.nonNotModified).toBe(1)
+    const stillFirst = loop.listPulls(null)
+    expect(stillFirst.etag).toBe(first.etag)
+
+    // A real upstream change (a new commit lands on #101) forces the next tick to
+    // be a 200 and the served list to reflect it.
+    mutatePulls(state, (pulls) => {
+      const pr = pulls.find((p) => p.number === 101)!
+      pr.headSha = 'HEAD-101-b'
+      pr.updatedAt = '2026-02-03T00:00:00.000Z'
+      pr.commitCount = 4
+    })
+    await loop.pollOnce()
+    expect(state.nonNotModified).toBe(2)
+    const afterChange = loop.listPulls(null)
+    expect(afterChange.etag).not.toBe(first.etag)
+    const pr101 = afterChange.items.find((it) => it.pull.number === 101)!
+    expect(pr101.pull.head.sha).toBe('HEAD-101-b')
+    expect(pr101.broker.commitCount).toBe(4)
+  })
+
+  test('M4.1.2: a resolved thread / new commit updates cached counts, head, compareKey, commitCount within one interval', async () => {
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+    await loop.pollOnce()
+
+    const before = loop.listPulls(null).items.find((it) => it.pull.number === 101)!
+    expect(before.broker.unresolvedThreads).toBe(2)
+    expect(before.broker.compareKey).toBe('MB-101...HEAD-101-a')
+    expect(before.broker.commitCount).toBe(3)
+
+    // A thread is resolved on github.com AND a commit lands: unresolved drops, the
+    // head + merge base move, and the commit count grows — all off the LIST poll.
+    mutatePulls(state, (pulls) => {
+      const pr = pulls.find((p) => p.number === 101)!
+      pr.unresolvedThreads = 0
+      pr.headSha = 'HEAD-101-b'
+      pr.mergeBaseSha = 'MB-101-new'
+      pr.commitCount = 5
+      pr.updatedAt = '2026-02-04T00:00:00.000Z'
+    })
+    await loop.pollOnce()
+
+    const after = loop.listPulls(null).items.find((it) => it.pull.number === 101)!
+    expect(after.broker.unresolvedThreads).toBe(0)
+    expect(after.pull.head.sha).toBe('HEAD-101-b')
+    expect(after.broker.compareKey).toBe('MB-101-new...HEAD-101-b')
+    expect(after.broker.commitCount).toBe(5)
+
+    // The UNCHANGED pull (#202) carried its prior meta forward untouched — the
+    // refresh is scoped to changed pulls, which is the cost point of the design.
+    const unchanged = loop.listPulls(null).items.find((it) => it.pull.number === 202)!
+    expect(unchanged.broker.compareKey).toBe('MB-202...HEAD-202-a')
+    expect(unchanged.broker.commitCount).toBe(1)
+  })
+
+  test('M4.1.2: a base advance under an UNCHANGED head (head + updated_at fixed) still refreshes compareKey', async () => {
+    // A base-branch advance moves neither the head SHA nor `updated_at`, but it
+    // does move the three-dot merge base — so `compareKey` MUST refresh, else the
+    // frontend's "base moved" staleness (head unchanged + base advanced) could
+    // never fire in broker mode. Change detection must key on the base SHA too.
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+    await loop.pollOnce()
+
+    const before = loop.listPulls(null).items.find((it) => it.pull.number === 101)!
+    expect(before.pull.head.sha).toBe('HEAD-101-a')
+    expect(before.broker.compareKey).toBe('MB-101...HEAD-101-a')
+
+    // ONLY the base advances: head, updated_at unchanged; the merge base moves.
+    mutatePulls(state, (pulls) => {
+      const pr = pulls.find((p) => p.number === 101)!
+      pr.baseSha = 'BASE-101-new'
+      pr.mergeBaseSha = 'MB-101-new'
+      // head SHA and updated_at deliberately UNCHANGED.
+    })
+    await loop.pollOnce()
+
+    const after = loop.listPulls(null).items.find((it) => it.pull.number === 101)!
+    // Head + updated_at are genuinely unchanged, proving the refresh fired on the
+    // base advance alone rather than on a head/updated_at bump.
+    expect(after.pull.head.sha).toBe('HEAD-101-a')
+    expect(after.pull.updated_at).toBe(before.pull.updated_at)
+    expect(after.pull.base.sha).toBe('BASE-101-new')
+    // The compareKey refreshed to the new merge base under the same head.
+    expect(after.broker.compareKey).toBe('MB-101-new...HEAD-101-a')
+  })
+
+  test('M4.1.3: /api/pulls returns 304 with the ETag until an upstream change, then 200', async () => {
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+    const store = openDirectStore({ dataDir })
+    // A broker api whose pull list is served from THIS poll loop.
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: tokenGated(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }), brokerTokenSource()),
+      repo: CONFORMANCE_REPO,
+      store,
+      pullList: loop,
+    })
+    await loop.pollOnce()
+
+    // First GET: a 200 carrying the ETag header and the full list.
+    const req1 = new Request('http://127.0.0.1/api/pulls', { method: 'GET' })
+    const res1 = await handleDirectApi(req1, CONFORMANCE_SESSION, api, 'broker')
+    expect(res1!.status).toBe(200)
+    const etag = res1!.headers.get('etag')
+    expect(etag).toBeTruthy()
+    const listBody = (await res1!.json()) as { items: unknown[]; etag: string }
+    expect(listBody.items).toHaveLength(2)
+    expect(listBody.etag).toBe(etag)
+
+    // Second GET with that ETag while upstream is unchanged: a bodiless 304 that
+    // echoes the ETag (the frozen CONDITIONAL_LIST_304_RULE).
+    const req2 = new Request('http://127.0.0.1/api/pulls', {
+      method: 'GET',
+      headers: { 'if-none-match': etag as string },
+    })
+    const res2 = await handleDirectApi(req2, CONFORMANCE_SESSION, api, 'broker')
+    expect(res2!.status).toBe(304)
+    expect(res2!.headers.get('etag')).toBe(etag)
+    expect(await res2!.text()).toBe('')
+
+    // After an upstream change the same conditional GET is a fresh 200.
+    mutatePulls(state, (pulls) => {
+      pulls.find((p) => p.number === 202)!.headSha = 'HEAD-202-b'
+      pulls.find((p) => p.number === 202)!.updatedAt = '2026-02-09T00:00:00.000Z'
+    })
+    await loop.pollOnce()
+    const req3 = new Request('http://127.0.0.1/api/pulls', {
+      method: 'GET',
+      headers: { 'if-none-match': etag as string },
+    })
+    const res3 = await handleDirectApi(req3, CONFORMANCE_SESSION, api, 'broker')
+    expect(res3!.status).toBe(200)
+    expect(res3!.headers.get('etag')).not.toBe(etag)
+
+    store.close()
+  })
+
+  test('M4.1.3: the broker ETag is stable across a graceful restart with no upstream change', async () => {
+    // Two loops over the SAME upstream (same list ETag): a fresh process re-fetches
+    // the list on its first tick (a 200, since it has no stored ETag), but the
+    // broker ETag it derives from GitHub's unchanged list ETag equals the one the
+    // previous process served — so the frontend's stored If-None-Match still 304s.
+    const stateA = initialPollState(initialPollPulls())
+    const loopA = buildPollLoop(stateA)
+    await loopA.pollOnce()
+    const etagA = loopA.listPulls(null).etag
+
+    // A DIFFERENT loop instance (a restart) over an identical upstream state.
+    const stateB = initialPollState(initialPollPulls())
+    const loopB = buildPollLoop(stateB)
+    await loopB.pollOnce()
+    const etagB = loopB.listPulls(null).etag
+
+    expect(etagB).toBe(etagA)
+    // And the restarted loop answers 304 to the ETag the first process handed out.
+    const conditional = loopB.listPulls(etagA)
+    expect(conditional.notModified).toBe(true)
+    expect(conditional.etag).toBe(etagA)
+  })
+
+  test('M4.1.1: a tick whose credential is awaiting is SKIPPED, and the cache keeps serving; repeated failure surfaces unavailable', async () => {
+    // The loop must survive an AwaitingCredentialError per tick without crashing
+    // or blanking a populated cache, and only after repeated failure does the
+    // served list report "live data unavailable".
+    const state = initialPollState(initialPollPulls())
+    const { facts } = fakePollSources(state)
+    let failing = false
+    // A list client that throws AwaitingCredentialError while `failing`.
+    const flakyClient = {
+      async listOpenPulls(owner: string, repo: string, etag: string | null) {
+        if (failing) throw new AwaitingCredentialError('credential file is empty')
+        return fakePollSources(state).client.listOpenPulls(owner, repo, etag)
+      },
+      getPullFacts: facts.getPullFacts,
+    }
+    const loop = createPollLoop({
+      client: flakyClient,
+      facts,
+      repo: CONFORMANCE_REPO,
+      maxStaleTicks: 3,
+    })
+
+    // Warm the cache with a good tick.
+    await loop.pollOnce()
+    expect(loop.listPulls(null).items).toHaveLength(2)
+
+    // Two failing ticks: skipped, cache still serves (below the stale threshold).
+    failing = true
+    await loop.pollOnce()
+    await loop.pollOnce()
+    expect(loop.listPulls(null).items).toHaveLength(2)
+
+    // A third failing tick crosses the threshold: the served list now reports
+    // unavailable rather than an indefinitely stale read.
+    await loop.pollOnce()
+    expect(() => loop.listPulls(null)).toThrow(/live pull list/)
+
+    // A good tick recovers: the cache serves again and the streak resets.
+    failing = false
+    await loop.pollOnce()
+    expect(loop.listPulls(null).items).toHaveLength(2)
+  })
+
+  test('M4.1.1: the list read succeeds but the FACTS phase throws → the streak accumulates across ticks and trips the 502', async () => {
+    // The stale tripwire must not be defeatable by a REST list that keeps 200-ing
+    // while the facts phase (GraphQL, a SEPARATE rate bucket) keeps failing. The
+    // failure streak must accumulate across ticks — not oscillate 0↔1 — so a list
+    // that can never refresh its facts eventually surfaces "live data unavailable"
+    // instead of serving an indefinitely stale list as fresh 200s.
+    const state = initialPollState(initialPollPulls())
+    const { client } = fakePollSources(state)
+    let factsFailing = false
+    // A facts source whose batched counts query throws while `factsFailing`.
+    const flakyFacts: PollFactsSource = {
+      async getPullFacts(owner, repo, prNumbers) {
+        if (factsFailing) throw new Error('GraphQL rate bucket exhausted')
+        return fakePollSources(state).facts.getPullFacts(owner, repo, prNumbers)
+      },
+      async getCompare(owner, repo, base, head) {
+        return fakePollSources(state).facts.getCompare(owner, repo, base, head)
+      },
+    }
+    const loop = createPollLoop({
+      client,
+      facts: flakyFacts,
+      repo: CONFORMANCE_REPO,
+      maxStaleTicks: 3,
+    })
+
+    // Warm the cache with a good tick (facts succeed).
+    await loop.pollOnce()
+    expect(loop.listPulls(null).items).toHaveLength(2)
+
+    // Now the facts phase fails on every tick. To keep the facts phase RUNNING
+    // each tick (so it can fail), the list must report a change each tick — a
+    // stuck-304 idle list would skip the facts phase entirely. Bump a pull each
+    // tick so the list 200s with a changed pull whose facts refresh then throws.
+    factsFailing = true
+    for (let i = 0; i < 2; i++) {
+      mutatePulls(state, (pulls) => {
+        const pr = pulls.find((p) => p.number === 101)!
+        pr.commitCount += 1
+        pr.updatedAt = `2026-02-1${i}T00:00:00.000Z`
+      })
+      await loop.pollOnce()
+    }
+    // Two facts-phase failures below the threshold: the warm cache still serves.
+    expect(loop.listPulls(null).items).toHaveLength(2)
+
+    // A third facts-phase failure crosses the threshold: the served list now
+    // reports unavailable — the tripwire fired despite the list read succeeding.
+    mutatePulls(state, (pulls) => {
+      pulls.find((p) => p.number === 101)!.commitCount += 1
+      pulls.find((p) => p.number === 101)!.updatedAt = '2026-02-20T00:00:00.000Z'
+    })
+    await loop.pollOnce()
+    expect(() => loop.listPulls(null)).toThrow(/live pull list/)
+
+    // Facts recover: a good tick clears the streak and the cache serves again.
+    factsFailing = false
+    mutatePulls(state, (pulls) => {
+      pulls.find((p) => p.number === 101)!.updatedAt = '2026-02-21T00:00:00.000Z'
+    })
+    await loop.pollOnce()
+    expect(loop.listPulls(null).items).toHaveLength(2)
+  })
+
+  test('M4.1.1: a SINGLE pull\'s compare failure is isolated — the tick still succeeds and that pull carries prior meta', async () => {
+    // One pull's merge-base compare persistently 404s. That must NOT abort the
+    // whole tick or trip the stale tripwire: the failing pull keeps its PRIOR
+    // meta while every other pull refreshes, and the streak stays clear.
+    const state = initialPollState(initialPollPulls())
+    const { client, facts } = fakePollSources(state)
+    let breakCompareFor: number | null = null
+    const isolatedFacts: PollFactsSource = {
+      getPullFacts: facts.getPullFacts,
+      async getCompare(owner, repo, base, head) {
+        // #101's head after the mutation below; fail its compare only.
+        if (breakCompareFor !== null && head === 'HEAD-101-b') {
+          throw new Error('compare 404 for one pull')
+        }
+        return facts.getCompare(owner, repo, base, head)
+      },
+    }
+    const loop = createPollLoop({
+      client,
+      facts: isolatedFacts,
+      repo: CONFORMANCE_REPO,
+      maxStaleTicks: 3,
+    })
+    await loop.pollOnce()
+    const before101 = loop.listPulls(null).items.find((it) => it.pull.number === 101)!
+    expect(before101.broker.compareKey).toBe('MB-101...HEAD-101-a')
+
+    // Both pulls change; only #101's compare will fail.
+    breakCompareFor = 101
+    mutatePulls(state, (pulls) => {
+      const a = pulls.find((p) => p.number === 101)!
+      a.headSha = 'HEAD-101-b'
+      a.commitCount = 9
+      a.updatedAt = '2026-03-01T00:00:00.000Z'
+      const b = pulls.find((p) => p.number === 202)!
+      b.headSha = 'HEAD-202-b'
+      b.commitCount = 7
+      b.mergeBaseSha = 'MB-202-new'
+      b.updatedAt = '2026-03-02T00:00:00.000Z'
+    })
+    await loop.pollOnce()
+
+    // The tick still succeeded: the served list is intact (never threw).
+    const items = loop.listPulls(null).items
+    // #101's compare failed → it carries its PRIOR meta (compareKey unchanged),
+    // and its head still updated because the list row itself refreshed.
+    const after101 = items.find((it) => it.pull.number === 101)!
+    expect(after101.broker.compareKey).toBe('MB-101...HEAD-101-a')
+    // #202 refreshed normally — one bad pull did not abort the others.
+    const after202 = items.find((it) => it.pull.number === 202)!
+    expect(after202.broker.compareKey).toBe('MB-202-new...HEAD-202-b')
+    expect(after202.broker.commitCount).toBe(7)
+  })
+
+  test('M4.1: listPulls before any successful poll is broker_unreachable, never a fabricated empty list', async () => {
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+    const store = openDirectStore({ dataDir })
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: tokenGated(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }), brokerTokenSource()),
+      repo: CONFORMANCE_REPO,
+      store,
+      pullList: loop,
+    })
+    // No pollOnce() yet: the cache is cold.
+    const req = new Request('http://127.0.0.1/api/pulls', { method: 'GET' })
+    const res = await handleDirectApi(req, CONFORMANCE_SESSION, api, 'broker')
+    expect(res!.status).toBe(502)
+    const body = (await res!.json()) as { code: string }
+    expect(body.code).toBe('broker_unreachable')
+    store.close()
+  })
+
+  test('M4.1: direct mode has no poll loop, so GET /api/pulls stays a 501 placeholder', async () => {
+    // The live list is a broker-only capability; direct mode must keep answering
+    // an honest not_implemented for /api/pulls, unchanged by this milestone.
+    const store = openDirectStore({ dataDir })
+    const api = buildBrokerApi(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }), store)
+    const req = new Request('http://127.0.0.1/api/pulls', { method: 'GET' })
+    const res = await handleDirectApi(req, CONFORMANCE_SESSION, api, 'direct')
+    expect(res!.status).toBe(501)
+    const body = (await res!.json()) as { code: string }
+    expect(body.code).toBe('not_implemented')
+    store.close()
+  })
+})
+
+describe('M4.1.4 — broker 304 passthrough to the frontend polling (IN-GATE SIMULATION)', () => {
+  // IN-GATE SIMULATION: this exercises the server's 200-then-304 passthrough
+  // through the router against a fake poll loop. The live frontend chain
+  // (usePullList's etagRef + reconstruction) is already built and unchanged, so
+  // this proves the broker END of the contract, not a live browser round trip.
+  test('a 200 then a conditional 304, and a real change reflected within one interval', async () => {
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+    const store = openDirectStore({ dataDir })
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: tokenGated(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }), brokerTokenSource()),
+      repo: CONFORMANCE_REPO,
+      store,
+      pullList: loop,
+    })
+    await loop.pollOnce()
+
+    // The frontend's first poll: a 200 it caches its items + etag from.
+    const first = await handleDirectApi(
+      new Request('http://127.0.0.1/api/pulls', { method: 'GET' }),
+      CONFORMANCE_SESSION,
+      api,
+      'broker',
+    )
+    expect(first!.status).toBe(200)
+    const etag = first!.headers.get('etag') as string
+    const firstItems = ((await first!.json()) as { items: { pull: { number: number } }[] }).items
+
+    // The frontend's next poll (same etag, upstream idle): a 304 the client
+    // reconstructs into its last-known list — no snapshot sync involved.
+    const idle = await handleDirectApi(
+      new Request('http://127.0.0.1/api/pulls', { method: 'GET', headers: { 'if-none-match': etag } }),
+      CONFORMANCE_SESSION,
+      api,
+      'broker',
+    )
+    expect(idle!.status).toBe(304)
+
+    // An upstream change lands; within one poll interval the next conditional
+    // poll is a 200 carrying the new inbox state — live, no snapshot sync.
+    mutatePulls(state, (pulls) => {
+      pulls.find((p) => p.number === 101)!.unresolvedThreads = 0
+      pulls.find((p) => p.number === 101)!.updatedAt = '2026-02-10T00:00:00.000Z'
+    })
+    await loop.pollOnce()
+    const live = await handleDirectApi(
+      new Request('http://127.0.0.1/api/pulls', { method: 'GET', headers: { 'if-none-match': etag } }),
+      CONFORMANCE_SESSION,
+      api,
+      'broker',
+    )
+    expect(live!.status).toBe(200)
+    const liveBody = (await live!.json()) as {
+      items: { pull: { number: number }; broker: { unresolvedThreads: number } }[]
+    }
+    const pr101 = liveBody.items.find((it) => it.pull.number === 101)!
+    expect(pr101.broker.unresolvedThreads).toBe(0)
+    // The inbox reflects the change without any /sync call.
+    expect(firstItems.find((it) => it.pull.number === 101)).toBeDefined()
+
+    store.close()
+  })
+})
+
+describe('M4.1.5 — idle-polling cost budget (IN-GATE SIMULATION, not live-verified)', () => {
+  // IN-GATE SIMULATION: over N synthetic idle ticks against a fake clock/client,
+  // only the FIRST is a non-304; the rest are free 304s. This is a SIMULATION of
+  // the cost budget — a truly-live idle hour rides a later milestone and is NOT
+  // verified here. The assertion bounds the simulated cost, not a real one.
+  test('N idle ticks cost exactly one non-304 request (the rest are free 304s)', async () => {
+    const state = initialPollState(initialPollPulls())
+    const loop = buildPollLoop(state)
+
+    // 120 ticks ≈ an hour at a 30s cadence, all with no upstream change.
+    const TICKS = 120
+    for (let i = 0; i < TICKS; i++) await loop.pollOnce()
+
+    // Only the first tick spent a 200; every subsequent idle tick was a free 304.
+    expect(state.nonNotModified).toBe(1)
+    // The served list is intact after an hour of idle polling.
+    expect(loop.listPulls(null).items).toHaveLength(2)
   })
 })
