@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/hero.svg" alt="revu — code review for people GitHub can't see" width="100%"/>
+<img src="docs/assets/hero.svg" alt="revu — code review for people GitHub can't see" width="100%"/>
 
 <br/><br/>
 
@@ -31,21 +31,21 @@ every API call authenticates as one shared GitHub App, and github.com is closed 
 <table>
   <tr>
     <td width="50%">
-      <img src="docs/shots/inbox.png" alt="Inbox: sections driven by what needs doing"/>
+      <img src="docs/assets/screenshots/inbox.png" alt="Inbox: sections driven by what needs doing"/>
       <p align="center"><sub><b>Inbox</b> — sections driven by what needs doing today; the unresolved count on your own PRs is the loudest number on screen</sub></p>
     </td>
     <td width="50%">
-      <img src="docs/shots/files.png" alt="Files screen: virtualized diff with inline threads"/>
+      <img src="docs/assets/screenshots/files-thread.png" alt="Files screen: virtualized diff with inline threads"/>
       <p align="center"><sub><b>Files</b> — virtualized, syntax-highlighted diffs with inline threads; the snapshot seal dates everything you're looking at</sub></p>
     </td>
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/shots/author-queue.png" alt="Author mode: walk unresolved threads one at a time"/>
+      <img src="docs/assets/screenshots/author-queue.png" alt="Author mode: walk unresolved threads one at a time"/>
       <p align="center"><sub><b>Author mode</b> — walk unresolved feedback one thread at a time (<code>j</code>/<code>k</code>), with "+N commits since" hints for what might already be fixed</sub></p>
     </td>
     <td width="50%">
-      <img src="docs/shots/reconcile.png" alt="Reconcile: decide what happens to every pending comment after the branch moved"/>
+      <img src="docs/assets/screenshots/reconcile.png" alt="Reconcile: decide what happens to every pending comment after the branch moved"/>
       <p align="center"><sub><b>Reconcile</b> — the branch moved mid-review; every pending comment gets an explicit decision. Nothing is ever silently discarded</sub></p>
     </td>
   </tr>
@@ -79,7 +79,7 @@ rather than smoothed over:
 
 ## Design
 
-<img src="docs/palette.svg" alt="Six hexes carry the whole app" width="100%"/>
+<img src="docs/assets/palette.svg" alt="Six hexes carry the whole app" width="100%"/>
 
 Dark-only, dense, keyboard-first. The diff palette was solved first — teal/rust on
 the blue↔orange axis survives red-green color deficiency, line tints stay under 10%
