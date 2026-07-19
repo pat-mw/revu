@@ -42,6 +42,42 @@ jobs:
       - name: Gate (oxlint + tsc -b + bun test + vite build)
         run: bun run check
 
+  # Runs the RevuApi conformance suite across every transport leg as a matrix.
+  # The two required legs run in-gate here: the in-process mock (A) and revud
+  # serving the mock store over real HTTP (B), held to the same shared
+  # assertions. The two live legs — direct mode vs the scratch repo (C) and
+  # broker mode vs the scratch org (D) — run only when their secret/env is
+  # present; without secrets they log a visible skipped-pending-secrets line and
+  # do not fail the matrix. No repository secrets are wired into this job, so on
+  # a public fork or a secret-less run it is legs A+B green with C+D skipped.
+  conformance-matrix:
+    name: conformance-matrix
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Conformance matrix (mock + revud-mock HTTP required; live legs skipped-pending-secrets)
+        run: bun run conformance:matrix
+
   # Runs the browser-driven end-to-end flow after the gate passes. The app is
   # built in HTTP mode, revud serves it on an ephemeral port, and a headless
   # system Chrome (preinstalled on ubuntu-latest, resolved via

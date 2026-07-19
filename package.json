@@ -12,6 +12,7 @@
     "build:app": "bun run --filter '@revu/app' build",
     "build:e2e": "VITE_REVU_API=/ bun run build:app",
     "revud": "bun run packages/revud/src/index.ts",
+    "conformance:matrix": "bun run scripts/conformance-matrix.ts",
     "dev:e2e": "VITE_REVU_API=/ bun run build:app && bun run packages/revud/src/index.ts",
     "test:e2e": "bun run build:e2e && bun run e2e/happy-path.ts",
     "check": "oxlint --deny-warnings && tsc -b && bun test && bun run --filter '@revu/app' build",
