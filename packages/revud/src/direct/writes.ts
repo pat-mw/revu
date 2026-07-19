@@ -177,6 +177,91 @@ async function reviewCommentsMatch(
 }
 
 /**
+ * The audit endpoint recorded for each inline comment a review creates. A review
+ * submit journals the REVIEW's id under `submitReview` (review id-space), but a
+ * review's inline comments each have their OWN comment id in the comment
+ * id-space — a distinct provenance that carries the comment authorship the
+ * snapshot's `commentAuthors` map is keyed by. Journaling those ids under a
+ * dedicated endpoint (one row per created inline comment) lets author assembly
+ * map each real comment id to its human, and keeps that provenance separate from
+ * the review row so the two id-spaces are never conflated. This value is a
+ * comment-CREATING endpoint: it names ids revu itself minted, not ids it merely
+ * touched (a reaction, a resolve).
+ */
+const SUBMIT_REVIEW_COMMENT_ENDPOINT = 'submitReviewComment'
+
+/**
+ * Read every inline comment id a just-created review carries and journal each
+ * one under `submitReviewComment`, so the author of every comment the review
+ * opened is recoverable from the audit journal (the review row alone journals
+ * only the review id, which lives in a different id-space than the comment ids).
+ *
+ * Reads `GET /pulls/{n}/reviews/{id}/comments` — the same per-review comment
+ * list the idempotency re-check paginates — because the create-review POST
+ * response does not reliably enumerate the inline comments' assigned ids. Each
+ * id is journaled once; a review with no inline comments journals nothing. Runs
+ * only after a confirmed successful submit, so every id it records belongs to a
+ * comment that actually reached GitHub.
+ */
+async function journalReviewComments(
+  deps: WriteDeps,
+  prNumber: number,
+  reviewId: number,
+): Promise<void> {
+  let page = 1
+  for (;;) {
+    const result = await deps.github.getReviewComments(
+      deps.repo.owner,
+      deps.repo.repo,
+      prNumber,
+      reviewId,
+      { page, perPage: 100 },
+    )
+    for (const raw of result.items) {
+      const c = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+      if (typeof c.id === 'number') {
+        deps.writeDecorator.recordWrite(c.id, {
+          endpoint: SUBMIT_REVIEW_COMMENT_ENDPOINT,
+          pr: prNumber,
+        })
+      }
+    }
+    if (!result.hasNext) break
+    page += 1
+  }
+}
+
+/**
+ * Journal a review's inline comment ids as provenance, fully isolated. This runs
+ * only AFTER the review is confirmed on GitHub, so a failure here must never
+ * propagate: turning a landed submit into a user-visible error would keep the
+ * draft and risk a double-post on resubmit (a draft is deleted only on confirmed
+ * success, and a confirmed success is never undone by later bookkeeping). A
+ * read/write hiccup at worst degrades `commentAuthors` to the name-match fallback
+ * for this one review until the next sync. A review that opened no inline
+ * comments has nothing to journal, so the remote read is skipped entirely.
+ */
+async function journalReviewCommentsIsolated(
+  deps: WriteDeps,
+  prNumber: number,
+  reviewId: number,
+  inlineCommentCount: number,
+): Promise<void> {
+  if (inlineCommentCount === 0) return
+  try {
+    await journalReviewComments(deps, prNumber, reviewId)
+  } catch (err) {
+    // Sanitized: a review/PR id and the error's NAME only — never reader- or
+    // token-bearing content.
+    console.warn(
+      `revud: could not journal inline comment ids for review ${reviewId} on ` +
+        `PR ${prNumber} (${err instanceof Error ? err.name : 'unknown error'}); ` +
+        `commentAuthors falls back to name-match for it until the next sync.`,
+    )
+  }
+}
+
+/**
  * Read every page of a PR's reviews and map them onto `ReviewSummary[]`. Used
  * by the idempotency re-check; the page cost is small (a PR has few reviews) and
  * it runs only on the submit path, right before the guard-passing POST.
@@ -294,6 +379,10 @@ export async function submitReview(
         endpoint: 'submitReview',
         pr: input.prNumber,
       })
+      // Journal each inline comment id too (isolated: the review already landed
+      // on the lost first attempt, so a journaling failure must never fail this
+      // retry or block the draft deletion below).
+      await journalReviewCommentsIsolated(deps, input.prNumber, candidate.id, comments.length)
       store.deleteDraft(humanId, input.prNumber)
       return { status: 'ok', review: candidate }
     }
@@ -349,6 +438,10 @@ export async function submitReview(
   // Confirmed success: record the write, then delete the draft. Deleting only
   // here is the whole invariant — nothing above this line touches the draft.
   writeDecorator.recordWrite(review.id, { endpoint: 'submitReview', pr: input.prNumber })
+  // Journal each inline comment id (isolated: the review has already landed, so a
+  // journaling failure must never turn this confirmed submit into a user-visible
+  // failure or block the draft deletion below).
+  await journalReviewCommentsIsolated(deps, input.prNumber, review.id, comments.length)
   store.deleteDraft(humanId, input.prNumber)
   return { status: 'ok', review }
 }

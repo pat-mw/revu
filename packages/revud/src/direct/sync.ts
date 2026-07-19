@@ -249,15 +249,66 @@ async function fetchImmutable(
 }
 
 /**
+ * The audit endpoints that CREATE a comment, and so contribute genuine comment
+ * authorship to `commentAuthors`. A reply creates one comment (`replyToThread`);
+ * a review submit creates one comment per inline comment, each journaled under
+ * `submitReviewComment`. Every other endpoint journals a comment id revu did NOT
+ * create — `submitReview` records the REVIEW id (a different id-space entirely),
+ * `resolveThread`/`addReaction` record the id of a comment revu merely touched —
+ * so they carry no comment authorship and are excluded. Keeping the filter to
+ * the creating endpoints is what stops a reaction or a resolve from claiming
+ * authorship of a comment someone else wrote.
+ */
+const COMMENT_CREATING_ENDPOINTS: ReadonlySet<string> = new Set([
+  'replyToThread',
+  'submitReviewComment',
+])
+
+/**
+ * Assemble `commentAuthors` (GitHub comment id → author `Human.id`) from the
+ * workspace audit journal for one pull request. Reads the WORKSPACE store's own
+ * `listAudit` (the in-request-path journal), never any cross-process host union:
+ * a sync runs in-workspace and answers only for the writes this workspace itself
+ * journaled.
+ *
+ * Only comment-CREATING rows contribute: a reply's own comment id and each inline
+ * review comment's id map to the human who authored them. A row that merely
+ * touched a comment (a reaction, a thread resolve) or that records the review id
+ * (`submitReview`, a different id-space) is skipped, so a touch can never be read
+ * as authorship. When the same comment id appears more than once (a landed-review
+ * retry re-journals every comment), the LAST row wins — insertion order is
+ * oldest→newest, so the most recent attribution stands, which for a single human
+ * is a no-op and for a corrected re-journal is the intended value.
+ */
+function assembleCommentAuthors(
+  store: DirectStore,
+  prNumber: number,
+): Record<number, string> {
+  const authors: Record<number, string> = {}
+  for (const row of store.listAudit({ pr: prNumber })) {
+    if (COMMENT_CREATING_ENDPOINTS.has(row.endpoint)) {
+      authors[row.githubId] = row.humanId
+    }
+  }
+  return authors
+}
+
+/**
  * Fetch the mutable half: pull detail (with the derived merge base folded in),
  * issue comments, reviews, check runs for the head commit, and the review
  * threads. Threads are the one field sourced from GraphQL rather than REST; they
  * are refetched every sync (a thread can resolve with no head movement) and the
  * GraphQL calls they cost are folded into the same request counter.
+ *
+ * `commentAuthors` is assembled from the workspace audit journal (comment-
+ * creating rows only) and folded in when non-empty. In direct mode the journal
+ * is empty (the passthrough decorator records nothing), so the map is empty and
+ * the field is omitted, exactly as before; broker mode's journal populates it.
  */
 async function fetchMutable(
   github: GithubClient,
   repo: RepoRef,
+  store: DirectStore,
   prNumber: number,
   detailRaw: unknown,
   mergeBaseSha: string,
@@ -297,9 +348,15 @@ async function fetchMutable(
   // Threads come from the GraphQL `reviewThreads` connection, normalized to the
   // REST `ReviewThread`/`ReviewComment` shape. Each GraphQL page is counted in
   // the shared request counter, so `syncStats.requests` reflects the mutable-half
-  // GraphQL cost honestly. `commentAuthors` is broker-only (there is no write log
-  // in direct mode), so it is deliberately absent.
+  // GraphQL cost honestly.
   const threads = await fetchReviewThreads(github, repo, prNumber, counter)
+
+  // `commentAuthors` rides the mutable half: comment id → author `Human.id`,
+  // assembled from the workspace audit journal's comment-creating rows. It is
+  // empty under a passthrough (direct) decorator that journals nothing, so the
+  // field is omitted there — the wire shape is byte-identical to before — and
+  // populated only when broker writes have journaled comment authorship.
+  const commentAuthors = assembleCommentAuthors(store, prNumber)
 
   return {
     fetchedAt: syncedAt,
@@ -308,6 +365,7 @@ async function fetchMutable(
     issueComments,
     reviews,
     checks,
+    ...(Object.keys(commentAuthors).length > 0 ? { commentAuthors } : {}),
   }
 }
 
@@ -397,6 +455,7 @@ export async function syncPull(deps: SyncDeps, prNumber: number): Promise<SyncRe
   const mutable = await fetchMutable(
     github,
     repo,
+    store,
     prNumber,
     detailRaw,
     mergeBaseSha,

@@ -30,18 +30,26 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AnchorResult, Session } from '@revu/shared'
+import type {
+  AnchorResult,
+  GhUser,
+  Session,
+  SubmitReviewInput,
+} from '@revu/shared'
 import {
   blobContentToLines,
   classifyPendingComment,
+  isOwnComment,
+  prefixBody,
   selectAnchorBlobSha,
 } from '@revu/shared'
 import { AwaitingCredentialError, createFileCredentialTokenSource } from '../broker/token-source'
-import type { GithubClient } from './github-client'
+import type { GithubClient, Page, PageParams, SubmitReviewBody } from './github-client'
 import type { TokenSource } from './token-source'
 import { createDirectApi, type DirectApi } from './direct-api'
 import { handleDirectApi } from '../direct-router'
 import { openDirectStore, type DirectStore } from './store'
+import { createBrokerWriteDecorator } from './write-decorator'
 import {
   CONFORMANCE_REPO,
   CONFORMANCE_SESSION,
@@ -361,6 +369,194 @@ describe('broker awaiting-credential → broker_unreachable (502)', () => {
     expect(body.code).toBe('broker_unreachable')
     // No token material ever crosses the HTTP boundary.
     expect(body.message).not.toContain(FAKE_TOKEN)
+
+    store.close()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// commentAuthors ground truth — broker-authored comments detected as OWN
+// (additive block; keeps its own fixtures so it merges without touching the
+// scenarios above)
+// ————————————————————————————————————————————————————————————————
+
+/** The bot login the write-enabled broker posts every comment as. */
+const AUTHORS_BOT_LOGIN = 'revu-authors[bot]'
+/** Deterministic timestamp injected into the broker decorator's audit rows. */
+const AUTHORS_NOW = '2026-07-18T12:00:00.000Z'
+
+/**
+ * A write-enabled broker session: the session self-identifies as the bot for the
+ * write guards (`viewerLogin` = bot) AND routes the prefix parser through the bot
+ * (`brokerLogin` = bot). The human is a real contractor whose lowercased email is
+ * the audit/journal key — never rendered into a body.
+ */
+const AUTHORS_SESSION: Session = {
+  human: { id: 'dana@contractor.co', name: 'Dana Ortiz', role: 'contractor', email: 'dana@contractor.co' },
+  brokerLogin: AUTHORS_BOT_LOGIN,
+  workspace: 'direct-o-r',
+  viewerLogin: AUTHORS_BOT_LOGIN,
+}
+
+/** One page carrying `items` on page 1, empty thereafter. */
+function authorsPage<T>(items: T[], params: PageParams): Page<T> {
+  return params.page === 1 ? { items, hasNext: false } : { items: [], hasNext: false }
+}
+
+/** The bot user object every broker-authored comment carries. */
+function botUser(): GhUser {
+  return {
+    login: AUTHORS_BOT_LOGIN,
+    id: 99,
+    node_id: 'BOT',
+    avatar_url: '',
+    html_url: '',
+    type: 'Bot',
+  }
+}
+
+/**
+ * A read+write fake for the `commentAuthors` scenario: the base-moved read
+ * surface (so a sync produces a real snapshot) composed with a submit path that
+ * accepts one review, attributes it and its inline comments to the bot, and
+ * re-serves the created inline comments by review id — exactly what
+ * `journalReviewComments` reads to journal each comment's authorship.
+ */
+function authorsWriteRemote(state: {
+  mergeBaseSha: string
+  reviewComments: Record<string, unknown>[]
+}): GithubClient {
+  const base = movingBaseClient({ mergeBaseSha: state.mergeBaseSha, unresolvedComments: 0 })
+  let nextReviewId = 600
+  return {
+    ...base,
+    async getPullReviews(_o, _r, _n, params): Promise<Page<unknown>> {
+      // No prior reviews exist, so the idempotency re-check finds no candidate
+      // and the submit posts fresh.
+      return authorsPage([], params)
+    },
+    async submitReview(_o, _r, _n, body: SubmitReviewBody): Promise<unknown> {
+      const id = nextReviewId++
+      // Each inline comment gets a bot-authored id in the comment id-space; the
+      // POST response body itself is the review only, matching real GitHub.
+      state.reviewComments = body.comments.map((c, i) => ({
+        id: 9100 + i,
+        path: c.path,
+        side: c.side,
+        original_line: c.line,
+        original_start_line: c.start_line ?? null,
+        body: c.body,
+        user: botUser(),
+      }))
+      return {
+        id,
+        node_id: `PRR_${id}`,
+        user: botUser(),
+        body: body.body,
+        state: 'COMMENTED',
+        submitted_at: AUTHORS_NOW,
+        commit_id: body.commit_id,
+      }
+    },
+    async getReviewComments(_o, _r, _n, _reviewId, params): Promise<Page<unknown>> {
+      // The per-review comment list the submit path reads to journal each
+      // created inline comment's id.
+      return authorsPage(state.reviewComments, params)
+    },
+  }
+}
+
+describe('commentAuthors ground truth (broker-authored comment detected as OWN)', () => {
+  test('a mediated inline review comment is journaled, rides the synced snapshot, and resolves as the session human OWN via commentAuthors', async () => {
+    const store = openDirectStore({ dataDir })
+    const state = { mergeBaseSha: 'MB1', reviewComments: [] as Record<string, unknown>[] }
+    const api = createDirectApi({
+      session: AUTHORS_SESSION,
+      github: tokenGated(authorsWriteRemote(state), brokerTokenSource()),
+      repo: CONFORMANCE_REPO,
+      store,
+      // The broker decorator stamps every body and journals every confirmed
+      // write to the workspace audit log — the ground truth commentAuthors reads.
+      writeDecorator: createBrokerWriteDecorator(AUTHORS_SESSION, store, () => AUTHORS_NOW),
+    })
+
+    // A cold sync establishes the snapshot and the head the submit guards against.
+    const first = await api.syncPull(MOVING_BASE_PR)
+    // No writes yet → no authorship journaled → the field is omitted (not empty).
+    expect(first.mutable.commentAuthors).toBeUndefined()
+
+    const input: SubmitReviewInput = {
+      prNumber: MOVING_BASE_PR,
+      expectedHeadSha: first.immutable.headSha,
+      event: 'COMMENT',
+      body: 'Overall solid; one nit inline.',
+      comments: [
+        {
+          key: 'k1',
+          path: 'a.ts',
+          side: 'RIGHT',
+          start_side: null,
+          line: 1,
+          start_line: null,
+          body: 'Use a Map here instead of an object.',
+          createdAt: AUTHORS_NOW,
+          updatedAt: AUTHORS_NOW,
+          anchor: { lineText: 'x', contextBefore: [], contextAfter: [] },
+        },
+      ],
+    }
+    const result = await api.submitReview(input)
+    expect(result.status).toBe('ok')
+
+    // The submit journaled the review id AND each inline comment id: the
+    // comment-creating row (submitReviewComment) is what commentAuthors consumes.
+    const commentRows = store.listAudit({ pr: MOVING_BASE_PR }).filter(
+      (r) => r.endpoint === 'submitReviewComment',
+    )
+    expect(commentRows).toHaveLength(1)
+    const createdCommentId = commentRows[0].githubId
+    expect(commentRows[0].humanId).toBe(AUTHORS_SESSION.human.id)
+
+    // A re-sync now carries commentAuthors, mapping the real GitHub comment id to
+    // the human id — the M1.3 id-path assembled from the journal end to end.
+    const second = await api.syncPull(MOVING_BASE_PR)
+    const authors = second.mutable.commentAuthors
+    expect(authors).toBeDefined()
+    expect(authors![createdCommentId]).toBe(AUTHORS_SESSION.human.id)
+
+    // The verify scenario, isolated so commentAuthors ground truth is what WINS
+    // (not a coincidental name-match): the bot-authored comment smuggles a
+    // DIFFERENT human's name into its body than the journal recorded, so name
+    // matching alone would give the WRONG answer for both humans. The write log
+    // overrides it in both directions.
+    const otherHuman = { id: 'eve@contractor.co', name: 'Eve Lin', role: 'contractor' as const, email: 'eve@contractor.co' }
+    const brokerComment = {
+      id: createdCommentId,
+      user: botUser(),
+      // Stamped with Eve's name, but the journal attributes this comment id to Dana.
+      body: prefixBody(otherHuman, 'Use a Map here instead of an object.'),
+    }
+    // Dana IS the author per the write log, even though the body names Eve.
+    expect(
+      isOwnComment(brokerComment, {
+        human: AUTHORS_SESSION.human,
+        commentAuthors: authors,
+        botLogin: AUTHORS_SESSION.brokerLogin,
+        viewerLogin: AUTHORS_SESSION.viewerLogin,
+      }),
+    ).toBe(true)
+
+    // Eve is NOT the author per the write log, even though the body names Eve —
+    // the log wins over the (misleading) name-match and keys on the stable id, so
+    // it distinguishes the humans behind the one shared bot login.
+    expect(
+      isOwnComment(brokerComment, {
+        human: otherHuman,
+        commentAuthors: authors,
+        botLogin: AUTHORS_SESSION.brokerLogin,
+        viewerLogin: AUTHORS_SESSION.viewerLogin,
+      }),
+    ).toBe(false)
 
     store.close()
   })
