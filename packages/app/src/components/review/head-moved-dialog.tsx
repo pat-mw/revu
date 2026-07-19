@@ -14,7 +14,7 @@ import { useToast } from '@/components/ui/toast'
 import { shortSha } from '@/lib/time'
 import { useReconcile } from '@/state/drafts'
 import { useSyncPull } from '@/state/queries'
-import { describeApiError } from './error-copy'
+import { describeApiError, HEAD_MOVED_TITLE } from './error-copy'
 
 export interface HeadMovedDialogProps {
   prNumber: number
@@ -80,7 +80,7 @@ export function HeadMovedDialog({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>The branch moved while you were reviewing</DialogTitle>
+          <DialogTitle>{HEAD_MOVED_TITLE}</DialogTitle>
           <DialogDescription>
             {newCommits} new {newCommits === 1 ? 'commit' : 'commits'} landed since your
             snapshot (<span className="font-mono text-xs">{shortSha(draftHeadSha)}</span> →{' '}
