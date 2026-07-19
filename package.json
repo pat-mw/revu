@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "workspaces": ["packages/*"],
+  "workspaces": ["packages/*", "!packages/docs"],
   "scripts": {
     "dev": "bun run --filter '@revu/app' dev",
     "lint": "oxlint --deny-warnings",
@@ -16,7 +16,9 @@
     "dev:e2e": "VITE_REVU_API=/ bun run build:app && bun run packages/revud/src/index.ts",
     "test:e2e": "bun run build:e2e && bun run e2e/happy-path.ts",
     "check": "oxlint --deny-warnings && tsc -b && bun test && bun run --filter '@revu/app' build",
-    "preview": "bun run --filter '@revu/app' preview"
+    "preview": "bun run --filter '@revu/app' preview",
+    "docs:dev": "cd packages/docs && bun install && bun run dev",
+    "docs:build": "cd packages/docs && bun install && bun run build"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",

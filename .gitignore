@@ -15,6 +15,12 @@ dist
 dist-ssr
 *.local
 
+# Next.js build output (the @revu/docs Fumadocs app)
+.next/
+out/
+# fumadocs-mdx generated content index
+.source/
+
 # revud on-disk broker document (durable localStorage backend)
 .revud/
 

@@ -1,0 +1,54 @@
+name: docs
+
+# Builds the standalone Fumadocs site (packages/docs). This workflow is
+# intentionally separate from the required `check` gate and is NOT a required
+# status check: the docs app uses React 19 / Next and its own nested install,
+# so it must never gate the React 18 app's `check`, `conformance-matrix`, or
+# `e2e` jobs. Runs only when docs sources change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "packages/docs/**"
+      - ".github/workflows/docs.yml"
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs-build:
+    name: docs-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-docs-${{ runner.os }}-${{ hashFiles('packages/docs/bun.lock') }}
+          restore-keys: |
+            bun-docs-${{ runner.os }}-
+
+      - name: Install docs dependencies (nested, isolated from root)
+        working-directory: packages/docs
+        run: bun install --frozen-lockfile
+
+      - name: Build docs
+        working-directory: packages/docs
+        run: bun run build

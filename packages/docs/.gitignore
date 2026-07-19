@@ -1,0 +1,17 @@
+# deps (docs keeps its own nested install, isolated from the root workspace)
+/node_modules
+
+# fumadocs-mdx generated content index
+.source
+
+# next build output
+/.next/
+/out/
+/build
+*.tsbuildinfo
+next-env.d.ts
+
+# misc
+.DS_Store
+.env*.local
+.vercel
