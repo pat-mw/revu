@@ -7,16 +7,19 @@
  *   out: { id, lines } on success | { id, error } on any failure
  *
  * The highlighter core is created once with the pure-JavaScript regex engine
- * (no WASM fetch) and the `revu-dark` theme. Languages are loaded lazily: each
- * distinct `lang` is dynamically imported and registered on first use, then
- * reused. Any failure — unknown language, grammar error, tokenizer throw — is
- * reported as `{ id, error }`; the main thread renders that request as plain
- * text. Highlighting is best-effort and must never take the app down with it.
+ * (no WASM fetch) and both app themes (`revu-dark`, `revu-light`); each request
+ * names the theme to tokenize under, so a scheme switch re-highlights against
+ * the light or dark syntax palette without recreating the worker. Languages are
+ * loaded lazily: each distinct `lang` is dynamically imported and registered on
+ * first use, then reused. Any failure — unknown language, grammar error,
+ * tokenizer throw — is reported as `{ id, error }`; the main thread renders that
+ * request as plain text. Highlighting is best-effort and must never take the app
+ * down with it.
  */
 
 import { createHighlighterCore, type HighlighterCore } from 'shiki/core'
 import { createJavaScriptRegexEngine } from 'shiki/engine/javascript'
-import { revuDarkTheme } from './theme'
+import { revuDarkTheme, revuLightTheme, type HighlightTheme } from './theme'
 
 /** One highlighted token: its text and (when the theme assigns one) a hex color. */
 interface CodeToken {
@@ -29,6 +32,8 @@ interface HighlightRequest {
   id: number
   lang: string
   content: string
+  /** Which app color scheme to tokenize under; defaults to dark if absent. */
+  theme?: HighlightTheme
 }
 
 /** Successful response: one token array per line of the input. */
@@ -73,7 +78,7 @@ let highlighterPromise: Promise<HighlighterCore> | null = null
 function getHighlighter(): Promise<HighlighterCore> {
   if (!highlighterPromise) {
     highlighterPromise = createHighlighterCore({
-      themes: [revuDarkTheme],
+      themes: [revuDarkTheme, revuLightTheme],
       langs: [],
       engine: createJavaScriptRegexEngine(),
     })
@@ -92,17 +97,22 @@ async function ensureLanguage(highlighter: HighlighterCore, lang: string): Promi
 }
 
 /**
- * Tokenize `content` as `lang` under `revu-dark`, flattening Shiki's themed
- * tokens to plain `{ content, color }`. The concatenation of `content` across a
- * line's tokens is byte-for-byte identical to that source line, which the diff
- * viewer relies on to slice tokens by character offset for word-level overlays.
+ * Tokenize `content` as `lang` under the requested app theme, flattening Shiki's
+ * themed tokens to plain `{ content, color }`. The concatenation of `content`
+ * across a line's tokens is byte-for-byte identical to that source line, which
+ * the diff viewer relies on to slice tokens by character offset for word-level
+ * overlays.
  */
-async function tokenize(lang: string, content: string): Promise<CodeToken[][]> {
+async function tokenize(
+  lang: string,
+  content: string,
+  theme: HighlightTheme,
+): Promise<CodeToken[][]> {
   const highlighter = await getHighlighter()
   await ensureLanguage(highlighter, lang)
   const themed = highlighter.codeToTokensBase(content, {
     lang,
-    theme: 'revu-dark',
+    theme,
   })
   return themed.map((line) =>
     line.map((token) =>
@@ -112,8 +122,8 @@ async function tokenize(lang: string, content: string): Promise<CodeToken[][]> {
 }
 
 self.addEventListener('message', (event: MessageEvent<HighlightRequest>) => {
-  const { id, lang, content } = event.data
-  tokenize(lang, content).then(
+  const { id, lang, content, theme } = event.data
+  tokenize(lang, content, theme ?? 'revu-dark').then(
     (lines) => {
       const message: HighlightSuccess = { id, lines }
       ;(self as unknown as Worker).postMessage(message)

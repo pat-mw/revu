@@ -18,17 +18,17 @@
 /*
  * revu docs theme — the product palette, ported onto Fumadocs design tokens.
  *
- * The six named hexes below are the app's real tokens (canvas/ink/add/del/
- * draft/stale plus muted greys and borders); they are the single source of
- * truth and are not re-decided here. Violet is the app's thesis color — the one
- * loud move, reserved for pending/draft state — so it becomes the docs primary.
- * Teal and gold are diff/seal accents and map onto success/warning.
+ * The named hexes below are the app's real tokens (canvas/ink/add/del/draft/
+ * stale plus muted greys and borders) in BOTH schemes; they are the single
+ * source of truth and are not re-decided here. Violet is the app's thesis color
+ * — the one loud move, reserved for pending/draft state — so it becomes the docs
+ * primary. Teal and gold are diff/seal accents and map onto success/warning.
  *
- * The app is dark-only and dense. These docs are dark-first: the dark values
- * are a faithful port of the app; the light values are a genuine light variant
- * on the same warm-neutral, low-chroma axis (canvas warms toward paper, the
- * accents hold their hue) so the site stays on-brand if a reader forces light.
- * The theme toggle is disabled in the provider, so dark is what ships.
+ * Both schemes ship and match the app in each: dark is the default (the
+ * product's heritage), and the toggle flips to the app's real light palette. The
+ * scheme is chosen by the class next-themes writes on <html> — `.dark` or
+ * `.light` — the same polarity switch the app uses, so toggling flips BOTH the
+ * background and the foreground together (never one without the other).
  */
 
 @theme {
@@ -45,7 +45,7 @@
   --radius-sm: 4px;
 }
 
-/* ————— Dark (the faithful port; this is what ships) ————— */
+/* ————— Dark (the app's heritage scheme; the default) ————— */
 .dark {
   --color-fd-background: #151613; /* app canvas */
   --color-fd-foreground: #d9d7cd; /* app ink */
@@ -87,50 +87,59 @@
   --color-fd-diff-add-symbol: #4cc8a8;
 
   --color-fd-overlay: rgba(0, 0, 0, 0.45);
+
+  color-scheme: dark;
 }
 
-/* ————— Light (a faithful warm-neutral variant on the same axis) —————
-   Scoped so it never applies to a `.dark` root: `:root` and `.dark` share
-   specificity, so without this guard source order alone would decide the
-   winner on `<html class="dark">`. The site ships dark; this is the fallback. */
-:root:not(.dark) {
-  --color-fd-background: #f4f3ee; /* warm paper, the canvas' inverse */
-  --color-fd-foreground: #22241f; /* raised, as near-black ink */
+/* ————— Light (a faithful port of the app's real .light palette) —————
+   next-themes writes `class="light"` on <html> when the toggle flips, mirroring
+   the class the app itself uses; scoping to `.light` (the app's own selector,
+   not a `:not(.dark)` guard) is what makes toggling flip BOTH background and
+   foreground together. Every hex is the app's exact light token. */
+.light {
+  --color-fd-background: #f4f2ea; /* app canvas (warm paper, not white) */
+  --color-fd-foreground: #26261f; /* app ink */
 
-  --color-fd-muted: #eae8e0;
-  --color-fd-muted-foreground: #6b6a61; /* app ink-faint */
+  --color-fd-muted: #eceadf; /* app panel */
+  --color-fd-muted-foreground: #5f5e54; /* app ink-mut */
 
-  --color-fd-popover: #fbfaf6;
-  --color-fd-popover-foreground: #22241f;
+  --color-fd-popover: #e3e0d3; /* app raised */
+  --color-fd-popover-foreground: #26261f; /* app ink */
 
-  --color-fd-card: #edece5;
-  --color-fd-card-foreground: #22241f;
+  --color-fd-card: #eceadf; /* app panel */
+  --color-fd-card-foreground: #26261f; /* app ink */
 
-  --color-fd-border: #d7d5c9;
+  --color-fd-border: #d9d5c6; /* app line (hairline) */
 
-  --color-fd-primary: #6a4fe0; /* draft-violet, darkened for contrast on paper */
-  --color-fd-primary-foreground: #f4f3ee;
+  --color-fd-primary: #6741cf; /* app draft-violet — the thesis accent */
+  --color-fd-primary-foreground: #f4f2ea; /* app canvas */
 
-  --color-fd-secondary: #e5e3da;
-  --color-fd-secondary-foreground: #22241f;
+  --color-fd-secondary: #e3e0d3; /* app raised */
+  --color-fd-secondary-foreground: #26261f; /* app ink */
 
-  --color-fd-accent: #e0ded4;
-  --color-fd-accent-foreground: #22241f;
+  --color-fd-accent: #dcd8c9; /* app overlay */
+  --color-fd-accent-foreground: #26261f; /* app ink */
 
-  --color-fd-ring: #6b6a61;
+  --color-fd-ring: #3a3a32; /* app ring (neutral ink, never semantic) */
 
-  --color-fd-success: #2f9c80; /* teal, deepened for paper */
-  --color-fd-warning: #a8862f; /* gold, deepened for paper */
-  --color-fd-error: #c9463f;
-  --color-fd-info: #6a4fe0;
-  --color-fd-idea: #a8862f;
+  /* Callout / semantic accents — the app's light diff + seal hues. */
+  --color-fd-success: #0f7d63; /* app add-teal */
+  --color-fd-warning: #8a6d10; /* app stale-gold */
+  --color-fd-error: #c22b26; /* app danger */
+  --color-fd-info: #6741cf; /* app draft-violet */
+  --color-fd-idea: #8a6d10; /* app stale-gold */
 
-  --color-fd-diff-remove: rgba(229, 136, 94, 0.14);
-  --color-fd-diff-remove-symbol: #b25a30;
-  --color-fd-diff-add: rgba(76, 200, 168, 0.14);
-  --color-fd-diff-add-symbol: #2f9c80;
+  /* Code diff blocks — the app's light-tuned line tints (lifted alpha so a wash
+     over paper still reads while syntax highlighting survives on top). */
+  --color-fd-diff-remove: rgba(182, 74, 23, 0.1);
+  --color-fd-diff-remove-symbol: #b64a17;
+  --color-fd-diff-add: rgba(15, 125, 99, 0.1);
+  --color-fd-diff-add-symbol: #0f7d63;
 
-  --color-fd-overlay: rgba(0, 0, 0, 0.2);
+  /* On light the overlay is a warm-brown wash, not flat black — on-palette. */
+  --color-fd-overlay: rgba(43, 40, 30, 0.42);
+
+  color-scheme: light;
 }
 
 html {

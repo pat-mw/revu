@@ -1,13 +1,25 @@
 @import "tailwindcss";
 
 /*
- * revu token system — dark-only by decision (see DESIGN.md).
- * Six named hexes carry the whole app:
- *   canvas #151613 · ink #D9D7CD · add #4CC8A8 · del #E5885E · draft #A48FFF · stale #D9B44A
+ * revu token system — two schemes, dark by heritage (see DESIGN.md).
+ * Six named hexes carry the whole app in each scheme:
+ *   dark  canvas #151613 · ink #D9D7CD · add #4CC8A8 · del #E5885E · draft #A48FFF · stale #D9B44A
+ *   light canvas #F4F2EA · ink #26261F · add #0F7D63 · del #B64A17 · draft #6741CF · stale #8A6D10
  * Violet is spent exclusively on draft/pending state (work GitHub cannot see).
  * Diff line tints stay ≤ 10% alpha so syntax highlighting survives on top;
- * word-level emphasis steps to ~26–28% alpha. Color is never the only channel:
+ * word-level emphasis steps to ~24–26% alpha. Color is never the only channel:
  * gutters always carry +/− glyphs, staleness always carries a glyph + text.
+ *
+ * The scheme is chosen by a `.light` class on <html> (dark is the absence of the
+ * class). The `@theme` block below holds the dark values as the default so all
+ * `bg-canvas` / `text-add` / … utilities resolve without a class; `.light`
+ * re-binds the same custom properties to the light palette. Nothing hardcodes a
+ * hex outside this file — swapping the class swaps the whole app.
+ *
+ * The light palette re-derives, not tweaks: teal/rust darken to stay on the
+ * blue↔orange axis with legible contrast on a warm-neutral (not white) canvas;
+ * every diff/draft/stale tint alpha is re-tuned because a dark-tuned rgba over a
+ * light base washes out to nothing. Body ink clears ~13:1 on the light canvas.
  */
 
 @theme {
@@ -59,7 +71,66 @@
   --stale-tint: rgba(217, 180, 74, 0.12);
   --resolved-tint: rgba(150, 148, 138, 0.07);
 
+  /* Text selection wash and the stale-seal border edge — both draft/stale hues
+     at an alpha the scheme owns, so they follow light/dark like every tint. */
+  --selection-bg: rgba(164, 143, 255, 0.3);
+  --stale-edge: rgba(217, 180, 74, 0.45);
+
+  /* Modal scrim behind dialogs — a deep wash of the dark canvas. */
+  --scrim: rgba(0, 0, 0, 0.55);
+
   color-scheme: dark;
+}
+
+/*
+ * Light scheme. Warm-neutral canvas (#F4F2EA, not pure white) that echoes the
+ * warm dark; surfaces step DARKER than the canvas (dark stepped lighter), so the
+ * same panel/raised/overlay/hairline hierarchy reads with the light polarity.
+ * add/del stay teal/rust on the blue↔orange axis, darkened for ≥4.4:1 on the
+ * canvas so the +/− glyphs and word-diff fills read; draft-violet and stale-gold
+ * stay distinct and legible. Diff-line-tint alphas are lifted (0.10 vs 0.09) and
+ * word/gutter/draft/stale/resolved re-tuned so each reads as an intentional wash
+ * over light rather than disappearing — every value still ≤ ~12% for line washes
+ * and ≤ ~24% for word emphasis, keeping syntax highlighting the top layer.
+ */
+.light {
+  --color-canvas: #f4f2ea;
+  --color-panel: #eceadf;
+  --color-raised: #e3e0d3;
+  --color-overlay: #dcd8c9;
+  --color-line: #d9d5c6;
+  --color-line-strong: #c9c4b2;
+
+  --color-ink: #26261f;
+  --color-ink-mut: #5f5e54;
+  --color-ink-faint: #84837a;
+
+  --color-add: #0f7d63;
+  --color-del: #b64a17;
+  --color-draft: #6741cf;
+  --color-stale: #8a6d10;
+  --color-danger: #c22b26;
+  --color-ring: #3a3a32;
+
+  --diff-add-bg: rgba(15, 125, 99, 0.1);
+  --diff-add-word-bg: rgba(15, 125, 99, 0.24);
+  --diff-add-gutter: rgba(15, 125, 99, 0.18);
+  --diff-del-bg: rgba(182, 74, 23, 0.1);
+  --diff-del-word-bg: rgba(182, 74, 23, 0.22);
+  --diff-del-gutter: rgba(182, 74, 23, 0.18);
+  --diff-hunk-bg: #e9e6da;
+  --draft-tint: rgba(103, 65, 207, 0.1);
+  --draft-tint-strong: rgba(103, 65, 207, 0.2);
+  --stale-tint: rgba(138, 109, 16, 0.14);
+  --resolved-tint: rgba(95, 94, 84, 0.08);
+
+  --selection-bg: rgba(103, 65, 207, 0.22);
+  --stale-edge: rgba(138, 109, 16, 0.55);
+
+  /* On light the scrim is a warm-brown wash, not flat black — softer, on-palette. */
+  --scrim: rgba(43, 40, 30, 0.42);
+
+  color-scheme: light;
 }
 
 html,
@@ -88,10 +159,10 @@ samp {
 }
 
 ::selection {
-  background: rgba(164, 143, 255, 0.3);
+  background: var(--selection-bg);
 }
 
-/* Dense dark scrollbars */
+/* Dense scrollbars — thumb + track follow the active scheme's tokens. */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--color-line-strong) transparent;
@@ -144,7 +215,7 @@ samp {
   @apply inline-flex items-center gap-1.5 rounded-(--radius-sm) border border-line bg-panel px-2 py-0.5 font-mono text-2xs text-ink-mut;
 }
 .seal[data-stale="true"] {
-  border-color: rgba(217, 180, 74, 0.45);
+  border-color: var(--stale-edge);
   background: var(--stale-tint);
   color: var(--color-stale);
 }

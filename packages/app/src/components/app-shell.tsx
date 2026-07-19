@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
-import { Check, ChevronDown } from 'lucide-react'
+import { Check, ChevronDown, Moon, Sun } from 'lucide-react'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,7 +23,8 @@ import { useRateLimit } from '@/state/queries'
 import { useCurrentHuman, useSession } from '@/state/session'
 import { devControls } from '@/api/dev'
 import { useHumans } from '@/state/dev-humans'
-import { useSequenceShortcut } from '@/lib/keyboard'
+import { useTheme } from '@/state/theme'
+import { useSequenceShortcut, useShortcut } from '@/lib/keyboard'
 import { minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 
@@ -78,7 +79,15 @@ function RateChip() {
  * panel plus a quiet, non-interactive workspace line: the app reviews through
  * one GitHub App identity, and that fact is always visible here.
  */
-function IdentityMenu({ onOpenDevPanel }: { onOpenDevPanel: () => void }) {
+function IdentityMenu({
+  onOpenDevPanel,
+  theme,
+  onToggleTheme,
+}: {
+  onOpenDevPanel: () => void
+  theme: 'dark' | 'light'
+  onToggleTheme: () => void
+}) {
   const human = useCurrentHuman()
   const session = useSession()
   const humans = useHumans()
@@ -128,6 +137,26 @@ function IdentityMenu({ onOpenDevPanel }: { onOpenDevPanel: () => void }) {
           )
         })}
         <DropdownMenuSeparator />
+        <DropdownMenuItem
+          // Keep the menu open on toggle so the scheme switch is visible in place.
+          onSelect={(e) => {
+            e.preventDefault()
+            onToggleTheme()
+          }}
+          className="gap-2"
+        >
+          {theme === 'dark' ? (
+            <Sun size={14} strokeWidth={1.5} aria-hidden />
+          ) : (
+            <Moon size={14} strokeWidth={1.5} aria-hidden />
+          )}
+          <span className="flex-1">
+            {theme === 'dark' ? 'Light theme' : 'Dark theme'}
+          </span>
+          <span className="text-2xs text-ink-faint">
+            {theme === 'dark' ? 'Dark' : 'Light'}
+          </span>
+        </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenDevPanel}>Dev panel…</DropdownMenuItem>
         <DropdownMenuSeparator />
         <div className="px-2 py-1 font-mono text-2xs leading-snug text-ink-faint">
@@ -157,6 +186,13 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [sheetOpen, setSheetOpen] = useState(false)
   const [devOpen, setDevOpen] = useState(false)
 
+  // Color scheme is applied to <html> and the highlighter from the stored
+  // preference here, once, at the top of the shell — the menu below only reads it.
+  const { theme, setTheme } = useTheme()
+  const toggleTheme = useCallback(() => {
+    setTheme(theme === 'dark' ? 'light' : 'dark')
+  }, [theme, setTheme])
+
   const openSheet = useCallback(() => setSheetOpen(true), [])
   const openDevPanel = useCallback(() => setDevOpen(true), [])
 
@@ -171,6 +207,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     const n = matchPrNumber(location.pathname)
     if (n !== null) navigate(`/pr/${n}/conversation`)
   })
+
+  // Toggle the color scheme from anywhere; documented in the '?' sheet catalog.
+  useShortcut('mod+shift+l', toggleTheme)
 
   return (
     <div className="flex h-screen flex-col bg-canvas">
@@ -203,7 +242,11 @@ export function AppShell({ children }: { children: ReactNode }) {
               ?
             </span>
           </Button>
-          <IdentityMenu onOpenDevPanel={openDevPanel} />
+          <IdentityMenu
+            onOpenDevPanel={openDevPanel}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+          />
         </div>
       </header>
 

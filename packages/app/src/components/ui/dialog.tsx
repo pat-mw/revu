@@ -21,7 +21,7 @@ export const DialogOverlay = forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
-    className={cn('fixed inset-0 z-50 bg-[rgba(0,0,0,0.55)]', className)}
+    className={cn('fixed inset-0 z-50 bg-(--scrim)', className)}
     {...props}
   />
 ))

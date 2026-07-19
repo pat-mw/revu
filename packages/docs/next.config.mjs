@@ -12,6 +12,19 @@ const config = {
   turbopack: {
     root: import.meta.dirname,
   },
+  // The site is documentation-only; the root is a doorway, not a landing page,
+  // so it forwards straight to the docs tree. Temporary (307/308) rather than
+  // permanent so the mapping is not cached by browsers if the site later grows
+  // a real home.
+  async redirects() {
+    return [
+      {
+        source: "/",
+        destination: "/docs",
+        permanent: false,
+      },
+    ];
+  },
 };
 
 export default withMDX(config);

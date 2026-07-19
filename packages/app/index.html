@@ -5,6 +5,26 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>revu</title>
+    <script>
+      /*
+       * No-flash color scheme. Runs before the app's first paint and adds the
+       * `light` class to <html> only when the human's cached choice is light —
+       * dark is the default (the app's heritage) and needs no class. The value
+       * is the same key the app writes on every theme change; the broker copy is
+       * authoritative and reconciles the cache once the app loads. `prefers-
+       * color-scheme` is deliberately NOT consulted: a first-time visitor lands
+       * on dark on purpose.
+       */
+      (function () {
+        try {
+          if (localStorage.getItem('revu.theme') === 'light') {
+            document.documentElement.classList.add('light')
+          }
+        } catch (_) {
+          /* storage blocked — fall through to the dark default */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

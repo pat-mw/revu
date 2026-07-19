@@ -436,16 +436,19 @@ export type FileViewedState = Record<
  * Per-human workspace preferences — broker-side settings that are not scoped to
  * any one PR and must survive a page reload and a workspace rebuild (they are
  * invisible to GitHub, keyed by the human). `diffMode` is the diff layout the
- * Files tab opens in. New preference fields append here; the setter merges a
- * partial patch so a caller changing one field never overwrites the others.
+ * Files tab opens in; `theme` is the color scheme (dark is the app's heritage
+ * default). New preference fields append here; the setter merges a partial
+ * patch so a caller changing one field never overwrites the others.
  */
 export interface HumanPreferences {
   diffMode: 'unified' | 'split'
+  theme: 'dark' | 'light'
 }
 
 /** Defaults applied when a human has no stored preferences yet. */
 export const DEFAULT_PREFERENCES: HumanPreferences = {
   diffMode: 'unified',
+  theme: 'dark',
 }
 
 // ————————————————————————————————————————————————————————————————

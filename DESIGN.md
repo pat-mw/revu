@@ -92,6 +92,84 @@ mean color is redundant, never load-bearing. Add/del never appear outside diff s
 so the two "brand" colors the user actually learns are violet (= your unsent work) and
 gold (= time moved under you) — which is the app's whole thesis in two hues.
 
+## Two schemes — dark by heritage, light re-derived (not tinted)
+
+The palette above is the **dark** scheme, and dark stays the default: a first-time visitor
+lands on dark on purpose, and only an explicit choice moves them. But dark is no longer the
+*only* scheme. A **light** scheme ships alongside it, chosen by a `.light` class on `<html>`
+(dark is the absence of the class), so the same `bg-canvas` / `text-add` / `--diff-*`
+utilities resolve against whichever palette is active. Nothing hardcodes a hex outside the
+global stylesheet — swapping the class swaps the whole app, and the syntax highlighter
+carries a matching light theme so code and diffs stay legible on light.
+
+The light scheme is a **re-derivation, not a tint of the dark values**. A dark-tuned rgba
+laid over a light base washes out to nothing, and teal/rust light enough to glow on
+near-black are too pale to read on a light canvas — so every value is re-anchored while the
+*principles* are held exactly: add/del stay teal/rust on the blue↔orange axis (colorblind-
+safe), line tints stay low-alpha so syntax highlighting is the top layer, word emphasis
+steps alpha and never hue, violet stays reserved for draft/pending, gold stays staleness,
+and color is never the only channel (the `+`/`−` glyphs and the stale glyph+text remain).
+
+Choices specific to light:
+
+- **Warm-neutral canvas, not white.** `#F4F2EA` echoes the warm dark rather than a clinical
+  white. Surfaces step **darker** than the canvas (in dark they step lighter), so the
+  panel → raised → overlay → hairline hierarchy reads with the light polarity.
+- **Teal/rust darkened onto the canvas.** add `#0F7D63` and del `#B64A17` are deep enough to
+  carry the gutter glyphs and word-diff fills against light while staying on their hue axis.
+- **Diff-line alphas lifted, word/gutter/draft/stale re-tuned.** Line washes rise to ~10%
+  (from 9% on dark) and every derived tint is re-tuned so each reads as an intentional wash
+  over light instead of disappearing — still ≤ ~12% for line washes and ≤ ~24% for word
+  emphasis, keeping highlighting the loudest hue on the line.
+- **Draft-violet and stale-gold darkened, still distinct.** draft `#6741CF` and stale
+  `#8A6D10` hold their exclusive meanings and stay legible and separable on light.
+- **Contrast.** Body ink `#26261F` clears ~13:1 on the light canvas (well past the ~7:1 bar);
+  muted/faint inks stay above their AA thresholds.
+
+Full light token set (the source of truth is the global stylesheet's `.light` block; this
+table mirrors it):
+
+| Token | Dark | Light |
+| --- | --- | --- |
+| `--color-canvas` | `#151613` | `#F4F2EA` |
+| `--color-panel` | `#1B1D19` | `#ECEADF` |
+| `--color-raised` | `#22241F` | `#E3E0D3` |
+| `--color-overlay` | `#282B25` | `#DCD8C9` |
+| `--color-line` | `#2E312B` | `#D9D5C6` |
+| `--color-line-strong` | `#3C4038` | `#C9C4B2` |
+| `--color-ink` | `#D9D7CD` | `#26261F` |
+| `--color-ink-mut` | `#96948A` | `#5F5E54` |
+| `--color-ink-faint` | `#6B6A61` | `#84837A` |
+| `--color-add` | `#4CC8A8` | `#0F7D63` |
+| `--color-del` | `#E5885E` | `#B64A17` |
+| `--color-draft` | `#A48FFF` | `#6741CF` |
+| `--color-stale` | `#D9B44A` | `#8A6D10` |
+| `--color-danger` | `#E5645E` | `#C22B26` |
+| `--color-ring` | `#DAD8CE` | `#3A3A32` |
+| `--diff-add-bg` | `rgba(76,200,168,.09)` | `rgba(15,125,99,.10)` |
+| `--diff-add-word-bg` | `rgba(76,200,168,.26)` | `rgba(15,125,99,.24)` |
+| `--diff-add-gutter` | `rgba(76,200,168,.14)` | `rgba(15,125,99,.18)` |
+| `--diff-del-bg` | `rgba(229,136,94,.09)` | `rgba(182,74,23,.10)` |
+| `--diff-del-word-bg` | `rgba(229,136,94,.24)` | `rgba(182,74,23,.22)` |
+| `--diff-del-gutter` | `rgba(229,136,94,.14)` | `rgba(182,74,23,.18)` |
+| `--diff-hunk-bg` | `#1E211C` | `#E9E6DA` |
+| `--draft-tint` | `rgba(164,143,255,.12)` | `rgba(103,65,207,.10)` |
+| `--draft-tint-strong` | `rgba(164,143,255,.24)` | `rgba(103,65,207,.20)` |
+| `--stale-tint` | `rgba(217,180,74,.12)` | `rgba(138,109,16,.14)` |
+| `--resolved-tint` | `rgba(150,148,138,.07)` | `rgba(95,94,84,.08)` |
+| `--selection-bg` | `rgba(164,143,255,.30)` | `rgba(103,65,207,.22)` |
+| `--stale-edge` | `rgba(217,180,74,.45)` | `rgba(138,109,16,.55)` |
+| `--scrim` | `rgba(0,0,0,.55)` | `rgba(43,40,30,.42)` |
+
+The syntax theme is co-designed per scheme: a light role palette (near-black warm fg,
+desaturated slate-blue keywords, darkened-teal types/tags, warm-sand strings/attributes,
+muted-rust numbers) that clears ~4.5:1 on the light canvas while still ceding the loudest
+hue on any diff line to the teal/rust line tint. The scheme choice is a per-human
+preference (broker-side, alongside the diff layout), applied to `<html>` before first paint
+by a tiny inline boot script reading a local cache of that choice — so there is no dark
+flash on load. `prefers-color-scheme` is deliberately not consulted on first visit: dark is
+the heritage default, honored until the human chooses otherwise.
+
 ## The one risk
 
 Reserving the only saturated accent for **invisible state** (the draft) instead of brand
