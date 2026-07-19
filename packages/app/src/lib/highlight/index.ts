@@ -14,13 +14,19 @@
  *   - Highlighting never breaks the app. No worker, an unhighlightable path, a
  *     grammar error, or a tokenizer throw all resolve to `null` (plain text),
  *     with at most one `console.warn` per session.
- *   - Results are cached across unmounts, keyed by content hash + language, so
- *     revisiting a file is instant. The cache is bounded (least-recently-used
- *     eviction) to keep memory flat over a long review.
+ *   - Results are cached across unmounts, keyed by content hash + language +
+ *     active theme, so revisiting a file is instant and the light/dark token
+ *     sets never collide. The cache is bounded (least-recently-used eviction)
+ *     to keep memory flat over a long review.
+ *   - Switching the app color scheme re-tokenizes visible files against the
+ *     matching syntax theme: `setHighlightTheme` records the new scheme and
+ *     bumps a generation counter the hook depends on, so every mounted
+ *     `useFileTokens` re-requests (from cache when warm) under the new theme.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { languageForPath } from './languages'
+import type { HighlightTheme } from './theme'
 
 /** One highlighted token: its text and, when the theme colors it, a hex string. */
 export interface CodeToken {
@@ -33,6 +39,53 @@ interface HighlightRequest {
   id: number
   lang: string
   content: string
+  theme: HighlightTheme
+}
+
+// ————————————————————————————————————————————————————————————————
+// Active syntax theme — mirrors the app color scheme.
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The scheme the diff viewer highlights under. Initialized from the `<html>`
+ * class the no-flash boot script applied, so first-paint tokens already match
+ * the scheme; `setHighlightTheme` moves it when the user toggles.
+ */
+function initialTheme(): HighlightTheme {
+  if (typeof document === 'undefined') return 'revu-dark'
+  return document.documentElement.classList.contains('light') ? 'revu-light' : 'revu-dark'
+}
+
+let activeTheme: HighlightTheme = initialTheme()
+
+/**
+ * A version counter that changes whenever the active theme changes. `useFileTokens`
+ * subscribes to it so a scheme switch forces every mounted hook to re-request
+ * tokens under the new theme (served from cache once warm).
+ */
+let themeGeneration = 0
+const themeListeners = new Set<() => void>()
+
+function subscribeTheme(listener: () => void): () => void {
+  themeListeners.add(listener)
+  return () => themeListeners.delete(listener)
+}
+
+function getThemeGeneration(): number {
+  return themeGeneration
+}
+
+/**
+ * Point syntax highlighting at a color scheme. No-op if unchanged; otherwise it
+ * bumps the generation so mounted diff views re-tokenize under the new theme.
+ * Call this from wherever the theme preference is applied to `<html>`.
+ */
+export function setHighlightTheme(theme: 'dark' | 'light'): void {
+  const next: HighlightTheme = theme === 'light' ? 'revu-light' : 'revu-dark'
+  if (next === activeTheme) return
+  activeTheme = next
+  themeGeneration += 1
+  for (const listener of themeListeners) listener()
 }
 
 /** Response from the worker: tokens on success, an error string on failure. */
@@ -56,9 +109,9 @@ function djb2(input: string): string {
   return (hash >>> 0).toString(16)
 }
 
-/** Cache key for a (content, language) pair. */
-function cacheKey(lang: string, content: string): string {
-  return `${lang}:${djb2(content)}`
+/** Cache key for a (theme, language, content) triple. */
+function cacheKey(theme: HighlightTheme, lang: string, content: string): string {
+  return `${theme}:${lang}:${djb2(content)}`
 }
 
 // ————————————————————————————————————————————————————————————————
@@ -178,11 +231,15 @@ function handleWorkerError(event: ErrorEvent): void {
  * or `null` if the worker is unavailable. Errors surface through the worker's
  * message/error handlers as `null`.
  */
-function requestTokens(lang: string, content: string): Promise<CodeToken[][] | null> {
+function requestTokens(
+  theme: HighlightTheme,
+  lang: string,
+  content: string,
+): Promise<CodeToken[][] | null> {
   const active = getWorker()
   if (!active) return Promise.resolve(null)
   const id = nextRequestId++
-  const request: HighlightRequest = { id, lang, content }
+  const request: HighlightRequest = { id, lang, content, theme }
   return new Promise<CodeToken[][] | null>((resolve) => {
     pending.set(id, resolve)
     try {
@@ -209,13 +266,18 @@ export { languageForPath } from './languages'
  * those cases. On success returns one `CodeToken[]` per line whose concatenated
  * `content` equals that line exactly.
  *
- * Kicks the worker at most once per (path-language, content) pair and caches the
- * result module-side, so the same file re-renders synchronously from cache after
- * a remount. State updates after unmount are dropped.
+ * Kicks the worker at most once per (theme, path-language, content) triple and
+ * caches the result module-side, so the same file re-renders synchronously from
+ * cache after a remount or a scheme switch back. State updates after unmount are
+ * dropped. Switching the app color scheme re-runs this effect (via the theme
+ * generation) so the diff re-highlights under the light or dark syntax palette.
  */
 export function useFileTokens(path: string, content: string | null): CodeToken[][] | null {
+  // Re-render this hook whenever the active syntax theme changes.
+  useSyncExternalStore(subscribeTheme, getThemeGeneration, getThemeGeneration)
+
   const lang = content === null ? null : languageForPath(path)
-  const key = lang === null || content === null ? null : cacheKey(lang, content)
+  const key = lang === null || content === null ? null : cacheKey(activeTheme, lang, content)
   const cached = key === null ? null : (cacheGet(key) ?? null)
 
   const [tokens, setTokens] = useState<CodeToken[][] | null>(cached)
@@ -235,8 +297,9 @@ export function useFileTokens(path: string, content: string | null): CodeToken[]
     // Nothing cached yet: show plain text until the worker replies.
     setTokens(null)
 
+    const theme = activeTheme
     let active = true
-    requestTokens(lang, content).then((lines) => {
+    requestTokens(theme, lang, content).then((lines) => {
       if (lines !== null) cacheSet(key, lines)
       if (active) setTokens(lines)
     })

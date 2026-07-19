@@ -195,7 +195,7 @@ describe('a record key literally named __proto__ survives vRecord', () => {
 
 describe('human preferences validators', () => {
   test('a full preferences body round-trips losslessly', () => {
-    const prefs: HumanPreferences = { diffMode: 'split' }
+    const prefs: HumanPreferences = { diffMode: 'split', theme: 'light' }
     const wire = JSON.parse(JSON.stringify(prefs))
     expect(validateHumanPreferences(wire)).toStrictEqual(wire)
   })

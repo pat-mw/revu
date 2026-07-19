@@ -573,6 +573,7 @@ export const vFileViewedState: Validator<FileViewedState> = vRecord(
 
 export const vHumanPreferences: Validator<HumanPreferences> = vObject({
   diffMode: vLiteral('unified', 'split'),
+  theme: vLiteral('dark', 'light'),
 })
 
 // Submit & reconcile
@@ -718,7 +719,10 @@ export const validateSetViewedBody: Validator<{
  * field that IS present must satisfy its type.
  */
 export const validateSetPreferencesBody: Validator<Partial<HumanPreferences>> =
-  vObject({ diffMode: vOptional(vLiteral('unified', 'split')) })
+  vObject({
+    diffMode: vOptional(vLiteral('unified', 'split')),
+    theme: vOptional(vLiteral('dark', 'light')),
+  })
 
 // Error envelope validator
 

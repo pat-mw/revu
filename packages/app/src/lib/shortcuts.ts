@@ -24,6 +24,7 @@ export const SHORTCUT_CATALOG: ShortcutDef[] = [
   { id: 'go-files', keys: ['g', 'f'], label: 'Go to files', group: 'Global' },
   { id: 'go-conversation', keys: ['g', 'c'], label: 'Go to conversation', group: 'Global' },
   { id: 'resync', keys: 'shift+r', label: 'Re-sync snapshot', group: 'Global' },
+  { id: 'toggle-theme', keys: 'mod+shift+l', label: 'Toggle light / dark theme', group: 'Global' },
 
   // ——— Navigation ———
   { id: 'next-file', keys: 'j', label: 'Next file', group: 'Navigation' },
