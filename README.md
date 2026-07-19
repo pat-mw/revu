@@ -53,6 +53,13 @@ local store, and reconciles instead of failing when the branch moves under you.
 
 <br/>
 
+<div align="center">
+<img src="docs/assets/gifs/reconcile.gif" alt="The reconcile flow: submitting a review against a moved head opens the branch-moved dialog; Re-sync & reconcile classifies every pending comment as anchors-cleanly or drifted, and nothing is discarded without a decision" width="80%"/>
+<p><sub><b>Reconcile</b> — the branch moved mid-review; submit routes through an explicit decision for every pending comment instead of throwing the draft away</sub></p>
+</div>
+
+<br/>
+
 ## What it is
 
 **revu** is a keyboard-first, offline-first pull-request review client you run yourself.

@@ -21,6 +21,8 @@ and a seeded draft.
    those lines.
 4. Move on. The draft saves automatically — there is no separate "save" step.
 
+![Focusing a diff line, pressing c, typing an inline comment, and watching it land as a violet pending draft marked "only visible to you"](/assets/gifs/inline-comment.gif)
+
 ![An inline review thread open against a diff line, with a suggestion block and Reply / Resolve actions, and the draft review bar pinned at the bottom showing one pending comment](/assets/screenshots/files-thread.png)
 
 ## Reply to an existing thread
@@ -50,6 +52,12 @@ Write a suggestion the way you would on GitHub — a fenced block tagged
 refillPerSecond: z.number().positive().max(1_000).default(10),
 ```
 ````
+
+The composer has a **suggestion** affordance that seeds the fenced block with the
+line you are commenting on, so you edit a copy of the real code rather than
+retyping it:
+
+![Opening the composer on a diff line, using the suggestion affordance to seed a fenced suggestion block from the focused line, editing the replacement, and adding it to the draft as a pending suggested change](/assets/gifs/suggestion-block.gif)
 
 ## Drafts save as you type — the honest caveat
 
