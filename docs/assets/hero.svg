@@ -18,7 +18,7 @@
 
   <!-- tagline -->
   <text x="80" y="162" class="sans" font-size="21" fill="#96948A">Code review for people GitHub can’t see.</text>
-  <text x="80" y="192" class="mono" font-size="13.5" fill="#6B6A61">every contractor is one shared App · drafts live on the broker · a PR is a snapshot</text>
+  <text x="80" y="192" class="mono" font-size="13.5" fill="#6B6A61">a PR is a snapshot · the draft is local and survives · reconcile, never discard</text>
 
   <!-- the snapshot seal, in its stale state — the signature element -->
   <g>
@@ -65,6 +65,6 @@
 
   <!-- bottom strip -->
   <line x1="80" y1="320" x2="1120" y2="320" stroke="#2E312B"/>
-  <text x="80" y="342" class="mono" font-size="12" fill="#6B6A61">design prototype · mock data only · Bun + Vite + React 18</text>
+  <text x="80" y="342" class="mono" font-size="12" fill="#6B6A61">local-first review · direct + mock modes · Bun + Vite + React 18</text>
   <text x="1120" y="342" text-anchor="end" class="mono" font-size="12" fill="#6B6A61">⌘K · j/k · c · ?</text>
 </svg>
