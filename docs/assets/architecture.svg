@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="arch-title arch-desc">
+  <title id="arch-title">revu architecture — one API contract, one daemon, three injected mode strategies around a shared core</title>
+  <desc id="arch-desc">The React app talks only to the RevuApi contract. In-browser it binds the mock; over HTTP it reaches the revud daemon. Inside revud, one shared core (sync engine, snapshot store, draft store, re-anchor) is wrapped by an injected TokenSource and WriteDecorator. Three mode strategy pairs plug in: mock (in-browser oracle), direct (your own token, writes as you), and broker (host-injected short-lived token, writes stamped as the shared bot).</desc>
+  <defs>
+    <style>
+      .mono { font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace; }
+      .sans { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+    </style>
+  </defs>
+
+  <!-- Self-contained background: renders identically on GitHub light AND dark. -->
+  <rect width="1200" height="720" rx="14" fill="#151613"/>
+  <rect x="0.5" y="0.5" width="1199" height="719" rx="13.5" fill="none" stroke="#2E312B"/>
+
+  <!-- ——— header ——— -->
+  <text x="48" y="52" class="sans" font-size="20" font-weight="700" fill="#D9D7CD">Architecture</text>
+  <circle cx="197" cy="45" r="4.5" fill="#A48FFF"/>
+  <text x="48" y="76" class="mono" font-size="13" fill="#6B6A61">one contract · one daemon · three injected mode strategies around a shared core</text>
+
+  <!-- ——— Layer 1: the React app ——— -->
+  <g>
+    <rect x="48" y="104" width="1104" height="66" rx="10" fill="#1B1D19" stroke="#2E312B"/>
+    <text x="72" y="134" class="sans" font-size="15" font-weight="600" fill="#D9D7CD">revu app</text>
+    <text x="72" y="155" class="sans" font-size="12.5" fill="#96948A">Vite · React 18 · TanStack Query/Virtual — inbox, virtualized diff, threads, reconcile, draft rail</text>
+    <text x="1128" y="142" text-anchor="end" class="mono" font-size="12" fill="#6B6A61">packages/app</text>
+  </g>
+
+  <!-- arrow app → contract -->
+  <g stroke="#3C4038" stroke-width="1.5">
+    <line x1="600" y1="170" x2="600" y2="196"/>
+  </g>
+  <path d="M600 202 l-5 -8 h10 z" fill="#3C4038"/>
+  <text x="612" y="190" class="mono" font-size="11.5" fill="#6B6A61">reads &amp; writes through one interface</text>
+
+  <!-- ——— Layer 2: the RevuApi contract ——— -->
+  <g>
+    <rect x="48" y="202" width="1104" height="62" rx="10" fill="#1B1D19" stroke="#A48FFF" stroke-opacity="0.5"/>
+    <rect x="48" y="202" width="4" height="62" rx="2" fill="#A48FFF"/>
+    <text x="72" y="230" class="mono" font-size="15" font-weight="500" fill="#D9D7CD">RevuApi</text>
+    <text x="72" y="250" class="sans" font-size="12.5" fill="#96948A">the transport contract — the only boundary the app knows; every mode is one implementation of it</text>
+    <text x="1128" y="238" text-anchor="end" class="mono" font-size="12" fill="#6B6A61">packages/shared</text>
+  </g>
+
+  <!-- fork: in-browser mock (left) vs HTTP to daemon (right) -->
+  <g stroke="#3C4038" stroke-width="1.5" fill="none">
+    <path d="M600 264 v18 M600 282 h-352 M600 282 h352 M248 282 v20 M952 282 v20"/>
+  </g>
+  <path d="M248 308 l-5 -8 h10 z" fill="#3C4038"/>
+  <path d="M952 308 l-5 -8 h10 z" fill="#3C4038"/>
+  <text x="248" y="300" text-anchor="middle" class="mono" font-size="11.5" fill="#6B6A61">?mock=1 · in-browser</text>
+  <text x="952" y="300" text-anchor="middle" class="mono" font-size="11.5" fill="#6B6A61">HTTP · loopback only</text>
+
+  <!-- left leaf: the mock oracle (no daemon) -->
+  <g>
+    <rect x="48" y="310" width="360" height="76" rx="10" fill="#1B1D19" stroke="#2E312B"/>
+    <text x="72" y="338" class="sans" font-size="14" font-weight="600" fill="#4CC8A8">mock</text>
+    <text x="72" y="359" class="sans" font-size="12" fill="#96948A">the permanent oracle &amp; the demo mode — pure,</text>
+    <text x="72" y="375" class="sans" font-size="12" fill="#96948A">HTTP-free, fixtures shaped exactly like GitHub</text>
+  </g>
+
+  <!-- right: the revud daemon holding the shared core + strategy slots -->
+  <g>
+    <rect x="432" y="310" width="720" height="330" rx="12" fill="#191B17" stroke="#2E312B"/>
+    <text x="456" y="340" class="sans" font-size="15" font-weight="700" fill="#D9D7CD">revud</text>
+    <text x="512" y="340" class="sans" font-size="12.5" fill="#96948A">the local daemon — binds loopback, serves the contract over HTTP</text>
+    <text x="1128" y="340" text-anchor="end" class="mono" font-size="12" fill="#6B6A61">packages/revud</text>
+
+    <!-- injected TokenSource (top wrap) -->
+    <g>
+      <rect x="456" y="356" width="672" height="40" rx="8" fill="#1B1D19" stroke="#D9B44A" stroke-opacity="0.45"/>
+      <text x="476" y="381" class="mono" font-size="13" fill="#D9B44A">TokenSource</text>
+      <text x="600" y="381" class="sans" font-size="12" fill="#96948A">injected credential — where the GitHub token comes from, custody-scoped</text>
+    </g>
+
+    <!-- the ONE shared core -->
+    <g>
+      <rect x="456" y="404" width="672" height="118" rx="8" fill="#22241F" stroke="#3C4038"/>
+      <text x="476" y="428" class="sans" font-size="13" font-weight="600" fill="#D9D7CD">shared core</text>
+      <text x="576" y="428" class="sans" font-size="11.5" fill="#6B6A61">one engine — the mode never forks it</text>
+      <!-- four core cells -->
+      <g class="mono" font-size="12">
+        <rect x="476" y="440" width="150" height="64" rx="6" fill="#1B1D19" stroke="#2E312B"/>
+        <text x="491" y="470" fill="#D9D7CD">sync engine</text>
+        <text x="491" y="490" class="sans" font-size="10.5" fill="#6B6A61">one burst, then local</text>
+
+        <rect x="638" y="440" width="150" height="64" rx="6" fill="#1B1D19" stroke="#2E312B"/>
+        <text x="653" y="470" fill="#D9D7CD">snapshot store</text>
+        <text x="653" y="490" class="sans" font-size="10.5" fill="#6B6A61">content-addressed</text>
+
+        <rect x="800" y="440" width="150" height="64" rx="6" fill="#1B1D19" stroke="#2E312B"/>
+        <text x="815" y="470" fill="#D9D7CD">draft store</text>
+        <text x="815" y="490" class="sans" font-size="10.5" fill="#6B6A61">per-human, durable</text>
+
+        <rect x="962" y="440" width="150" height="64" rx="6" fill="#1B1D19" stroke="#2E312B"/>
+        <text x="977" y="470" fill="#D9D7CD">re-anchor</text>
+        <text x="977" y="490" class="sans" font-size="10.5" fill="#6B6A61">clean/drift/lost</text>
+      </g>
+    </g>
+
+    <!-- injected WriteDecorator (bottom wrap) -->
+    <g>
+      <rect x="456" y="530" width="672" height="40" rx="8" fill="#1B1D19" stroke="#A48FFF" stroke-opacity="0.45"/>
+      <text x="476" y="555" class="mono" font-size="13" fill="#A48FFF">WriteDecorator</text>
+      <text x="600" y="555" class="sans" font-size="12" fill="#96948A">injected write path — stamps &amp; journals identity on the way out (or passes through)</text>
+    </g>
+
+    <!-- the two host-backed strategy pairs plug into the slots -->
+    <g>
+      <rect x="456" y="582" width="326" height="44" rx="8" fill="#1B1D19" stroke="#2E312B"/>
+      <rect x="456" y="582" width="4" height="44" rx="2" fill="#4CC8A8"/>
+      <text x="476" y="602" class="sans" font-size="13" font-weight="600" fill="#4CC8A8">direct</text>
+      <text x="476" y="619" class="sans" font-size="11" fill="#96948A">your own token · writes land as you</text>
+    </g>
+    <g>
+      <rect x="802" y="582" width="326" height="44" rx="8" fill="#1B1D19" stroke="#2E312B"/>
+      <rect x="802" y="582" width="4" height="44" rx="2" fill="#A48FFF"/>
+      <text x="822" y="602" class="sans" font-size="13" font-weight="600" fill="#A48FFF">broker</text>
+      <text x="822" y="619" class="sans" font-size="11" fill="#96948A">host-injected short-lived token · writes stamped as the shared bot</text>
+    </g>
+
+    <!-- slot connectors: strategies feed the injected wraps -->
+    <g stroke="#3C4038" stroke-width="1.3" stroke-dasharray="3 3" fill="none">
+      <path d="M540 582 v-12"/>
+      <path d="M900 582 v-12"/>
+    </g>
+  </g>
+
+  <!-- footer key -->
+  <line x1="48" y1="668" x2="1152" y2="668" stroke="#2E312B"/>
+  <g class="sans" font-size="11.5">
+    <circle cx="56" cy="692" r="4" fill="#A48FFF"/>
+    <text x="68" y="696" fill="#6B6A61">draft / identity — the work GitHub can't see yet</text>
+    <circle cx="392" cy="692" r="4" fill="#4CC8A8"/>
+    <text x="404" y="696" fill="#6B6A61">writes land as you</text>
+    <circle cx="596" cy="692" r="4" fill="#D9B44A"/>
+    <text x="608" y="696" fill="#6B6A61">injected credential custody</text>
+    <text x="1152" y="696" text-anchor="end" class="mono" fill="#6B6A61">a new transport is a sibling of mock</text>
+  </g>
+</svg>

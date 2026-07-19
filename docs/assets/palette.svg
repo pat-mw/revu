@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="150" viewBox="0 0 1200 150" role="img" aria-label="revu palette — six hexes carry the whole app">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="150" viewBox="0 0 1200 150" role="img" aria-labelledby="palette-title palette-desc">
+  <title id="palette-title">revu palette — six hexes carry the whole app</title>
+  <desc id="palette-desc">Six swatches: canvas warm near-black #151613, ink text #D9D7CD, add teal #4CC8A8 (diff only), del rust #E5885E (diff only), draft violet #A48FFF (your unsent work), and stale brass #D9B44A (time moved).</desc>
   <defs>
     <style>
       .mono { font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace; }
