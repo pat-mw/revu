@@ -258,10 +258,12 @@ bun run scripts/seed-scratch.ts
 bun run scripts/seed-scratch.ts --repo owner/name --workspace /path/to/clone
 ```
 
-A hard guard refuses to run against any repository whose name is not on the
-built-in allowlist of intended scratch targets (names containing `sandbox`,
-`scratch`, or `fixture`) and not in the explicit allow set. This prevents the
-script from mutating a real repository by accident.
+A hard guard refuses to run unless the target satisfies **both** conditions: it
+is on the built-in allow set of intended scratch repositories, **and** its name
+contains one of the markers `sandbox`, `scratch`, or `fixture`. Adding a new
+scratch target therefore means both listing it in the allow set and giving it a
+marked name. This prevents the script from mutating a real repository by
+accident.
 
 Requires an authenticated `gh` CLI with `repo` scope. The script shells out to
 `gh` and `git`; it never handles a token itself.

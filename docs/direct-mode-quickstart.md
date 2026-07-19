@@ -78,7 +78,10 @@ Source: `packages/revud/src/index.ts` — `resolveRepoOverride`;
 ## Authentication
 
 The daemon needs a GitHub token with `repo` scope (or the fine-grained
-equivalent: Contents read, Pull requests read/write, Metadata read).
+equivalent: Contents read, Pull requests read/write, Metadata read). The review
+daemon itself never pushes commits or refs, so it needs only **Contents: read**;
+the fixture seeder (`scripts/seed-scratch.ts`) force-pushes branches and so needs
+**Contents: write** — see `docs/direct-mode-auth.md` for the seeder's scopes.
 
 Token resolution order (source: `packages/revud/src/direct/token-source.ts`):
 

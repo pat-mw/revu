@@ -7,10 +7,15 @@ bun install
 bun run check      # lint → typecheck → bun test → app build
 ```
 
-`bun run check` is the gate. It must pass before any change is ready. All four
-steps run in order; a failure in an earlier step stops the pipeline.
+`bun run check` is the local gate. It must pass before any change is ready. All
+four steps run in order; a failure in an earlier step stops the pipeline.
 
-Source: `package.json` — `scripts.check`.
+CI runs `bun run check` plus two further jobs that are not part of `check`: the
+cross-transport conformance matrix (`bun run conformance:matrix`) and the
+browser end-to-end flow (`bun run test:e2e`). A green local `check` is
+necessary but not sufficient — a pull request must pass all three.
+
+Source: `package.json` — `scripts.check`; `.github/workflows/ci.yml`.
 
 ## Test discipline
 
