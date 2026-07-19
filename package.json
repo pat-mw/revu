@@ -22,8 +22,11 @@
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
+    "@types/upng-js": "^2.1.5",
+    "gifenc": "^1.0.3",
     "oxlint": "^1.71.0",
     "playwright-core": "^1.61.1",
-    "typescript": "~6.0.2"
+    "typescript": "~6.0.2",
+    "upng-js": "^2.1.0"
   }
 }

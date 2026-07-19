@@ -35,6 +35,13 @@ durable store rather than `localStorage`, closing the tab, restarting the daemon
 back tomorrow all recover the exact draft you left. The UI treats that persistence as quietly
 load-bearing — you are meant to trust it enough to stop thinking about it.
 
+Keyed to the human means **isolated** between humans: one person's pending draft
+is not another's. Switching the active identity swaps the whole review rail —
+the pending comment that belonged to the first human simply is not there for the
+second.
+
+![Switching the active human from the dev panel: the violet review rail carrying one human's pending draft is replaced by an empty rail for the next human, proving drafts are per-human](/assets/gifs/draft-isolation.gif)
+
 ## Deleted only on confirmed submit success
 
 The invariant that makes all of this safe: **a draft is deleted from disk only on confirmed
