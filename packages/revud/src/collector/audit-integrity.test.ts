@@ -311,9 +311,13 @@ describe('KNOWN LIMIT (surfaced for triage): journal forgery can self-launder a 
   // artifact. The forgery is bounded: re-keying forces the forged row under the
   // forger's OWN binding, so the write stays attributed to them — what is lost
   // is the mediated-vs-out-of-band distinction (e.g. an unstamped bot comment
-  // dodging the detector), never cross-human attribution. A candidate
-  // mitigation is cross-checking absolved artifacts for the mediated author
-  // stamp their bodies must carry.
+  // dodging the detector), never cross-human attribution. Cross-checking an
+  // absolved artifact for the mediated author-stamp its body would carry is NOT
+  // a fix: that stamp is a public, deterministic prefix composed inside the
+  // sudo-controlled workspace, so prepending it to an out-of-band body costs the
+  // attacker exactly what forging the journal row costs (and it would misflag a
+  // legitimately empty-bodied mediated review). It could only ever be a
+  // lazy-bypass heuristic, never a boundary.
   test.skipIf(true)('a forged submitReview row absolves the same workspace out-of-band bot review', () => {
     const botLogin = 'revu-app[bot]'
     // On GitHub: one bot-authored review the contractor posted with a raw curl.

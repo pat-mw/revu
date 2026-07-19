@@ -58,7 +58,7 @@ const ERRNO_MNEMONIC = /^[A-Z][A-Z0-9_]{0,31}$/
 const STUB_INDEX_HTML = '<!doctype html><html><body><div id="root"></div></body></html>'
 
 function makeStubDist(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'revu-custody-dist-'))
+  const dir = tmpDir('revu-custody-dist-')
   writeFileSync(join(dir, 'index.html'), STUB_INDEX_HTML, 'utf8')
   return dir
 }

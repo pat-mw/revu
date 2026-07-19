@@ -37,7 +37,8 @@ workspace.
 The audit journal is **append-only**: the only statements that ever touch
 `audit_log` are create, insert, and select (`direct/store.ts:appendAudit`,
 `collector/host-store.ts:landAudit`); no update or delete path exists on either
-store surface, and offboarding purges a departing human's drafts and viewed
+store's code surface — the guarantee is the reviewed code, not a database-level
+constraint — and offboarding purges a departing human's drafts and viewed
 state while retaining every journal row
 (`collector/offboard.ts:offboardHuman`).
 
@@ -79,11 +80,18 @@ The injected token carries `pull_requests: write`. A contractor with sudo in
 their workspace can read that token and `curl` the GitHub App directly —
 posting, approving, or editing as the bot while **bypassing revu entirely**.
 revu cannot prevent this and does not claim to. The compensating control is
-**detection**: the host collector reconciles every bot-authored review and
-comment on GitHub against the merged all-humans journal union and flags every
-artifact the journal cannot account for
+**detection**: the host collector reconciles bot-authored reviews and comments
+on GitHub against the merged all-humans journal union and flags any artifact the
+journal cannot account for
 (`broker/out-of-band-writes.ts:detectOutOfBandWrites`,
-`collector/collector.ts:runCollectorTick`).
+`collector/collector.ts:runCollectorTick`). Two limits keep that claim honest.
+Coverage is per reconcile pass, over the pull requests a pass is handed — those
+with pulled journal activity, plus whatever complete open-PR set the operator
+feeds it; a bypass on a pull request a pass never examines is not checked, so
+completeness is an operator-wiring obligation the code cannot itself enforce.
+And in this codebase the reconcile is a library, not yet a running loop: no
+scheduler or pull source drives `runCollectorTick` outside its tests. Detection
+here is a designed control awaiting deployment wiring, not one already operating.
 
 What a hostile workspace **can** do:
 
@@ -93,14 +101,19 @@ What a hostile workspace **can** do:
   is exactly why audit identity derives host-side from the channel-authentic
   `coder.owner`, never from workspace claims;
 - forge rows in its own local journal. Re-keying forces a forged row under the
-  forger's **own** binding, so the write stays attributed to them — but a
-  forged `submitReview` row naming a directly-posted bot artifact currently
-  absolves it from out-of-band detection (a known, surfaced limitation: the
-  detector's absolving evidence is workspace-produced; see the skipped
-  demonstration in `collector/audit-integrity.test.ts`). Detection also has
-  enumerated residual channels — reactions, thread resolve/unresolve, review
-  dismissal, in-place PATCH edits, PR title/body edits, `contents: write` —
-  and point-in-time gaps, documented in `out-of-band-writes.ts`.
+  forger's **own** binding, so the write stays attributed to them — but a forged
+  creating row absolves the bypass it names, and transitively its linked
+  artifacts: a forged `submitReview` row absolves that review and every inline
+  comment carrying its review id, and a forged `replyToThread` row absolves the
+  named comment and vouches its parent review (one forged parent id can cover
+  many comments). This is a known, surfaced limitation — the detector's absolving
+  evidence is itself workspace-produced; see the skipped demonstration in
+  `collector/audit-integrity.test.ts`. Detection also has enumerated residual
+  channels — reactions, thread resolve/unresolve, review dismissal, in-place
+  PATCH edits (a mediated review's body can be rewritten out-of-band with no
+  detectable trace: reviews expose no `updated_at`), PR title/body edits, and
+  `contents: write` — plus point-in-time gaps, all documented in
+  `out-of-band-writes.ts`.
 
 What a hostile workspace **cannot** do:
 
