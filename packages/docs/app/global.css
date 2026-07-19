@@ -2,6 +2,137 @@
 @import "fumadocs-ui/css/neutral.css";
 @import "fumadocs-ui/css/preset.css";
 
+/* Self-hosted product faces. These mirror the web app's own font wiring so the
+   docs render as the same product: Atkinson Hyperlegible for body/UI, Iosevka
+   for code, Archivo (variable) for headings/display. All glyphs ship locally
+   via @fontsource — no network requests at runtime. */
+@import "@fontsource/iosevka/400.css";
+@import "@fontsource/iosevka/400-italic.css";
+@import "@fontsource/iosevka/500.css";
+@import "@fontsource/iosevka/700.css";
+@import "@fontsource/atkinson-hyperlegible/400.css";
+@import "@fontsource/atkinson-hyperlegible/400-italic.css";
+@import "@fontsource/atkinson-hyperlegible/700.css";
+@import "@fontsource-variable/archivo/index.css";
+
+/*
+ * revu docs theme — the product palette, ported onto Fumadocs design tokens.
+ *
+ * The six named hexes below are the app's real tokens (canvas/ink/add/del/
+ * draft/stale plus muted greys and borders); they are the single source of
+ * truth and are not re-decided here. Violet is the app's thesis color — the one
+ * loud move, reserved for pending/draft state — so it becomes the docs primary.
+ * Teal and gold are diff/seal accents and map onto success/warning.
+ *
+ * The app is dark-only and dense. These docs are dark-first: the dark values
+ * are a faithful port of the app; the light values are a genuine light variant
+ * on the same warm-neutral, low-chroma axis (canvas warms toward paper, the
+ * accents hold their hue) so the site stays on-brand if a reader forces light.
+ * The theme toggle is disabled in the provider, so dark is what ships.
+ */
+
+@theme {
+  /* Product faces bound to Tailwind's font utilities, which Fumadocs and its
+     typography plugin consume for body, headings, and code. */
+  --font-sans: "Atkinson Hyperlegible", system-ui, sans-serif;
+  --font-mono: "Iosevka", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-display: "Archivo Variable", "Archivo", system-ui, sans-serif;
+
+  /* Denser than Fumadocs' defaults, to feel like the app's tight chrome. */
+  --radius-xl: 8px;
+  --radius-lg: 6px;
+  --radius-md: 5px;
+  --radius-sm: 4px;
+}
+
+/* ————— Dark (the faithful port; this is what ships) ————— */
+.dark {
+  --color-fd-background: #151613; /* app canvas */
+  --color-fd-foreground: #d9d7cd; /* app ink */
+
+  --color-fd-muted: #1b1d19; /* app panel */
+  --color-fd-muted-foreground: #96948a; /* app ink-mut */
+
+  --color-fd-popover: #22241f; /* app raised */
+  --color-fd-popover-foreground: #d9d7cd; /* app ink */
+
+  --color-fd-card: #1b1d19; /* app panel */
+  --color-fd-card-foreground: #d9d7cd; /* app ink */
+
+  --color-fd-border: #2e312b; /* app line (hairline) */
+
+  --color-fd-primary: #a48fff; /* app draft-violet — the thesis accent */
+  --color-fd-primary-foreground: #151613; /* app canvas */
+
+  --color-fd-secondary: #22241f; /* app raised */
+  --color-fd-secondary-foreground: #d9d7cd; /* app ink */
+
+  --color-fd-accent: #282b25; /* app overlay */
+  --color-fd-accent-foreground: #d9d7cd; /* app ink */
+
+  --color-fd-ring: #dad8ce; /* app ring (neutral ink, never semantic) */
+
+  /* Callout / semantic accents — the app's diff + seal hues. */
+  --color-fd-success: #4cc8a8; /* app add-teal */
+  --color-fd-warning: #d9b44a; /* app stale-gold */
+  --color-fd-error: #e5645e; /* app danger */
+  --color-fd-info: #a48fff; /* app draft-violet */
+  --color-fd-idea: #d9b44a; /* app stale-gold */
+
+  /* Code diff blocks — alpha-stepped tints derived from add/del, matching the
+     app's own diff viewer (≤10% line tint so highlighting survives on top). */
+  --color-fd-diff-remove: rgba(229, 136, 94, 0.09);
+  --color-fd-diff-remove-symbol: #e5885e;
+  --color-fd-diff-add: rgba(76, 200, 168, 0.09);
+  --color-fd-diff-add-symbol: #4cc8a8;
+
+  --color-fd-overlay: rgba(0, 0, 0, 0.45);
+}
+
+/* ————— Light (a faithful warm-neutral variant on the same axis) —————
+   Scoped so it never applies to a `.dark` root: `:root` and `.dark` share
+   specificity, so without this guard source order alone would decide the
+   winner on `<html class="dark">`. The site ships dark; this is the fallback. */
+:root:not(.dark) {
+  --color-fd-background: #f4f3ee; /* warm paper, the canvas' inverse */
+  --color-fd-foreground: #22241f; /* raised, as near-black ink */
+
+  --color-fd-muted: #eae8e0;
+  --color-fd-muted-foreground: #6b6a61; /* app ink-faint */
+
+  --color-fd-popover: #fbfaf6;
+  --color-fd-popover-foreground: #22241f;
+
+  --color-fd-card: #edece5;
+  --color-fd-card-foreground: #22241f;
+
+  --color-fd-border: #d7d5c9;
+
+  --color-fd-primary: #6a4fe0; /* draft-violet, darkened for contrast on paper */
+  --color-fd-primary-foreground: #f4f3ee;
+
+  --color-fd-secondary: #e5e3da;
+  --color-fd-secondary-foreground: #22241f;
+
+  --color-fd-accent: #e0ded4;
+  --color-fd-accent-foreground: #22241f;
+
+  --color-fd-ring: #6b6a61;
+
+  --color-fd-success: #2f9c80; /* teal, deepened for paper */
+  --color-fd-warning: #a8862f; /* gold, deepened for paper */
+  --color-fd-error: #c9463f;
+  --color-fd-info: #6a4fe0;
+  --color-fd-idea: #a8862f;
+
+  --color-fd-diff-remove: rgba(229, 136, 94, 0.14);
+  --color-fd-diff-remove-symbol: #b25a30;
+  --color-fd-diff-add: rgba(76, 200, 168, 0.14);
+  --color-fd-diff-add-symbol: #2f9c80;
+
+  --color-fd-overlay: rgba(0, 0, 0, 0.2);
+}
+
 html {
   scrollbar-gutter: stable;
 }
@@ -9,4 +140,29 @@ html {
 html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
+}
+
+/* Headings take the display face, as in the app. The nav wordmark is rendered
+   with the font-display utility in the layout options. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-display);
+}
+
+/* Inline and block code take Iosevka, matching the app's terminal-dense feel. */
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* Dense dark scrollbars, ported from the app. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-fd-border) transparent;
 }
