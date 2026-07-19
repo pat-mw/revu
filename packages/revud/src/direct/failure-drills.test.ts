@@ -112,8 +112,11 @@ describe('drill: GitHub 5xx mid-sync → honest partial, resume fetches only the
       store,
     })
 
-    // syncPull RESOLVES (never rejects) with an honest partial — the frozen rule
-    // that a partial is a 200 value, not an error.
+    // In the direct engine, syncPull RESOLVES (never rejects) with an honest
+    // partial: the drop rides on the resolved snapshot, it is not thrown. (The
+    // mock adapter instead surfaces a mid-transfer drop as a thrown network
+    // error while keeping the very same partial — both keep it and resume; the
+    // conformance suite pins each transport's own surfacing.)
     const first = await api.syncPull(MOVING_BASE_PR)
     expect(first.partial).not.toBeNull()
     expect(first.partial?.missingBlobShas ?? []).toContain(MOVING_BASE_HEAD_BLOB_SHA)

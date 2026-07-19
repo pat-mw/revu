@@ -117,11 +117,12 @@ describe('drill: broker down mid draft-save keeps the draft, retry succeeds', ()
 
 describe('drill: rate-limit exhaustion surfaces the countdown copy', () => {
   test('describeApiError renders "Rate limit exhausted. Resets in N minutes." with N from minutesUntil', () => {
-    // describeApiError calls minutesUntil(resetAt) against the REAL clock (it
-    // takes no injectable now), so the reset is anchored to the current time and
-    // the expected minute count is read from the SAME function the copy uses —
-    // never a magic number, and never racing a wall-clock tick, because the
-    // resetAt sits far enough out that a few ms of drift can't cross a minute.
+    // describeApiError calls minutesUntil(resetAt) without passing a clock, so it
+    // falls back to minutesUntil's default of the real current time; the reset is
+    // anchored to now and the expected minute count is read from the SAME
+    // function the copy uses — never a magic number, and never racing a
+    // wall-clock tick, because the resetAt sits far enough out that a few ms of
+    // drift can't cross a minute.
     const resetAt = new Date(Date.now() + 25 * 60_000).toISOString()
     const error = new ApiError('rate_limited', 'GitHub rate limit reached.', resetAt)
 
