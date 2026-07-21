@@ -428,6 +428,7 @@ function writeFake(cfg: {
     getPullFiles: () => { throw new Error('unexpected getPullFiles') },
     getIssueComments: () => { throw new Error('unexpected getIssueComments') },
     getPullCommits: () => { throw new Error('unexpected getPullCommits') },
+    getRateLimit: async () => ({ limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }),
     getCheckRuns: () => { throw new Error('unexpected getCheckRuns') },
     getTree: () => { throw new Error('unexpected getTree') },
     getBlob: () => { throw new Error('unexpected getBlob') },

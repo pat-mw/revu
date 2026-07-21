@@ -139,6 +139,9 @@ export function movingBaseClient(state: {
     async getPullCommits(_o, _r, _n, params): Promise<Page<unknown>> {
       return page([{ sha: 'c1', commit: { message: 'm', author: { date: '2026-01-01' } } }], params)
     },
+    async getRateLimit() {
+      return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }
+    },
     async getCheckRuns() {
       return { check_runs: [] }
     },
@@ -320,6 +323,9 @@ export function movingHeadClient(state: RemoteState): GithubClient {
         commit: { message: `commit ${c.sha}`, author: { name: 'A', email: 'a@x.io', date: c.date } },
       }))
       return page(items, params)
+    },
+    async getRateLimit() {
+      return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }
     },
     async getCheckRuns() {
       return { check_runs: [] }

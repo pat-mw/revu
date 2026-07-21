@@ -3,6 +3,7 @@ import type {
   FileViewedState,
   HumanPreferences,
   PullListResponse,
+  RateLimitInfo,
   ReactionKey,
   ReactionRollup,
   ReconcileReport,
@@ -75,6 +76,21 @@ export interface DirectApi {
    * empty list.
    */
   listPulls(ifNoneMatch: string | null): PullListResponse
+
+  /**
+   * The shared GitHub allowance, read live from GitHub rather than accumulated
+   * here.
+   *
+   * Worth being explicit, because the instinct is to count requests locally and
+   * total them across workspaces: the bucket belongs to the CREDENTIAL. Under an
+   * app installation every workspace authenticates as the same installation and
+   * spends from one allowance, so GitHub is already the shared counter and each
+   * caller sees the same figure. Nothing needs aggregating, and a locally
+   * accumulated count would be wrong the moment a second workspace synced.
+   *
+   * The endpoint behind this is free — reading the allowance does not spend it.
+   */
+  getRateLimit(): Promise<RateLimitInfo>
 
   /** Run the burst sync and persist; may resolve a `partial` snapshot. */
   syncPull(prNumber: number): Promise<Snapshot>
@@ -228,6 +244,10 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
         },
         prNumber,
       )
+    },
+
+    async getRateLimit(): Promise<RateLimitInfo> {
+      return deps.github.getRateLimit()
     },
 
     getSnapshot(prNumber: number): Snapshot | null {

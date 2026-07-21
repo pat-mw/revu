@@ -10,6 +10,7 @@ import type {
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  RateLimitInfo,
   ReactionRollup,
   ReconcileReport,
   ReviewComment,
@@ -43,6 +44,12 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     // These router tests run in direct mode, where writes are gated by mode,
     // not by the broker write capability — so the fake honestly reports false.
     brokerWritesEnabled: false,
+    getRateLimit: async () => ({
+      limit: 5000,
+      remaining: 4999,
+      used: 1,
+      reset: '2026-01-01T00:00:00.000Z',
+    }),
     listPulls() {
       // Direct mode has no poll loop; the live list is broker-only. The router
       // never dispatches here in direct mode (it falls through to the 501
@@ -351,17 +358,29 @@ describe('handleDirectApi', () => {
     expect(body.code).toBe('persist_failed')
   })
 
-  test('a not-yet-built route (list, threads, rate-limit) is a 501 not_implemented', async () => {
+  test('a not-yet-built route (list, threads) is a 501 not_implemented', async () => {
     for (const [method, path] of [
       ['GET', '/api/pulls'],
       ['GET', '/api/pulls/204/threads'],
-      ['GET', '/api/rate-limit'],
     ] as const) {
       const res = await handleDirectApi(req(method, path), SESSION, fakeApi())
       expect(res?.status).toBe(501)
       const body = (await res?.json()) as { code: string }
       expect(body.code).toBe('not_implemented')
     }
+  })
+
+  // The allowance is GitHub's to report, not this daemon's to accumulate: every
+  // workspace under one installation spends from the same bucket, so the figure
+  // is read live rather than summed locally.
+  test('GET rate-limit answers the live allowance, not a 501', async () => {
+    const res = await handleDirectApi(req('GET', '/api/rate-limit'), SESSION, fakeApi())
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as RateLimitInfo
+    expect(body.limit).toBe(5000)
+    expect(body.remaining).toBe(4999)
+    expect(body.used).toBe(1)
+    expect(typeof body.reset).toBe('string')
   })
 
   test('GET reconcile returns the ReconcileReport as a 200 value', async () => {

@@ -144,6 +144,9 @@ function fakeClient(fx: LargePrFixture): { client: GithubClient; calls: Calls } 
       calls.commits += 1
       return onePage(fx.commits as unknown[], params)
     },
+    async getRateLimit() {
+      return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }
+    },
     async getCheckRuns() {
       calls.checkRuns += 1
       return { check_runs: [] }

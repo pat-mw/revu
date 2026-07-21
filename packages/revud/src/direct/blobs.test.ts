@@ -110,6 +110,7 @@ function fakeApi(opts: {
     getIssueComments: notUsed as unknown as GithubClient['getIssueComments'],
     getPullReviews: notUsed as unknown as GithubClient['getPullReviews'],
     getPullCommits: notUsed as unknown as GithubClient['getPullCommits'],
+    getRateLimit: async () => ({ limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }),
     getCheckRuns: notUsed,
     getTree: notUsed,
     async getBlob(_o, _r, sha): Promise<GhBlobRaw> {
