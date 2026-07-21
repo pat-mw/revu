@@ -1036,7 +1036,90 @@ const threads: ReviewThread[] = [
 
 // ————— conversation, reviews, checks, commits —————
 
+/**
+ * Third-party bots that comment on the client's repo with raw-HTML bodies.
+ * They are real GitHub apps, not broker-proxied contractors, so their bodies
+ * carry no human prefix and their `user` is the app's own bot identity.
+ */
+const LINEAR_BOT: GhUser = {
+  login: 'linear[bot]',
+  id: 9100341,
+  node_id: nodeId('BOT', 9100341),
+  avatar_url: '',
+  html_url: 'https://github.com/apps/linear',
+  type: 'Bot',
+}
+
+const GREPTILE_BOT: GhUser = {
+  login: 'greptile-apps[bot]',
+  id: 9100352,
+  node_id: nodeId('BOT', 9100352),
+  avatar_url: '',
+  html_url: 'https://github.com/apps/greptile-apps',
+  type: 'Bot',
+}
+
+/**
+ * A Linear linkback in the shape the Linear GitHub app posts: raw HTML —
+ * paragraph link, `<details>`/`<summary>`, `<sub>`, and a `<picture>` with a
+ * dark-scheme `<source srcset>` — exercising exactly the tags the markdown
+ * renderer must produce as real elements rather than escaped text.
+ */
+export const linearLinkbackBody = [
+  '<p><a href="https://linear.app/meridian/issue/MER-1289/gateway-rate-limiting">MER-1289 Gateway rate limiting</a></p>',
+  '<details><summary>Synced with Linear</summary>',
+  '<p><sub>This pull request is linked to MER-1289. The issue moves to <strong>In Review</strong> while this PR is open and closes when it merges.</sub></p>',
+  '<picture>',
+  '<source media="(prefers-color-scheme: dark)" srcset="https://static.linear.app/badges/mer-1289-dark.png 1x, https://static.linear.app/badges/mer-1289-dark@2x.png 2x">',
+  '<img alt="MER-1289 status badge" src="https://static.linear.app/badges/mer-1289.png" height="20">',
+  '</picture>',
+  '</details>',
+].join('\n')
+
+/**
+ * A Greptile-style review summary: HTML heading and table, a `<details>`
+ * section whose body holds a ```mermaid fence (blank lines around the fence
+ * keep it markdown inside the raw-HTML flow block), and a `<sub>` footer.
+ */
+export const greptileSummaryBody = [
+  '<h3>Greptile Summary</h3>',
+  '<p>Adds a per-tenant token bucket in front of the gateway write path. Buckets refill lazily on access, idle buckets are evicted on a sweep, and limits are configurable per tenant tier.</p>',
+  '<table>',
+  '<thead><tr><th>File</th><th>Change</th><th>Risk</th></tr></thead>',
+  '<tbody>',
+  '<tr><td><code>limiter/bucket.ts</code></td><td>Token bucket core</td><td>Medium</td></tr>',
+  '<tr><td><code>limiter/config.ts</code></td><td>Tier limits</td><td>Low</td></tr>',
+  '<tr><td><code>gateway/middleware.ts</code></td><td>Enforcement hook</td><td>Medium</td></tr>',
+  '</tbody>',
+  '</table>',
+  '<details>',
+  '<summary>Request flow</summary>',
+  '',
+  '```mermaid',
+  'sequenceDiagram',
+  '  participant C as Client',
+  '  participant G as Gateway',
+  '  participant B as Bucket',
+  '  C->>G: write request',
+  '  G->>B: take(tenant)',
+  '  B-->>G: granted or drained',
+  '  G-->>C: 200 or 429 with Retry-After',
+  '```',
+  '',
+  '</details>',
+  '<sub>Last reviewed commit: 4f21c09 · <a href="https://app.greptile.com/review/meridian-labs/atlas/312">View in Greptile</a></sub>',
+].join('\n')
+
 const issueComments: IssueComment[] = [
+  {
+    id: 61312000,
+    node_id: nodeId('IC', 61312000),
+    user: LINEAR_BOT,
+    body: linearLinkbackBody,
+    created_at: daysAgo(3),
+    updated_at: daysAgo(3),
+    reactions: emptyReactions(61312000),
+  },
   {
     id: 61312001,
     node_id: nodeId('IC', 61312001),
@@ -1057,6 +1140,15 @@ const issueComments: IssueComment[] = [
     created_at: hoursAgo(18),
     updated_at: hoursAgo(18),
     reactions: emptyReactions(61312002),
+  },
+  {
+    id: 61312003,
+    node_id: nodeId('IC', 61312003),
+    user: GREPTILE_BOT,
+    body: greptileSummaryBody,
+    created_at: hoursAgo(23),
+    updated_at: hoursAgo(23),
+    reactions: emptyReactions(61312003),
   },
 ]
 

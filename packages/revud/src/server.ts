@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { join, normalize, relative, isAbsolute } from 'node:path'
 import type { Server } from 'bun'
@@ -7,6 +8,7 @@ import type { RevuMode } from './api-router'
 import type { DirectApi } from './direct/direct-api'
 import { handleApi } from './api-router'
 import { handleDirectApi } from './direct-router'
+import { handleImageProxy } from './image-proxy'
 
 /**
  * The single-port HTTP server. One Bun process serves the built frontend as
@@ -15,6 +17,9 @@ import { handleDirectApi } from './direct-router'
  *
  * Routing:
  *   - `/api/*` → the reused mock adapter via the API router.
+ *   - `/image-proxy` → the server-side image fetch for remote images in
+ *     comment bodies (its own module; it never touches session or credential
+ *     state).
  *   - an existing file under `dist/` → that file (content type from `Bun.file`).
  *   - any other non-file path → `dist/index.html`, so client-side routing works
  *     (SPA fallback).
@@ -74,12 +79,72 @@ export function resolveStaticPath(distDir: string, pathname: string): string | n
 }
 
 /**
+ * Build the app's Content-Security-Policy from the built `index.html`.
+ *
+ * The CSP is load-bearing, not hygiene: comment bodies deliberately render raw
+ * HTML and diagrams, so the policy is the backstop when a sanitizer bug lets
+ * markup through. `script-src` is `'self'` plus a hash per inline script found
+ * in the actual served `index.html` (the no-flash theme snippet), computed from
+ * the file so the policy can never drift from the markup. Remote images ride
+ * `/image-proxy`, which is what makes `img-src 'self'` honest. `style-src`
+ * carries `'unsafe-inline'` because React style attributes (diff tints, the
+ * command palette) and mermaid's embedded stylesheet require it — a style
+ * injection cannot reach the network here, since every fetching directive is
+ * pinned to `'self'` or `'none'`. `frame-src 'self'` exists for the sandboxed
+ * `srcdoc` diagram frames; `object-src`/`base-uri`/`form-action 'none'` close
+ * the plugin, `<base>`-pivot, and form-exfiltration routes outright, and
+ * `frame-ancestors 'none'` refuses embedding of the app itself.
+ */
+export function buildContentSecurityPolicy(indexHtml: string): string {
+  const hashes: string[] = []
+  const inlineScript = /<script(?![^>]*\ssrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi
+  for (const match of indexHtml.matchAll(inlineScript)) {
+    const body = match[1] ?? ''
+    if (body.trim() === '') continue
+    hashes.push(`'sha256-${createHash('sha256').update(body).digest('base64')}'`)
+  }
+  return [
+    "default-src 'self'",
+    ["script-src 'self'", ...hashes].join(' '),
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "frame-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ')
+}
+
+/**
+ * Stamp the security headers every response carries; `csp` is added only for
+ * HTML (the policy governs documents — putting it on JSON and assets is inert
+ * noise). `nosniff` keeps a response from being reinterpreted as a scriptable
+ * type, and the referrer policy keeps PR-derived URLs out of outbound requests.
+ */
+export function applySecurityHeaders(res: Response, csp?: string): Response {
+  res.headers.set('x-content-type-options', 'nosniff')
+  res.headers.set('referrer-policy', 'no-referrer')
+  if (csp !== undefined) res.headers.set('content-security-policy', csp)
+  return res
+}
+
+/**
  * Serve a static asset from `distDir`, falling back to `index.html` for any
  * unknown non-file path (SPA routing). Shared by every mode's handler so static
  * serving behaves identically regardless of how `/api/*` is answered. Only
- * GET/HEAD reach here; any other method on a non-API path is a 405.
+ * GET/HEAD reach here; any other method on a non-API path is a 405. HTML
+ * responses carry the CSP from `csp()` (computed lazily from the served
+ * `index.html`, once).
  */
-async function serveStatic(distDir: string, indexPath: string, req: Request): Promise<Response> {
+async function serveStatic(
+  distDir: string,
+  indexPath: string,
+  req: Request,
+  csp: () => Promise<string>,
+): Promise<Response> {
   const url = new URL(req.url)
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     return new Response('Method Not Allowed', { status: 405 })
@@ -89,12 +154,38 @@ async function serveStatic(distDir: string, indexPath: string, req: Request): Pr
   if (staticPath && staticPath !== distDir) {
     const file = Bun.file(staticPath)
     if (await file.exists()) {
-      return new Response(file)
+      const res = new Response(file)
+      return staticPath.endsWith('.html')
+        ? applySecurityHeaders(res, await csp())
+        : applySecurityHeaders(res)
     }
   }
 
   // SPA fallback: unknown, non-file, non-API path → index.html.
-  return new Response(Bun.file(indexPath))
+  return applySecurityHeaders(new Response(Bun.file(indexPath)), await csp())
+}
+
+/**
+ * Lazily compute (and cache) the CSP for the served `index.html`. Read at
+ * first use rather than handler construction so a handler built against a
+ * not-yet-written dist directory still constructs; a missing or unreadable
+ * index yields a hashless policy, which fails closed (the inline script would
+ * be refused, never allowed too broadly).
+ */
+function cspProvider(indexPath: string): () => Promise<string> {
+  let cached: string | null = null
+  return async () => {
+    if (cached === null) {
+      let indexHtml = ''
+      try {
+        indexHtml = await Bun.file(indexPath).text()
+      } catch {
+        // Fall through to the hashless policy.
+      }
+      cached = buildContentSecurityPolicy(indexHtml)
+    }
+    return cached
+  }
 }
 
 /**
@@ -108,11 +199,14 @@ export function createFetchHandler(
   mode: RevuMode,
 ): (req: Request) => Promise<Response> {
   const indexPath = join(distDir, 'index.html')
+  const csp = cspProvider(indexPath)
 
   return async function fetch(req: Request): Promise<Response> {
     const apiResponse = await handleApi(req, mock, mode)
-    if (apiResponse) return apiResponse
-    return serveStatic(distDir, indexPath, req)
+    if (apiResponse) return applySecurityHeaders(apiResponse)
+    const proxyResponse = await handleImageProxy(req)
+    if (proxyResponse) return proxyResponse
+    return serveStatic(distDir, indexPath, req, csp)
   }
 }
 
@@ -132,11 +226,14 @@ export function createDirectFetchHandler(
   mode: RevuMode = 'direct',
 ): (req: Request) => Promise<Response> {
   const indexPath = join(distDir, 'index.html')
+  const csp = cspProvider(indexPath)
 
   return async function fetch(req: Request): Promise<Response> {
     const apiResponse = await handleDirectApi(req, session, api, mode)
-    if (apiResponse) return apiResponse
-    return serveStatic(distDir, indexPath, req)
+    if (apiResponse) return applySecurityHeaders(apiResponse)
+    const proxyResponse = await handleImageProxy(req)
+    if (proxyResponse) return proxyResponse
+    return serveStatic(distDir, indexPath, req, csp)
   }
 }
 
