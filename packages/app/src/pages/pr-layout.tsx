@@ -454,6 +454,7 @@ export function PrLayout() {
             />
           </div>
           <nav className="-mb-px flex items-end gap-4" aria-label="Pull request sections">
+            <TabLink to="description" label="Description" />
             <TabLink
               to="conversation"
               label="Conversation"
