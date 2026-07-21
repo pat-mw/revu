@@ -86,7 +86,12 @@ export function resolveStaticPath(distDir: string, pathname: string): string | n
  * markup through. `script-src` is `'self'` plus a hash per inline script found
  * in the actual served `index.html` (the no-flash theme snippet), computed from
  * the file so the policy can never drift from the markup. Remote images ride
- * `/image-proxy`, which is what makes `img-src 'self'` honest. `style-src`
+ * `/image-proxy`, which is what keeps `img-src` pinned to `'self'` — with one
+ * carve-out mirroring the markdown renderer's allowlist: GitHub's own
+ * attachment hosts (`github.com/user-attachments/` and
+ * `*.githubusercontent.com`) are fetched directly by the browser, because those
+ * assets are gated on the viewer's GitHub session cookie and the
+ * credential-less proxy can never retrieve them. `style-src`
  * carries `'unsafe-inline'` because React style attributes (diff tints, the
  * command palette) and mermaid's embedded stylesheet require it — a style
  * injection cannot reach the network here, since every fetching directive is
@@ -107,7 +112,7 @@ export function buildContentSecurityPolicy(indexHtml: string): string {
     "default-src 'self'",
     ["script-src 'self'", ...hashes].join(' '),
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data:",
+    "img-src 'self' data: https://github.com/user-attachments/ https://*.githubusercontent.com",
     "font-src 'self'",
     "connect-src 'self'",
     "frame-src 'self'",

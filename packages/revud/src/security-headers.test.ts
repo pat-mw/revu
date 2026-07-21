@@ -38,6 +38,14 @@ describe('buildContentSecurityPolicy', () => {
     expect(csp).toContain("frame-ancestors 'none'")
   })
 
+  it('img-src permits exactly GitHub attachment hosts beyond self', () => {
+    const csp = buildContentSecurityPolicy(html)
+    const imgSrc = csp.split('; ').find((d) => d.startsWith('img-src '))
+    expect(imgSrc).toBe(
+      "img-src 'self' data: https://github.com/user-attachments/ https://*.githubusercontent.com",
+    )
+  })
+
   it('emits a hashless (fail-closed) policy for markup with no inline scripts', () => {
     const csp = buildContentSecurityPolicy('<!doctype html><html><body></body></html>')
     expect(csp).toContain("script-src 'self';")
