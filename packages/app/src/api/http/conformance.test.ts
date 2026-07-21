@@ -23,7 +23,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Subprocess } from 'bun'
-import { runConformanceSuite } from '@revu/shared/conformance'
+import { expectPartialSyncThrows, runConformanceSuite } from '@revu/shared/conformance'
 import { createHttpApi } from './adapter'
 
 const REVUD_ENTRY = join(import.meta.dir, '..', '..', '..', '..', 'revud', 'src', 'index.ts')
@@ -151,5 +151,9 @@ describe('revud-mock over HTTP conformance', () => {
       daemon = await startDaemon(dataDir, distDir)
       return createHttpApi(daemon.base)
     },
+    // The daemon reuses the mock store, so the simulated drop reaches the wire
+    // as the `network` error envelope and the client adapter rethrows it as an
+    // ApiError. Asserting the code here proves the envelope survives HTTP.
+    partialSyncSurfacing: expectPartialSyncThrows('network'),
   })
 })

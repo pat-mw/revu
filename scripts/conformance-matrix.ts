@@ -30,6 +30,12 @@
  * `skipped: <required secret/env> absent` line. It is NEVER reported as a silent
  * pass, and a live leg whose committed runner is not yet available is reported
  * as skipped-deferred rather than green.
+ *
+ * A live leg is expected to differ from the in-gate legs in exactly one place:
+ * how a sync that dies mid-transfer reaches the caller. Legs A and B raise it as
+ * a `network` error; an engine driving real GitHub resolves with a partial
+ * snapshot instead. Both are conformant, so the runner declares its shape via
+ * the suite's `partialSyncSurfacing` hook rather than the suite assuming one.
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'

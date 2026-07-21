@@ -15,14 +15,23 @@
  *
  * The frozen-contract semantics the suite encodes are the point of the whole
  * exercise: `submitReview` returns `head_moved` as a 200-level VALUE and never
- * throws for it; `syncPull` that dies mid-transfer keeps a PARTIAL snapshot
- * (surfacing the drop as a `network` error) and the retry completes with
- * `partial: null`; `getSnapshot` answers `null` (never a thrown 404) for a
- * pull that was never synced. Every adapter must uphold all three.
+ * throws for it; `syncPull` that dies mid-transfer keeps a PARTIAL snapshot and
+ * the retry completes with `partial: null`; `getSnapshot` answers `null` (never
+ * a thrown 404) for a pull that was never synced. Every adapter must uphold all
+ * three.
+ *
+ * One thing deliberately does NOT live in the shared assertions: HOW a dropped
+ * transfer reaches the caller. The contract permits either shape — a raised
+ * error or a promise that resolves with `partial` set — and which one a given
+ * adapter produces is a property of its transport, not of the contract. So the
+ * suite asserts the transport-agnostic OUTCOME itself (a partial snapshot is
+ * kept, the retry fetches only the missing blobs, the retry clears the partial)
+ * and delegates the surfacing shape to a per-runner hook. See
+ * `PartialSyncSurfacing`.
  */
 import { beforeAll, describe, expect, it } from 'bun:test'
 import { ApiError, blobContentToLines, classifyPendingComment, selectAnchorBlobSha } from '../src/index.ts'
-import type { AnchorResult, PendingComment, RevuApi } from '../src/index.ts'
+import type { AnchorResult, ApiErrorCode, PendingComment, RevuApi, Snapshot } from '../src/index.ts'
 
 /**
  * Names the fixture pull that exercises each invariant. Every runner passes the
@@ -46,6 +55,77 @@ export interface ConformanceScenarios {
 }
 
 /**
+ * What the interrupted first `syncPull` actually did at the call site. Capturing
+ * it as a value instead of asserting inline is what lets the outcome checks stay
+ * shared while the surfacing check varies per transport.
+ */
+export type PartialSyncOutcome =
+  | { kind: 'threw'; error: unknown }
+  | { kind: 'resolved'; snapshot: Snapshot }
+
+/**
+ * A runner's expectation about HOW its transport surfaces a sync that dies
+ * mid-transfer. The suite drives the scenario and hands the captured outcome
+ * here; a failed `expect` inside the hook fails the shared suite exactly as an
+ * inline assertion would.
+ *
+ * This is the seam that keeps the suite runnable against every transport. An
+ * in-process adapter and an HTTP client both raise the dropped transfer as an
+ * `ApiError` with code `network`, because both own the moment the transfer
+ * breaks. An engine driving real GitHub does not: it collects what it managed to
+ * transfer and RESOLVES with `snapshot.partial` set. Both are conformant — the
+ * contract explicitly allows `syncPull` to resolve partial rather than throw —
+ * so pinning one shape in the shared assertions would fail honest adapters on
+ * transport shape rather than on behaviour.
+ *
+ * Use `expectPartialSyncThrows` or `expectPartialSyncResolves` to build one.
+ */
+export type PartialSyncSurfacing = (outcome: PartialSyncOutcome) => void | Promise<void>
+
+/**
+ * Surfacing expectation for a transport that raises the dropped transfer as an
+ * `ApiError` carrying `code`, having already persisted the partial snapshot.
+ */
+export function expectPartialSyncThrows(code: ApiErrorCode): PartialSyncSurfacing {
+  return (outcome) => {
+    expect(outcome.kind).toBe('threw')
+    const error = outcome.kind === 'threw' ? outcome.error : null
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error instanceof ApiError ? error.code : null).toBe(code)
+  }
+}
+
+/**
+ * Surfacing expectation for a transport that answers a dropped transfer by
+ * resolving with the partial snapshot rather than raising. The returned
+ * snapshot must name what is missing, or the caller has no way to resume.
+ */
+export function expectPartialSyncResolves(): PartialSyncSurfacing {
+  return (outcome) => {
+    expect(outcome.kind).toBe('resolved')
+    const snapshot = outcome.kind === 'resolved' ? outcome.snapshot : null
+    expect(snapshot?.partial ?? null).not.toBeNull()
+    expect(snapshot?.partial?.missingBlobShas.length ?? 0).toBeGreaterThan(0)
+  }
+}
+
+/**
+ * The fallback used when a runner supplies no surfacing hook: assert only what
+ * the contract itself guarantees, which is that the interruption reached the
+ * caller in ONE of the two legal shapes. A sync that quietly reported success,
+ * or that raised something outside the error envelope, still fails here — the
+ * missing hook loosens the assertion to the contract floor, it never skips it.
+ * Runners whose transport pins a shape should say so and get the tighter check.
+ */
+export const expectPartialSyncSurfacedSomehow: PartialSyncSurfacing = (outcome) => {
+  if (outcome.kind === 'threw') {
+    expect(outcome.error).toBeInstanceOf(ApiError)
+    return
+  }
+  expect(outcome.snapshot.partial).not.toBeNull()
+}
+
+/**
  * Everything a runner hands the suite: how to build the adapter, which pulls to
  * drive, and how to restart the implementation under test for the durability
  * check. `restart` MUST return the adapter to use afterward — the mock keeps
@@ -64,6 +144,25 @@ export interface ConformanceConfig {
    * use afterward. Broker-side state (drafts) must survive the round trip.
    */
   restart: () => RevuApi | Promise<RevuApi>
+  /**
+   * How THIS transport surfaces a sync that dies mid-transfer. Omitting it
+   * falls back to `expectPartialSyncSurfacedSomehow`, which still asserts the
+   * interruption reached the caller in a contract-legal shape.
+   */
+  partialSyncSurfacing?: PartialSyncSurfacing
+}
+
+/**
+ * Run one `syncPull` and report what it did without deciding whether that was
+ * correct. Nothing is swallowed: a rejection is carried out whole as `error`, so
+ * a surfacing hook can inspect the real value rather than a flattened code.
+ */
+async function captureSyncOutcome(api: RevuApi, prNumber: number): Promise<PartialSyncOutcome> {
+  try {
+    return { kind: 'resolved', snapshot: await api.syncPull(prNumber) }
+  } catch (error) {
+    return { kind: 'threw', error }
+  }
 }
 
 /**
@@ -194,14 +293,14 @@ export function runConformanceSuite(config: ConformanceConfig): void {
     })
 
     describe('partial-sync resume fetches only the missing blobs', () => {
-      it('the first sync throws a network ApiError and keeps a partial snapshot', async () => {
-        let code: string | null = null
-        try {
-          await api.syncPull(scenarios.partialSync)
-        } catch (e) {
-          if (e instanceof ApiError) code = e.code
-        }
-        expect(code).toBe('network')
+      it('the interrupted first sync surfaces the drop the way this transport does', async () => {
+        // Drive the scenario once and capture what came back, then let the
+        // runner assert the shape its transport produces. Everything the
+        // contract actually promises is asserted by the two cases below, which
+        // hold for every transport.
+        const outcome = await captureSyncOutcome(api, scenarios.partialSync)
+        const surfacing = config.partialSyncSurfacing ?? expectPartialSyncSurfacedSomehow
+        await surfacing(outcome)
       })
 
       it('the kept partial snapshot names the missing blobs', async () => {
