@@ -11,6 +11,7 @@
  * No-leak is asserted live and in-process: the token is read from the credential
  * file inside this script only to confirm it never appears in any synced snapshot
  * or stat; it is never printed. Configuration:
+ *   REVU_SMOKE_REPO        the scratch repository to read, as owner/name
  *   REVU_CREDENTIALS_FILE  the injected credential file to read
  *   REVU_SANDBOX_DIR       a local clone of the sandbox repo (for git blobs)
  */
@@ -26,8 +27,9 @@ import {
   createFileCredentialTokenSource,
 } from '../packages/revud/src/broker/token-source'
 import type { RepoRef } from '../packages/revud/src/direct/repo'
+import { resolveSmokeRepo } from './smoke-target'
 
-const REPO: RepoRef = { owner: 'pat-mw', repo: 'revu-sandbox' }
+const REPO: RepoRef = resolveSmokeRepo()
 
 function requireEnv(name: string): string {
   const v = process.env[name]

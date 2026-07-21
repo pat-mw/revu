@@ -1,8 +1,10 @@
 /**
- * Live direct-mode sync smoke check against the seeded sandbox
- * `pat-mw/revu-sandbox`. Run with an authenticated `gh` (or GH_TOKEN set):
+ * Live direct-mode sync smoke check against a seeded scratch sandbox. Name the
+ * target with `REVU_SMOKE_REPO` (there is no default — this script writes to the
+ * repository it is pointed at) and run it with an authenticated `gh` (or
+ * GH_TOKEN set):
  *
- *   bun run scripts/smoke-direct.ts
+ *   REVU_SMOKE_REPO=owner/name bun run scripts/smoke-direct.ts
  *
  * This is NOT part of the `bun test` gate: it makes real GitHub REST calls, so a
  * `*.test.ts` would red CI (the gate runs with no network). It exercises the REST
@@ -44,8 +46,9 @@ import type { DirectStore } from '../packages/revud/src/direct/store'
 import { syncPull } from '../packages/revud/src/direct/sync'
 import type { CommandRunner } from '../packages/revud/src/direct/command-runner'
 import type { RepoRef } from '../packages/revud/src/direct/repo'
+import { resolveSmokeRepo } from './smoke-target'
 
-const REPO: RepoRef = { owner: 'pat-mw', repo: 'revu-sandbox' }
+const REPO: RepoRef = resolveSmokeRepo()
 
 let failures = 0
 function check(label: string, cond: boolean, detail?: unknown): void {
@@ -570,7 +573,7 @@ async function baseAdvanceSection(github: GithubClient, runner: CommandRunner): 
 }
 
 /**
- * Run one `gh api` call as the authenticated pat-mw user and parse the JSON.
+ * Run one `gh api` call as the authenticated `gh` user and parse the JSON.
  * Used to VERIFY, from GitHub's own side, that what the write path posted is
  * actually visible on github.com (not just what revud believes it posted).
  */
@@ -757,7 +760,7 @@ async function writeSection(github: GithubClient): Promise<void> {
 }
 
 /**
- * Prove the free lunch end to end: clone `pat-mw/revu-sandbox`, `git fetch
+ * Prove the free lunch end to end: clone the target repository, `git fetch
  * origin` so both the merge base and head SHAs are local, then run a cold sync of
  * the large PR (#2) with the local-first blob provider pointed at the clone. It
  * reports the total API request count (≤12 with local-git blobs), that
@@ -768,7 +771,7 @@ async function writeSection(github: GithubClient): Promise<void> {
 async function blobSection(github: GithubClient, runner: CommandRunner): Promise<void> {
   console.log('\n=== Section B: local-first blob provider (real clone) ===')
   const cloneParent = mkdtempSync(join(tmpdir(), 'revu-clone-'))
-  const cwd = join(cloneParent, 'revu-sandbox')
+  const cwd = join(cloneParent, REPO.repo)
   const dataDir = mkdtempSync(join(tmpdir(), 'revu-blob-'))
   try {
     // Clone and fetch so both merge_base and head are present locally.
