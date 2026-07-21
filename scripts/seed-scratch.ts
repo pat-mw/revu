@@ -39,7 +39,7 @@ const DEFAULT_REPO = 'pat-mw/revu-sandbox'
  * thing that unlocks a run; a repo not listed aborts before any network call.
  * Every entry must be an obvious throwaway (name contains a scratch marker).
  */
-const ALLOWED_SCRATCH_REPOS = new Set<string>([DEFAULT_REPO])
+const ALLOWED_SCRATCH_REPOS = new Set<string>([DEFAULT_REPO, 'apoha-pat/revu-sandbox'])
 
 /** Substrings that mark a repository name as an intended scratch target. */
 const SCRATCH_MARKERS = ['sandbox', 'scratch', 'fixture']

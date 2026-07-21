@@ -265,6 +265,13 @@ scratch target therefore means both listing it in the allow set and giving it a
 marked name. This prevents the script from mutating a real repository by
 accident.
 
+Two targets are currently allow-listed: `pat-mw/revu-sandbox` and
+`apoha-pat/revu-sandbox` (private, owned by the `apoha-pat` user account). The
+latter is installed with the scratch GitHub App `revutestbed`; its permission
+grant — deliberately one permission wider than the production App's — and the
+owner decision behind that gap are recorded in `docs/agent/CHECKPOINT_2.md`
+§E.3 and `docs/agent/MILESTONES.md`'s M3.1 (deferred) issue.
+
 Requires an authenticated `gh` CLI with `repo` scope. The script shells out to
 `gh` and `git`; it never handles a token itself.
 
