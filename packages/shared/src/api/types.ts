@@ -261,6 +261,20 @@ export interface Session {
 }
 
 /** Broker-side annotations that ride alongside a pure GitHub list item. */
+/**
+ * Rolled-up CI state for a pull's head commit, cheap enough to carry on the
+ * list. `pending` covers anything still in flight; `total` is how many checks
+ * the rollup summarizes, so a surface can say "3 checks" rather than implying a
+ * single one.
+ *
+ * Deliberately coarse: the list is a place to decide what to open, and the full
+ * per-check breakdown already lives on the synced snapshot.
+ */
+export interface ChecksRollup {
+  state: 'success' | 'failure' | 'pending'
+  total: number
+}
+
 export interface BrokerPullMeta {
   /** Which human drove the App when the PR was opened; null if a real org member opened it. */
   authorHumanId: string | null
@@ -278,6 +292,12 @@ export interface BrokerPullMeta {
   compareKey: string
   /** Total commits on the PR right now — snapshot delta gives "N new commits". */
   commitCount: number
+  /**
+   * Rolled-up CI state for the head commit. Absent means nothing has reported
+   * — a pull with no CI configured and one whose checks have not started are
+   * the same fact from the list's point of view, and neither is a failure.
+   */
+  checks?: ChecksRollup
 }
 
 export interface PullListItem {

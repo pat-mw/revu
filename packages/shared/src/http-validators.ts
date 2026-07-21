@@ -21,6 +21,7 @@ import type {
   AnchorResult,
   BrokerPullMeta,
   CheckRun,
+  ChecksRollup,
   CommitInfo,
   FileBlob,
   FileViewedState,
@@ -467,6 +468,11 @@ export const vSession: Validator<Session> = vObject({
   viewerLogin: vOptional(vString),
 })
 
+export const vChecksRollup: Validator<ChecksRollup> = vObject({
+  state: vLiteral('success', 'failure', 'pending'),
+  total: vNumber,
+})
+
 export const vBrokerPullMeta: Validator<BrokerPullMeta> = vObject({
   authorHumanId: vNullable(vString),
   canApprove: vBoolean,
@@ -474,6 +480,7 @@ export const vBrokerPullMeta: Validator<BrokerPullMeta> = vObject({
   assignedReviewerHumanIds: vArray(vString),
   compareKey: vString,
   commitCount: vNumber,
+  checks: vOptional(vChecksRollup),
 })
 
 export const vPullListItem: Validator<PullListItem> = vObject({

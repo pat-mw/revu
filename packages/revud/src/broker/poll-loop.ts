@@ -1,5 +1,6 @@
 import type {
   BrokerPullMeta,
+  ChecksRollup,
   PullListItem,
   PullListResponse,
   PullSummary,
@@ -25,11 +26,11 @@ import { AwaitingCredentialError } from './token-source'
  *
  * The broker-level ETag is DERIVED from GitHub's list ETag COMPOSED with a hash
  * of the served per-pull meta annotations (author / approvability / assigned
- * reviewers) rather than hashed from the full item bodies. The GitHub pull
- * objects are NOT hashed — their field order or float formatting could drift and
- * force a 200 every restart — only the list ETag (a stable upstream property) and
- * the meta annotations (simple scalars/arrays under this process's control) feed
- * the ETag.
+ * reviewers / CI rollup) rather than hashed from the full item bodies. The GitHub
+ * pull objects are NOT hashed — their field order or float formatting could drift
+ * and force a 200 every restart — only the list ETag (a stable upstream property)
+ * and the meta annotations (simple scalars/arrays under this process's control)
+ * feed the ETag.
  *
  * This keeps it restart-stable AND meta-sensitive:
  *   - Restart-stable: a fresh process re-fetches the list (its first tick has no
@@ -37,13 +38,16 @@ import { AwaitingCredentialError } from './token-source'
  *     unchanged content and the durable meta inputs (the `pr_author` table, the
  *     reviewers file, `REVU_BOT_LOGIN`) are identical, so the composed ETag is
  *     byte-identical to the one the previous process served — the frontend's
- *     stored `If-None-Match` still 304s.
- *   - Meta-sensitive: a reviewers-file edit or a late `pr_author` record changes
- *     the served `assignedReviewerHumanIds` / `authorHumanId` WITHOUT moving the
- *     upstream list (the list still 304s). Because the meta hash is folded into
- *     the ETag and RECOMPUTED on 304 ticks too, the served ETag flips and the
- *     frontend's next conditional GET is a fresh 200 carrying the new meta,
- *     rather than silently keeping the stale items behind a matching ETag.
+ *     stored `If-None-Match` still 304s. The CI rollup rides the same way: a
+ *     fresh process treats every pull as changed and re-observes it, so it lands
+ *     back on the same value while CI itself has not moved.
+ *   - Meta-sensitive: a reviewers-file edit, a late `pr_author` record, or a CI
+ *     run finishing changes the served `assignedReviewerHumanIds` /
+ *     `authorHumanId` / `checks` WITHOUT moving the upstream list (the list still
+ *     304s). Because the meta hash is folded into the ETag and RECOMPUTED on 304
+ *     ticks too, the served ETag flips and the frontend's next conditional GET is
+ *     a fresh 200 carrying the new meta, rather than silently keeping the stale
+ *     items behind a matching ETag.
  *
  * Single repo/scope only: this cache serves ONE repo. A cross-scope cache is a
  * later concern; this module deliberately holds exactly one scope's list.
@@ -66,6 +70,33 @@ import { AwaitingCredentialError } from './token-source'
  * that bumps `updated_at`) or a full snapshot sync. This is inherent to
  * list-ETag change detection and is accepted: a cross-PR reviewThreads sweep
  * every tick would defeat the idle-cost budget this cache exists to protect.
+ *
+ * The CI rollup does NOT accept that same staleness, because it would land on
+ * exactly the pulls a reviewer is waiting on. A CI run completing moves no head
+ * SHA, no base SHA, and no `updated_at`, so it is invisible to `changedNumbers`:
+ * a rollup refreshed only through the changed set would sit on `pending` for as
+ * long as the pull sits still, and an indicator that says "still running" about a
+ * build that failed ten minutes ago is worse than showing nothing at all.
+ *
+ * So an UNSETTLED rollup is itself a change signal: every tick — including an
+ * upstream-304 tick — re-observes the rollup for the pulls whose last-known
+ * rollup is `pending`, and only those. The cost is bounded by how much CI is
+ * actually in flight, rides the batched facts query the loop already issues (one
+ * GraphQL request, never a per-PR REST call against the shared bucket), and
+ * decays to nothing the moment every build settles — an idle repo with no CI
+ * running issues no sweep at all. Because a swept rollup can move while the
+ * upstream list 304s, the served ETag is recomputed after the sweep; without that
+ * the frontend's conditional GET would keep matching and the new CI state would
+ * never reach it.
+ *
+ * What remains stale, honestly: a rollup that is ABSENT (no CI has reported)
+ * stays absent until the pull next changes, so CI that first registers on a
+ * head that has stopped moving is not picked up within the interval — the list
+ * shows no indicator, which is the truthful reading of "nothing has reported".
+ * And a SETTLED rollup that changes because a job was re-run on an unchanged
+ * head is not swept either. Both are bounded, both fail toward silence rather
+ * than toward a confident wrong answer, and neither is worth a per-tick sweep of
+ * every open pull.
  */
 
 /** How often the poll loop ticks, in milliseconds (~30 seconds). */
@@ -90,12 +121,22 @@ function djb2Hex(input: string): string {
 
 /**
  * A DETERMINISTIC serialization of the served per-pull meta annotations — the
- * `pr → {authorHumanId, canApprove, assignedReviewerHumanIds}` projection, sorted
- * by PR number so item order never affects the result. Only these annotation
- * scalars/arrays are serialized (never the GitHub pull objects, whose float/field
- * -order drift is the reason the list ETag — not a body hash — anchors the ETag).
- * The reviewer ids are left in their file order (a lead's list order is a durable
- * property of the file); the object shape is fixed so key order is stable.
+ * `pr → {authorHumanId, canApprove, assignedReviewerHumanIds, checks}`
+ * projection, sorted by PR number so item order never affects the result. Only
+ * these annotation scalars/arrays are serialized (never the GitHub pull objects,
+ * whose float/field-order drift is the reason the list ETag — not a body hash —
+ * anchors the ETag). The reviewer ids are left in their file order (a lead's list
+ * order is a durable property of the file); the object shape is fixed so key
+ * order is stable.
+ *
+ * The CI rollup MUST be in here. It is the one served annotation that can move
+ * while every other input — including the upstream list ETag — stands still, so
+ * leaving it out would mean a finished build never reaches a client holding a
+ * matching ETag: it would get a 304 and keep the stale rollup indefinitely. It is
+ * re-projected field by field rather than embedded by reference so its key order
+ * is fixed no matter how the rollup object was built, and an ABSENT rollup
+ * serializes as `null` — distinct from every present state, so a rollup appearing
+ * or disappearing moves the hash too.
  */
 function serializeAnnotations(items: PullListItem[]): string {
   const rows = items
@@ -104,6 +145,10 @@ function serializeAnnotations(items: PullListItem[]): string {
       authorHumanId: it.broker.authorHumanId,
       canApprove: it.broker.canApprove,
       assignedReviewerHumanIds: it.broker.assignedReviewerHumanIds,
+      checks:
+        it.broker.checks === undefined
+          ? null
+          : { state: it.broker.checks.state, total: it.broker.checks.total },
     }))
     .sort((a, b) => a.pr - b.pr)
   return JSON.stringify(rows)
@@ -115,10 +160,10 @@ function serializeAnnotations(items: PullListItem[]): string {
  * the same durable meta always yields the same broker ETag, because every input
  * is durable (the upstream ETag is a property of GitHub's response; the meta comes
  * from the `pr_author` table, the reviewers file, and `REVU_BOT_LOGIN`). It is
- * also meta-sensitive: a reviewers-file / author-record change moves the meta hash
- * even when the list ETag is unchanged, so the served ETag flips on a meta-only
- * change. An empty upstream ETag (a test double that omits one) still yields a
- * stable value keyed on the empty string, so a 304 loop can still form.
+ * also meta-sensitive: a reviewers-file / author-record / CI-rollup change moves
+ * the meta hash even when the list ETag is unchanged, so the served ETag flips on
+ * a meta-only change. An empty upstream ETag (a test double that omits one) still
+ * yields a stable value keyed on the empty string, so a 304 loop can still form.
  */
 export function brokerEtag(listEtag: string, items: PullListItem[]): string {
   return `W/"pulls:${djb2Hex(listEtag)}:${djb2Hex(serializeAnnotations(items))}"`
@@ -138,7 +183,8 @@ interface CacheState {
    * The deterministic broker-level ETag served on `/v1/pulls`, composed from the
    * list ETag AND a hash of the served meta annotations. Recomputed whenever the
    * served items or their annotations change — including on a meta-only 304 tick —
-   * so a reviewers-file / author-record edit flips it even when upstream 304s.
+   * so a reviewers-file / author-record edit or a finished CI run flips it even
+   * when upstream 304s.
    */
   brokerEtag: string
   rateLimit: RateLimitInfo
@@ -152,13 +198,45 @@ function unknownRateLimit(): RateLimitInfo {
 /**
  * A per-pull broker-meta refresh: the live facts a changed pull needs. The
  * loop composes this into `BrokerPullMeta`, layering in the per-pull author /
- * reviewer / approvability annotations from the annotation resolver.
+ * reviewer / approvability annotations from the annotation resolver and the CI
+ * rollup (which is tracked separately, because it refreshes on its own schedule).
  */
 interface PullMetaFacts {
   unresolvedThreads: number
   commitCount: number
   /** `${mergeBaseSha}...${headSha}` — the same compare key a full sync computes. */
   compareKey: string
+}
+
+/**
+ * Everything on a pull's served meta EXCEPT the CI rollup. The rollup is layered
+ * on last, from its own source, so the three ways a meta gets built (fresh facts,
+ * carried forward, first-seen default) cannot each invent their own rule for it.
+ */
+type MetaWithoutChecks = Omit<BrokerPullMeta, 'checks'>
+
+/**
+ * What one tick learned about a pull's CI rollup.
+ *
+ * `undefined` — NOT OBSERVED. The batched query did not answer for this pull, or
+ * answered without a rollup field. The prior rollup carries forward untouched,
+ * which is what keeps one pull's checks failure from blanking its indicator or
+ * failing the tick.
+ *
+ * `null` — OBSERVED, NOTHING REPORTED. The pull resolved and has no CI rollup at
+ * all. Any prior rollup is CLEARED: a pull whose head moved to a commit no
+ * workflow runs on must stop advertising the old commit's result.
+ *
+ * A `ChecksRollup` — observed and current.
+ */
+type ObservedRollup = ChecksRollup | null | undefined
+
+/** What one facts phase learned: full facts for changed pulls, rollups for every pull it asked about. */
+interface FactsRefresh {
+  /** Keyed by PR number; a pull missing here carries its prior facts forward. */
+  facts: Map<number, PullMetaFacts>
+  /** Keyed by PR number; a pull missing here carries its prior rollup forward. */
+  checks: Map<number, ChecksRollup | null>
 }
 
 /**
@@ -186,12 +264,45 @@ export interface PrAuthorResolver {
 }
 
 /**
+ * One pull's batched facts as the poll loop consumes them.
+ *
+ * Wider than what the REST/GraphQL client currently returns, by exactly one
+ * OPTIONAL field: the head commit's CI rollup. Widening here rather than
+ * narrowing at the call site means a facts source that does not report a rollup
+ * (every rollup is simply never observed, so the field stays absent on the served
+ * meta) and one that does are the same type, and the loop's rollup policy is
+ * written once against the richer shape.
+ */
+export interface PollPullFacts {
+  unresolvedThreads: number
+  commitCount: number
+  /**
+   * The head commit's rolled-up CI state, when the batched query returned one.
+   * Absent means the query did not answer for this pull's rollup — the loop
+   * carries the prior rollup forward rather than blanking it. `null` means the
+   * query DID answer and there is no CI to report, which clears any prior rollup.
+   */
+  checks?: ChecksRollup | null
+}
+
+/**
  * The engine the poll loop needs beyond the list read: the batched per-pull facts
- * (unresolved counts + commit counts) and a merge-base compare for the compare
- * key. Kept narrow so the loop is trivially faked in a test.
+ * (unresolved counts + commit counts + the CI rollup) and a merge-base compare for
+ * the compare key. Kept narrow so the loop is trivially faked in a test.
  */
 export interface PollFactsSource {
-  getPullFacts: PullListClient['getPullFacts']
+  /**
+   * One batched query answering for many pulls at once. The loop calls this AT
+   * MOST once per tick and never issues a per-PR request of its own: the REST
+   * allowance is shared by every reviewer on the installation, so a per-pull CI
+   * fetch would multiply the whole installation's idle cost by the size of the
+   * review queue.
+   */
+  getPullFacts(
+    owner: string,
+    repo: string,
+    prNumbers: number[],
+  ): Promise<Record<number, PollPullFacts>>
   /** `GET /repos/{o}/{r}/compare/{base}...{head}` — the merge base of a compare. */
   getCompare(
     owner: string,
@@ -241,7 +352,10 @@ export interface PollLoopDeps {
  * author / reviewer / approvability annotations are always current (they come
  * from the host-side seams, not the diff facts), so they are filled here too.
  */
-function defaultMeta(pull: PullSummary, annotations: PullAnnotations): BrokerPullMeta {
+function defaultMeta(
+  pull: PullSummary,
+  annotations: PullAnnotations,
+): MetaWithoutChecks {
   return {
     authorHumanId: annotations.authorHumanId,
     canApprove: annotations.canApprove,
@@ -253,12 +367,61 @@ function defaultMeta(pull: PullSummary, annotations: PullAnnotations): BrokerPul
 }
 
 /**
- * Compose a full `BrokerPullMeta` from live facts plus the current author /
+ * Carry a pull's prior diff-derived facts forward under FRESH annotations — what
+ * an unchanged pull serves. Written out field by field rather than spread so the
+ * CI rollup is deliberately dropped here and re-decided by the rollup layer,
+ * instead of surviving by accident whenever the meta happens to be copied.
+ */
+function carriedMeta(
+  prior: BrokerPullMeta,
+  annotations: PullAnnotations,
+): MetaWithoutChecks {
+  return {
+    authorHumanId: annotations.authorHumanId,
+    canApprove: annotations.canApprove,
+    unresolvedThreads: prior.unresolvedThreads,
+    assignedReviewerHumanIds: annotations.assignedReviewerHumanIds,
+    compareKey: prior.compareKey,
+    commitCount: prior.commitCount,
+  }
+}
+
+/**
+ * Settle a pull's CI rollup for this tick: what was observed if anything was,
+ * otherwise what was already being served. An observed `null` collapses to
+ * absent, which is how a rollup is cleared.
+ */
+function settleRollup(
+  observed: ObservedRollup,
+  prior: ChecksRollup | undefined,
+): ChecksRollup | undefined {
+  if (observed === undefined) return prior
+  return observed === null ? undefined : observed
+}
+
+/**
+ * Attach the settled rollup to a meta, OMITTING the key entirely when there is
+ * no rollup. Absence is the contract's way of saying nothing has reported, so the
+ * field must be missing rather than present-and-undefined — the two are the same
+ * to a reader of the object but not to the serialization the ETag hashes.
+ */
+function withChecks(
+  meta: MetaWithoutChecks,
+  rollup: ChecksRollup | undefined,
+): BrokerPullMeta {
+  return rollup === undefined ? { ...meta } : { ...meta, checks: rollup }
+}
+
+/**
+ * Compose a `BrokerPullMeta` from live facts plus the current author /
  * reviewer / approvability annotations. The facts drive the diff-derived fields;
  * the annotations drive `authorHumanId`, `canApprove`, and
- * `assignedReviewerHumanIds`.
+ * `assignedReviewerHumanIds`. The CI rollup is layered on separately.
  */
-function metaFromFacts(facts: PullMetaFacts, annotations: PullAnnotations): BrokerPullMeta {
+function metaFromFacts(
+  facts: PullMetaFacts,
+  annotations: PullAnnotations,
+): MetaWithoutChecks {
   return {
     authorHumanId: annotations.authorHumanId,
     canApprove: annotations.canApprove,
@@ -387,30 +550,52 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
   }
 
   /**
-   * Refresh live facts for exactly the changed pulls: one batched GraphQL query
-   * for unresolved-thread + commit counts, and one merge-base compare per changed
-   * pull for the true `compareKey`. The compare is bounded to changed pulls, so
-   * an idle poll (no changes) spends nothing here.
+   * Pulls whose last-served rollup is still in flight, and therefore the only
+   * ones whose CI state can move without the upstream list moving with it. A
+   * settled rollup does not need re-asking, and a pull with no rollup at all has
+   * nothing to go stale — so this set is empty on a queue with no CI running,
+   * and the sweep it drives costs nothing at all.
+   */
+  function unsettledNumbers(items: PullListItem[]): number[] {
+    return items
+      .filter((it) => it.broker.checks?.state === 'pending')
+      .map((it) => it.pull.number)
+  }
+
+  /**
+   * Run the facts phase: ONE batched GraphQL query covering the changed pulls
+   * plus the `alsoWatch` pulls whose rollup is unsettled, then one merge-base
+   * compare per CHANGED pull for the true `compareKey`. The compares stay bounded
+   * to changed pulls — the watched pulls contribute only their rollup, which the
+   * one query already carries, so watching them adds no request. With nothing
+   * changed and nothing watched, the phase issues nothing at all.
    *
    * A batched-counts failure (the GraphQL query throws — e.g. its SEPARATE rate
    * bucket is exhausted) propagates and fails the whole tick: it is a facts-phase
    * outage, so the caller counts it toward the stale threshold rather than
    * silently serving a list whose facts never refresh. But a SINGLE pull's
    * merge-base compare failing (a persistent 404 on one PR's compare) is isolated
-   * HERE: that pull is simply omitted from the returned map, so the caller carries
-   * its PRIOR meta forward unchanged and every other changed pull still refreshes.
-   * One bad pull must never abort the whole tick.
+   * HERE: that pull is simply omitted from the returned facts map, so the caller
+   * carries its PRIOR meta forward unchanged and every other changed pull still
+   * refreshes. One bad pull must never abort the whole tick. Its rollup, which
+   * came from the batched query and not the compare, still applies — a broken
+   * compare is no reason to freeze a pull's CI indicator.
    */
   async function refreshFacts(
     changed: PullSummary[],
-  ): Promise<Map<number, PullMetaFacts>> {
-    const out = new Map<number, PullMetaFacts>()
-    if (changed.length === 0) return out
-    const counts = await deps.facts.getPullFacts(
-      owner,
-      repo,
-      changed.map((p) => p.number),
-    )
+    alsoWatch: number[],
+  ): Promise<FactsRefresh> {
+    const out: FactsRefresh = { facts: new Map(), checks: new Map() }
+    const numbers = [...changed.map((p) => p.number), ...alsoWatch]
+    if (numbers.length === 0) return out
+    const counts = await deps.facts.getPullFacts(owner, repo, numbers)
+    for (const n of numbers) {
+      const c = counts[n]
+      // A pull the query could not resolve, or resolved without a rollup field,
+      // is left OUT of the map — "not observed", so the caller keeps what it was
+      // already serving rather than blanking a perfectly good indicator.
+      if (c?.checks !== undefined) out.checks.set(n, c.checks)
+    }
     for (const pull of changed) {
       const c = counts[pull.number]
       let compare: { merge_base_commit: { sha: string } }
@@ -422,13 +607,36 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
         // content is ever logged; the failure is simply absorbed per pull.
         continue
       }
-      out.set(pull.number, {
+      out.facts.set(pull.number, {
         unresolvedThreads: c?.unresolvedThreads ?? 0,
         commitCount: c?.commitCount ?? 0,
         compareKey: `${compare.merge_base_commit.sha}...${pull.head.sha}`,
       })
     }
     return out
+  }
+
+  /**
+   * Re-observe the unsettled rollups on an upstream-304 tick, where no other
+   * facts are refreshed.
+   *
+   * Its failure is ABSORBED rather than counted against the stale threshold, and
+   * deliberately so: before this sweep existed a 304 tick made no upstream facts
+   * call whatsoever, so letting one fail the tick would make an idle broker more
+   * fragile than it was. A failed sweep leaves every rollup exactly as it was —
+   * still `pending`, which is the last thing actually observed and remains the
+   * honest reading while nothing better is known.
+   */
+  async function sweepUnsettledChecks(
+    items: PullListItem[],
+  ): Promise<Map<number, ChecksRollup | null>> {
+    const watching = unsettledNumbers(items)
+    if (watching.length === 0) return new Map()
+    try {
+      return (await refreshFacts([], watching)).checks
+    } catch {
+      return new Map()
+    }
   }
 
   async function pollOnce(): Promise<void> {
@@ -455,17 +663,25 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
           // Unchanged upstream: the diff-derived fields (counts, compareKey) stay
           // as they were, but the host-side annotations (author, reviewers,
           // approvability) may have moved independently of the diff — so
-          // re-annotate the cached items in place. Also refresh the rate limit
-          // (its headers ride the 304). A 304 IS a successful tick, so it clears
-          // the failure streak.
+          // re-annotate the cached items in place. The CI rollup can move
+          // independently too, and unlike the annotations it lives upstream, so
+          // the unsettled ones are re-observed here as well. Also refresh the rate
+          // limit (its headers ride the 304). A 304 IS a successful tick, so it
+          // clears the failure streak.
+          const swept = await sweepUnsettledChecks(cache.items)
           cache.items = cache.items.map((it) => ({
             pull: it.pull,
-            broker: { ...it.broker, ...annotationsFor(it.pull) },
+            broker: withChecks(
+              carriedMeta(it.broker, annotationsFor(it.pull)),
+              settleRollup(swept.get(it.pull.number), it.broker.checks),
+            ),
           }))
           // Recompute the broker ETag from the (unchanged) list ETag AND the
-          // freshly re-applied annotations: a meta-only change during an
-          // upstream-304 tick MUST flip the served ETag, or the frontend keeps
-          // stale items behind a matching ETag and never sees the new meta.
+          // freshly re-applied annotations and rollups: a meta-only change during
+          // an upstream-304 tick MUST flip the served ETag, or the frontend keeps
+          // stale items behind a matching ETag and never sees the new meta. An
+          // upstream 304 no longer implies the served meta is unchanged, which is
+          // precisely why this recompute cannot be skipped as an optimization.
           cache.brokerEtag = brokerEtag(cache.listEtag, cache.items)
           if (page.rateLimit !== null) cache.rateLimit = page.rateLimit
           consecutiveFailures = 0
@@ -481,10 +697,15 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
       const priorItems = cache?.items ?? []
       const changed = changedNumbers(page.items, priorItems)
       const changedPulls = page.items.filter((p) => changed.has(p.number))
+      // A pull whose rollup is unsettled rides along in the same batched query
+      // even though the list says it did not change, because a build finishing
+      // is exactly the change the list cannot see. Already-changed pulls are
+      // excluded — they are being asked about anyway.
+      const watching = unsettledNumbers(priorItems).filter((n) => !changed.has(n))
       // A facts-phase outage (the batched counts query throws) propagates out of
       // here to the catch below and counts as a failed tick — so a REST list that
       // keeps 200-ing while GraphQL is down cannot masquerade as fresh forever.
-      const facts = await refreshFacts(changedPulls)
+      const refreshed = await refreshFacts(changedPulls, watching)
       const priorMetaByNumber = new Map(
         priorItems.map((it) => [it.pull.number, it.broker]),
       )
@@ -495,13 +716,21 @@ export function createPollLoop(deps: PollLoopDeps): PollLoop {
         // up a reviewers-file or author-record change even when the diff facts
         // did not move.
         const annotations = annotationsFor(pull)
-        const fresh = facts.get(pull.number)
-        if (fresh !== undefined) return { pull, broker: metaFromFacts(fresh, annotations) }
         const carried = priorMetaByNumber.get(pull.number)
-        if (carried !== undefined) {
-          return { pull, broker: { ...carried, ...annotations } }
+        const fresh = refreshed.facts.get(pull.number)
+        const base =
+          fresh !== undefined
+            ? metaFromFacts(fresh, annotations)
+            : carried !== undefined
+              ? carriedMeta(carried, annotations)
+              : defaultMeta(pull, annotations)
+        return {
+          pull,
+          broker: withChecks(
+            base,
+            settleRollup(refreshed.checks.get(pull.number), carried?.checks),
+          ),
         }
-        return { pull, broker: defaultMeta(pull, annotations) }
       })
 
       const sortedItems = sortItems(items)

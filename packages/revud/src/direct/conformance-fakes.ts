@@ -1,5 +1,6 @@
 import { expect } from 'bun:test'
 import type {
+  ChecksRollup,
   PendingComment,
   PullSummary,
   RateLimitInfo,
@@ -16,11 +17,10 @@ import type {
   GithubClient,
   Page,
   PageParams,
-  PullFacts,
   PullListClient,
   PullListPage,
 } from './github-client'
-import type { PollFactsSource } from '../broker/poll-loop'
+import type { PollFactsSource, PollPullFacts } from '../broker/poll-loop'
 import type { RepoRef } from './repo'
 import type { DirectApi } from './direct-api'
 import type { TokenSource } from './token-source'
@@ -476,6 +476,17 @@ export interface FakePull {
   /** Merge base the compare fake reports; the compareKey is `${mergeBase}...${headSha}`. */
   mergeBaseSha: string
   /**
+   * The head commit's CI rollup as the batched-facts fake reports it. Omit to
+   * model a facts source that answers without a rollup at all (the field is never
+   * observed, so a prior rollup carries forward); `null` models a pull the query
+   * resolved but that has no CI reporting on it.
+   *
+   * Mutating this WITHOUT `mutatePulls` is how a test models a build finishing:
+   * the ETag sequence does not move, so the next poll is still an upstream 304
+   * and only the rollup has changed.
+   */
+  checks?: ChecksRollup | null
+  /**
    * The PR author's github login. Defaults to `'author'` (an org member) when
    * omitted; set it to the broker bot login to model an App-authored PR, which
    * drives the `canApprove` annotation (a bot-authored PR is not self-approvable).
@@ -529,10 +540,15 @@ export interface PollFakeState {
   etagSeq: number
   /** Requests answered with a 200 (a real cost); a 304 does not increment this. */
   nonNotModified: number
+  /**
+   * Batched facts queries issued. A tick with nothing to ask about must not
+   * issue one at all, which is what keeps an idle poll free.
+   */
+  factsQueries: number
 }
 
 export function initialPollState(pulls: FakePull[]): PollFakeState {
-  return { pulls, etagSeq: 1, nonNotModified: 0 }
+  return { pulls, etagSeq: 1, nonNotModified: 0, factsQueries: 0 }
 }
 
 /** Apply a change and bump the ETag sequence so the next poll observes a 200. */
@@ -553,6 +569,29 @@ export function fakePollSources(state: PollFakeState): {
   facts: PollFactsSource
 } {
   const currentEtag = (): string => `gh-list-etag-${state.etagSeq}`
+  /**
+   * The batched facts query, shared by both seams so a test cannot accidentally
+   * exercise two different fakes. A pull the state does not know is OMITTED,
+   * modelling a number GitHub could not resolve.
+   */
+  async function pullFacts(
+    _owner: string,
+    _repo: string,
+    prNumbers: number[],
+  ): Promise<Record<number, PollPullFacts>> {
+    state.factsQueries += 1
+    const out: Record<number, PollPullFacts> = {}
+    for (const n of prNumbers) {
+      const p = state.pulls.find((x) => x.number === n)
+      if (p === undefined) continue
+      out[n] = {
+        unresolvedThreads: p.unresolvedThreads,
+        commitCount: p.commitCount,
+        ...(p.checks === undefined ? {} : { checks: p.checks }),
+      }
+    }
+    return out
+  }
   const client: PullListClient = {
     async listOpenPulls(_owner, _repo, etag): Promise<PullListPage> {
       const responseEtag = currentEtag()
@@ -568,17 +607,10 @@ export function fakePollSources(state: PollFakeState): {
         rateLimit: fakeRateLimit(),
       }
     },
-    async getPullFacts(_owner, _repo, prNumbers): Promise<Record<number, PullFacts>> {
-      const out: Record<number, PullFacts> = {}
-      for (const n of prNumbers) {
-        const p = state.pulls.find((x) => x.number === n)
-        if (p) out[n] = { unresolvedThreads: p.unresolvedThreads, commitCount: p.commitCount }
-      }
-      return out
-    },
+    getPullFacts: pullFacts,
   }
   const facts: PollFactsSource = {
-    getPullFacts: client.getPullFacts,
+    getPullFacts: pullFacts,
     async getCompare(_owner, _repo, _base, head): Promise<GhCompareRaw> {
       const p = state.pulls.find((x) => x.headSha === head)
       return { merge_base_commit: { sha: p?.mergeBaseSha ?? 'UNKNOWN' } }
