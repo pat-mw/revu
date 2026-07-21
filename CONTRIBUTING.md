@@ -69,6 +69,26 @@ When you add a new adapter, run the conformance suite against it before
 claiming the implementation is correct. When the contract changes, update the
 suite first.
 
+### What the suite leaves to the transport
+
+The suite asserts outcomes, not transport mechanics. There is one place the
+contract genuinely permits two shapes, and the suite parameterizes over it
+rather than picking a winner: how a `syncPull` that dies mid-transfer reaches
+the caller. The in-process mock and the daemon-over-HTTP client both raise it as
+an `ApiError` with code `network`; an engine driving real GitHub collects what
+it transferred and resolves with `snapshot.partial` set. Both are conformant.
+
+A runner declares its own shape through the `partialSyncSurfacing` field, built
+with `expectPartialSyncThrows('network')` or `expectPartialSyncResolves()`. The
+outcome assertions — a partial snapshot is kept and names what is missing, the
+retry fetches only those blobs, the retry clears the partial — stay shared and
+apply to every leg.
+
+Omitting the field is allowed but weaker: the fallback asserts only that the
+interruption arrived in one of the two legal shapes. It never skips, so a sync
+that reported plain success still fails. Prefer declaring the shape your
+transport actually produces.
+
 Source: `packages/shared/conformance/suite.ts`.
 
 ## Code comment rule

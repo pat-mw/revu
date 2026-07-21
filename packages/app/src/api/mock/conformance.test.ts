@@ -15,7 +15,7 @@
  * page reload or a workspace rebuild.
  */
 import { beforeAll, describe } from 'bun:test'
-import { runConformanceSuite } from '@revu/shared/conformance'
+import { expectPartialSyncThrows, runConformanceSuite } from '@revu/shared/conformance'
 import { createMockApi } from '@/api/mock/adapter'
 import { mockDev } from '@/api/mock/devtools'
 import { store } from '@/api/mock/store'
@@ -45,5 +45,10 @@ describe('mock adapter conformance', () => {
       store.flush()
       return createMockApi()
     },
+    // The mock owns the simulated drop, so it writes the partial snapshot and
+    // then raises the drop as a `network` ApiError — the same shape the app's
+    // error copy renders. A transport that instead resolves with the partial is
+    // equally conformant, which is why this expectation is per-runner.
+    partialSyncSurfacing: expectPartialSyncThrows('network'),
   })
 })
