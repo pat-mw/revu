@@ -80,7 +80,7 @@ list_candidates() {
   [ -n "${REVU_REPOS_DIR:-}" ] && [ -d "${REVU_REPOS_DIR}" ] || return 0
   for d in "${REVU_REPOS_DIR}"/*/; do
     [ -d "${d}.git" ] || continue
-    printf '  cd %s\n' "${d%/}"
+    printf '      cd %s\n' "${d%/}"
   done
 }
 
@@ -154,7 +154,7 @@ countdown() {
 }
 
 heading() { printf '\n%srevu%s %s·%s %s%s%s\n' "${B}" "${OFF}" "${DIM}" "${OFF}" "${ACCENT}" "$1" "${OFF}"; }
-field()   { printf '  %-12s %s\n' "$1" "$2"; }
+field()   { printf '  %-14s %s\n' "$1" "$2"; }
 
 print_commands() {
   printf '\n'
@@ -230,8 +230,8 @@ cmd_open() {
   if [ -n "${REVU_ACCESS_HINT:-}" ]; then
     printf '\n  %sIt binds loopback. To reach it from your own machine, run THERE:%s\n\n' \
       "${DIM}" "${OFF}"
-    printf '  %s%s%s\n' "${B}" "${REVU_ACCESS_HINT}" "${OFF}"
-    printf '\n  then open %s\n' "${URL}"
+    printf '      %s%s%s\n' "${B}" "${REVU_ACCESS_HINT}" "${OFF}"
+    printf '\n  %sthen open%s %s\n' "${DIM}" "${OFF}" "${URL}"
   else
     printf '\n  %sIt binds loopback — reachable only from this machine.%s\n' "${DIM}" "${OFF}"
   fi
