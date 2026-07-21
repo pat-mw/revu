@@ -25,6 +25,11 @@ import {
  * Every modified file's head blob is the literal head content; its base is the
  * head with the patch reversed. `pullFile` derives additions/deletions from the
  * patch so the file list matches what the viewer renders.
+ *
+ * Its base is the runtime-bump branch rather than the default branch — the
+ * strict flags land on the pinned toolchain — which also makes it the sibling
+ * of the ingest pull request one level down the same stack, so the inbox tree
+ * has two children to order under one branch.
  */
 
 const MARCUS = HUMANS.find((h) => h.id === 'h-marcus')!
@@ -891,7 +896,7 @@ const detail: PullDetail = {
       '',
       'CI is red on purpose right now — the flip found 14 pre-existing errors across six files this PR does not yet touch, and four suites pin behaviour that the null guards deliberately change. I will push the remaining fixes and update the tests once we agree on the `totalFor` question below.',
       '',
-      'Heads up: this branch also conflicts with `main` after the billing rename that landed yesterday — I will rebase once the direction is settled so I do not redo the conflict resolution twice.',
+      'Heads up: this sits on `chore/node-22` so the strict flags land on the pinned toolchain, and it now conflicts with that branch after the billing rename came through — I will rebase once the direction is settled so I do not redo the conflict resolution twice.',
     ].join('\n'),
   ),
   user: BROKER_BOT,
@@ -907,9 +912,9 @@ const detail: PullDetail = {
     repo: { full_name: OWNER, default_branch: REPO.default_branch },
   },
   base: {
-    ref: 'main',
+    ref: 'chore/node-22',
     sha: BASE_SHA,
-    label: 'meridian-labs:main',
+    label: 'meridian-labs:chore/node-22',
     repo: { full_name: OWNER, default_branch: REPO.default_branch },
   },
   merge_base_sha: MERGE_BASE_SHA,

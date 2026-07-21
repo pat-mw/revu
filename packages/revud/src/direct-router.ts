@@ -91,7 +91,6 @@ function errorJson(code: string, message: string, status: number): Response {
  */
 const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
   ROUTES.listReviewThreads.path,
-  ROUTES.getRateLimit.path,
 ])
 
 /**
@@ -323,6 +322,14 @@ export async function handleDirectApi(
         const snapshot = await api.syncPull(n)
         return json(snapshot)
       }
+    }
+
+    // ——— getRateLimit: the shared allowance, read live from GitHub. ———
+    // Not accumulated here and not summed across workspaces: the bucket belongs
+    // to the credential, and every workspace under one installation spends from
+    // the same one, so GitHub is already the shared counter.
+    if (method === ROUTES.getRateLimit.method && matchRoute(ROUTES.getRateLimit.path, path)) {
+      return json(await api.getRateLimit())
     }
 
     // ——— getSnapshot: null for never-synced (200), never 404-as-error. ———

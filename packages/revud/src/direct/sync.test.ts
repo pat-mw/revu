@@ -126,6 +126,9 @@ function fakeClient(cfg: FakeConfig): { client: GithubClient; calls: Calls } {
       calls.commits += 1
       return page([cfg.commits ?? []], params)
     },
+    async getRateLimit() {
+      return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }
+    },
     async getCheckRuns() {
       calls.checkRuns += 1
       return { check_runs: cfg.checkRuns ?? [] }
@@ -255,7 +258,10 @@ describe('Snapshot assembly matches the contract shape', () => {
     const { client } = fakeClient(baseConfig())
     const gated: GithubClient = {
       ...client,
-      async getCheckRuns(): Promise<unknown> {
+      async getRateLimit() {
+      return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }
+    },
+    async getCheckRuns(): Promise<unknown> {
         throw new GithubRequestError(403, '/check-runs', 'Resource not accessible by integration')
       },
     }
@@ -270,7 +276,10 @@ describe('Snapshot assembly matches the contract shape', () => {
     const { client } = fakeClient(baseConfig())
     const broken: GithubClient = {
       ...client,
-      async getCheckRuns(): Promise<unknown> {
+      async getRateLimit() {
+      return { limit: 5000, remaining: 4999, used: 1, reset: '2026-01-01T00:00:00.000Z' }
+    },
+    async getCheckRuns(): Promise<unknown> {
         throw new GithubRequestError(500, '/check-runs', 'server error')
       },
     }

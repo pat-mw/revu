@@ -59,6 +59,7 @@ export function throwingGithubClient(): GithubClient {
     getIssueComments: () => notUsed('getIssueComments'),
     getPullReviews: () => notUsed('getPullReviews'),
     getPullCommits: () => notUsed('getPullCommits'),
+    getRateLimit: () => notUsed('getRateLimit'),
     getCheckRuns: () => notUsed('getCheckRuns'),
     getTree: () => notUsed('getTree'),
     getBlob: () => notUsed('getBlob'),

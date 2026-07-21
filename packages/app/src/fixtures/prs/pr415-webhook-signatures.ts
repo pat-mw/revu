@@ -29,6 +29,11 @@ import {
  * refetches the mutable half unconditionally but reuses every blob: the
  * compare key is unchanged and blobs are content-addressed, so
  * `syncStats.blobsReused` equals the blob count and `blobsFetched` is zero.
+ *
+ * It is also the only pull request NOT aimed at the default branch: a timing
+ * oracle has to reach the shipped line, so this one targets the release branch.
+ * That makes it the second root of the inbox tree, which is what proves the
+ * tree groups by base branch at all rather than drawing one list under `main`.
  */
 
 const SHA_BASE = fakeSha('pr415-base')
@@ -485,7 +490,12 @@ const detail: PullDetail = {
     label: 'meridian-labs:webhooks/constant-time-verify',
     repo: { ...REPO },
   },
-  base: { ref: 'main', sha: SHA_BASE, label: 'meridian-labs:main', repo: { ...REPO } },
+  base: {
+    ref: 'release/0.41',
+    sha: SHA_BASE,
+    label: 'meridian-labs:release/0.41',
+    repo: { ...REPO },
+  },
   created_at: hoursAgo(52),
   updated_at: hoursAgo(5),
   merged: false,

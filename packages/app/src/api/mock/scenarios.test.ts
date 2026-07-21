@@ -22,6 +22,7 @@
 import { beforeAll, describe, expect, it } from 'bun:test'
 import { createMockApi } from '@/api/mock/adapter'
 import { mockDev } from '@/api/mock/devtools'
+import { store } from '@/api/mock/store'
 import { fixtureDB } from '@/fixtures'
 import type { PullListResponse, ReviewDraft, ReviewThread, Snapshot } from '@revu/shared'
 import { ApiError, parseCommentIdentity } from '@revu/shared'
@@ -300,5 +301,37 @@ describe('per-human preferences', () => {
     mockDev.setFailureMode('all')
     expect((await api.getPreferences()).diffMode).toBe('split')
     mockDev.setFailureMode('none')
+  })
+})
+
+describe('per-human inbox arrangement', () => {
+  it('defaults to the list arrangement', async () => {
+    mockDev.setHuman('h-priya')
+    expect((await api.getPreferences()).inboxView).toBe('list')
+  })
+
+  it('a set persists and reads back', async () => {
+    const saved = await api.setPreferences({ inboxView: 'tree' })
+    expect(saved.inboxView).toBe('tree')
+    expect((await api.getPreferences()).inboxView).toBe('tree')
+  })
+
+  it('is per-human: another human still sees the default', async () => {
+    mockDev.setHuman('h-alice')
+    expect((await api.getPreferences()).inboxView).toBe('list')
+    mockDev.setHuman('h-priya')
+    expect((await api.getPreferences()).inboxView).toBe('tree')
+  })
+
+  it('survives a reload, and the diff layout survives alongside it', async () => {
+    // Persist the whole broker document, then read it back through a freshly
+    // built adapter over the same store — the in-process stand-in for the page
+    // reload or workspace rebuild the arrangement has to outlive. Asserting the
+    // diff layout too proves the second preference was stored beside the first
+    // rather than replacing it.
+    store.flush()
+    const reloaded = await createMockApi().getPreferences()
+    expect(reloaded.inboxView).toBe('tree')
+    expect(reloaded.diffMode).toBe('split')
   })
 })

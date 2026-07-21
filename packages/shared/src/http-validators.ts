@@ -21,6 +21,7 @@ import type {
   AnchorResult,
   BrokerPullMeta,
   CheckRun,
+  ChecksRollup,
   CommitInfo,
   FileBlob,
   FileViewedState,
@@ -467,6 +468,11 @@ export const vSession: Validator<Session> = vObject({
   viewerLogin: vOptional(vString),
 })
 
+export const vChecksRollup: Validator<ChecksRollup> = vObject({
+  state: vLiteral('success', 'failure', 'pending'),
+  total: vNumber,
+})
+
 export const vBrokerPullMeta: Validator<BrokerPullMeta> = vObject({
   authorHumanId: vNullable(vString),
   canApprove: vBoolean,
@@ -474,6 +480,7 @@ export const vBrokerPullMeta: Validator<BrokerPullMeta> = vObject({
   assignedReviewerHumanIds: vArray(vString),
   compareKey: vString,
   commitCount: vNumber,
+  checks: vOptional(vChecksRollup),
 })
 
 export const vPullListItem: Validator<PullListItem> = vObject({
@@ -573,6 +580,7 @@ export const vFileViewedState: Validator<FileViewedState> = vRecord(
 
 export const vHumanPreferences: Validator<HumanPreferences> = vObject({
   diffMode: vLiteral('unified', 'split'),
+  inboxView: vLiteral('list', 'tree'),
   theme: vLiteral('dark', 'light'),
 })
 
@@ -721,6 +729,7 @@ export const validateSetViewedBody: Validator<{
 export const validateSetPreferencesBody: Validator<Partial<HumanPreferences>> =
   vObject({
     diffMode: vOptional(vLiteral('unified', 'split')),
+    inboxView: vOptional(vLiteral('list', 'tree')),
     theme: vOptional(vLiteral('dark', 'light')),
   })
 

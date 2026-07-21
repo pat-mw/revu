@@ -4,6 +4,7 @@ import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import { buildSnapshot, emptyReactions, nodeId } from '@/fixtures/helpers'
+import { rollupChecks } from '@/lib/checks-rollup'
 import { store } from './store'
 import { delay, localDelay } from './latency'
 
@@ -223,17 +224,28 @@ export function createMockApi(): RevuApi {
     async listPulls(opts?: { etag?: string }): Promise<PullListResponse> {
       await delay('read')
       failReads()
-      const items: PullListItem[] = store.listEffectiveRemotes().map((r) => ({
-        pull: toSummary(r.detail),
-        broker: {
-          ...r.broker,
-          // The broker's poll loop is always fresh — these are recomputed
-          // from the current effective remote, never trusted from fixtures.
-          unresolvedThreads: r.threads.filter((t) => !t.isResolved).length,
-          commitCount: r.commits.length,
-          compareKey: `${r.detail.merge_base_sha}...${r.detail.head.sha}`,
-        },
-      }))
+      const items: PullListItem[] = store.listEffectiveRemotes().map((r) => {
+        // The CI rollup is DERIVED from the same check runs the PR header
+        // reads, through the same helper, so the list row and the header can
+        // never disagree about a pull. A pull with no check runs carries no
+        // rollup at all — absent means nothing has reported, which is not a
+        // failure and is not a pass.
+        const checks = rollupChecks(r.checks)
+        return {
+          pull: toSummary(r.detail),
+          broker: {
+            // The broker's poll loop is always fresh — these are recomputed
+            // from the current effective remote, never trusted from fixtures.
+            authorHumanId: r.broker.authorHumanId,
+            canApprove: r.broker.canApprove,
+            assignedReviewerHumanIds: r.broker.assignedReviewerHumanIds,
+            unresolvedThreads: r.threads.filter((t) => !t.isResolved).length,
+            commitCount: r.commits.length,
+            compareKey: `${r.detail.merge_base_sha}...${r.detail.head.sha}`,
+            ...(checks === undefined ? {} : { checks }),
+          },
+        }
+      })
       items.sort((a, b) => b.pull.updated_at.localeCompare(a.pull.updated_at))
       const etag = `W/"${djb2(JSON.stringify(items)).toString(16)}"`
       if (opts?.etag !== undefined && opts.etag === etag) {

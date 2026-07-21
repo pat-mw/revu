@@ -2,10 +2,11 @@ import { useCallback, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { Link, NavLink, Outlet, useParams } from 'react-router'
 import { Download, Inbox, RefreshCw } from 'lucide-react'
-import type { ApiError, CheckRun, Snapshot, StalenessInfo } from '@revu/shared'
+import type { ApiError, Snapshot, StalenessInfo } from '@revu/shared'
 import { identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
 import { useSession } from '@/state/session'
+import { countChecks } from '@/lib/checks-rollup'
 import { minutesUntil, relativeTime, shortSha } from '@/lib/time'
 import { useShortcut } from '@/lib/keyboard'
 import { cn } from '@/lib/cn'
@@ -262,33 +263,6 @@ function TabLink({ to, label, count }: { to: string; label: string; count?: numb
 }
 
 // ————————————————————————————————————————————————————————————————
-// Checks rollup for the header chip
-// ————————————————————————————————————————————————————————————————
-
-function checksRollup(checks: CheckRun[]): {
-  passed: number
-  failed: number
-  running: number
-  total: number
-} {
-  let passed = 0
-  let failed = 0
-  let running = 0
-  for (const c of checks) {
-    if (c.status !== 'completed') running++
-    else if (c.conclusion === 'success') passed++
-    else if (
-      c.conclusion === 'failure' ||
-      c.conclusion === 'timed_out' ||
-      c.conclusion === 'cancelled'
-    ) {
-      failed++
-    }
-  }
-  return { passed, failed, running, total: checks.length }
-}
-
-// ————————————————————————————————————————————————————————————————
 // Layout
 // ————————————————————————————————————————————————————————————————
 
@@ -391,7 +365,7 @@ export function PrLayout() {
     session.brokerLogin,
   )
   const detail = snapshot?.mutable.pull
-  const rollup = snapshot ? checksRollup(snapshot.mutable.checks) : null
+  const rollup = snapshot ? countChecks(snapshot.mutable.checks) : null
   const checksDot =
     rollup === null
       ? ''
@@ -480,6 +454,7 @@ export function PrLayout() {
             />
           </div>
           <nav className="-mb-px flex items-end gap-4" aria-label="Pull request sections">
+            <TabLink to="description" label="Description" />
             <TabLink
               to="conversation"
               label="Conversation"

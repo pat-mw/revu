@@ -360,6 +360,20 @@ export interface GithubClient extends GithubViewerClient {
   /** `GET /repos/{o}/{r}/commits/{sha}/check-runs` — check runs for a commit. */
   getCheckRuns(owner: string, repo: string, sha: string): Promise<unknown>
 
+  /**
+   * `GET /rate_limit` — the current state of the shared bucket.
+   *
+   * The bucket belongs to the CREDENTIAL, not to this process: under an app
+   * installation every workspace authenticates as the same installation and
+   * therefore draws from one allowance, which is why no aggregation across
+   * workspaces is needed to report it honestly — GitHub is already the shared
+   * counter, and each caller sees the same figure.
+   *
+   * This endpoint is documented as free: it does not itself consume quota, so
+   * polling it to display the quota is not self-defeating.
+   */
+  getRateLimit(): Promise<RateLimitInfo>
+
   /** `GET /repos/{o}/{r}/git/trees/{sha}?recursive=1` — the full recursive tree of a commit. */
   getTree(owner: string, repo: string, sha: string): Promise<GhTreeRaw>
 
@@ -777,6 +791,35 @@ function rateLimitFromHeaders(headers: Headers): RateLimitInfo | null {
 }
 
 /**
+ * Map a `resources.core` object from `GET /rate_limit` onto the contract's
+ * `RateLimitInfo`. Same shape as the response headers but delivered as a body,
+ * and with `reset` again a unix-epoch SECONDS integer rather than a timestamp.
+ * Returns null on anything unrecognisable, so a caller reports a failure rather
+ * than a fabricated allowance.
+ */
+function rateLimitFromCore(core: unknown): RateLimitInfo | null {
+  if (typeof core !== 'object' || core === null) return null
+  const c = core as { limit?: unknown; remaining?: unknown; used?: unknown; reset?: unknown }
+  const limit = Number(c.limit)
+  const remaining = Number(c.remaining)
+  const used = Number(c.used)
+  const resetEpoch = Number(c.reset)
+  if (
+    !Number.isFinite(limit) ||
+    !Number.isFinite(remaining) ||
+    !Number.isFinite(resetEpoch)
+  ) {
+    return null
+  }
+  return {
+    limit,
+    remaining,
+    used: Number.isFinite(used) ? used : limit - remaining,
+    reset: new Date(resetEpoch * 1000).toISOString(),
+  }
+}
+
+/**
  * Map one raw row from `GET /repos/{o}/{r}/pulls` onto the contract's
  * `PullSummary` — EXACTLY the list-shaped fields, never the detail-only counts a
  * list read does not carry. Missing/mistyped fields default to their zero value
@@ -1142,6 +1185,25 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient & Pu
 
     async getCheckRuns(owner: string, repo: string, sha: string): Promise<unknown> {
       return getJson(`/repos/${enc(owner)}/${enc(repo)}/commits/${enc(sha)}/check-runs`)
+    },
+
+    async getRateLimit(): Promise<RateLimitInfo> {
+      const body = (await getJson('/rate_limit')) as {
+        resources?: { core?: unknown }
+      }
+      // `core` is the bucket every REST read here spends from; the response also
+      // carries search, graphql and others, which are separate allowances and
+      // would misreport this one.
+      const core = body.resources?.core
+      const parsed = rateLimitFromCore(core)
+      if (parsed === null) {
+        throw new GithubRequestError(
+          502,
+          '/rate_limit',
+          'rate limit response did not carry a usable core bucket',
+        )
+      }
+      return parsed
     },
 
     async getTree(owner: string, repo: string, sha: string): Promise<GhTreeRaw> {
