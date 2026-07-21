@@ -35,7 +35,13 @@ export interface DevSnapshot {
  * can trust that subscribers have been signaled.
  */
 export interface DevControls {
-  get(): Promise<DevSnapshot>
+  /**
+   * The current dev snapshot, or `null` when the transport exposes no dev
+   * surface at all. Only the in-browser mock and a mock-backed daemon carry
+   * one; a daemon talking to real GitHub deliberately serves no dev routes, and
+   * `null` is the honest answer there rather than a snapshot of blanks.
+   */
+  get(): Promise<DevSnapshot | null>
   setHuman(id: string): Promise<void>
   setLatency(m: DevState['latency']): Promise<void>
   setFailureMode(m: DevState['failureMode']): Promise<void>
@@ -89,8 +95,18 @@ interface DevWire {
 function httpControls(base: string): DevControls {
   const root = base.replace(/\/+$/, '')
 
-  async function readDev(): Promise<DevSnapshot> {
+  async function readDev(): Promise<DevSnapshot | null> {
     const res = await fetch(`${root}/api/dev`)
+    // The dev routes exist only while the daemon is serving the mock store; in
+    // every other mode they are absent by design, because they would let any
+    // caller choose the acting human. A refusal answers with a JSON error body,
+    // which parses cleanly — so the status, not the parse, is what decides.
+    // Reading the body regardless would yield a snapshot of `undefined` fields
+    // that every consumer would then dereference.
+    if (!res.ok) {
+      await res.body?.cancel()
+      return null
+    }
     const wire = (await res.json()) as DevWire
     return { dev: wire.dev, rate: wire.rate, humans: wire.humans }
   }

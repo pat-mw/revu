@@ -8,6 +8,11 @@ import { devControls, DEV_EVENT } from '@/api/dev'
  * `DEV_EVENT` (the roster is stable, but a reset re-seeds it). Starts empty and
  * populates once the first fetch resolves, so the identity switchers render an
  * empty list until then rather than blocking.
+ *
+ * Stays empty when no dev surface exists, which is the case whenever the
+ * daemon talks to real GitHub. Switching the acting human is a mock-only
+ * affordance, so an empty roster is the correct steady state there — callers
+ * render no switcher at all rather than an empty one.
  */
 export function useHumans(): Human[] {
   const [humans, setHumans] = useState<Human[]>([])
@@ -15,7 +20,7 @@ export function useHumans(): Human[] {
     let live = true
     const refresh = () => {
       void devControls.get().then((snap) => {
-        if (live) setHumans(snap.humans)
+        if (live) setHumans(snap?.humans ?? [])
       })
     }
     refresh()

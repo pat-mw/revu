@@ -19,7 +19,7 @@ import {
 import { CommandPalette } from '@/components/palette'
 import { ShortcutSheet } from '@/components/shortcut-sheet'
 import { DevPanel } from '@/components/dev/dev-panel'
-import { useRateLimit } from '@/state/queries'
+import { usePullList, useRateLimit } from '@/state/queries'
 import { useCurrentHuman, useSession } from '@/state/session'
 import { devControls } from '@/api/dev'
 import { useHumans } from '@/state/dev-humans'
@@ -28,8 +28,16 @@ import { useSequenceShortcut, useShortcut } from '@/lib/keyboard'
 import { minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 
-/** The client-side repo the whole workspace is scoped to — a chrome constant. */
-const REPO_CONTEXT = 'meridian-labs/atlas'
+/**
+ * Header label for the repository the workspace is scoped to. Read from the
+ * pull list rather than held as a constant, so the chrome names the repository
+ * actually being reviewed instead of whichever one the fixtures describe.
+ * Blank until the first list resolves — a wrong name is worse than none.
+ */
+function useRepoContext(): string | null {
+  const list = usePullList()
+  return list.data?.items[0]?.pull.base.repo.full_name ?? null
+}
 
 /** Match `/pr/:n` at the head of a path, returning the PR number or null. */
 function matchPrNumber(pathname: string): number | null {
@@ -114,29 +122,39 @@ function IdentityMenu({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-[13rem]">
-        {humans.map((h) => {
-          const active = h.id === human.id
-          return (
-            <DropdownMenuItem
-              key={h.id}
-              onSelect={() => void devControls.setHuman(h.id)}
-              className="gap-2"
-            >
-              <NameAvatar name={h.name} size="sm" />
-              <span className="min-w-0 flex-1 truncate">{h.name}</span>
-              <span className="shrink-0 text-2xs text-ink-faint">{h.role}</span>
-              {active && (
-                <Check
-                  size={14}
-                  strokeWidth={2}
-                  className="shrink-0 !text-draft"
-                  aria-hidden
-                />
-              )}
-            </DropdownMenuItem>
-          )
-        })}
-        <DropdownMenuSeparator />
+        {/* Choosing who you are acting as is a demo affordance and exists only
+            while the store is the mock one. Against real GitHub the roster is
+            empty, and the switcher is omitted rather than shown empty — the
+            acting identity there comes from the workspace, not from a menu. */}
+        {humans.length > 0 && (
+          <>
+            {humans.map((h) => {
+              const active = h.id === human.id
+              return (
+                <DropdownMenuItem
+                  key={h.id}
+                  onSelect={() => void devControls.setHuman(h.id)}
+                  className="gap-2"
+                >
+                  <NameAvatar name={h.name} size="sm" />
+                  <span className="min-w-0 flex-1 truncate">{h.name}</span>
+                  <span className="shrink-0 text-2xs text-ink-faint">
+                    {h.role}
+                  </span>
+                  {active && (
+                    <Check
+                      size={14}
+                      strokeWidth={2}
+                      className="shrink-0 !text-draft"
+                      aria-hidden
+                    />
+                  )}
+                </DropdownMenuItem>
+              )
+            })}
+            <DropdownMenuSeparator />
+          </>
+        )}
         <DropdownMenuItem
           // Keep the menu open on toggle so the scheme switch is visible in place.
           onSelect={(e) => {
@@ -157,7 +175,11 @@ function IdentityMenu({
             {theme === 'dark' ? 'Dark' : 'Light'}
           </span>
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onOpenDevPanel}>Dev panel…</DropdownMenuItem>
+        {humans.length > 0 && (
+          <DropdownMenuItem onSelect={onOpenDevPanel}>
+            Dev panel…
+          </DropdownMenuItem>
+        )}
         <DropdownMenuSeparator />
         <div className="px-2 py-1 font-mono text-2xs leading-snug text-ink-faint">
           {session.workspace} · via {session.brokerLogin}
@@ -195,6 +217,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const openSheet = useCallback(() => setSheetOpen(true), [])
   const openDevPanel = useCallback(() => setDevOpen(true), [])
+  const repoContext = useRepoContext()
 
   // Sequence navigation. `g i` always goes home; `g f` / `g c` switch the
   // current PR's tab and no-op gracefully when no PR is open.
@@ -226,9 +249,11 @@ export function AppShell({ children }: { children: ReactNode }) {
           />
         </Link>
 
-        <span className="hidden font-mono text-2xs text-ink-faint sm:inline">
-          {REPO_CONTEXT}
-        </span>
+        {repoContext !== null && (
+          <span className="hidden font-mono text-2xs text-ink-faint sm:inline">
+            {repoContext}
+          </span>
+        )}
 
         <div className="ml-auto flex items-center gap-2.5">
           <RateChip />
