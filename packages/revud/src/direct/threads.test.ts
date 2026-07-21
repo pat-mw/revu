@@ -511,3 +511,41 @@ describe('fetchReviewThreads — pagination', () => {
     expect(c.n).toBe(4)
   })
 })
+
+describe('actor normalization across the two GitHub APIs', () => {
+  // REST reports an app as `slug[bot]`; GraphQL reports the bare `slug` and
+  // marks it only via `__typename`. These threads are normalized onto the REST
+  // shape, so a bot must come back out spelled the REST way — otherwise it can
+  // never match the configured bot login, and every identity decision
+  // downstream treats a broker-written comment as a genuine GitHub user.
+  const oneComment = (author: unknown) =>
+    threadNode({
+      comments: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [commentNode({ author } as never)],
+      },
+    })
+
+  test('a Bot actor normalizes to the REST `slug[bot]` login and Bot type', () => {
+    const thread = normalizeReviewThread(oneComment({ login: 'revutestbed', __typename: 'Bot' }))
+    expect(thread.comments[0].user.login).toBe('revutestbed[bot]')
+    expect(thread.comments[0].user.type).toBe('Bot')
+  })
+
+  test('a User actor keeps its login untouched and stays a User', () => {
+    const thread = normalizeReviewThread(oneComment({ login: 'dkozlov', __typename: 'User' }))
+    expect(thread.comments[0].user.login).toBe('dkozlov')
+    expect(thread.comments[0].user.type).toBe('User')
+  })
+
+  test('an already-suffixed bot login is not double-suffixed', () => {
+    const thread = normalizeReviewThread(oneComment({ login: 'revutestbed[bot]', __typename: 'Bot' }))
+    expect(thread.comments[0].user.login).toBe('revutestbed[bot]')
+  })
+
+  test('a missing actor stays an empty User login, never a bare `[bot]`', () => {
+    const thread = normalizeReviewThread(oneComment(null))
+    expect(thread.comments[0].user.login).toBe('')
+    expect(thread.comments[0].user.type).toBe('User')
+  })
+})

@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# revu — start, inspect and open the review client for the repository you are in.
+#
+#   revu            open it
+#   revu status     running? which repository, whose identity, credential age
+#   revu logs [-f]  the daemon log
+#   revu restart    restart it, reviewing the repository you are standing in
+#   revu stop
+#   revu start
+#
+# revu reviews the repository of the current directory, resolved from its
+# `origin` remote, and refuses when there is not one. It never falls back to a
+# configured default: doing so would let a run from a home directory quietly
+# open a repository nobody asked for and look entirely successful.
+#
+# DEPLOYMENT SETTINGS, all optional — a host supplies these so this script does
+# not have to know anything about where it is installed:
+#
+#   REVU_PREFIX       where revud and its assets live. Default /opt/revu.
+#   REVU_REPOS_DIR    where repositories are cloned. Named in the error when the
+#                     current directory is not one, so a user is told where to go.
+#   REVU_ACCESS_HINT  how to reach a loopback port from outside this machine,
+#                     printed verbatim. Deployment-specific by nature.
+#
+# The daemon's own settings (`REVU_REPO`, `REVU_BOT_LOGIN`, `REVU_PORT`, …) are
+# read from `$REVU_PREFIX/runtime.env` when present.
+set -euo pipefail
+
+PREFIX="${REVU_PREFIX:-/opt/revu}"
+RUNTIME_ENV="${PREFIX}/runtime.env"
+BIN="${PREFIX}/revud"
+CURRENT="${PREFIX}/current.repo"
+DATA_DIR="${HOME}/.local/share/revu"
+LOG="${DATA_DIR}/revud.log"
+CRED="${HOME}/.git-credentials"
+
+if [ -f "${RUNTIME_ENV}" ]; then
+  # shellcheck disable=SC1090
+  . "${RUNTIME_ENV}"
+fi
+PORT="${REVU_PORT:-4780}"
+URL="http://127.0.0.1:${PORT}/"
+
+# Colour only on a terminal, and never when NO_COLOR is set. Everything stays
+# legible without it — colour marks structure, it never carries meaning on its
+# own, so a piped or logged run loses nothing but the styling.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; ACCENT=$'\033[36m'; WARN=$'\033[33m'; OFF=$'\033[0m'
+else
+  B=''; DIM=''; ACCENT=''; WARN=''; OFF=''
+fi
+
+die() { printf '%sFATAL:%s %s\n' "${WARN}" "${OFF}" "$*" >&2; exit 1; }
+
+[ -x "${BIN}" ] || die "revu is not installed here (${BIN} is missing)."
+
+is_running() { pgrep -x revud >/dev/null 2>&1; }
+
+# `owner/name` for the current directory's GitHub origin, or nothing.
+detect_repo() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || return 1
+  local url
+  url=$(git remote get-url origin 2>/dev/null) || return 1
+  case "${url}" in
+    https://github.com/*|http://github.com/*) url=${url#*github.com/} ;;
+    git@github.com:*)                         url=${url#git@github.com:} ;;
+    ssh://git@github.com/*)                   url=${url#ssh://git@github.com/} ;;
+    *) return 1 ;;                            # a git repo, but not a GitHub one
+  esac
+  url=${url%.git}; url=${url%/}
+  case "${url}" in
+    */*/*|*/) return 1 ;;                     # misparsed; better to refuse than guess
+    */*) printf '%s\n' "${url}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Repositories available to move into, for the "you are in the wrong place" hint.
+list_candidates() {
+  [ -n "${REVU_REPOS_DIR:-}" ] && [ -d "${REVU_REPOS_DIR}" ] || return 0
+  for d in "${REVU_REPOS_DIR}"/*/; do
+    [ -d "${d}.git" ] || continue
+    printf '      cd %s\n' "${d%/}"
+  done
+}
+
+# Age of the injected GitHub credential. It is short-lived and refreshed by
+# something outside this machine; when that stops, the only symptom is reads
+# failing for no stated reason. Naming the age turns that into an answer.
+credential_age() {
+  [ -f "${CRED}" ] || { printf 'absent — reads will fail\n'; return; }
+  local mins
+  mins=$(( ( $(date +%s) - $(stat -c %Y "${CRED}" 2>/dev/null || echo 0) ) / 60 ))
+  if [ "${mins}" -ge 55 ]; then printf '%d min old — may have expired\n' "${mins}"
+  else printf '%d min old\n' "${mins}"; fi
+}
+
+# Which repository the running daemon actually serves. Recorded under the
+# prefix, which a container rebuilds from its image on every start, so the
+# record cannot outlive the process it describes.
+current_repo() {
+  if [ -s "${CURRENT}" ] && is_running; then cat "${CURRENT}"
+  else printf '%s\n' "${REVU_REPO:-}"; fi
+}
+
+start_daemon() {
+  local repo="${1:?start_daemon needs a repository}"
+  mkdir -p "${DATA_DIR}"
+  printf '%s\n' "${repo}" > "${CURRENT}" 2>/dev/null || true
+  REVU_MODE="${REVU_MODE:-broker}" \
+  REVU_REPO="${repo}" \
+  REVU_BOT_LOGIN="${REVU_BOT_LOGIN:-}" \
+  REVU_DIST_DIR="${REVU_DIST_DIR:-${PREFIX}/dist}" \
+  REVU_DATA_DIR="${DATA_DIR}" \
+  REVU_PORT="${PORT}" \
+  nohup "${BIN}" >> "${LOG}" 2>&1 &
+  local i=0
+  while [ "${i}" -lt 10 ]; do
+    sleep 1
+    is_running && return 0
+    i=$(( i + 1 ))
+  done
+  printf '%sFATAL:%s revud did not come up. Last lines of %s:\n' "${WARN}" "${OFF}" "${LOG}" >&2
+  tail -5 "${LOG}" >&2 2>/dev/null || true
+  exit 1
+}
+
+# The editor's own CLI — how a process in here reaches the machine the editor
+# runs on, to forward the port and open the page there. Present only in an
+# editor terminal, where the IPC socket is exported.
+editor_cli() {
+  [ -n "${VSCODE_IPC_HOOK_CLI:-}" ] || return 1
+  local cli
+  cli=$(find "${HOME}/.cursor-server" "${HOME}/.vscode-server" \
+          -path '*remote-cli*' -type f -perm -u+x 2>/dev/null | head -1)
+  [ -n "${cli}" ] || return 1
+  printf '%s\n' "${cli}"
+}
+
+# Hold before the browser takes focus, so what was just printed can be read.
+# Enter skips the wait, Ctrl-C abandons it. With stdin not a terminal, `read -t`
+# returns instantly on EOF and the loop would spin, so a plain sleep stands in.
+countdown() {
+  local secs=3
+  printf '\n'
+  if [ ! -t 0 ]; then sleep "${secs}"; return 0; fi
+  while [ "${secs}" -gt 0 ]; do
+    printf '\r  %sOpening in %d…%s  %sEnter to open now · Ctrl-C to stay here%s ' \
+      "${ACCENT}" "${secs}" "${OFF}" "${DIM}" "${OFF}"
+    if read -r -t 1 _discard; then break; fi
+    secs=$(( secs - 1 ))
+  done
+  printf '\r%-72s\r' ''
+}
+
+heading() { printf '\n%srevu%s %s·%s %s%s%s\n' "${B}" "${OFF}" "${DIM}" "${OFF}" "${ACCENT}" "$1" "${OFF}"; }
+field()   { printf '  %-14s %s\n' "$1" "$2"; }
+
+print_commands() {
+  printf '\n'
+  field "revu status" "${DIM}running? repository, identity, credential age${OFF}"
+  field "revu logs -f" "${DIM}follow the daemon log${OFF}"
+  field "revu restart" "${DIM}restart, reviewing the current directory${OFF}"
+  field "revu stop" "${DIM}stop it${OFF}"
+}
+
+cmd_status() {
+  local repo; repo=$(current_repo)
+  heading "${repo:-no repository}"
+  if is_running; then
+    field "status" "running  ${DIM}pid $(pgrep -x revud | tr '\n' ' ')${OFF}"
+  else
+    field "status" "${WARN}not running${OFF}  ${DIM}start it with: revu${OFF}"
+  fi
+  field "you" "$(git config --get user.email 2>/dev/null || printf '%s' '<no git identity>')"
+  field "writes as" "${REVU_BOT_LOGIN:-${DIM}disabled — no bot login configured${OFF}}"
+  field "address" "${URL}  ${DIM}loopback only${OFF}"
+  field "credential" "$(credential_age)"
+  field "build" "$(cut -c1-12 "${PREFIX}/revu.commit" 2>/dev/null || printf 'unknown')"
+  # The log tail is a diagnostic, so show it only when there is something wrong.
+  if ! is_running && [ -f "${LOG}" ]; then
+    printf '\n  %slast log%s %s\n' "${DIM}" "${OFF}" "$(tail -1 "${LOG}" | cut -c1-96)"
+  fi
+  printf '\n'
+}
+
+cmd_open() {
+  local here running cli candidates
+  if ! here=$(detect_repo); then
+    printf '\n%sFATAL:%s not a GitHub repository — %s\n' "${WARN}" "${OFF}" "$(pwd)" >&2
+    printf '\n  revu reviews the repository you are standing in.\n' >&2
+    candidates=$(list_candidates)
+    if [ -n "${candidates}" ]; then
+      printf '\n  %sAvailable here:%s\n' "${DIM}" "${OFF}" >&2
+      printf '%s\n' "${candidates}" >&2
+    fi
+    if is_running; then
+      printf '\n  %s%s is already being served — revu status%s\n' \
+        "${DIM}" "$(current_repo)" "${OFF}" >&2
+    fi
+    printf '\n' >&2
+    exit 1
+  fi
+
+  running=$(current_repo)
+  if is_running && [ -n "${running}" ] && [ "${running}" != "${here}" ]; then
+    printf '\n%sWARN:%s the running daemon is reviewing %s, not %s.\n' \
+      "${WARN}" "${OFF}" "${running}" "${here}" >&2
+    printf '      One repository is served at a time — %srevu restart%s switches it.\n' \
+      "${B}" "${OFF}" >&2
+  fi
+  is_running || start_daemon "${here}"
+
+  heading "${here}"
+  field "address" "${URL}"
+
+  # Print first, open second: the browser takes focus, so anything printed
+  # afterwards is printed to nobody.
+  if cli=$(editor_cli); then
+    print_commands
+    countdown
+    if "${cli}" --openExternal "${URL}" >/dev/null 2>&1; then
+      printf '  %sOpened — your editor is forwarding the port.%s\n\n' "${DIM}" "${OFF}"
+      return 0
+    fi
+    printf '\n%sWARN:%s the editor would not open it; forward the port yourself.\n' \
+      "${WARN}" "${OFF}" >&2
+  fi
+
+  if [ -n "${REVU_ACCESS_HINT:-}" ]; then
+    printf '\n  %sIt binds loopback. To reach it from your own machine, run THERE:%s\n\n' \
+      "${DIM}" "${OFF}"
+    printf '      %s%s%s\n' "${B}" "${REVU_ACCESS_HINT}" "${OFF}"
+    printf '\n  %sthen open%s %s\n' "${DIM}" "${OFF}" "${URL}"
+  else
+    printf '\n  %sIt binds loopback — reachable only from this machine.%s\n' "${DIM}" "${OFF}"
+  fi
+  print_commands
+  printf '\n'
+}
+
+case "${1:-open}" in
+  open|'')   cmd_open ;;
+  status)    cmd_status ;;
+  logs)      shift
+             [ -f "${LOG}" ] || die "no log yet at ${LOG} — revu has not run here."
+             if [ $# -gt 0 ]; then tail "$@" "${LOG}"; else tail -n 40 "${LOG}"; fi ;;
+  start)     if is_running; then
+               printf 'already running — reviewing %s\n' "$(current_repo)"
+             else
+               here=$(detect_repo) || die "not a GitHub repository — $(pwd)"
+               start_daemon "${here}" && printf 'started, reviewing %s\n' "${here}"
+             fi ;;
+  stop)      if pkill -x revud 2>/dev/null; then printf 'stopped\n'; else printf 'was not running\n'; fi ;;
+  restart)   here=$(detect_repo) || die "not a GitHub repository — cd into one first."
+             pkill -x revud 2>/dev/null || true
+             sleep 1
+             start_daemon "${here}" && printf 'restarted, reviewing %s\n' "${here}" ;;
+  -h|--help|help)
+             sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d' ;;
+  *)         die "unknown command '$1' — try: revu --help" ;;
+esac

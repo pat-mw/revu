@@ -210,26 +210,34 @@ export function CommandPalette({
           </>
         )}
 
-        <CommandSeparator />
-        <CommandGroup heading="Identity">
-          {humans.map((h) => (
-            <CommandItem
-              key={h.id}
-              value={`identity switch ${h.name} ${h.role}`}
-              onSelect={() => run(() => void devControls.setHuman(h.id))}
-            >
-              {h.id === currentHuman.id ? (
-                <User strokeWidth={1.5} aria-hidden />
-              ) : (
-                <NameAvatar name={h.name} size="sm" />
-              )}
-              <span className="truncate">
-                Switch to {h.name}
-                <span className="text-ink-faint"> · {h.role}</span>
-              </span>
-            </CommandItem>
-          ))}
-        </CommandGroup>
+        {/* Switching the acting human is a demo affordance backed by the mock
+            store. The roster is empty against real GitHub, where identity comes
+            from the workspace — so the whole group is omitted rather than shown
+            with no entries under it. */}
+        {humans.length > 0 && (
+          <>
+            <CommandSeparator />
+            <CommandGroup heading="Identity">
+              {humans.map((h) => (
+                <CommandItem
+                  key={h.id}
+                  value={`identity switch ${h.name} ${h.role}`}
+                  onSelect={() => run(() => void devControls.setHuman(h.id))}
+                >
+                  {h.id === currentHuman.id ? (
+                    <User strokeWidth={1.5} aria-hidden />
+                  ) : (
+                    <NameAvatar name={h.name} size="sm" />
+                  )}
+                  <span className="truncate">
+                    Switch to {h.name}
+                    <span className="text-ink-faint"> · {h.role}</span>
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </>
+        )}
 
         <CommandSeparator />
         <CommandGroup heading="Help">

@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router'
 import { MessageSquare } from 'lucide-react'
 import type { IssueComment, ReviewComment, ReviewSummary, ReviewThread } from '@revu/shared'
 import { identityName, parseCommentIdentity } from '@revu/shared'
+import type { CommentIdentity } from '@revu/shared'
 import { useSnapshot } from '@/state/queries'
 import { useThreads } from '@/state/threads'
 import { useSession } from '@/state/session'
@@ -43,22 +44,49 @@ const REVIEW_STATE_META: Record<
  * A compact timeline row for a submitted review. Broker-authored review bodies
  * carry the smuggled human prefix, so identity parsing recovers who actually
  * approved/commented and yields the clean body to render.
+ *
+ * A review submitted as line comments alone has an empty body, and therefore
+ * no prefix to recover the author from — it would otherwise show as the bare
+ * bot. `attributedTo` supplies the identity its own line comments resolved to,
+ * so the row names the reviewer even when the review itself says nothing.
  */
-function ReviewRow({ review }: { review: ReviewSummary }) {
+function ReviewRow({
+  review,
+  attributedTo,
+  commentCount,
+}: {
+  review: ReviewSummary
+  attributedTo?: CommentIdentity
+  commentCount: number
+}) {
   const session = useSession()
   const parsed = parseCommentIdentity({ user: review.user, body: review.body }, session.brokerLogin)
   const meta = REVIEW_STATE_META[review.state]
   const body = parsed.body.trim()
+  // Only a body-less broker review needs the fallback: anything the prefix
+  // resolved, or any genuine GitHub author, already names the right person.
+  const identity =
+    parsed.identity.kind === 'bot' && attributedTo !== undefined
+      ? attributedTo
+      : parsed.identity
   return (
     <article className="rounded-(--radius-sm) border border-line bg-panel px-3 py-2">
       <div className="flex min-w-0 items-center gap-2">
-        <IdentityAvatar identity={parsed.identity} size="xs" />
+        <IdentityAvatar identity={identity} size="xs" />
         <span className="truncate text-sm font-medium text-ink">
-          {identityName(parsed.identity)}
+          {identityName(identity)}
         </span>
         <Badge className="shrink-0" variant={meta.variant}>
           {meta.label}
         </Badge>
+        {/* A review with no body is an envelope around its line comments, not
+            a remark in its own right. Naming the count says what happened
+            instead of leaving a row that reads as an empty message. */}
+        {body === '' && commentCount > 0 && (
+          <span className="shrink-0 text-2xs text-ink-faint">
+            {commentCount} {commentCount === 1 ? 'comment' : 'comments'} on the diff
+          </span>
+        )}
         <span className="ml-auto shrink-0 text-2xs text-ink-faint">
           {relativeTime(review.submitted_at)}
         </span>
@@ -139,6 +167,36 @@ export function ConversationPage() {
     ]
     return items.sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
   }, [snapshot])
+
+  /**
+   * Who each review is really from, and how much it carried, derived from its
+   * own line comments. A review submitted as comments alone has an empty body
+   * and so no smuggled prefix to read; its comments do carry one, and every
+   * comment names the review it belongs to. Only unanimous attribution is
+   * used — a review whose comments disagree is left to its literal author
+   * rather than guessing.
+   */
+  const reviewAttribution = useMemo(() => {
+    const byReview = new Map<number, { identity?: CommentIdentity; count: number }>()
+    for (const thread of threads ?? []) {
+      for (const comment of thread.comments) {
+        const reviewId = comment.pull_request_review_id
+        if (reviewId === null) continue
+        const entry = byReview.get(reviewId) ?? { count: 0 }
+        entry.count += 1
+        const { identity } = parseCommentIdentity(comment, session.brokerLogin)
+        if (entry.count === 1) entry.identity = identity
+        else if (
+          entry.identity !== undefined &&
+          identityName(entry.identity) !== identityName(identity)
+        ) {
+          entry.identity = undefined
+        }
+        byReview.set(reviewId, entry)
+      }
+    }
+    return byReview
+  }, [threads, session.brokerLogin])
 
   const threadGroups = useMemo(() => {
     if (!threads) return []
@@ -242,7 +300,12 @@ export function ConversationPage() {
                       />
                     </div>
                   ) : (
-                    <ReviewRow key={`review-${entry.review.id}`} review={entry.review} />
+                    <ReviewRow
+                      key={`review-${entry.review.id}`}
+                      review={entry.review}
+                      attributedTo={reviewAttribution.get(entry.review.id)?.identity}
+                      commentCount={reviewAttribution.get(entry.review.id)?.count ?? 0}
+                    />
                   ),
                 )}
               </div>

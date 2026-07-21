@@ -146,6 +146,31 @@ export function createDirectFetchHandler(
  * serves the real session; every other mode serves the reused mock. Returns the
  * Bun `Server`.
  */
+/**
+ * Bind the IPv6 loopback in addition to the IPv4 one, on the same port.
+ *
+ * Binding `127.0.0.1` alone is not enough in practice. Inside a container
+ * `localhost` frequently resolves to `::1` first, so a caller that dials the
+ * name — an editor's port forwarder, most notably — reaches an address nothing
+ * is listening on and reports the port closed. `curl` hides this by retrying
+ * over IPv4; a forwarder generally does not.
+ *
+ * `::1` is still loopback, so this changes nothing about exposure: the daemon
+ * remains unreachable from any other container on the shared bridge, which is
+ * the property that matters. Binding `::` would break that and is not this.
+ *
+ * Best-effort by design. A container with IPv6 disabled cannot bind `::1` at
+ * all, and failing to serve at all there would be far worse than serving on one
+ * family — so the error is swallowed and the IPv4 listener stands alone.
+ */
+export function startLoopbackAlias(opts: ServeOptions): Server | null {
+  try {
+    return startServer({ ...opts, hostname: '::1' })
+  } catch {
+    return null
+  }
+}
+
 export function startServer(opts: ServeOptions): Server {
   if (!existsSync(opts.distDir) || !existsSync(join(opts.distDir, 'index.html'))) {
     throw new Error(
