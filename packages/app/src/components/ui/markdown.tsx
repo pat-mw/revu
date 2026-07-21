@@ -9,6 +9,7 @@ import type { Root, RootContent } from 'hast'
 import { cn } from '@/lib/cn'
 import {
   MARKDOWN_SANITIZE_SCHEMA,
+  isGithubAttachmentUrl,
   proxiedImageUrl,
   proxiedSrcSet,
 } from '@/lib/markdown-security'
@@ -92,27 +93,42 @@ function sourceFallback(source: string) {
 }
 
 /**
- * A comment-body image with a quiet failure state.
+ * A comment-body image with an actionable failure state.
  *
- * When the element's load errors, the image is replaced by a small muted note
- * instead of the browser's broken-image glyph. The note's wording names the
- * dominant cause: GitHub attachment URLs bypass the proxy and are authorised
- * by the viewer's GitHub session cookie, so a signed-out browser 404s them.
- * One wording serves every failure — the error event carries no cause, and a
- * proxied third-party image that happens to die deserves the same unobtrusive
- * treatment rather than a second near-identical string guessed from the URL.
- * The `alt` text stays visible in the note, since it is often the only
- * description of what the screenshot showed. Spans only: an image renders
- * inside `<p>`, where block elements are invalid.
+ * Receives the ORIGINAL remote URL and routes it through `proxiedImageUrl`
+ * itself, because on failure the original is what matters: the element is
+ * replaced by a small link that opens that URL in a new tab, where the
+ * reader's own browser session can authorise it — the one reliable way to see
+ * a GitHub attachment from a browser that holds a GitHub session, and an
+ * honest escape hatch for any other dead image. The link leads; a muted note
+ * ("images require github user credentials") accompanies it, naming the
+ * dominant cause — GitHub attachment URLs bypass the proxy and are gated on a
+ * GitHub session cookie, so a signed-out browser 404s them. The error event
+ * itself carries no cause, so the note stays the same for every failure. The
+ * `alt` text stays visible too, since it is often the only description of
+ * what the screenshot showed. The link renders only for absolute `http(s)`
+ * URLs — anything else has nowhere sensible to open. Spans only: an image
+ * renders inside `<p>`, where block elements are invalid.
  */
 function MarkdownImage({ className, src, alt, ...props }: ComponentPropsWithoutRef<'img'>) {
   const [failed, setFailed] = useState(false)
 
   if (failed) {
+    const openable = typeof src === 'string' && /^https?:\/\//i.test(src)
     return (
-      <span className="inline-flex flex-wrap items-baseline gap-x-1.5 font-sans text-2xs text-ink-faint">
-        <span>images require github user credentials</span>
-        {alt !== undefined && alt !== '' && <span className="italic">{alt}</span>}
+      <span className="inline-flex flex-wrap items-baseline gap-x-1.5 font-sans text-2xs">
+        {openable && (
+          <a
+            href={src}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-add underline decoration-add/40 underline-offset-2 hover:decoration-add"
+          >
+            {isGithubAttachmentUrl(src) ? 'open in github' : 'open image'}
+          </a>
+        )}
+        <span className="text-ink-faint">images require github user credentials</span>
+        {alt !== undefined && alt !== '' && <span className="italic text-ink-faint">{alt}</span>}
       </span>
     )
   }
@@ -122,7 +138,7 @@ function MarkdownImage({ className, src, alt, ...props }: ComponentPropsWithoutR
       {...props}
       alt={alt}
       loading="lazy"
-      src={src}
+      src={proxiedImageUrl(src)}
       onError={() => setFailed(true)}
       className={cn('my-2 max-w-full rounded-(--radius-sm)', className)}
     />
@@ -195,9 +211,7 @@ const components: Components = {
   td: ({ node: _node, className, ...props }) => (
     <td className={cn('border border-line px-2 py-1', className)} {...props} />
   ),
-  img: ({ node: _node, src, ...props }) => (
-    <MarkdownImage {...props} src={proxiedImageUrl(src)} />
-  ),
+  img: ({ node: _node, ...props }) => <MarkdownImage {...props} />,
   /**
    * `source` inside `<picture>`: `srcset` is the one URL-bearing attribute the
    * upstream URL transform does not cover, so it is re-filtered per candidate
