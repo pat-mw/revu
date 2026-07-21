@@ -14,7 +14,7 @@ import type { Server } from 'bun'
 import type { Session } from '@revu/shared'
 import { DEFAULT_PREFERENCES } from '@revu/shared'
 import type { DirectApi } from './direct/direct-api'
-import { startServer } from './server'
+import { startLoopbackAlias, startServer } from './server'
 
 /**
  * Run `startServer` while capturing the options the first `Bun.serve` call
@@ -168,5 +168,86 @@ describe('broker mode serve wiring', () => {
     server = captured.server
     expect(captured.opts?.hostname).toBeUndefined()
     expect(server.port).toBeGreaterThan(0)
+  })
+})
+
+describe('the IPv6 loopback alias', () => {
+  let primary: Server | undefined
+  let alias: Server | null | undefined
+  let dist: string | undefined
+
+  afterEach(() => {
+    alias?.stop(true)
+    primary?.stop(true)
+    if (dist !== undefined) rmSync(dist, { recursive: true, force: true })
+    alias = undefined
+    primary = undefined
+    dist = undefined
+  })
+
+  // Binding 127.0.0.1 alone leaves `localhost` broken wherever it resolves to
+  // ::1 first, which is the common case inside a container — the port reads as
+  // closed to anything that dials the name rather than the address.
+  test('serves the same port over ::1 as well as 127.0.0.1', async () => {
+    dist = makeStubDist()
+    const opts = {
+      port: 0,
+      distDir: dist,
+      directSession: SESSION,
+      directApi: stubApi(),
+      mode: 'broker' as const,
+      hostname: '127.0.0.1',
+    }
+    primary = startServer(opts)
+    alias = startLoopbackAlias({ ...opts, port: primary.port })
+    if (alias === null) return // no IPv6 in this environment; nothing to assert
+
+    const v4 = await fetch(`http://127.0.0.1:${primary.port}/api/session`)
+    const v6 = await fetch(`http://[::1]:${primary.port}/api/session`)
+    expect(v4.status).toBe(200)
+    expect(v6.status).toBe(200)
+    expect(((await v6.json()) as Session).human.id).toBe(SESSION.human.id)
+  })
+
+  test('asks for ::1, not the address the primary listener already holds', () => {
+    dist = makeStubDist()
+    const captured = captureServeOptions(
+      () =>
+        startLoopbackAlias({
+          port: 0,
+          distDir: dist as string,
+          directSession: SESSION,
+          directApi: stubApi(),
+          mode: 'broker',
+          hostname: '127.0.0.1',
+        }) as Server,
+    )
+    alias = captured.server
+    expect(captured.opts?.hostname).toBe('::1')
+  })
+
+  // A container with IPv6 disabled cannot bind ::1 at all. Serving on one
+  // family is a great deal better than refusing to serve, so the failure is
+  // absorbed rather than propagated to boot.
+  test('returns null instead of throwing when the bind fails', () => {
+    dist = makeStubDist()
+    const realServe = Bun.serve.bind(Bun)
+    ;(Bun as { serve: typeof Bun.serve }).serve = (() => {
+      throw new Error('EAFNOSUPPORT')
+    }) as typeof Bun.serve
+    try {
+      expect(
+        startLoopbackAlias({
+          port: 0,
+          distDir: dist as string,
+          directSession: SESSION,
+          directApi: stubApi(),
+          mode: 'broker',
+          hostname: '127.0.0.1',
+        }),
+      ).toBeNull()
+    } finally {
+      ;(Bun as { serve: typeof Bun.serve }).serve = realServe
+    }
   })
 })

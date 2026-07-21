@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { installDiskStorage } from './storage'
 import { loadMock } from './mock-bridge'
-import { startServer } from './server'
+import { startLoopbackAlias, startServer } from './server'
 import type { RevuMode } from './api-router'
 import { DirectStartupError, resolveDirectContext } from './direct/context'
 import { createDirectApi } from './direct/direct-api'
@@ -317,16 +317,22 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
   // Warm the cache and begin the ~30s cadence now that the api is assembled.
   pollLoop.start()
 
-  const server = startServer({
+  const serveOptions = {
     port,
     distDir,
     directSession: context.session,
     directApi: brokerApi,
-    mode: 'broker',
+    mode: 'broker' as const,
     // Loopback only: the injected credential never rides an interface anyone
     // outside the workspace can reach.
     hostname: '127.0.0.1',
-  })
+  }
+  const server = startServer(serveOptions)
+  // Serve the IPv6 loopback too, on the same port. Inside a container
+  // `localhost` usually resolves to `::1` first, so a caller that dials the
+  // name rather than the address finds nothing listening. Still loopback, so
+  // exposure is unchanged; null when the container has no IPv6 at all.
+  const serverV6 = startLoopbackAlias({ ...serveOptions, port: server.port })
 
   const shutdown = (signal: string): void => {
     try {
@@ -334,6 +340,7 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
       store.close()
     } finally {
       server.stop(true)
+      serverV6?.stop(true)
       console.log(`revud: ${signal} received, stopped.`)
       process.exit(0)
     }
