@@ -84,15 +84,29 @@ function toThreadSubjectType(value: string | null | undefined): 'LINE' | 'FILE' 
   return value === 'FILE' ? 'FILE' : 'LINE'
 }
 
-/** A GraphQL `Actor` (only `login` is available) narrowed to the contract's `GhUser`. */
-function toUser(author: { login: string } | null | undefined): GhUser {
+/**
+ * A GraphQL `Actor` narrowed to the contract's `GhUser`.
+ *
+ * The two GitHub APIs spell an app's login differently: REST reports
+ * `slug[bot]`, GraphQL reports the bare `slug` and distinguishes apps only by
+ * the actor's `__typename`. These comments are normalized onto the REST shape,
+ * so the suffix is restored here — otherwise a comment written through the
+ * broker never matches the configured bot login, and every identity decision
+ * downstream treats it as a genuine GitHub user: the stamped human is rendered
+ * as raw body text under the bot's name, and own-comment detection misses.
+ */
+function toUser(
+  author: { login: string; __typename?: string } | null | undefined,
+): GhUser {
+  const login = typeof author?.login === 'string' ? author.login : ''
+  const isBot = author?.__typename === 'Bot'
   return {
-    login: typeof author?.login === 'string' ? author.login : '',
+    login: isBot && login !== '' && !login.endsWith('[bot]') ? `${login}[bot]` : login,
     id: 0,
     node_id: '',
     avatar_url: '',
     html_url: '',
-    type: 'User',
+    type: isBot ? 'Bot' : 'User',
   }
 }
 

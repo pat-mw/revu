@@ -578,7 +578,7 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$a
               body
               createdAt
               updatedAt
-              author { login }
+              author { login __typename }
               pullRequestReview { fullDatabaseId }
               replyTo { fullDatabaseId }
               commit { oid }
@@ -615,7 +615,7 @@ const THREAD_COMMENTS_QUERY = `query($threadId:ID!,$after:String) {
           body
           createdAt
           updatedAt
-          author { login }
+          author { login __typename }
           pullRequestReview { fullDatabaseId }
           replyTo { fullDatabaseId }
           commit { oid }
@@ -660,7 +660,7 @@ const RESOLVED_THREAD_SELECTION = `thread {
             body
             createdAt
             updatedAt
-            author { login }
+            author { login __typename }
             pullRequestReview { fullDatabaseId }
             replyTo { fullDatabaseId }
             commit { oid }
