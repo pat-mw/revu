@@ -3,6 +3,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   MARKDOWN_SANITIZE_SCHEMA,
+  isGithubAttachmentUrl,
   proxiedImageUrl,
   proxiedSrcSet,
 } from '@/lib/markdown-security'
@@ -146,6 +147,76 @@ describe('remote images ride the proxy', () => {
     )
     expect(proxiedSrcSet('javascript:alert(1)')).toBeUndefined()
     expect(proxiedSrcSet(undefined)).toBeUndefined()
+  })
+})
+
+describe('github attachment hosts bypass the proxy', () => {
+  const attachment =
+    'https://github.com/user-attachments/assets/0b8a2c1e-9f3d-4a6b-8c5e-1d2f3a4b5c6d'
+  const privateImage =
+    'https://private-user-images.githubusercontent.com/12345/467-abc.png?jwt=eyJ0'
+
+  it('a github.com/user-attachments URL keeps its original src', () => {
+    const html = render(`![failing test screenshot](${attachment})`)
+    expect(html).toContain(`src="${attachment}"`)
+    expect(html).not.toContain('/image-proxy?url=https%3A%2F%2Fgithub.com')
+  })
+
+  it('a *.githubusercontent.com URL keeps its original src', () => {
+    const html = render(`<img src="${privateImage}" alt="trace">`)
+    expect(html).toContain('src="https://private-user-images.githubusercontent.com/12345/467-abc.png?jwt=eyJ0"')
+    expect(html).not.toContain('githubusercontent.com%2F')
+  })
+
+  it('a third-party image still rides the proxy', () => {
+    const html = render('![badge](https://cdn.example/badge.svg)')
+    expect(html).toContain('src="/image-proxy?url=https%3A%2F%2Fcdn.example%2Fbadge.svg"')
+    expect(html).not.toContain('src="https://cdn.example')
+  })
+
+  it('host spoofing never bypasses the proxy', () => {
+    for (const spoof of [
+      'https://evil.example/?x=github.com',
+      'https://github.com.evil.example/x.png',
+      'https://notgithub.com/x.png',
+      'https://github.com@evil.example/user-attachments/x.png',
+      'https://evilgithubusercontent.com/x.png',
+    ]) {
+      expect(isGithubAttachmentUrl(spoof)).toBe(false)
+      expect(proxiedImageUrl(spoof)).toBe(`/image-proxy?url=${encodeURIComponent(spoof)}`)
+    }
+  })
+
+  it('the bypass requires https and, on github.com, the user-attachments path', () => {
+    expect(isGithubAttachmentUrl(`http://${attachment.slice('https://'.length)}`)).toBe(false)
+    expect(isGithubAttachmentUrl('https://github.com/pat-mw/repo/raw/main/x.png')).toBe(false)
+    expect(isGithubAttachmentUrl(attachment)).toBe(true)
+    expect(isGithubAttachmentUrl(privateImage)).toBe(true)
+    expect(isGithubAttachmentUrl('https://user-images.githubusercontent.com/1/2.png')).toBe(true)
+  })
+
+  it('a protocol-relative github URL is still refused outright', () => {
+    expect(proxiedImageUrl('//github.com/user-attachments/assets/0b8a2c1e.png')).toBeUndefined()
+  })
+
+  it('srcSet candidates are allowlisted per candidate', () => {
+    expect(proxiedSrcSet(`${attachment} 1x, https://cdn.example/2.png 2x`)).toBe(
+      `${attachment} 1x, /image-proxy?url=https%3A%2F%2Fcdn.example%2F2.png 2x`,
+    )
+    expect(proxiedSrcSet('//github.com/user-attachments/assets/a.png 1x')).toBeUndefined()
+  })
+})
+
+describe('image load-failure fallback', () => {
+  it('the static render carries the image, not the note', () => {
+    const html = render('![alt text](https://cdn.example/pic.png)')
+    expect(html).toContain('<img')
+    expect(html).not.toContain('images require github user credentials')
+  })
+
+  it('alt text survives onto the rendered element for the failure note to reuse', () => {
+    const html = render('![failing test screenshot](https://cdn.example/pic.png)')
+    expect(html).toContain('alt="failing test screenshot"')
   })
 })
 

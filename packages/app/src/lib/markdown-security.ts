@@ -3,7 +3,8 @@ import type { Options as SanitizeSchema } from 'rehype-sanitize'
 
 /**
  * The sanitization schema for comment/prose markdown, and the URL rewrites that
- * route every remote image through the daemon's image proxy.
+ * route remote images through the daemon's image proxy (with a narrow
+ * pass-through for GitHub's session-gated attachment hosts).
  *
  * Comment bodies are hostile input: anyone who can comment on the client's repo
  * (or author a CI check summary) controls them, and the SPA shares its origin
@@ -40,20 +41,59 @@ export const MARKDOWN_SANITIZE_SCHEMA: SanitizeSchema = {
 export const IMAGE_PROXY_PATH = '/image-proxy'
 
 /**
+ * True for URLs on GitHub's own attachment/asset hosts, which must reach the
+ * browser unproxied.
+ *
+ * Screenshots pasted into comments on a private repo live at
+ * `https://github.com/user-attachments/assets/<uuid>` (and historically on
+ * `*.githubusercontent.com`, e.g. `private-user-images.` / `user-images.`).
+ * Access is authorised by the viewer's GitHub session cookie — no App or
+ * installation token can read them — so the credential-less image proxy gets a
+ * 404 and the only way to render them is a direct browser fetch riding the
+ * reviewer's own GitHub session, exactly as github.com renders them itself.
+ *
+ * Matching is on the parsed hostname, never a substring of the URL, so
+ * `https://evil.example/?x=github.com`, `https://github.com.evil.example/`,
+ * and `https://github.com@evil.example/` all fail. `https` is required. The
+ * `github.com` case is additionally pinned to the `/user-attachments/` path:
+ * github.com serves far more than attachments, and since allowlisted URLs are
+ * fetched by the browser with the reviewer's GitHub cookies, the
+ * cookie-bearing surface a hostile comment can aim at is kept to the one path
+ * that needs it. `*.githubusercontent.com` needs no path pin — every
+ * subdomain is GitHub-operated static asset hosting.
+ */
+export function isGithubAttachmentUrl(src: string): boolean {
+  let url: URL
+  try {
+    url = new URL(src)
+  } catch {
+    return false
+  }
+  if (url.protocol !== 'https:') return false
+  if (url.hostname === 'github.com') return url.pathname.startsWith('/user-attachments/')
+  return url.hostname.endsWith('.githubusercontent.com')
+}
+
+/**
  * Rewrite a remote image URL to the daemon's image proxy.
  *
  * Absolute `http(s)` URLs become `/image-proxy?url=…` so the page itself never
  * dials a third-party host: the fetch happens in the daemon's process (in
  * broker mode, inside the workspace rather than on the reviewer's machine), a
  * strict `img-src 'self'` stays enforceable, and content-type/size limits are
- * applied at one chokepoint. Relative URLs pass through untouched (they resolve
- * against the daemon's own origin). Anything else — including the empty string
- * an upstream URL transform substitutes for a disallowed scheme — yields
- * `undefined` so no `src` is emitted at all.
+ * applied at one chokepoint. The single exception is GitHub's own attachment
+ * hosts (`isGithubAttachmentUrl`), which pass through unrewritten: they are
+ * gated on the viewer's GitHub session cookie, which the proxy by design never
+ * carries, and the CSP's `img-src` names exactly these hosts. Relative URLs
+ * pass through untouched (they resolve against the daemon's own origin).
+ * Anything else — including the empty string an upstream URL transform
+ * substitutes for a disallowed scheme — yields `undefined` so no `src` is
+ * emitted at all.
  */
 export function proxiedImageUrl(src: string | undefined | null): string | undefined {
   if (src === undefined || src === null || src === '') return undefined
   if (/^https?:\/\//i.test(src)) {
+    if (isGithubAttachmentUrl(src)) return src
     return `${IMAGE_PROXY_PATH}?url=${encodeURIComponent(src)}`
   }
   // Protocol-relative URLs would resolve to a third-party host; refuse them
@@ -70,8 +110,9 @@ export function proxiedImageUrl(src: string | undefined | null): string | undefi
  *
  * `srcset` is a comma-separated list of `URL [descriptor]` candidates; the
  * sanitize schema's protocol check only inspects the first candidate, so this
- * filters per candidate: `http(s)` URLs are proxied, everything else is
- * dropped. An empty result yields `undefined` so no attribute is emitted.
+ * filters per candidate: `http(s)` URLs are proxied (or, for GitHub attachment
+ * hosts, passed through unrewritten), everything else is dropped. An empty
+ * result yields `undefined` so no attribute is emitted.
  * (Candidate URLs containing literal commas are not representable in `srcset`
  * without escaping and are treated as separate — malformed — candidates.)
  */
@@ -85,9 +126,11 @@ export function proxiedSrcSet(srcSet: string | undefined | null): string | undef
     const url = spaceAt === -1 ? trimmed : trimmed.slice(0, spaceAt)
     const descriptor = spaceAt === -1 ? '' : trimmed.slice(spaceAt)
     const proxied = proxiedImageUrl(url)
-    // Only proxied absolute URLs survive; a relative candidate inside a bot
+    // Only absolute URLs survive — proxied, or passed through because the
+    // host is a GitHub attachment host; a relative candidate inside a bot
     // comment is meaningless and a non-http scheme is hostile.
-    if (proxied === undefined || !proxied.startsWith(IMAGE_PROXY_PATH)) continue
+    if (proxied === undefined) continue
+    if (!proxied.startsWith(IMAGE_PROXY_PATH) && !isGithubAttachmentUrl(proxied)) continue
     rewritten.push(`${proxied}${descriptor}`)
   }
   return rewritten.length > 0 ? rewritten.join(', ') : undefined

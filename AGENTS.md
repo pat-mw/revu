@@ -5,13 +5,11 @@ Binding for every agent writing code in this repo. Read `DESIGN.md` first.
 ## Ownership & verification
 
 - File ownership is exclusive: create/edit ONLY the files assigned to you. Local helper
-  components live inside your files. Shared contracts (`src/api/types.ts`,
-  `src/api/client.ts`, `src/fixtures/contract.ts`, `src/styles/globals.css`) are
+  components live inside your files. Shared contracts (`packages/app/src/api/index.ts`,
+  `packages/app/src/fixtures/contract.ts`, `packages/app/src/styles/globals.css`) are
   read-only inputs — if one seems wrong, report it in your final message instead of
   editing it.
-- Verify with `cd /Users/patmw/dev/tasteful/revu && bunx tsc -b --force 2>&1 | head -40`.
-  Until all phases land, imports of files owned by OTHER agents may fail to resolve —
-  fix errors only in YOUR files; missing-module errors elsewhere are expected mid-build.
+- Verify with `bunx tsc -b --force 2>&1 | head -40` from the repo root.
 
 ## The gate — `bun run check`
 

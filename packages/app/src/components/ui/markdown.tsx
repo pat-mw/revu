@@ -1,5 +1,5 @@
-import { isValidElement } from 'react'
-import type { ReactNode } from 'react'
+import { isValidElement, useState } from 'react'
+import type { ComponentPropsWithoutRef, ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -92,6 +92,44 @@ function sourceFallback(source: string) {
 }
 
 /**
+ * A comment-body image with a quiet failure state.
+ *
+ * When the element's load errors, the image is replaced by a small muted note
+ * instead of the browser's broken-image glyph. The note's wording names the
+ * dominant cause: GitHub attachment URLs bypass the proxy and are authorised
+ * by the viewer's GitHub session cookie, so a signed-out browser 404s them.
+ * One wording serves every failure — the error event carries no cause, and a
+ * proxied third-party image that happens to die deserves the same unobtrusive
+ * treatment rather than a second near-identical string guessed from the URL.
+ * The `alt` text stays visible in the note, since it is often the only
+ * description of what the screenshot showed. Spans only: an image renders
+ * inside `<p>`, where block elements are invalid.
+ */
+function MarkdownImage({ className, src, alt, ...props }: ComponentPropsWithoutRef<'img'>) {
+  const [failed, setFailed] = useState(false)
+
+  if (failed) {
+    return (
+      <span className="inline-flex flex-wrap items-baseline gap-x-1.5 font-sans text-2xs text-ink-faint">
+        <span>images require github user credentials</span>
+        {alt !== undefined && alt !== '' && <span className="italic">{alt}</span>}
+      </span>
+    )
+  }
+
+  return (
+    <img
+      {...props}
+      alt={alt}
+      loading="lazy"
+      src={src}
+      onError={() => setFailed(true)}
+      className={cn('my-2 max-w-full rounded-(--radius-sm)', className)}
+    />
+  )
+}
+
+/**
  * Renderer overrides. Every override drops the `node` prop before spreading
  * (react-markdown passes the hast node to custom components; spread onto a DOM
  * element it would serialize as a junk attribute), and elements with
@@ -157,13 +195,8 @@ const components: Components = {
   td: ({ node: _node, className, ...props }) => (
     <td className={cn('border border-line px-2 py-1', className)} {...props} />
   ),
-  img: ({ node: _node, className, src, ...props }) => (
-    <img
-      {...props}
-      loading="lazy"
-      src={proxiedImageUrl(src)}
-      className={cn('my-2 max-w-full rounded-(--radius-sm)', className)}
-    />
+  img: ({ node: _node, src, ...props }) => (
+    <MarkdownImage {...props} src={proxiedImageUrl(src)} />
   ),
   /**
    * `source` inside `<picture>`: `srcset` is the one URL-bearing attribute the
