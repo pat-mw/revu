@@ -277,6 +277,37 @@ Requires an authenticated `gh` CLI with `repo` scope. The script shells out to
 
 Source: `scripts/seed-scratch.ts`.
 
+### Live smoke scripts — naming the target repository
+
+Four scripts run against a real, seeded scratch repository:
+
+| Script | Mode | Effect on the target |
+| --- | --- | --- |
+| `scripts/smoke-direct.ts` | direct | Mutating — leaves review comments; moves a fixture branch and puts it back. |
+| `scripts/smoke-broker.ts` | broker | Read-only. |
+| `scripts/smoke-broker-write.ts` | broker | Mutating — posts one inline comment, then deletes it. |
+| `scripts/smoke-broker-detector.ts` | broker | Mutating — posts one issue comment, then deletes it. |
+
+All four take their target from `REVU_SMOKE_REPO`, as `owner/name`:
+
+```bash
+REVU_SMOKE_REPO=owner/name bun run scripts/smoke-broker.ts
+```
+
+There is **no default**. An unset, malformed, or unmarked value exits 2 with a
+message naming the variable and never falls back to a built-in repository — a
+fallback would let a typo or a forgotten export aim a mutating run at a
+repository nobody named. As with the seeder, the repository name must contain
+one of the markers `sandbox`, `scratch`, or `fixture`.
+
+Point `REVU_SMOKE_REPO` at the same repository the fixture seeder populated:
+the smokes assume that script's pull requests (`#1`–`#5`) and `fixture/…`
+branches. The broker smokes additionally need `REVU_SANDBOX_DIR` to be a local
+clone **of that same repository** — nothing cross-checks the two, and a clone of
+a different repository yields wrong blob reads rather than an error.
+
+Source: `scripts/smoke-target.ts`.
+
 ---
 
 ## Environment variable reference
@@ -289,6 +320,7 @@ Source: `scripts/seed-scratch.ts`.
 | `REVU_DATA_DIR` | `~/.local/share/revu` | `packages/revud/src/direct/store.ts` |
 | `REVU_DIST_DIR` | `packages/app/dist` | `packages/revud/src/index.ts` |
 | `REVU_BOT_LOGIN` | — (reads-only) | `packages/revud/src/direct/session.ts` |
+| `REVU_SMOKE_REPO` | — (required by the live smokes) | `scripts/smoke-target.ts` |
 | `REVU_CREDENTIALS_FILE` | `~/.git-credentials` | `packages/revud/src/broker/token-source.ts` |
 | `REVU_REVIEWERS_FILE` | `<data-dir>/reviewers.yaml` | `packages/revud/src/broker/reviewer-assignment.ts` |
 | `REVU_HOST_DATA_DIR` | `~/.local/share/revu/host` | `packages/revud/src/collector/host-store.ts` |

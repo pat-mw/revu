@@ -9,15 +9,17 @@
  * comment is out-of-band by construction: revu never creates one.
  *
  * The token is used in-process only and never printed. Configuration:
+ *   REVU_SMOKE_REPO        the scratch repository to write to, as owner/name
  *   REVU_CREDENTIALS_FILE  the injected credential file
- *   REVU_BOT_LOGIN         the App bot login (e.g. revu-sandbox-app[bot])
+ *   REVU_BOT_LOGIN         the App bot login (e.g. my-review-app[bot])
  */
 import { createGithubClient } from '../packages/revud/src/direct/github-client'
 import { createFileCredentialTokenSource } from '../packages/revud/src/broker/token-source'
 import { reconcilePullOutOfBand } from '../packages/revud/src/broker/out-of-band-writes'
 import type { RepoRef } from '../packages/revud/src/direct/repo'
+import { resolveSmokeRepo } from './smoke-target'
 
-const REPO: RepoRef = { owner: 'pat-mw', repo: 'revu-sandbox' }
+const REPO: RepoRef = resolveSmokeRepo()
 const PR = 1
 
 function requireEnv(name: string): string {

@@ -1,7 +1,7 @@
 /**
  * Broker-mode live WRITE smoke against the scratch sandbox.
  *
- * Proves the M3.4 write path end to end against real GitHub: the broker write
+ * Proves the broker write path end to end against real GitHub: the broker write
  * decorator stamps the human's `**name** (role)` prefix onto a mediated comment,
  * posts it as the shared App bot on the ambient injected token, and journals one
  * durable audit_log row. It then reads the comment back from GitHub to confirm
@@ -10,9 +10,10 @@
  *
  * Nothing is printed that could leak the token; the injected credential is used
  * in-process only. Configuration:
+ *   REVU_SMOKE_REPO        the scratch repository to write to, as owner/name
  *   REVU_CREDENTIALS_FILE  the injected credential file
  *   REVU_SANDBOX_DIR       a local clone of the sandbox repo (for git blobs)
- *   REVU_BOT_LOGIN         the App bot login (e.g. revu-sandbox-app[bot])
+ *   REVU_BOT_LOGIN         the App bot login (e.g. my-review-app[bot])
  */
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -26,8 +27,9 @@ import { createDirectApi } from '../packages/revud/src/direct/direct-api'
 import { createBrokerWriteDecorator } from '../packages/revud/src/direct/write-decorator'
 import { createFileCredentialTokenSource } from '../packages/revud/src/broker/token-source'
 import type { RepoRef } from '../packages/revud/src/direct/repo'
+import { resolveSmokeRepo } from './smoke-target'
 
-const REPO: RepoRef = { owner: 'pat-mw', repo: 'revu-sandbox' }
+const REPO: RepoRef = resolveSmokeRepo()
 const PR = 1
 
 function requireEnv(name: string): string {

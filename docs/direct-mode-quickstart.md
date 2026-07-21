@@ -171,13 +171,24 @@ Source: `package.json` — `scripts.check`.
 ## Live smoke check
 
 `scripts/smoke-direct.ts` is a non-gated live script (it makes real GitHub
-calls) that exercises the full read and write path against the
-`pat-mw/revu-sandbox` repository. Run it with an authenticated `gh` or
-`GH_TOKEN` set:
+calls) that exercises the full read and write path against a seeded scratch
+repository. Name that repository with `REVU_SMOKE_REPO` and run it with an
+authenticated `gh` or `GH_TOKEN` set:
 
 ```bash
-bun run scripts/smoke-direct.ts
+REVU_SMOKE_REPO=owner/name bun run scripts/smoke-direct.ts
 ```
+
+`REVU_SMOKE_REPO` has **no default**. The script leaves permanent review
+comments and temporarily advances a fixture branch, so it refuses to start
+unless the target is named explicitly: an unset, malformed, or unmarked value
+exits 2 with a message rather than falling back to a built-in repository.
+Because the target is mutated, its name must also contain one of the scratch
+markers `sandbox`, `scratch`, or `fixture` — the same guard the fixture seeder
+applies.
+
+Seed the target first with `scripts/seed-scratch.ts`; the smoke expects that
+script's fixture pull requests (`#1`–`#5`) and `fixture/…` branches.
 
 This script is not part of `bun test`; it is a manual integration check.
 
@@ -191,5 +202,6 @@ This script is not part of `bun test`; it is a manual integration check.
 | `REVU_DATA_DIR` | `~/.local/share/revu` | `packages/revud/src/direct/store.ts` |
 | `REVU_ROLE` | `contractor` | `packages/revud/src/direct/session.ts` |
 | `REVU_DIST_DIR` | `packages/app/dist` | `packages/revud/src/index.ts` |
+| `REVU_SMOKE_REPO` | — (required by the live smokes) | `scripts/smoke-target.ts` |
 | `GH_TOKEN` | — | `packages/revud/src/direct/token-source.ts` |
 | `GITHUB_TOKEN` | — | `packages/revud/src/direct/token-source.ts` |
