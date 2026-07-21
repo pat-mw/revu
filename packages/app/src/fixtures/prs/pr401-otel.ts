@@ -25,6 +25,12 @@ import {
  *
  * Patch/blob consistency still holds for every file: a re-sync (which the
  * scenario does not fail) would fetch the remaining blobs and complete.
+ *
+ * Its base is the pooled-workers branch, not the default branch: the spans
+ * here instrument `worker-pool.ts`, a file that branch ADDS, so the diff only
+ * makes sense on top of it. That makes this the deepest pull request in the
+ * fixture stack — the inbox tree draws it two levels in, under the pool, under
+ * the runtime bump. Retarget it at the default branch and that depth vanishes.
  */
 
 const ALICE = HUMANS.find((h) => h.id === 'h-alice')!
@@ -864,9 +870,9 @@ const detail: PullDetail = {
     repo: { full_name: OWNER, default_branch: REPO.default_branch },
   },
   base: {
-    ref: 'main',
+    ref: 'marcus/ingest-worker-pool',
     sha: BASE_SHA,
-    label: 'meridian-labs:main',
+    label: 'meridian-labs:marcus/ingest-worker-pool',
     repo: { full_name: OWNER, default_branch: REPO.default_branch },
   },
   merge_base_sha: MERGE_BASE_SHA,

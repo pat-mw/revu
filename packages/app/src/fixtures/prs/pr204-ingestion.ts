@@ -35,6 +35,13 @@ import {
  * and every hunk header counts real context + changed lines. `pullFile` derives
  * additions/deletions from the patch so the file list can never disagree with
  * what the viewer renders.
+ *
+ * It is also the MIDDLE of the fixture stack: its base is the runtime-bump
+ * branch (the pool ships on the pinned toolchain, and the bump is green and
+ * conflict-free, so it is the sane thing to sit on), and the observability
+ * pull request sits on this branch in turn. That three-branch chain is the only
+ * non-zero nesting the inbox tree has to draw — flatten this base back onto the
+ * default branch and the tree view loses its depth.
  */
 
 const MARCUS = HUMANS.find((h) => h.id === 'h-marcus')!
@@ -3946,9 +3953,9 @@ const detail: PullDetail = {
     repo: { full_name: OWNER, default_branch: REPO.default_branch },
   },
   base: {
-    ref: 'main',
+    ref: 'chore/node-22',
     sha: BASE_SHA,
-    label: 'meridian-labs:main',
+    label: 'meridian-labs:chore/node-22',
     repo: { full_name: OWNER, default_branch: REPO.default_branch },
   },
   merge_base_sha: MERGE_BASE_SHA,

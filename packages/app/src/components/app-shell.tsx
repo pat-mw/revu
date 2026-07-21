@@ -48,8 +48,8 @@ function matchPrNumber(pathname: string): number | null {
 /**
  * The shared-bucket status chip. The single rate budget is spent across every
  * workspace in the installation, so its honesty matters: the number goes gold
- * under a thousand reads left and red under two hundred, and its tooltip names
- * exactly why a poll can be free (a 304 on the PR list costs nothing).
+ * under a thousand reads left and red under two hundred, and its tooltip says
+ * which activity actually spends the budget — an unchanged list poll does not.
  */
 function RateChip() {
   const rate = useRateLimit()
@@ -75,7 +75,8 @@ function RateChip() {
       </TooltipTrigger>
       <TooltipContent>
         Shared across every workspace in the installation. Resets in{' '}
-        {minutesUntil(reset)}m. Reads spend it; the PR list polls free on 304s.
+        {minutesUntil(reset)}m. Syncing and reading spend it; waiting on the
+        inbox does not.
       </TooltipContent>
     </Tooltip>
   )

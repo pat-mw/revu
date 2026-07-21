@@ -463,12 +463,20 @@ export type FileViewedState = Record<
 export interface HumanPreferences {
   diffMode: 'unified' | 'split'
   theme: 'dark' | 'light'
+  /**
+   * How the inbox arranges open pull requests. `list` groups them by what they
+   * need from you; `tree` arranges them by what they are stacked on, which is
+   * the only view that shows a stack's shape and distinguishes concurrent
+   * trains targeting different base branches.
+   */
+  inboxView: 'list' | 'tree'
 }
 
 /** Defaults applied when a human has no stored preferences yet. */
 export const DEFAULT_PREFERENCES: HumanPreferences = {
   diffMode: 'unified',
   theme: 'dark',
+  inboxView: 'list',
 }
 
 // ————————————————————————————————————————————————————————————————

@@ -580,6 +580,7 @@ export const vFileViewedState: Validator<FileViewedState> = vRecord(
 
 export const vHumanPreferences: Validator<HumanPreferences> = vObject({
   diffMode: vLiteral('unified', 'split'),
+  inboxView: vLiteral('list', 'tree'),
   theme: vLiteral('dark', 'light'),
 })
 
@@ -728,6 +729,7 @@ export const validateSetViewedBody: Validator<{
 export const validateSetPreferencesBody: Validator<Partial<HumanPreferences>> =
   vObject({
     diffMode: vOptional(vLiteral('unified', 'split')),
+    inboxView: vOptional(vLiteral('list', 'tree')),
     theme: vOptional(vLiteral('dark', 'light')),
   })
 
