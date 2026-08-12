@@ -410,3 +410,108 @@ Theme `@revu/docs` so the documentation site reads as the same product as the we
 ### Issue M7.10 — Light mode: app light palette + docs light/dark (+ branding, redirect)
 Add a real **light mode** to the web app — reopening the DESIGN.md dark-only decision — and make the docs support light/dark to match, **superseding M7.9's dark-lock**. The app gains a full light variant of every `packages/app` `globals.css` token (warm `#F4F2EA` canvas, `#26261F` ink, teal `#0F7D63` / rust `#B64A17` add/del re-derived for light, draft `#6741CF`, stale `#8A6D10`, diff-tint alphas re-derived), an identity-menu toggle + `mod+shift+l` shortcut persisting via the prefs store (a new `theme` field, migration-safe via the `DEFAULT_PREFERENCES` merge on both the app and revud stores), a no-flash boot script, and a co-designed light Shiki syntax theme. DESIGN.md documents the two schemes. The docs mirror the same palette with a working switcher, plus the `revu·docs` wordmark (Archivo + violet dot), favicon/metadata matching the app, and a `/`→`/docs` redirect. **Depends:** M7.9 (docs theme), M7.3. Added as scope growth within M7 (owner request).
 **Verify:** app + docs both render correct light AND dark (the toggle flips background + foreground together, no flash, diff/syntax legible, draft-violet + stale-gold read) and match each other; `bun run check` green (873 pass / 1 skip / 0, the app change is in-gate, prefs migration-safe + conformance-green); `bun run docs:build` green; `/`→`/docs` (307); root `bun.lock` unchanged.
+
+---
+
+## Milestone M8 — Local-only reviews (pre-PR branch review)
+
+**Goal:** review a local git branch against a base branch **before** any pull request exists, with the full revu review workflow, and with nothing ever sent to GitHub. Training feedback on a real client codebase stays inside the contractor's workspace; the client repo learns nothing until a PR is deliberately opened. A secondary and equally real outcome: the review pipeline stops depending on GitHub at all — a local review needs no token, no network, and no `origin`.
+
+Full design, including the surface map and the decision record, is `docs/agent/LOCAL_REVIEWS.md`. The shape in one line: **one new snapshot producer and one new write sink**, plugged into machinery (`anchor.ts`, `reconcile.ts`, `blobs.ts`, the two-half cache, the store's per-human halves) that is already provenance-blind.
+
+**Decisions carried by the design doc** — D1 archive-on-PR (never publish local comments); D2 reserved high-number identity at the contract level; D3 committed content only + dirty-worktree warning; D4 the reserved band never enters `snapshots.pr_number` / `audit_log.pr` / `pr_author.pr` (the store gets its own `local_*` tables); D5 a capability inside direct/broker mode, not a fourth mode; D6 the mock specifies it first; D7 the local write path has no GitHub client in scope; D8 local reviews use the live base tip where PRs use GitHub's stale `pull.base.sha`.
+
+**Exit criteria:**
+- A local review can be created from a branch + base pair, in a repo with **no GitHub remote, no token, and no network**, and the full review loop works: sync → inline comments → draft → submit → threads → reply → resolve.
+- Re-syncing after new commits, an amend, and a rebase all keep drafts alive and classify them through the existing reconcile flow; a rebase never mass-classifies comments as `lost` through unreachable objects.
+- No local comment, thread, review, or reaction ever reaches GitHub — enforced structurally (no GitHub client in the local write path), and asserted by a test that fails if one is introduced.
+- No synthetic id is ever written to `snapshots.pr_number`, `audit_log.pr`, or `pr_author.pr`; the host collector's and poll loop's view of "PR #N" is unchanged.
+- Conformance is green over a local-review leg in every transport (mock in-process, revud-mock HTTP, direct); `bun run check` + e2e green.
+- No GitHub-flavored affordance renders on a local review: no Checks or Description tab, no rate-limit cost copy, no "approves on github.com" lock, no "posted in one API call" toast.
+
+**Depends:** M2 (the direct sync engine, store, and reconcile this reuses). Independent of M3–M6 — it needs no broker, no collector, and no on-prem hardware. Deliverable in parallel with M7's docs track; if both land, M7.4's run-modes content gains a local-review page.
+
+### Issue M8.1 — Contract additions + the mock as the spec
+The mock is the permanent oracle, so local reviews are specified there first and revud conforms. Adds the id bands to `packages/shared` and the smallest possible surface extension to `RevuApi` (branch listing + create/list/delete of local reviews); every existing method keeps its signature.
+- [sub] `LOCAL_REVIEW_ID_BASE` / `LOCAL_ENTITY_ID_BASE` / `isLocalReviewId` in `packages/shared`, with the band-disjointness argument as tests (GitHub PR numbers, GitHub comment ids, the mock's 700M band, optimistic negatives).
+- [sub] Contract extension: `listBranches`, `createLocalReview`, `listLocalReviews`, `deleteLocalReview`; new routes using only the allowlisted `:n` param so the route-param invariant test passes unamended.
+- [sub] Mock implementation: synthetic `PullDetail`/`GhUser`/`ReviewSummary` shapes, local threads, local submit; a fixture local review reachable under `?mock=1`.
+- [sub] Validators for the new payloads; ref-name validation shared with the daemon.
+**Verify:** the existing conformance suite is green unchanged; a new local-review scenario walks create → sync → comment → submit → reply → resolve entirely in the mock; `?mock=1` demos it with no network.
+
+### Issue M8.2 — Store v4: `local_*` tables
+Additive migration in the existing doctrine — `CREATE TABLE IF NOT EXISTS` only, no row rewritten, no primary key altered (SQLite cannot alter a PK without a rebuild, which the doctrine forbids).
+- [sub] `local_reviews` (with `UNIQUE(repo, base_ref, head_ref)` and `MAX(id)+1` minting), `local_snapshots`, `local_threads`, `local_reviews_submitted`, `local_drafts`, `local_viewed`; `immutables` and `blobs` reused untouched.
+- [sub] `STORE_VERSION` 3→4 guarded step; a v3 file opens, migrates, and keeps every existing draft.
+- [sub] Draft isolation extended to `local_drafts`: `(human_id, local_id)`, `human_id` taken from the session and overwritten on write.
+- [sub] Typed store errors on the local tables (present-but-corrupt ≠ absent), matching the existing `StoreUnreadableError` / `StoreWriteError` behavior.
+**Verify:** a v3 database migrates in place with drafts intact; the draft-isolation test suite passes against the local tables (a spoofed `humanId` lands under the session id); `audit_log` and `pr_author` are provably untouched by any local operation.
+
+### Issue M8.3 — Local snapshot builder (git-only)
+A sibling of `fetchImmutable` that produces the identical `SnapshotImmutable` from one clone. Replaces `GET /pulls/{n}` + `GET /compare` with `git rev-parse` + `git merge-base`, and the files/tree/commits calls with `git diff --raw -M` + `--numstat` + `-U3` + `git log`.
+- [sub] Ref resolution and merge-base computation against the **live base tip** (D8), with typed errors for unrelated histories, shallow clones, and missing refs.
+- [sub] `git diff --raw -M` → `files` + `blobIndex` (both sides' SHAs in one command, no file cap, no tree truncation); `--numstat` counts; `-U3` patches; reproduce the "absent patch means binary or oversize" convention and the NUL-byte binary heuristic.
+- [sub] `git log` → `CommitInfo[]`; synthesize `PullDetail` per the design's field table.
+- [sub] `provisionBlobs` gains a local-only flag so the GitHub tier is unreachable, not merely unused; submodule (160000) and symlink (120000) entries skipped or explicitly marked.
+- [sub] Dirty-worktree detection via `git status --porcelain`, recorded on the review (D3).
+- [sub] Ref-name hardening: normalize to `refs/heads/…`, pass `--`, validate with `git check-ref-format` — a ref beginning with `-` is read by git as a flag and nothing validates command arguments today.
+**Verify:** against a seeded local repo, the built snapshot's `files`/`blobIndex`/`commits` match what the GitHub path produces for the same commit range; a branch with a renamed file, a binary file, a submodule, and a symlink all classify correctly; a ref named `--upload-pack=…` is rejected rather than executed.
+
+### Issue M8.4 — Local write sink
+Local implementations of the four write verbs, in a module with **no GitHub client in scope** (D7). Each returns a complete, well-formed value — the app's optimistic mutations copy fields back out of the response, so a stub that returns the old value makes an optimistic update silently revert.
+- [sub] `submitReview`: local head guard via `git rev-parse` → materialize each `PendingComment` into a local `ReviewThread` (locally minted thread id, positive comment ids) + a local `ReviewSummary`; draft deleted only on confirmed success. `head_moved` stays a 200-level value; the idempotency re-check and the 422 path are dropped as having no local analogue.
+- [sub] `replyToThread` / `resolveThread` / `addReaction` returning full normalized values.
+- [sub] No stamping: `prefixBody` is skipped and the real `Human.id` is stored on the comment; the two latent optimistic-path bugs (unconditional stamping in the synthetic reply, empty-login attribution on resolve) are not inherited.
+- [sub] Verdicts (`COMMENT`/`APPROVE`/`REQUEST_CHANGES`) kept as local training verdicts with `canApprove` true.
+**Verify:** a test asserts the local write module imports no GitHub client and fails if one is added; submit materializes threads the UI can render; resolve/react round-trip through the optimistic path without reverting; a draft survives every non-success outcome.
+
+### Issue M8.5 — Daemon wiring: dispatch, routes, `listPulls`, boot relaxation
+Local reviews are a capability inside direct/broker mode (D5), dispatched on the id band.
+- [sub] Dispatch in `direct-api` / `direct-router`: `isLocalReviewId(n)` routes sync, snapshot, threads, drafts, viewed, reconcile, and the writes to the local implementations; everything else is unchanged.
+- [sub] Create/list/delete routes wired to the store, with ref validation shared with M8.3.
+- [sub] `listPulls` merges local reviews into the list (direct mode currently 501s it) with a `compareKey`-derived ETag and a synthetic `RateLimitInfo`.
+- [sub] Boot relaxation: a repo with no github.com origin and no token still starts and serves local reviews; GitHub-only surfaces degrade honestly rather than blocking startup.
+**Verify:** `revud` starts in a repo with no remote and no token, creates a local review, and drives the full loop over HTTP; a GitHub PR in the same daemon is unaffected; the `/api/dev` mock-only gate and the 501 gates are unchanged.
+
+### Issue M8.6 — App: creation flow + inbox surface
+The only genuinely net-new UI in the milestone.
+- [sub] Create dialog: local branch picker + base picker (local branches and remote-tracking refs), title defaulting to the head branch, duplicate creation returning the existing review.
+- [sub] `Local reviews` inbox section above `Waiting on you`; a row variant that shows `base ← head` instead of `#number`, plus dirty-worktree and superseded badges.
+- [sub] Entry point in the inbox header row beside the List/Tree control; one command-palette entry in the **Go** group; optional chord registered in the shortcut catalog.
+**Verify:** a local review can be created, opened, and found again from a cold load; the tree view does not mis-parent local reviews; the palette entry is discoverable and the `?` sheet documents any chord.
+
+### Issue M8.7 — App: local-mode chrome + copy correctness
+A `mode: 'github' | 'local'` derived once from `isLocalReviewId` and threaded through the PR chrome, following the established "omit the group entirely rather than render it empty" precedent.
+- [sub] Tab set: omit **Checks** and **Description**; keep Files, Conversation (threads only), Commits. Suppress the author banner and the "isn't in this installation" 404.
+- [sub] Header + seal variant: `base ← head` and a `local` seal in place of `#347`; sync copy without request-budget estimates.
+- [sub] Review-bar variant: no `canApprove` lock popover naming an org member who "approves on github.com"; no "posted in one API call" toast; no "saved on the broker" framing.
+- [sub] Suppress the rate chip and the shared-bucket estimate on local reviews; sweep the remaining GitHub-asserting strings.
+**Verify:** no local review renders a Checks or Description tab, a rate cost, an approval instruction, or a claim that anything was posted; the reconcile and staleness vocabulary still renders (it is correct as-is); a real PR's chrome is byte-identical to before.
+
+### Issue M8.8 — Re-sync, rebase safety, and object pinning
+The edge case most likely to produce "everything is lost" for no visible reason.
+- [sub] Pin each synced snapshot's merge-base and head under `refs/revu/reviews/<id>/<compareKey>` so a later `git gc` cannot delete the objects anchoring resolves against.
+- [sub] Rebase/amend detection: `draft.headSha` absent from `commits` is reported as "the branch was rewritten" rather than falling silently to the author-date heuristic, which under-reports because a rebase preserves author date.
+- [sub] Graceful "objects missing, re-sync to rebuild" state where a dangling reference is a hard unreadable error today.
+- [sub] Deleted/renamed head or base → typed `not_found`, review read-only, drafts and threads preserved.
+- [sub] Base-advance behavior under D8 surfaced honestly (a local `compareKey` can change with zero new head commits).
+**Verify:** after `git gc --prune=now`, a rebased branch still reconciles its draft with no comment lost to a missing object; a rebase reports a rewrite rather than an under-counted "N new commits"; deleting the head branch loses no draft.
+
+### Issue M8.9 — Archive when a PR appears (D1)
+- [sub] Detection on repo + head ref + base ref, comparing `head.repo.full_name` so a fork's identically named branch does not match.
+- [sub] Archived state: read-only, threads/drafts/history preserved, a link to the PR; a PR closed without merging does not un-archive.
+- [sub] Inbox and chrome surfacing of the superseded state.
+**Verify:** opening a PR for a locally reviewed branch archives exactly that review and no other; the archived review still renders its threads; nothing is copied to the PR.
+
+### Issue M8.10 — Retention and GC
+The first `DELETE` this store grows beyond `deleteDraft`. A constantly rebased branch mints a fresh `compareKey` per sync and orphans the previous immutable half forever.
+- [sub] Delete a local review: its rows, its pinned refs, and its snapshots.
+- [sub] Prune immutables unreferenced by any snapshot (local or PR), leaving content-addressed blobs alone or pruning them under the same rule.
+- [sub] Bound the growth introduced by re-sync churn and document the policy.
+**Verify:** deleting a local review leaves no orphan rows and no pinned refs; the prune never removes an immutable half a live snapshot references; a PR snapshot is never collaterally affected.
+
+### Issue M8.11 — Conformance leg, e2e, and docs
+- [sub] A local-review leg in the conformance matrix, green in mock in-process, revud-mock HTTP, and direct.
+- [sub] An e2e that creates a local review and drives create → sync → comment → submit headlessly, asserting zero GitHub requests.
+- [sub] Docs: the local-review flow in the user-facing docs and the run-modes page; `docs/security-review.md` gains the statement that local reviews are deliberately invisible to the audit trail because they are deliberately invisible to the client.
+**Verify:** `bun run check` + e2e green; the conformance matrix has no skipped local leg; the e2e asserts zero outbound GitHub requests for the whole local flow.
