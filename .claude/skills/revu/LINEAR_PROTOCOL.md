@@ -1,5 +1,13 @@
 # LINEAR_PROTOCOL.md — operating the revu project via the Linear MCP
 
+> **⚠️ Linear is no longer where revu tracking is written.** The Uzo workspace hit its **free issue cap**:
+> `save_issue` fails with `You've exceeded the free issue limit for this workspace`, so **no issue or
+> sub-issue can be created** — every recipe below that creates or progresses an *issue* is dead. Tracking
+> moved to the local file board at **[`.claude/workstreams/`](../../workstreams/README.md)**, which is now
+> the source of truth. Linear holds **MT–M7 as read-only history**; its milestone, comment and status-update
+> recipes still work, and the ORIENT recipes are still the way to read that history. Do not attempt an issue
+> write without first confirming the cap has been raised.
+
 Exact tool recipes for the `revu` harness. Read the section for whatever you're about to do. All tools are **deferred** — load schemas with `ToolSearch` (`select:<name>,<name>`) before the first call in a session. The illustrative arg names below are not authoritative — the loaded schema is; if an example arg is rejected, use the schema's field name.
 
 ## Coordinates

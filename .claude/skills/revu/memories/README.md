@@ -4,6 +4,6 @@ Read **every file here** at the start of a session (the harness's Orient step). 
 
 | memory | what it holds |
 | --- | --- |
-| [linear-coordinates.md](./linear-coordinates.md) | The Linear project/team coordinates, the mapping decisions, and how the board was seeded |
+| [tracking-coordinates.md](./tracking-coordinates.md) | Where tracking lives (the local board at `.claude/workstreams/`, Linear as read-only history), the mapping decisions, and the free-issue-cap that moved it |
 | [hard-constraints.md](./hard-constraints.md) | Non-negotiable invariants any change must respect (contract semantics, caching, drafts, identity) |
 | [known-landmines.md](./known-landmines.md) | Specific traps already identified — in the prototype, the GitHub API, and the Linear MCP |
