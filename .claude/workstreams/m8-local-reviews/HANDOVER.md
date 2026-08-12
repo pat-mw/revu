@@ -14,8 +14,8 @@ in flight, no implementation started.
 **The workstream is fully planned.** [`ROADMAP.md`](./ROADMAP.md) is the execution plan;
 [`SESSION_PROTOCOL.md`](./SESSION_PROTOCOL.md) is how sessions behave. Both were produced adversarially — the
 roadmap by a three-way judge panel (max-parallelism vs stack-linear vs risk-first; stack-linear won
-unanimously) then verified unit-by-unit against the real tickets: **74 units, all placed exactly once, zero
-invented ids, every wave's file-disjointness checked against the tickets' own Files lines.**
+unanimously) then verified unit-by-unit against the real tickets: **every unit placed exactly once, zero invented ids,
+every wave's file-disjointness checked against the tickets' own Files lines.**
 
 **Five sessions, one linear chain:** `main → m8.1 → m8.6 → m8.7 → m8.2 → m8.3 → m8.4 → m8.5 → m8.8 → m8.10 →
 m8.9 → m8.11`. S1 the spec · S2 the app · S3 the daemon core · S4 the join + hardening · S5 archive + the
@@ -23,8 +23,15 @@ proof. **S2 and S3 are genuinely concurrent** (zero shared files — `packages/a
 two machines serial depth is 4. A ticket's PR opens the moment its Verify goes green, mid-session, never
 batched — that is what keeps a dead session's handover small.
 
-**Start here: Session 1 — the spec** ([M8.1](./tickets/M8.1-contract-and-mock.md), 6 units + a spike, ~9
-agents). It is the fork point for S2 and S3, and the frozen-contract extension must be proven before 60+
+**Test-first, verified.** A later audit pass took the ticket set from 74 to **87 units**: 67 Checks were
+strengthened from one-time observations into durable assertions, 13 units were added for test work that had no
+owner, and every ticket now carries a `## Testing exceptions` section naming what genuinely cannot be asserted.
+The doctrine is `SESSION_PROTOCOL.md` §4 — test first and observed RED, guards before the code they guard,
+negative controls for any assertion of absence. Two residuals worth knowing: wiring pins prove a call site is
+present but not that it executes, and break-observe-revert controls are enforced by the Log requirement rather
+than by CI — **a green Check with no logged red is unproven.**
+
+**Start here: Session 1 — the spec** ([M8.1](./tickets/M8.1-contract-and-mock.md), 7 units + a spike). It is the fork point for S2 and S3, and the frozen-contract extension must be proven before 60+
 units conform to it (D6). Its exit condition and wave plan are in `ROADMAP.md` → Session 1; a ready-to-paste
 session prompt is in [`PROMPTS.md`](./PROMPTS.md).
 

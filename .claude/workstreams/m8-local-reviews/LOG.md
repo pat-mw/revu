@@ -98,3 +98,34 @@ concurrently: daemon core (M8.2/M8.3/M8.4 → M8.5), app (M8.6/M8.7, which need 
 
 **Next** — **Session 1: the spec** (M8.1). Prompt in [`PROMPTS.md`](./PROMPTS.md), plan in `ROADMAP.md` →
 Session 1. It is the fork point: S2 (app) and S3 (daemon) both hang off it and can then run concurrently.
+
+---
+
+**update — 2026-08-12 · test-first audit over the whole ticket set**
+
+**Done**
+- Made the TDD doctrine explicit in [`SESSION_PROTOCOL.md`](./SESSION_PROTOCOL.md) §4: test first and observed
+  RED; a Check must be a **durable** assertion that runs on every future gate; guard rails land before the code
+  they guard; anything asserting an absence needs a negative control; the UI is not exempt (no jsdom, but
+  `renderToStaticMarkup` needs none — extract a pure predicate where a component resists assertion); and an
+  exception must be **named** with its compensating assertion.
+- Audited all 11 tickets against it, one agent per ticket reading the real code and its neighbouring tests.
+  **67 Checks strengthened. 13 new units added** for test work that had no owner — among them M8.2.7 (the
+  PR-keyed tripwire harness, armed, landing *first*), M8.4.8 (the in-memory local harness, ahead of its
+  number), M8.8.8 (the prune-survival suite and the control that gives it teeth), M8.10.7 (the in-flight-sync
+  gate, before the unit that wires a caller). **74 → 87 units.**
+- Every ticket gained a `## Testing exceptions` section naming what genuinely cannot be asserted and what
+  compensates for it.
+- `ROADMAP.md` gained a `## Test-first discipline` section and re-sequenced waves so guards land red first.
+
+**Decisions**
+- **A one-time observation is not a Check.** Several units rested on `tsc` clean, a `grep`, or a manual
+  `?mock=1` walk; those are corroboration and are now labelled as such, with a durable assertion beside them.
+- **Break-observe-revert controls are procedural, not gated.** Where a control cannot live in the suite, the
+  rule is that *a green Check with no logged red is unproven* — enforced by the Log requirement and the
+  recovery rule, not by CI. Stated rather than pretended otherwise.
+
+**Blockers** — none.
+
+**Next** — unchanged: **Session 1** (M8.1, now 7 units). Note M8.1.7 lands the dispatch sweep and M8.1.4's
+exhaustiveness guard is red-first.

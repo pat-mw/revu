@@ -54,10 +54,41 @@ The general rule: **package-level disjointness is safe; file-level overlap is no
 conflict (one shared interface append) is fine to plan for and resolve at integration; two workers editing the
 same function is not.
 
-## 4. The gate runs after every unit, not at PR time
+## 4. Test-first, and the gate after every unit
 
-`bun run check` after each unit lands, not once at the end. A red gate discovered at PR time means bisecting
-a wave of parallel work; a red gate discovered after one unit names its own cause.
+revu is built test-first — milestone MT established it and it is a hard constraint, not a preference: an agent
+must be able to verify its own work locally, unsupervised, with no external deployment. M8 does not get an
+exemption. Concretely, for **every** unit:
+
+1. **Write the test first and observe it fail.** A test that has never been red proves nothing — it may be
+   asserting a tautology, or not running at all. "Observed red" is part of the unit's Check, not a nicety.
+2. **Then make it green**, and run `bun run check` before the unit is called done.
+3. **The test must be durable.** A unit's Check is satisfied by an assertion that will run again, on every
+   future gate, and fail if someone regresses the behavior. A one-time manual observation is not a Check — at
+   most it is corroboration alongside one.
+
+**Guard rails land before the code they guard.** Where a unit exists to make something impossible — the D7
+"no GitHub client in the local write path" guard, the D4 "no synthetic id in a PR-keyed column" containment
+test, the mode-select tripwire — that test lands *first*, red, in an earlier wave than the code it constrains.
+A guard written afterwards tends to encode what the code does rather than what it must never do.
+
+**Negative controls for anything asserting an absence.** A test that passes because nothing happened is
+indistinguishable from a test that passes because it is broken. Where a Check asserts an absence — zero
+`/api/*` requests, an empty netlog, no comment lost to a pruned object — prove the assertion can fail:
+temporarily break the thing it guards, observe the test go red, revert. Record both observations in the
+ticket's Log.
+
+**The UI is not exempt.** `packages/app` has no `.test.tsx` by convention and no RTL/jsdom — but
+`renderToStaticMarkup` needs neither a DOM nor a new dependency, so a plain `.ts` test can render a real
+component and assert on its HTML. Where behavior genuinely cannot be asserted that way, extract the decision
+into a pure predicate, test the predicate, and keep the untested part to wiring thin enough to be read at a
+glance. A `?mock=1` walk is a demo, not a test; it corroborates, it never substitutes.
+
+**Where a unit truly cannot carry an automated test, say so in the ticket** — name the unit, the reason, and
+what compensating assertion exists. An acknowledged exception is fine; a silent one is how a suite rots.
+
+`bun run check` runs after each unit lands, not once at the end. A red gate discovered at PR time means
+bisecting a wave of parallel work; a red gate discovered after one unit names its own cause.
 
 Three harness landmines that will otherwise cost a session an hour each:
 

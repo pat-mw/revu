@@ -17,22 +17,23 @@ line the moment it lands. This section is the first thing an interrupted session
 
 ## Tickets
 
-74 units across 11 tickets. Dependencies below are the **post-review** graph — an adversarial pass over the
-ticket set corrected several of them, so this table is authoritative over any earlier sketch.
+**87 units across 11 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
+count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner.
 
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | Todo | 6 | shared, app | — | `m8.1/contract-and-mock` | — |
-| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | Todo | 6 | revud | M8.1 | `m8.2/store-v4` | — |
-| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 7 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
-| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 7 | revud | M8.1 | `m8.4/local-write-sink` | — |
-| [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 7 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
-| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | Todo | 6 | app | M8.1 | `m8.6/app-creation-flow` | — |
-| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | Todo | 9 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
-| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 7 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
-| [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 6 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
-| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 6 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
-| [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 7 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
+| [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | Todo | 7 | shared, app | — | `m8.1/contract-and-mock` | — |
+| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | Todo | 7 | revud | M8.1 | `m8.2/store-v4` | — |
+| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
+| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
+| [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
+| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | Todo | 7 | app | M8.1 | `m8.6/app-creation-flow` | — |
+| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | Todo | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
+| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
+| [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
+| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
+| [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
 
 ## Dependency graph
 
