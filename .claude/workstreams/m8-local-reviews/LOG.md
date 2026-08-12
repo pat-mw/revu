@@ -62,3 +62,39 @@ Query key — while the store gets its own `local_*` tables.
 **Next** — implementation. **M8.1 gates everything** (it is the spec — D6). After it lands, three tracks run
 concurrently: daemon core (M8.2/M8.3/M8.4 → M8.5), app (M8.6/M8.7, which need only the mock), and hardening
 (M8.8 after M8.3, M8.10 after M8.2). M8.11 closes the milestone.
+
+---
+
+**update — 2026-08-12 · tickets deepened, workstream planned**
+
+**Done**
+- Authored all eleven ticket files (~370 KB), then ran two adversarial critics and a patch pass over the set.
+  **24 findings applied, 0 rejected.** Four units were added for work no ticket owned: daemon-side
+  `listBranches` (a `git for-each-ref` read, not a store read as M8.5 assumed — M8.3.7), the D3
+  uncommitted-changes banner (M8.7.8), the two latent optimistic-path bugs in `state/threads.ts` (M8.7.9), and
+  edge case 18, the conflict-terminated reconcile that leaves `draft.headSha` stale (M8.8.7).
+- Wrote [`SESSION_PROTOCOL.md`](./SESSION_PROTOCOL.md) — how a session behaves when nobody is watching: tiers
+  and single-retry escalation, blast-radius rules, eight stop-and-hand-over conditions, the stacked-PR rule
+  that keeps a session from ever waiting on a merge, and the continuous resume contract.
+- Wrote [`ROADMAP.md`](./ROADMAP.md) via a three-way judge panel — max-parallelism vs stack-linear vs
+  risk-first, scored by three judges on unsupervised safety, throughput, resumability, stack coherence and
+  verification integrity. **Stack-linear won unanimously**; the synthesis grafted dual-lane concurrency and
+  unit-frontier starts from the losing plans. Verified unit-by-unit against the real tickets afterwards.
+
+**Decisions**
+- **Three open questions became recorded decisions in M8.1**, where the spec belongs — the mock's `listPulls`
+  includes local reviews (D-a); a submitted local `ReviewSummary` never enters `snapshot.mutable.reviews`
+  (D-b); `dirty`/`archivedPr` ride a new `LocalReviewSummary` rather than the frozen `BrokerPullMeta` (D-c).
+  Six tickets that were re-asking those now point at the answers.
+- **The chain order is derived from verified file ownership, not from the dependency graph alone.** The app
+  surface settles before M8.8's and M8.9's app-side units append to it; the store settles before retention
+  deletes from it; `direct-api.ts`/`direct-router.ts` are touched in one strict order. Every rebase in the
+  stack is then mechanical by construction.
+- **The dependency graph was wrong and is now acyclic and mutually inverse.** M8.7 sits behind M8.6, M8.9
+  behind M8.6+M8.7, M8.8/M8.10 behind M8.5. Two pre-existing inconsistencies fell out (M8.1 blocked M8.5
+  without M8.5 depending on it; likewise M8.4→M8.9). `BOARD.md` carries the corrected four-layer graph.
+
+**Blockers** — none. Session 1 is ready to start.
+
+**Next** — **Session 1: the spec** (M8.1). Prompt in [`PROMPTS.md`](./PROMPTS.md), plan in `ROADMAP.md` →
+Session 1. It is the fork point: S2 (app) and S3 (daemon) both hang off it and can then run concurrently.

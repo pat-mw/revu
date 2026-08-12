@@ -5,6 +5,38 @@ act from it alone.
 
 ---
 
+## 2026-08-12 — planned; ready to start Session 1
+
+**State: clean.** `main` unchanged at `177068a`. Branch `m8/local-reviews-design`, PR
+[#69](https://github.com/pat-mw/revu/pull/69) — docs + board only, gate green, awaiting human merge. Nothing
+in flight, no implementation started.
+
+**The workstream is fully planned.** [`ROADMAP.md`](./ROADMAP.md) is the execution plan;
+[`SESSION_PROTOCOL.md`](./SESSION_PROTOCOL.md) is how sessions behave. Both were produced adversarially — the
+roadmap by a three-way judge panel (max-parallelism vs stack-linear vs risk-first; stack-linear won
+unanimously) then verified unit-by-unit against the real tickets: **74 units, all placed exactly once, zero
+invented ids, every wave's file-disjointness checked against the tickets' own Files lines.**
+
+**Five sessions, one linear chain:** `main → m8.1 → m8.6 → m8.7 → m8.2 → m8.3 → m8.4 → m8.5 → m8.8 → m8.10 →
+m8.9 → m8.11`. S1 the spec · S2 the app · S3 the daemon core · S4 the join + hardening · S5 archive + the
+proof. **S2 and S3 are genuinely concurrent** (zero shared files — `packages/app` vs `packages/revud`), so on
+two machines serial depth is 4. A ticket's PR opens the moment its Verify goes green, mid-session, never
+batched — that is what keeps a dead session's handover small.
+
+**Start here: Session 1 — the spec** ([M8.1](./tickets/M8.1-contract-and-mock.md), 6 units + a spike, ~9
+agents). It is the fork point for S2 and S3, and the frozen-contract extension must be proven before 60+
+units conform to it (D6). Its exit condition and wave plan are in `ROADMAP.md` → Session 1; a ready-to-paste
+session prompt is in [`PROMPTS.md`](./PROMPTS.md).
+
+**What S1 owes the human on completion:** decision package #1 — M8.5 OQ1 (how local-only is switched on),
+M8.8 OQ2 (whether the commit-delta rewrite lands on the shipped GitHub PR path), M8.10 OQ1–OQ3 (blob-prune
+defaults), and M8.2 OQ1's behavioral half. S3 ends blocked on those rulings, so S1's handover must state them
+with a recommendation each.
+
+**Decisions, hazards, and board hygiene:** unchanged from the entry below — read it too.
+
+---
+
 ## 2026-08-12 — designed and seeded; no implementation started
 
 **State: clean.** `main` is unchanged at `177068a`. One PR open: [#69](https://github.com/pat-mw/revu/pull/69)
