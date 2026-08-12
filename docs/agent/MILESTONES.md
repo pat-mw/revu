@@ -1,6 +1,8 @@
 # revu — Milestones
 
-Companion to `revu-integration-guide.md`. This document is the single source for populating Linear: each `## Milestone` becomes a Linear milestone (or project), each `### Issue` becomes an issue, each `- [sub]` line becomes a sub-issue. IDs (`M2.3`) are stable references — use them in branch names and commit messages so cross-session context survives in Linear.
+Companion to `revu-integration-guide.md`. This document is the single source for populating the board: each `## Milestone` becomes a workstream, each `### Issue` becomes a ticket, each `- [sub]` line becomes a unit. IDs (`M2.3`) are stable references — use them in branch names and commit messages so cross-session context survives.
+
+**Where the board lives:** MT–M7 were seeded into the Linear `revu` project, which now holds them as read-only history — the workspace hit its free issue cap and `save_issue` no longer works. From **M8** onward the board is local, at `.claude/workstreams/<id>-<slug>/`. This document and the board must never drift: if scope changes, update both in the same PR.
 
 Conventions used throughout:
 
@@ -416,6 +418,8 @@ Add a real **light mode** to the web app — reopening the DESIGN.md dark-only d
 ## Milestone M8 — Local-only reviews (pre-PR branch review)
 
 **Goal:** review a local git branch against a base branch **before** any pull request exists, with the full revu review workflow, and with nothing ever sent to GitHub. Training feedback on a real client codebase stays inside the contractor's workspace; the client repo learns nothing until a PR is deliberately opened. A secondary and equally real outcome: the review pipeline stops depending on GitHub at all — a local review needs no token, no network, and no `origin`.
+
+**Live tracking for this workstream is the local board at `.claude/workstreams/m8-local-reviews/`** — `BOARD.md` for current state, `HANDOVER.md` for the cross-session handover, and one file per ticket under `tickets/` carrying its units, its Verify, and verified code anchors. The sections below are the seed text those files were built from; the board is what changes as work lands.
 
 Full design, including the surface map and the decision record, is `docs/agent/LOCAL_REVIEWS.md`. The shape in one line: **one new snapshot producer and one new write sink**, plugged into machinery (`anchor.ts`, `reconcile.ts`, `blobs.ts`, the two-half cache, the store's per-human halves) that is already provenance-blind.
 
