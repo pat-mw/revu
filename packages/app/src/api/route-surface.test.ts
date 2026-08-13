@@ -57,6 +57,13 @@ const PINNED_ROUTES: Record<string, string> = {
   getPreferences: 'GET /api/preferences',
   setPreferences: 'PUT /api/preferences',
   getRateLimit: 'GET /api/rate-limit',
+  listBranches: 'GET /api/branches',
+  createLocalReview: 'POST /api/local-reviews',
+  listLocalReviews: 'GET /api/local-reviews',
+  // Only `:n` — the local review id is a positive integer in a reserved band,
+  // which is what lets the local surface reuse the existing param allowlist
+  // instead of introducing a ref-shaped path segment.
+  deleteLocalReview: 'DELETE /api/local-reviews/:n',
 }
 
 /** The method names an object actually implements, sorted for comparison. */

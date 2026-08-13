@@ -1,4 +1,4 @@
-import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
+import type { AnchorResult, BranchRef, CommitInfo, CreateLocalReviewInput, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, LocalReviewSummary, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
 import { ApiError, prefixBody, blobContentToLines, classifyPendingComment } from '@revu/shared'
 import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
@@ -6,6 +6,7 @@ import { fixtureDB } from '@/fixtures'
 import { buildSnapshot, emptyReactions, nodeId } from '@/fixtures/helpers'
 import { rollupChecks } from '@/lib/checks-rollup'
 import { store } from './store'
+import * as local from './local'
 import { delay, localDelay } from './latency'
 
 /**
@@ -709,6 +710,38 @@ export function createMockApi(): RevuApi {
       await delay('read')
       failReads()
       return store.rateInfo()
+    },
+
+    // ——— local-only reviews ———
+    //
+    // Every method here fronts the local-review engine with transport shape
+    // only: a delay, and the failure gate that matches the kind of call.
+    // Reads of local state are treated exactly like drafts and viewed state —
+    // a short local delay, never a failure — because nothing they read lives
+    // behind the network. None of them spends the shared rate bucket: no call
+    // on this path reaches GitHub, so charging it would be a lie the UI then
+    // renders as a rate estimate.
+
+    async listBranches(): Promise<BranchRef[]> {
+      await localDelay()
+      return local.listBranches()
+    },
+
+    async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
+      await delay('write')
+      failWrites('The broker did not answer — the local review was not created.')
+      return local.createLocalReview(input)
+    },
+
+    async listLocalReviews(): Promise<LocalReviewSummary[]> {
+      await localDelay()
+      return local.listLocalReviews()
+    },
+
+    async deleteLocalReview(reviewId: number): Promise<void> {
+      await delay('write')
+      failWrites('The broker did not answer — the local review was not deleted.')
+      local.deleteLocalReview(reviewId)
     },
   }
   return api

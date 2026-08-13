@@ -23,8 +23,14 @@ export interface Route {
   method: HttpMethod
   /**
    * Path template. Segments prefixed with `:` are parameters filled by
-   * `fillPath`: `:n` (prNumber), `:sha` (blob sha), `:threadId`, `:id`
+   * `fillPath`: `:n` (review id — a pull request number, or a locally created
+   * review's id from the reserved band), `:sha` (blob sha), `:threadId`, `:id`
    * (commentId).
+   *
+   * The parameter names are a closed allowlist, enforced by tests: a path may
+   * introduce no others. Anything else a route needs — a branch name, say —
+   * rides in the body, which is also the only safe place for a value that is
+   * not URL-shaped.
    */
   path: string
 }
@@ -67,6 +73,20 @@ export const ROUTES = {
   /** Body is a partial `HumanPreferences` patch, e.g. `{ diffMode }`. */
   setPreferences: { method: 'PUT', path: '/api/preferences' },
   getRateLimit: { method: 'GET', path: '/api/rate-limit' },
+  /** No body, no params: the branches of the local repository this server serves. */
+  listBranches: { method: 'GET', path: '/api/branches' },
+  /**
+   * Body is `CreateLocalReviewInput` — `{ baseRef, headRef, title? }`, with both
+   * refs ideally fully qualified. Branch names ride in the body and NEVER in a
+   * path segment: a ref is not URL-safe, and the path params are a fixed
+   * allowlist keyed on the review id. There is no `repo` field — the server
+   * derives repository identity, so a client cannot address another repo.
+   */
+  createLocalReview: { method: 'POST', path: '/api/local-reviews' },
+  /** No body: every local review, with the local-only `dirty`/`archivedPr` annotations. */
+  listLocalReviews: { method: 'GET', path: '/api/local-reviews' },
+  /** No body; `:n` is the local review id. Answers `{ ok: true }`. */
+  deleteLocalReview: { method: 'DELETE', path: '/api/local-reviews/:n' },
 } as const satisfies Record<string, Route>
 
 /**

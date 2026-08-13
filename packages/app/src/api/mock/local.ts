@@ -1,4 +1,4 @@
-import type { CreateLocalReviewInput, GhRef, GhUser, Human, LocalReviewSummary, PullDetail, ReactionRollup, ReviewComment, ReviewSummary, ReviewThread, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
+import type { BranchRef, CreateLocalReviewInput, GhRef, GhUser, Human, LocalReviewSummary, PullDetail, ReactionRollup, ReviewComment, ReviewSummary, ReviewThread, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
 import { ApiError, isValidRefName, normalizeRefName } from '@revu/shared'
 import type { FixtureDB } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
@@ -199,6 +199,55 @@ function synthesizePullDetail(
     deletions: 0,
     changed_files: 0,
   }
+}
+
+/**
+ * The branches this workspace offers as review sides.
+ *
+ * Nothing git-shaped stands behind this store, so the listing is a fixed
+ * fixture rather than a `for-each-ref` read — chosen to exercise everything a
+ * picker has to handle: local branches and remote-tracking refs side by side,
+ * a base that exists ONLY as a remote-tracking ref, nested names, and exactly
+ * one default branch, which is the natural base preselection.
+ *
+ * Every ref is fully qualified because that is the only unambiguous form: a
+ * bare `origin/main` cannot be told apart from a local branch literally named
+ * `origin/main`, and a bare name is always read as a local branch when a
+ * creation request normalizes it.
+ */
+export function listBranches(): BranchRef[] {
+  const defaultBranch = db.repo.default_branch
+  const localNames = [
+    defaultBranch,
+    'release/0.41',
+    'chore/node-22',
+    'feat/gateway-rate-limiting',
+    'fix/cache-ttl-jitter',
+    'marcus/strict-null-checks',
+  ]
+  // `metering/usage-rollups` is deliberately tracked but not checked out —
+  // the "base exists only on the remote" case a picker must still offer.
+  const remoteNames = [
+    `origin/${defaultBranch}`,
+    'origin/release/0.41',
+    'origin/metering/usage-rollups',
+  ]
+  return [
+    ...localNames.map((name): BranchRef => ({
+      ref: `refs/heads/${name}`,
+      name,
+      kind: 'local',
+      isDefault: name === defaultBranch,
+    })),
+    ...remoteNames.map((name): BranchRef => ({
+      ref: `refs/remotes/${name}`,
+      name,
+      kind: 'remote',
+      // The default marker names the one branch to preselect as a base, and a
+      // remote-tracking copy of it is a different ref — so it is never marked.
+      isDefault: false,
+    })),
+  ]
 }
 
 /**

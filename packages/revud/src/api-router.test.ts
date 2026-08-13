@@ -69,6 +69,9 @@ const REQUEST_BODIES: Partial<Record<RouteName, unknown>> = {
   },
   setFileViewed: { path: 'src/a.ts', viewed: true, blobSha: null },
   setPreferences: {},
+  // Branch names ride in the body — never in a path segment — so this is the
+  // only local-review route the sweep has to carry input for.
+  createLocalReview: { baseRef: 'refs/heads/main', headRef: 'refs/heads/sweep' },
 }
 
 /**

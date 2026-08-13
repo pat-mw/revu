@@ -10,19 +10,27 @@
  * snapshot's `mutable.reviews`, creation is idempotent per branch pair, and
  * deletion removes the record without recycling its id or destroying drafts.
  *
+ * The final block leaves the engine behind and drives the four local-review
+ * methods of the API surface itself, because a correct engine reached through
+ * a wrong adapter is still a broken contract.
+ *
  * The mock store is one process-wide document shared across every test file,
  * so the suite resets it before and after itself.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import type { Human, PendingComment, ReviewDraft, Snapshot, SubmitReviewInput } from '@revu/shared'
+import type { BranchRef, Human, LocalReviewSummary, PendingComment, ReviewDraft, Snapshot, SubmitReviewInput } from '@revu/shared'
 import {
   ApiError,
   LOCAL_ENTITY_ID_BASE,
   LOCAL_REVIEW_ID_BASE,
+  isLocalReviewId,
+  isValidRefName,
   prefixBody,
+  validateBranchRef,
   validateLocalReviewSummary,
   vPullDetail,
 } from '@revu/shared'
+import { createMockApi } from './adapter'
 import { mockDev } from './devtools'
 import { store } from './store'
 import {
@@ -329,5 +337,133 @@ describe('deletion', () => {
 
     // Deleting a review that does not exist is a typed not_found.
     expect(thrownCode(() => deleteLocalReview(created.id))).toBe('not_found')
+  })
+})
+
+describe('the four local-review methods on the API surface', () => {
+  const api = createMockApi()
+
+  /** The ApiError code a rejected call carries, or null when it resolves. */
+  async function rejectedCode(p: Promise<unknown>): Promise<string | null> {
+    try {
+      await p
+      return null
+    } catch (e) {
+      return e instanceof ApiError ? e.code : `not an ApiError: ${String(e)}`
+    }
+  }
+
+  test('listBranches offers both kinds, fully qualified, with exactly one default', async () => {
+    const branches = await api.listBranches()
+    expect(branches.length).toBeGreaterThan(0)
+
+    for (const branch of branches) {
+      // The validator reconstructs only declared keys and throws on any
+      // mismatch, so "validates unchanged" is strict equality with its output
+      // over the serialized form the wire would actually carry.
+      const wire = JSON.parse(JSON.stringify(branch)) as unknown
+      expect(validateBranchRef(wire)).toStrictEqual(wire as BranchRef)
+      // A ref that is not fully qualified is ambiguous, and one that fails the
+      // syntactic check would be rejected by the creation call it feeds.
+      expect(branch.ref.startsWith('refs/')).toBe(true)
+      expect(isValidRefName(branch.ref)).toBe(true)
+      expect(branch.name).not.toBe('')
+    }
+
+    // A picker needs both sides of the remote boundary: a base is often only
+    // tracked, never checked out.
+    expect(branches.some((b) => b.kind === 'local')).toBe(true)
+    expect(branches.some((b) => b.kind === 'remote')).toBe(true)
+    // Exactly one default — the base preselection is a single answer, so
+    // neither zero nor two is a usable listing.
+    const defaults = branches.filter((b) => b.isDefault)
+    expect(defaults).toHaveLength(1)
+    expect(defaults[0].kind).toBe('local')
+    expect(defaults[0].ref).toBe('refs/heads/main')
+
+    // Distinct refs, so no two entries of a picker collapse onto one choice.
+    expect(new Set(branches.map((b) => b.ref)).size).toBe(branches.length)
+  })
+
+  test('a created review is listed with its local-only annotations and survives the wire', async () => {
+    const created = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/adapter-surface',
+      title: 'Adapter surface',
+    })
+    expect(isLocalReviewId(created.id)).toBe(true)
+    expect(created.title).toBe('Adapter surface')
+
+    const listed = await api.listLocalReviews()
+    const found = listed.find((r) => r.id === created.id)
+    expect(found).toBeDefined()
+    if (!found) return
+    expect(found).toStrictEqual(created)
+
+    // `dirty` and `archivedPr` are the two annotations that exist only on a
+    // local review, and they must be present as KEYS on the serialized form:
+    // a key whose value went `undefined` disappears in serialization, so a
+    // value check alone would pass on a summary that never carries them.
+    const wire = JSON.parse(JSON.stringify(found)) as Record<string, unknown>
+    expect(Object.prototype.hasOwnProperty.call(wire, 'dirty')).toBe(true)
+    expect(Object.prototype.hasOwnProperty.call(wire, 'archivedPr')).toBe(true)
+    expect(wire.dirty).toBe(false)
+    expect(wire.archivedPr).toBeNull()
+    expect(validateLocalReviewSummary(wire)).toStrictEqual(
+      wire as unknown as LocalReviewSummary,
+    )
+
+    // Creation is idempotent through the adapter exactly as it is in the
+    // engine: the same branch pair answers with the review already there.
+    const again = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/adapter-surface',
+    })
+    expect(again.id).toBe(created.id)
+    expect((await api.listLocalReviews()).filter((r) => r.id === created.id)).toHaveLength(1)
+  })
+
+  test('deleteLocalReview removes the whole record and answers not_found for an unknown id', async () => {
+    const humanId = mockDev.get().humanId
+    const created = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/adapter-delete',
+    })
+    // Synthesizing the snapshot is engine work; the deletion boundary being
+    // asserted is what the API surface does to it.
+    const snap = syncLocalReview(created.id)
+    store.putDraft(draftFor(humanId, created.id, snap))
+    expect((await api.listLocalReviews()).some((r) => r.id === created.id)).toBe(true)
+
+    await api.deleteLocalReview(created.id)
+
+    // The settled boundary is the FULL record: the review is gone from the
+    // listing and its cached snapshot is gone with it — not merely hidden.
+    expect((await api.listLocalReviews()).some((r) => r.id === created.id)).toBe(false)
+    expect(getLocalReview(created.id)).toBeNull()
+    expect(store.getSnapshot(created.id)).toBeNull()
+    // The other half of that boundary: per-human text is orphaned, never
+    // destroyed, and the id is never minted again so nothing inherits it.
+    expect(store.getDraft(humanId, created.id)).not.toBeNull()
+
+    expect(await rejectedCode(api.deleteLocalReview(created.id))).toBe('not_found')
+    // An invalid branch pair is a typed rejection through the adapter too,
+    // rather than a resolved value the caller would treat as a created review.
+    expect(
+      await rejectedCode(api.createLocalReview({ baseRef: 'main', headRef: 'main' })),
+    ).toBe('unprocessable')
+  })
+
+  test('no local-review call spends the shared rate bucket', async () => {
+    // The whole point of the local path: nothing it does reaches GitHub, so
+    // charging the bucket would make the rate estimate the UI renders a lie.
+    await api.listBranches()
+    const created = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/adapter-rate',
+    })
+    await api.listLocalReviews()
+    await api.deleteLocalReview(created.id)
+    expect(store.rateInfo().used).toBe(0)
   })
 })
