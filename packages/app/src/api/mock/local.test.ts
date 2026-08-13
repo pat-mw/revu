@@ -10,6 +10,11 @@
  * snapshot's `mutable.reviews`, creation is idempotent per branch pair, and
  * deletion removes the record without recycling its id or destroying drafts.
  *
+ * Two of them pin behavior that reads like an accident and is not, so nothing
+ * downstream "corrects" it into a divergence: the reaction rollup is shared
+ * per review rather than per person, and a submit that precedes the first sync
+ * succeeds while the threads it materializes stay unreadable until that sync.
+ *
  * The last two blocks leave the engine behind and drive the API surface
  * itself, because a correct engine reached through a wrong adapter is still a
  * broken contract: first the four local-review methods, then every method that
@@ -39,6 +44,7 @@ import { createMockApi } from './adapter'
 import { mockDev } from './devtools'
 import { ID_BASE, store } from './store'
 import {
+  addLocalReaction,
   createLocalReview,
   deleteLocalReview,
   getLocalReview,
@@ -315,6 +321,66 @@ describe('submit', () => {
 
     // Nothing on the local path ever spends the shared GitHub rate bucket.
     expect(store.rateInfo().used).toBe(0)
+  })
+})
+
+describe('reactions', () => {
+  test('the rollup is shared per review: a second human repeating an emoji gets it back unchanged', () => {
+    // Pinned deliberately. Reactions are shared-and-honest everywhere in this
+    // product — no surface models who reacted — so a repeat is a no-op that
+    // answers with the current rollup rather than an error, and the second
+    // human's optimistic bump settles back to the shared truth. Simulating
+    // per-person reactions on this one path is explicitly not wanted; this
+    // test is here so a later reader cannot mistake the no-op for a bug.
+    const firstHumanId = mockDev.get().humanId
+    const created = createLocalReview({ baseRef: 'main', headRef: 'feature/reactions' })
+    const snap = syncLocalReview(created.id)
+    const submitted = submitLocalReview({
+      prNumber: created.id,
+      expectedHeadSha: snap.immutable.headSha,
+      event: 'COMMENT',
+      body: 'A comment worth reacting to.',
+      comments: [pending('Worth a second opinion.', 12)],
+    })
+    expect(submitted.status).toBe('ok')
+
+    const commentId = store.getLocalReview(created.id)?.threads[0]?.comments[0]?.id
+    expect(commentId).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+    if (commentId === undefined) return
+
+    const first = addLocalReaction(created.id, commentId, 'heart')
+    expect(first.heart).toBe(1)
+    expect(first.total_count).toBe(1)
+
+    const second = mockDev.listHumans().find((h) => h.id !== firstHumanId)
+    expect(second).toBeDefined()
+    if (!second) return
+
+    mockDev.setHuman(second.id)
+    try {
+      // The same emoji from a different human: no throw, and the rollup comes
+      // back exactly as it was — one heart, not two.
+      const repeat = addLocalReaction(created.id, commentId, 'heart')
+      expect(repeat.heart).toBe(1)
+      expect(repeat.total_count).toBe(1)
+
+      // A DIFFERENT emoji from that same second human does register, so the
+      // no-op above is the shared rollup answering — not a second reviewer
+      // being unable to react at all.
+      const other = addLocalReaction(created.id, commentId, 'rocket')
+      expect(other.rocket).toBe(1)
+      expect(other.heart).toBe(1)
+      expect(other.total_count).toBe(2)
+    } finally {
+      mockDev.setHuman(firstHumanId)
+    }
+
+    // The stored comment carries that one shared rollup, with no per-human
+    // state beside it for anything to read.
+    const stored = store.getLocalReview(created.id)?.threads[0]?.comments[0]?.reactions
+    expect(stored?.heart).toBe(1)
+    expect(stored?.rocket).toBe(1)
+    expect(stored?.total_count).toBe(2)
   })
 })
 
@@ -742,6 +808,57 @@ describe('every id-taking method serves a local review id', () => {
         }),
       ),
     ).toBe('not_found')
+  })
+
+  test('submitting before the first sync succeeds, and its threads surface only at the next sync', async () => {
+    // A description of what happens today, pinned in both directions so any
+    // divergence is loud. Submit requires no snapshot, and the snapshot
+    // refresh a write performs finds none to refresh, so the review lands on
+    // the record while every read that comes off a snapshot still answers
+    // empty. Nothing is lost — the next sync republishes it.
+    const fresh = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/submit-before-sync',
+    })
+    expect(await api.getSnapshot(fresh.id)).toBeNull()
+
+    // The head sha a caller can name without syncing: list rows read the ref
+    // tips as they are now, so the head guard can be satisfied here.
+    const row = (await api.listPulls()).items.find((i) => i.pull.number === fresh.id)
+    expect(row).toBeDefined()
+    if (!row) return
+
+    const result = await api.submitReview({
+      prNumber: fresh.id,
+      expectedHeadSha: row.pull.head.sha,
+      event: 'COMMENT',
+      body: 'Submitted before this review was ever synced.',
+      comments: [pending('An inline comment with no snapshot behind it.', 12)],
+    })
+
+    // A full success, and still no snapshot: submit does not create one.
+    expect(result.status).toBe('ok')
+    if (result.status !== 'ok') return
+    expect(result.review.id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+    expect(await api.getSnapshot(fresh.id)).toBeNull()
+
+    // So the thread reads empty — the threads come off the snapshot…
+    expect(await api.listReviewThreads(fresh.id)).toEqual([])
+    // …while the record already holds both the verdict and the thread, which
+    // the list row counts: an unresolved count with nothing yet to open.
+    expect(listLocalSubmittedReviews(fresh.id).map((r) => r.id)).toEqual([result.review.id])
+    const rowAfter = (await api.listPulls()).items.find((i) => i.pull.number === fresh.id)
+    expect(rowAfter?.broker.unresolvedThreads).toBe(1)
+
+    // The first sync publishes what the record was already holding, verbatim.
+    const snap = await api.syncPull(fresh.id)
+    expect(snap.mutable.threads).toHaveLength(1)
+    expect(snap.mutable.threads[0].comments[0].body).toBe(
+      'An inline comment with no snapshot behind it.',
+    )
+    expect(await api.listReviewThreads(fresh.id)).toHaveLength(1)
+    // The verdict stays on the record even then, as on every local review.
+    expect(snap.mutable.reviews).toEqual([])
   })
 })
 

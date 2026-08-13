@@ -249,6 +249,74 @@ function seed(): StoreShape {
 }
 
 /**
+ * The highest id already handed out from one reserved band, expressed as the
+ * counter value that would have minted it (`id - base`), over an arbitrary
+ * collection of candidate ids. Anything that is not a safe integer at or above
+ * the band did not come from this band and is ignored, so a hand-edited or
+ * partly corrupt document can only ever raise the answer, never derail it.
+ */
+function bandHighWater(candidates: Iterable<unknown>, base: number): number {
+  let high = 0
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'number') continue
+    if (!Number.isSafeInteger(candidate) || candidate < base) continue
+    high = Math.max(high, candidate - base)
+  }
+  return high
+}
+
+/**
+ * Every id a persisted `localReviews` map hands out, split by the band it came
+ * from: review ids from the record keys and their `id` fields, entity ids from
+ * submitted review summaries, materialized thread comments, and the authorship
+ * lookup keyed beside them.
+ *
+ * The value is read as untrusted shape rather than as a typed record — this
+ * runs on a document that may predate the current build or have been edited by
+ * hand, which is the whole reason the ids are being recounted.
+ */
+function localIdsInDocument(localReviews: unknown): {
+  reviewIds: number[]
+  entityIds: number[]
+} {
+  const reviewIds: number[] = []
+  const entityIds: number[] = []
+  if (!localReviews || typeof localReviews !== 'object') return { reviewIds, entityIds }
+
+  for (const [key, value] of Object.entries(localReviews as Record<string, unknown>)) {
+    reviewIds.push(Number(key))
+    if (!value || typeof value !== 'object') continue
+    const record = value as Record<string, unknown>
+    reviewIds.push(Number(record.id))
+
+    if (Array.isArray(record.submitted)) {
+      for (const review of record.submitted as unknown[]) {
+        if (review && typeof review === 'object') {
+          entityIds.push(Number((review as Record<string, unknown>).id))
+        }
+      }
+    }
+    if (Array.isArray(record.threads)) {
+      for (const thread of record.threads as unknown[]) {
+        if (!thread || typeof thread !== 'object') continue
+        const comments = (thread as Record<string, unknown>).comments
+        if (!Array.isArray(comments)) continue
+        for (const comment of comments as unknown[]) {
+          if (comment && typeof comment === 'object') {
+            entityIds.push(Number((comment as Record<string, unknown>).id))
+          }
+        }
+      }
+    }
+    const authors = record.commentAuthors
+    if (authors && typeof authors === 'object') {
+      for (const id of Object.keys(authors as Record<string, unknown>)) entityIds.push(Number(id))
+    }
+  }
+  return { reviewIds, entityIds }
+}
+
+/**
  * Validate and MIGRATE a parsed persisted document in place, returning `null`
  * when it cannot be trusted. Drafts, viewed state, and every overlay are
  * irreplaceable local work — "drafts survive everything" — so a version bump
@@ -304,8 +372,37 @@ export function migrateStoreDocument(input: unknown): StoreShape | null {
   // high-water marks their id minting rides on. An older document simply has
   // none of either yet.
   if (parsed.localReviews === undefined) parsed.localReviews = {}
-  if (parsed.localCounters === undefined) {
-    parsed.localCounters = { review: 0, entity: 0 }
+
+  // The counters are then REPAIRED against the records actually present, not
+  // merely defaulted. A document can arrive with records but no usable
+  // counters — corruption, or a hand-edit that dropped them — and defaulting
+  // such a document to zero re-arms an id clobber: the next mint reissues the
+  // lowest id in the band, and storing a review record is a keyed overwrite,
+  // so the live record answering to that id is silently replaced. A durable
+  // store gives these ids a UNIQUE primary key and raises on the same
+  // collision, so leaving the repair out would make this document quietly
+  // wrong where the durable path is loudly wrong — a divergence between two
+  // implementations that are meant to be indistinguishable.
+  //
+  // The repair only ever raises a counter (`max(stored, derived)`), because a
+  // counter above the live high-water mark is CORRECT: deletion never frees an
+  // id for reuse, so recomputing from live records would drag it back down and
+  // let a new review inherit a dead one's drafts, viewed state, and caches.
+  const stored = parsed.localCounters
+  const { reviewIds, entityIds } = localIdsInDocument(parsed.localReviews)
+  parsed.localCounters = {
+    review: Math.max(
+      typeof stored?.review === 'number' && Number.isSafeInteger(stored.review)
+        ? stored.review
+        : 0,
+      bandHighWater(reviewIds, LOCAL_REVIEW_ID_BASE),
+    ),
+    entity: Math.max(
+      typeof stored?.entity === 'number' && Number.isSafeInteger(stored.entity)
+        ? stored.entity
+        : 0,
+      bandHighWater(entityIds, LOCAL_ENTITY_ID_BASE),
+    ),
   }
 
   parsed.v = STORE_VERSION

@@ -146,7 +146,12 @@ export interface ReviewComment {
  * client has one comment vocabulary.
  */
 export interface ReviewThread {
-  /** GraphQL node id, `PRRT_…` */
+  /**
+   * Opaque thread identifier. For a thread on a pull request this is the
+   * GraphQL node id, `PRRT_…`; a review created locally, which has no GitHub
+   * thread behind it, carries a different form. Nothing parses this value —
+   * it is passed through and echoed back — so no code may assume either shape.
+   */
   id: string
   isResolved: boolean
   isOutdated: boolean

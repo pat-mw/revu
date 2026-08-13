@@ -627,7 +627,7 @@ describe('cross-version durability: an older document is migrated, not wiped', (
   })
 })
 
-describe('cross-version durability: a v2 document upgrades to v3 without wiping drafts', () => {
+describe('cross-version durability: a v2 document upgrades to the current version without wiping drafts', () => {
   // Draft comments gained an optional `anchor.startLineText` (reconcile uses it
   // to validate a ranged comment's start line). That store change bumps the
   // version 2 → 3. A v2 document's draft comments have NO `startLineText`; if

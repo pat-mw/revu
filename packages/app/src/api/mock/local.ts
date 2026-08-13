@@ -675,10 +675,19 @@ export function resolveLocalThread(
  * React to a comment on a local review, returning the rollup the client
  * renders — returning a stale one would silently revert the optimistic bump.
  *
- * One person reacts here, and a reaction is per-person per-emoji, so a repeat
- * of the same emoji is a no-op that answers with the rollup unchanged. Adding
- * a reaction does not float the review's `updatedAt`, matching how a reaction
- * leaves a pull request's own timestamp alone.
+ * The rollup is SHARED PER REVIEW, not per person. It records which emoji are
+ * on a comment and never who put them there, so a reviewer adding an emoji the
+ * comment already carries receives the unchanged rollup and no error. That is
+ * a deliberate, system-wide choice rather than an omission here: reactions
+ * everywhere in this product are shared-and-honest, because on the paths that
+ * do reach GitHub many humans write through one account, which makes every
+ * reaction the same reaction no matter who clicked it. Simulating per-person
+ * reaction state on this path alone would make a local review the one surface
+ * whose counts mean something different from every other surface, so it is not
+ * built — the repeat no-op below is the specified behavior, not a gap to close.
+ *
+ * Adding a reaction does not float the review's `updatedAt`, matching how a
+ * reaction leaves a pull request's own timestamp alone.
  */
 export function addLocalReaction(
   reviewId: number,
