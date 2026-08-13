@@ -1,5 +1,5 @@
 import type { FileBlob, FileViewedState, HumanPreferences, IssueComment, RateLimitInfo, ReactionKey, ReactionRollup, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Snapshot } from '@revu/shared'
-import { DEFAULT_PREFERENCES } from '@revu/shared'
+import { DEFAULT_PREFERENCES, LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import type { DevState } from './devtools'
@@ -30,7 +30,7 @@ import type { DevState } from './devtools'
  */
 
 const STORAGE_KEY = 'revu.broker.v1'
-const STORE_VERSION = 3
+const STORE_VERSION = 4
 const RATE_LIMIT = 5000
 const HOUR_MS = 3_600_000
 /** New comment/review ids start well above any id a fixture author would use. */
@@ -66,6 +66,45 @@ export interface RemoteOverlay {
   touchedAt: string | null
 }
 
+/**
+ * One local-only review — a review of a branch pair that has no pull request
+ * and never talks to GitHub. The scalar fields mirror `LocalReviewSummary`
+ * one-for-one (the wire type is derived from this record, so they cannot
+ * drift); the three collections at the end are store-only:
+ *
+ * - `submitted` holds every submitted review verdict. Submitted local reviews
+ *   are read from HERE and are never appended to `snapshot.mutable.reviews` —
+ *   that array stays empty on a local review forever, which is what keeps the
+ *   Conversation surface threads-only.
+ * - `threads` is the durable home of materialized review threads; a re-sync
+ *   rebuilds the snapshot's mutable half from these.
+ * - `commentAuthors` maps comment id → `Human.id`. It is a lookup key for
+ *   own-comment detection only and is never rendered into a body or a user
+ *   object.
+ *
+ * Ref names are stored fully qualified (`refs/heads/…`, `refs/remotes/…`) so
+ * the uniqueness key `(repo, baseRef, headRef)` cannot be dodged by spelling
+ * the same branch two ways.
+ */
+export interface LocalReviewRecord {
+  id: number
+  repo: string
+  baseRef: string
+  headRef: string
+  title: string
+  baseSha: string | null
+  mergeBaseSha: string | null
+  headSha: string | null
+  dirty: boolean
+  archivedPr: number | null
+  createdAt: string
+  updatedAt: string
+  lastSyncedAt: string | null
+  submitted: ReviewSummary[]
+  threads: ReviewThread[]
+  commentAuthors: Record<number, string>
+}
+
 interface StoreShape {
   v: typeof STORE_VERSION
   dev: DevState
@@ -84,6 +123,15 @@ interface StoreShape {
   rate: { remaining: number; reset: string }
   /** Monotonic id counter for comments/reviews created through the app. */
   counter: number
+  /** Local-only reviews, keyed by their synthetic review id. */
+  localReviews: Record<number, LocalReviewRecord>
+  /**
+   * Persisted high-water marks for the two reserved local id bands. Counters,
+   * never a max-scan over live records: a deleted review's id must never be
+   * minted again, or the new review would inherit the old one's drafts, viewed
+   * state, and client-side caches.
+   */
+  localCounters: { review: number; entity: number }
 }
 
 function emptyOverlay(): RemoteOverlay {
@@ -161,67 +209,86 @@ function seed(): StoreShape {
       reset: new Date(Date.now() + HOUR_MS).toISOString(),
     },
     counter: 0,
+    localReviews: {},
+    localCounters: { review: 0, entity: 0 },
   }
 }
 
 /**
- * Load the persisted document, MIGRATING it in place rather than reseeding when
- * an older-but-valid version is found. Drafts, viewed state, and every overlay
- * are irreplaceable local work — "drafts survive everything" — so a version bump
- * must never discard a structurally sound document; it upgrades it and keeps all
- * of it. Only a genuinely missing, corrupt (a core field absent or wrong-typed),
- * or unknown-version (future, or not a number in [1, current]) document falls
- * through to a full reseed from fixtures.
+ * Validate and MIGRATE a parsed persisted document in place, returning `null`
+ * when it cannot be trusted. Drafts, viewed state, and every overlay are
+ * irreplaceable local work — "drafts survive everything" — so a version bump
+ * must never discard a structurally sound document; this upgrades it and keeps
+ * all of it. Only a genuinely corrupt (a core field absent or wrong-typed) or
+ * unknown-version (future, or not a number in [1, current]) document returns
+ * `null`, which the caller treats as "reseed from fixtures".
  *
  * When adding a new field in a future version, bump `STORE_VERSION` and add a
  * migration step below (default the field, then stamp the new version) — DO NOT
  * add the field to the corruption check above, or upgrading an old document
  * would wipe it. Migrate, never reseed, for additive changes.
  */
+export function migrateStoreDocument(input: unknown): StoreShape | null {
+  const parsed = input as Partial<StoreShape> | null
+  // Fields present since the first version: their absence means the document
+  // is genuinely corrupt (not merely old), so refusing it is correct.
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    typeof parsed.v !== 'number' ||
+    !parsed.dev ||
+    !parsed.drafts ||
+    !parsed.viewed ||
+    !parsed.snapshots ||
+    !parsed.blobs ||
+    !parsed.remoteMut ||
+    !parsed.syncAttempts ||
+    !parsed.rate ||
+    typeof parsed.counter !== 'number'
+  ) {
+    return null
+  }
+  // An unknown version — a future document this build can't reason about, or a
+  // nonsense value — is not safe to migrate blindly, so refuse it.
+  if (parsed.v < 1 || parsed.v > STORE_VERSION) return null
+
+  // Migrations, oldest → newest. Each step upgrades a structurally sound
+  // older document IN PLACE — defaulting any new field and keeping every
+  // draft, viewed entry, and overlay — so a version bump never reseeds.
+
+  // v1 → v2: v1 documents predate per-human preferences; default the field.
+  if (parsed.preferences === undefined) parsed.preferences = {}
+
+  // v2 → v3: draft comments gained an optional `anchor.startLineText`, used by
+  // reconcile to validate a ranged comment's start line. A v2 draft comment
+  // has no such field; leaving it absent is exactly the correct default — an
+  // absent `startLineText` makes reconcile fall back to the old rigid start
+  // shift, unchanged. No per-comment rewrite is needed, so this step only
+  // stamps the version below; the drafts themselves carry across untouched.
+
+  // v3 → v4: local-only reviews arrived, with their records and the persisted
+  // high-water marks their id minting rides on. An older document simply has
+  // none of either yet.
+  if (parsed.localReviews === undefined) parsed.localReviews = {}
+  if (parsed.localCounters === undefined) {
+    parsed.localCounters = { review: 0, entity: 0 }
+  }
+
+  parsed.v = STORE_VERSION
+  return parsed as StoreShape
+}
+
+/**
+ * Load the persisted document, migrating an older-but-valid version in place
+ * (see `migrateStoreDocument`). A missing, unparseable, corrupt, or
+ * unknown-version document falls through to a full reseed from fixtures.
+ */
 function load(): StoreShape {
   if (typeof localStorage === 'undefined') return seed()
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return seed()
-    const parsed = JSON.parse(raw) as Partial<StoreShape> | null
-    // Fields present since the first version: their absence means the document
-    // is genuinely corrupt (not merely old), so reseeding is correct.
-    if (
-      !parsed ||
-      typeof parsed !== 'object' ||
-      typeof parsed.v !== 'number' ||
-      !parsed.dev ||
-      !parsed.drafts ||
-      !parsed.viewed ||
-      !parsed.snapshots ||
-      !parsed.blobs ||
-      !parsed.remoteMut ||
-      !parsed.syncAttempts ||
-      !parsed.rate ||
-      typeof parsed.counter !== 'number'
-    ) {
-      return seed()
-    }
-    // An unknown version — a future document this build can't reason about, or a
-    // nonsense value — is not safe to migrate blindly, so reseed.
-    if (parsed.v < 1 || parsed.v > STORE_VERSION) return seed()
-
-    // Migrations, oldest → newest. Each step upgrades a structurally sound
-    // older document IN PLACE — defaulting any new field and keeping every
-    // draft, viewed entry, and overlay — so a version bump never reseeds.
-
-    // v1 → v2: v1 documents predate per-human preferences; default the field.
-    if (parsed.preferences === undefined) parsed.preferences = {}
-
-    // v2 → v3: draft comments gained an optional `anchor.startLineText`, used by
-    // reconcile to validate a ranged comment's start line. A v2 draft comment
-    // has no such field; leaving it absent is exactly the correct default — an
-    // absent `startLineText` makes reconcile fall back to the old rigid start
-    // shift, unchanged. No per-comment rewrite is needed, so this step only
-    // stamps the version below; the drafts themselves carry across untouched.
-
-    parsed.v = STORE_VERSION
-    return parsed as StoreShape
+    return migrateStoreDocument(JSON.parse(raw)) ?? seed()
   } catch {
     return seed()
   }
@@ -523,6 +590,77 @@ export const store = {
     state.counter += 1
     schedulePersist()
     return ID_BASE + state.counter
+  },
+
+  // ——— local-only reviews (a branch pair, no pull request, no GitHub) ———
+
+  getLocalReview(id: number): LocalReviewRecord | null {
+    const r = state.localReviews[id]
+    return r ? clone(r) : null
+  },
+
+  /** Every local review record, ordered by id (creation order). */
+  listLocalReviews(): LocalReviewRecord[] {
+    return Object.values(state.localReviews)
+      .sort((a, b) => a.id - b.id)
+      .map((r) => clone(r))
+  },
+
+  /**
+   * The record for an exact `(repo, baseRef, headRef)` triple — the in-document
+   * form of a UNIQUE constraint on those columns. Refs are compared as stored
+   * (fully qualified), so callers normalize before asking.
+   */
+  findLocalReviewByRefs(
+    repo: string,
+    baseRef: string,
+    headRef: string,
+  ): LocalReviewRecord | null {
+    for (const r of Object.values(state.localReviews)) {
+      if (r.repo === repo && r.baseRef === baseRef && r.headRef === headRef) {
+        return clone(r)
+      }
+    }
+    return null
+  },
+
+  putLocalReview(record: LocalReviewRecord): void {
+    state.localReviews[record.id] = clone(record)
+    schedulePersist()
+  },
+
+  /**
+   * Remove a local review record AND its cached snapshot — both live in this
+   * document and neither has meaning without the other. Per-human drafts and
+   * viewed state keyed to the id are deliberately left in place: user-written
+   * text is never destroyed by a delete, only orphaned (and the id is never
+   * minted again, so nothing can ever inherit it).
+   */
+  deleteLocalReview(id: number): void {
+    if (id in state.localReviews) {
+      delete state.localReviews[id]
+      delete state.snapshots[id]
+      schedulePersist()
+    }
+  },
+
+  /**
+   * Mint the next local review id from the reserved band. A persisted
+   * high-water mark, exactly like `nextId` — deletion never frees an id for
+   * reuse, so a recycled id can never collide with the drafts, viewed state,
+   * or client caches of a review that no longer exists.
+   */
+  nextLocalReviewId(): number {
+    state.localCounters.review += 1
+    schedulePersist()
+    return LOCAL_REVIEW_ID_BASE + state.localCounters.review
+  },
+
+  /** Mint the next comment/review-summary id from the reserved local entity band. */
+  nextLocalEntityId(): number {
+    state.localCounters.entity += 1
+    schedulePersist()
+    return LOCAL_ENTITY_ID_BASE + state.localCounters.entity
   },
 
   // ——— effective remote (fixture + overlay) ———
