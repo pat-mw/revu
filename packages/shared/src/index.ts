@@ -6,6 +6,7 @@
  */
 export * from './api/types'
 export * from './api/client'
+export * from './api/ids'
 export * from './lib/anchor'
 export * from './lib/identity'
 export * from './http'

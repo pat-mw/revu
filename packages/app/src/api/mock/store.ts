@@ -34,7 +34,7 @@ const STORE_VERSION = 3
 const RATE_LIMIT = 5000
 const HOUR_MS = 3_600_000
 /** New comment/review ids start well above any id a fixture author would use. */
-const ID_BASE = 700_000_000
+export const ID_BASE = 700_000_000
 
 const db = fixtureDB as FixtureDB
 
