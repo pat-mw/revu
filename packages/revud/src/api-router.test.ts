@@ -166,9 +166,13 @@ describe('mock-mode dispatch reaches every route', () => {
   }
 
   test('the table never shrinks below the routes swept above', () => {
-    // Without this, deleting every entry from `ROUTES` would leave a file of
-    // zero tests that passes.
-    expect(Object.keys(ROUTES).length).toBeGreaterThanOrEqual(19)
+    // Without this, deleting entries from `ROUTES` would leave a file of fewer
+    // tests — at the limit, zero — that still passes. The floor is a deliberate
+    // literal that moves only with an intentional route change, the same
+    // doctrine the fixture counts carry; left trailing the table's real size it
+    // silently stops covering the newest routes, which is how it must never be
+    // maintained. A floor, not an equality, so a pure addition still passes.
+    expect(Object.keys(ROUTES).length).toBeGreaterThanOrEqual(23)
   })
 
   test('an unknown path still produces the No route for envelope', async () => {

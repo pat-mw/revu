@@ -16,11 +16,12 @@
  *    different contracts.
  *
  * 2. **Additive-only.** Every pre-existing `method + path` pair is pinned as a
- *    literal below. Editing a path (a renamed segment, a changed verb) or
- *    deleting an entry fails this file; that turns "the route table only ever
- *    grows" from a review habit into an assertion. A new route is legal and
- *    passes — the bijection above still forces both adapters to carry its method
- *    — and its pair belongs in the table so the next change is pinned too.
+ *    literal below, and the SIZE of that pin table is itself pinned as a
+ *    literal. Editing a path (a renamed segment, a changed verb) or deleting an
+ *    entry fails this file; that turns "the route table only ever grows" from a
+ *    review habit into an assertion. A new route is legal and passes — the
+ *    bijection above still forces both adapters to carry its method — and its
+ *    pair belongs in the table so the next change is pinned too.
  *
  * Neither property is about behaviour, so nothing here calls a route. Whether a
  * request actually REACHES its own handler is a separate, runtime property of
@@ -34,8 +35,8 @@ import { mockDev } from '@/api/mock/devtools'
 
 /**
  * The `method + path` of every route, pinned literally. An entry may be ADDED
- * (and should be added here in the same change); an entry may never be edited or
- * removed.
+ * (and should be added here in the same change, alongside the pinned count
+ * below); an entry may never be edited or removed.
  */
 const PINNED_ROUTES: Record<string, string> = {
   getSession: 'GET /api/session',
@@ -106,11 +107,17 @@ describe('the route table is additive-only', () => {
     expect(actual).toEqual(PINNED_ROUTES)
   })
 
-  test('the table never shrinks below its pinned entries', () => {
-    // Guards the assertion above against being neutered by deleting a pin
-    // alongside the route it pins.
-    expect(Object.keys(ROUTES).length).toBeGreaterThanOrEqual(
-      Object.keys(PINNED_ROUTES).length,
-    )
+  test('the pin table still holds every route it has ever pinned', () => {
+    // A deliberate literal that moves only with an intentional route change —
+    // the same doctrine the fixture counts carry. It is what makes the pin
+    // table above non-neuterable: deleting a route AND the pin that pins it
+    // leaves every surviving pin matching, so any count derived from
+    // `PINNED_ROUTES` could only fail after the comparison above had already
+    // failed. Counting the pins against a literal fails on the deletion itself.
+    //
+    // Deliberately NOT a count of `ROUTES`: a pure addition to the route table
+    // must still pass this file untouched, and the bijection above is what
+    // holds an added route to both adapters.
+    expect(Object.keys(PINNED_ROUTES)).toHaveLength(23)
   })
 })
