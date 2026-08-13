@@ -190,6 +190,40 @@ function seed(): StoreShape {
     }
   }
 
+  // Local-only reviews are seeded as exactly the records a runtime creation
+  // produces, alongside the snapshot their last sync left behind — one review,
+  // one record, one way into the pull list. Their synced SHAs come off that
+  // snapshot rather than from a second declaration, and `dirty`/`archivedPr`
+  // hold their post-sync values: a seeded review is one that was created and
+  // synced, not a state only a fixture author can reach.
+  const localReviews: StoreShape['localReviews'] = {}
+  let localReviewCounter = 0
+  for (const lr of db.localReviews) {
+    localReviews[lr.id] = {
+      id: lr.id,
+      // Repo identity is the workspace's to derive, never the fixture's to name.
+      repo: db.repo.full_name,
+      baseRef: lr.baseRef,
+      headRef: lr.headRef,
+      title: lr.title,
+      baseSha: lr.snapshot.mutable.pull.base.sha,
+      mergeBaseSha: lr.snapshot.immutable.mergeBaseSha,
+      headSha: lr.snapshot.immutable.headSha,
+      dirty: false,
+      archivedPr: null,
+      createdAt: lr.createdAt,
+      updatedAt: lr.updatedAt,
+      lastSyncedAt: lr.snapshot.syncedAt,
+      submitted: [],
+      threads: [],
+      commentAuthors: {},
+    }
+    snapshots[lr.id] = clone(lr.snapshot)
+    // The mint counter starts above every seeded id, so a review created later
+    // can never be handed an id a seeded review already answers to.
+    localReviewCounter = Math.max(localReviewCounter, lr.id - LOCAL_REVIEW_ID_BASE)
+  }
+
   return {
     v: STORE_VERSION,
     dev: {
@@ -209,8 +243,8 @@ function seed(): StoreShape {
       reset: new Date(Date.now() + HOUR_MS).toISOString(),
     },
     counter: 0,
-    localReviews: {},
-    localCounters: { review: 0, entity: 0 },
+    localReviews,
+    localCounters: { review: localReviewCounter, entity: 0 },
   }
 }
 
