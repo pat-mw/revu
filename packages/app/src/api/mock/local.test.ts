@@ -10,15 +10,19 @@
  * snapshot's `mutable.reviews`, creation is idempotent per branch pair, and
  * deletion removes the record without recycling its id or destroying drafts.
  *
- * The final block leaves the engine behind and drives the four local-review
- * methods of the API surface itself, because a correct engine reached through
- * a wrong adapter is still a broken contract.
+ * The last two blocks leave the engine behind and drive the API surface
+ * itself, because a correct engine reached through a wrong adapter is still a
+ * broken contract: first the four local-review methods, then every method that
+ * takes a review id, on a local id and on a GitHub one. The second of those
+ * pairs is what keeps the dispatch honest — a bypass that quietly served local
+ * behavior to real pull requests would satisfy every local assertion on its
+ * own.
  *
  * The mock store is one process-wide document shared across every test file,
  * so the suite resets it before and after itself.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import type { BranchRef, Human, LocalReviewSummary, PendingComment, ReviewDraft, Snapshot, SubmitReviewInput } from '@revu/shared'
+import type { BranchRef, FileBlob, Human, LocalReviewSummary, PendingComment, PullListResponse, ReviewDraft, ReviewThread, Snapshot, SubmitReviewInput } from '@revu/shared'
 import {
   ApiError,
   LOCAL_ENTITY_ID_BASE,
@@ -28,11 +32,12 @@ import {
   prefixBody,
   validateBranchRef,
   validateLocalReviewSummary,
+  validatePullListResponse,
   vPullDetail,
 } from '@revu/shared'
 import { createMockApi } from './adapter'
 import { mockDev } from './devtools'
-import { store } from './store'
+import { ID_BASE, store } from './store'
 import {
   createLocalReview,
   deleteLocalReview,
@@ -465,5 +470,398 @@ describe('the four local-review methods on the API surface', () => {
     await api.listLocalReviews()
     await api.deleteLocalReview(created.id)
     expect(store.rateInfo().used).toBe(0)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// Everything below drives GitHub-shaped fixture pulls as well as local ids,
+// so it deliberately runs LAST in this file: those calls spend the simulated
+// rate bucket, and the assertions above are entitled to a bucket no local call
+// has ever touched.
+// ————————————————————————————————————————————————————————————————
+
+/** The `**Name** (role)` identity stamp the GitHub path applies and the local path must not. */
+const STAMP = /\*\*[^*\n]+\*\* \([^)]+\)/
+
+/** The ApiError code a rejected call carries, or null when it resolves. */
+async function apiErrorCode(p: Promise<unknown>): Promise<string | null> {
+  try {
+    await p
+    return null
+  } catch (e) {
+    return e instanceof ApiError ? e.code : `not an ApiError: ${String(e)}`
+  }
+}
+
+describe('every id-taking method serves a local review id', () => {
+  const api = createMockApi()
+  let localId = 0
+  let headSha = ''
+  let humanId = ''
+  let humanName = ''
+
+  beforeAll(async () => {
+    // The simulated latency profile is not what is under test here, and the
+    // default one budgets seconds for a single sync burst.
+    mockDev.setLatency('zero')
+    humanId = mockDev.get().humanId
+    humanName = mockDev.listHumans().find((h) => h.id === humanId)?.name ?? ''
+    localId = (
+      await api.createLocalReview({ baseRef: 'main', headRef: 'feature/dispatch' })
+    ).id
+  })
+
+  test('syncPull resolves a local snapshot instead of rejecting the id', async () => {
+    const snap = await api.syncPull(localId)
+    headSha = snap.immutable.headSha
+
+    expect(snap.prNumber).toBe(localId)
+    expect(snap.mutable.pull.number).toBe(localId)
+    // Nothing was requested of anything: the sync read local refs.
+    expect(snap.syncStats?.requests).toBe(0)
+    // The cached read finds it under the same key every PR snapshot uses —
+    // one snapshot keyspace, keyed by review id, with no local variant.
+    expect((await api.getSnapshot(localId))?.immutable.compareKey).toBe(
+      snap.immutable.compareKey,
+    )
+  })
+
+  test('listPulls carries the local review as an ordinary row, exactly once', async () => {
+    const list = await api.listPulls()
+    const rows = list.items.filter((i) => i.pull.number === localId)
+
+    // Exactly one: a review reaching the list by two mechanisms would render
+    // as two rows for one review.
+    expect(rows).toHaveLength(1)
+    const row = rows[0]
+    expect(isLocalReviewId(row.pull.number)).toBe(true)
+    expect(row.pull.title).toBe('feature/dispatch')
+    expect(row.pull.state).toBe('open')
+    expect(JSON.stringify(row.pull.user)).not.toContain('@')
+    // No CI can have reported on a branch that was never pushed, and absent is
+    // how the list spells "nothing reported" — never a synthesized pass.
+    expect(row.broker.checks).toBeUndefined()
+    // No GitHub self-review rule applies where no GitHub identity opened
+    // anything, and no App-driving human authored a pull request here.
+    expect(row.broker.canApprove).toBe(true)
+    expect(row.broker.authorHumanId).toBeNull()
+    expect(row.broker.assignedReviewerHumanIds).toEqual([])
+    expect(row.broker.compareKey).toBe(`${headSha}...${headSha}`)
+
+    // The row survives the transport that would carry it: the response
+    // validator reconstructs only declared keys and throws on any mismatch.
+    const wire = JSON.parse(JSON.stringify(list)) as unknown
+    expect(validatePullListResponse(wire)).toStrictEqual(wire as PullListResponse)
+  })
+
+  test('the draft verbs serve a local id through the one per-human draft keyspace', async () => {
+    const snap = (await api.getSnapshot(localId)) as Snapshot
+    const saved = await api.saveDraft(draftFor(humanId, localId, snap))
+    expect(saved.prNumber).toBe(localId)
+    expect((await api.getDraft(localId))?.body).toBe(saved.body)
+    // Drafts are keyed `(humanId, prNumber)` and a local id is just another
+    // prNumber — the store holds this one under exactly that key, with no
+    // parallel local keyspace beside it.
+    expect(store.getDraft(humanId, localId)?.body).toBe(saved.body)
+
+    // Which means isolation needs no new mechanism: another human reading the
+    // same local id sees nothing.
+    const other = mockDev.listHumans().find((h) => h.id !== humanId)
+    expect(other).toBeDefined()
+    if (!other) return
+    mockDev.setHuman(other.id)
+    expect(await api.getDraft(localId)).toBeNull()
+    mockDev.setHuman(humanId)
+    expect((await api.getDraft(localId))?.body).toBe(saved.body)
+
+    await api.discardDraft(localId)
+    expect(await api.getDraft(localId)).toBeNull()
+  })
+
+  test('submitReview materializes local threads, keeps mutable.reviews empty, and spends nothing', async () => {
+    const snap = (await api.getSnapshot(localId)) as Snapshot
+    await api.saveDraft(draftFor(humanId, localId, snap))
+    const spentBefore = store.rateInfo().used
+
+    const result = await api.submitReview({
+      prNumber: localId,
+      expectedHeadSha: headSha,
+      event: 'REQUEST_CHANGES',
+      body: 'Two things before this is ready.',
+      comments: [pending('This guard clause reads inverted.', 12)],
+    } satisfies SubmitReviewInput)
+
+    expect(result.status).toBe('ok')
+    if (result.status !== 'ok') return
+    expect(result.review.id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+    expect(result.review.state).toBe('CHANGES_REQUESTED')
+    // Verbatim: the stamp exists only because many humans share one GitHub
+    // bot, and locally the store records the author instead.
+    expect(result.review.body).toBe('Two things before this is ready.')
+    expect(result.review.body).not.toMatch(STAMP)
+    expect(JSON.stringify(result.review.user)).not.toContain('@')
+
+    const threads = await api.listReviewThreads(localId)
+    expect(threads).toHaveLength(1)
+    expect(threads[0].comments[0].body).toBe('This guard clause reads inverted.')
+    expect(threads[0].comments[0].body).not.toMatch(STAMP)
+    // …and the positive control for both absence assertions: the same matcher
+    // does match genuinely stamped output.
+    const control: Human = {
+      id: 'h-control',
+      name: 'Control Human',
+      role: 'contractor',
+      email: 'control@example.test',
+    }
+    expect(prefixBody(control, 'x')).toMatch(STAMP)
+
+    // The submitted verdict never enters the snapshot: that array stays empty
+    // for the life of a local review, which is what keeps its conversation
+    // surface threads-only.
+    const after = await api.getSnapshot(localId)
+    expect(after?.mutable.reviews).toEqual([])
+    expect(after?.mutable.issueComments).toEqual([])
+
+    expect(await api.getDraft(localId)).toBeNull()
+    expect(store.rateInfo().used).toBe(spentBefore)
+  })
+
+  test('replyToThread appends a verbatim local comment to the thread', async () => {
+    const [thread] = await api.listReviewThreads(localId)
+    const root = thread.comments[0]
+    const spentBefore = store.rateInfo().used
+
+    const reply = await api.replyToThread(localId, thread.id, 'Reworded — take another look.')
+
+    expect(reply.body).toBe('Reworded — take another look.')
+    expect(reply.body).not.toMatch(STAMP)
+    expect(reply.id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+    expect(reply.in_reply_to_id).toBe(root.id)
+    expect(reply.path).toBe(thread.path)
+    expect(JSON.stringify(reply.user)).not.toContain('@')
+
+    const reread = (await api.listReviewThreads(localId)).find((t) => t.id === thread.id)
+    expect(reread?.comments).toHaveLength(2)
+    expect(reread?.comments[1].id).toBe(reply.id)
+    // Authorship is a stored key, never body text.
+    const snap = await api.getSnapshot(localId)
+    expect(snap?.mutable.commentAuthors?.[reply.id]).toBe(humanId)
+    expect(store.rateInfo().used).toBe(spentBefore)
+  })
+
+  test('resolveThread flips both ways and returns the whole normalized thread', async () => {
+    const [thread] = await api.listReviewThreads(localId)
+    const spentBefore = store.rateInfo().used
+
+    const resolved = await api.resolveThread(localId, thread.id, true)
+    expect(resolved.id).toBe(thread.id)
+    expect(resolved.isResolved).toBe(true)
+    // Attributed to the one local reviewer by display name — never an email,
+    // and never an empty login.
+    expect(resolved.resolvedBy?.login).toBe(humanName)
+    expect(JSON.stringify(resolved.resolvedBy)).not.toContain('@')
+    expect(
+      (await api.listReviewThreads(localId)).find((t) => t.id === thread.id)?.isResolved,
+    ).toBe(true)
+
+    const reopened = await api.resolveThread(localId, thread.id, false)
+    expect(reopened.isResolved).toBe(false)
+    expect(reopened.resolvedBy).toBeNull()
+    expect(store.rateInfo().used).toBe(spentBefore)
+  })
+
+  test('addReaction bumps a local rollup that names no github.com resource', async () => {
+    const [thread] = await api.listReviewThreads(localId)
+    const commentId = thread.comments[0].id
+    const spentBefore = store.rateInfo().used
+
+    const rollup = await api.addReaction(localId, commentId, 'heart')
+    expect(rollup.heart).toBe(1)
+    expect(rollup.total_count).toBe(1)
+    expect(rollup.url).toBe('')
+
+    const snap = await api.getSnapshot(localId)
+    const cached = snap?.mutable.threads
+      .flatMap((t) => t.comments)
+      .find((c) => c.id === commentId)
+    expect(cached?.reactions.heart).toBe(1)
+    expect(store.rateInfo().used).toBe(spentBefore)
+  })
+
+  test('reconcileDraft classifies a local draft against the local snapshot', async () => {
+    const snap = (await api.getSnapshot(localId)) as Snapshot
+    await api.saveDraft({
+      ...draftFor(humanId, localId, snap),
+      comments: [pending('Still pending after the branch moved.', 12)],
+    })
+
+    const report = await api.reconcileDraft(localId)
+    expect(report.prNumber).toBe(localId)
+    expect(report.currentHeadSha).toBe(headSha)
+    expect(report.draftHeadSha).toBe(headSha)
+    expect(report.results).toHaveLength(1)
+
+    await api.discardDraft(localId)
+  })
+
+  test('the viewed-state verbs key a local id like any other review', async () => {
+    const state = await api.setFileViewed(localId, 'src/index.ts', true, 'blob-sha-local')
+    expect(state['src/index.ts'].viewed).toBe(true)
+    expect((await api.getFileViewed(localId))['src/index.ts'].viewed).toBe(true)
+    expect(store.getViewed(humanId, localId)['src/index.ts'].viewed).toBe(true)
+  })
+
+  test('getBlob takes no review id, so one content-addressed store serves both paths', async () => {
+    const blob: FileBlob = {
+      sha: 'localdispatchblob0000000000000000000000',
+      path: 'src/index.ts',
+      content: 'const x = compute()\n',
+      size: 20,
+      binary: false,
+    }
+    store.putBlobs([blob])
+    expect(await api.getBlob(blob.sha)).toEqual(blob)
+    expect(await apiErrorCode(api.getBlob('sha-that-was-never-fetched'))).toBe('not_found')
+  })
+
+  test('an unknown local id is a typed not_found from the local engine, not a silent empty', async () => {
+    const ghost = LOCAL_REVIEW_ID_BASE + 987_654
+    expect(isLocalReviewId(ghost)).toBe(true)
+    expect(await apiErrorCode(api.syncPull(ghost))).toBe('not_found')
+    expect(await apiErrorCode(api.replyToThread(ghost, 'local:1:1', 'x'))).toBe('not_found')
+    expect(await apiErrorCode(api.resolveThread(ghost, 'local:1:1', true))).toBe('not_found')
+    expect(await apiErrorCode(api.addReaction(ghost, 1, 'heart'))).toBe('not_found')
+    expect(
+      await apiErrorCode(
+        api.submitReview({
+          prNumber: ghost,
+          expectedHeadSha: headSha,
+          event: 'COMMENT',
+          body: 'x',
+          comments: [],
+        }),
+      ),
+    ).toBe('not_found')
+  })
+})
+
+describe('a non-local id still takes the GitHub-shaped path, unchanged', () => {
+  // Without this block a dispatch that degenerated into a blanket bypass —
+  // serving local behavior to real pull requests — would satisfy every
+  // assertion above. Each case names something only the GitHub path does.
+  const api = createMockApi()
+  const remotePr = 347
+  let brokerLogin = ''
+  let remoteThread: ReviewThread
+
+  beforeAll(async () => {
+    mockDev.setLatency('zero')
+    brokerLogin = (await api.getSession()).brokerLogin
+  })
+
+  test('syncPull on a fixture pull still fetches a real compare and spends the bucket', async () => {
+    const spentBefore = store.rateInfo().used
+    const snap = await api.syncPull(remotePr)
+
+    expect(snap.prNumber).toBe(remotePr)
+    expect(snap.immutable.files.length).toBeGreaterThan(0)
+    expect(snap.immutable.commits.length).toBeGreaterThan(0)
+    expect(snap.syncStats?.requests).toBeGreaterThan(0)
+    expect(store.rateInfo().used).toBeGreaterThan(spentBefore)
+  })
+
+  test('replyToThread on a fixture pull still stamps the body and posts as the shared bot', async () => {
+    const threads = await api.listReviewThreads(remotePr)
+    const target = threads.find((t) => !t.isResolved)
+    expect(target).toBeDefined()
+    if (!target) return
+    remoteThread = target
+    const spentBefore = store.rateInfo().used
+
+    const reply = await api.replyToThread(remotePr, target.id, 'Pushed a fix.')
+
+    // The stamp is the sharpest possible proof the GitHub path ran: it is the
+    // one thing the local path is forbidden to do.
+    expect(reply.body).toMatch(STAMP)
+    expect(reply.body).not.toBe('Pushed a fix.')
+    expect(reply.user.login).toBe(brokerLogin)
+    // A GitHub-path id comes from the mock's own band, never a local one.
+    expect(reply.id).toBeGreaterThanOrEqual(ID_BASE)
+    expect(reply.id).toBeLessThan(LOCAL_REVIEW_ID_BASE)
+    expect(reply.html_url).toContain('github.com')
+    expect(store.rateInfo().used).toBeGreaterThan(spentBefore)
+  })
+
+  test('resolveThread on a fixture pull still attributes to the bot login', async () => {
+    const resolved = await api.resolveThread(remotePr, remoteThread.id, true)
+    expect(resolved.isResolved).toBe(true)
+    expect(resolved.resolvedBy?.login).toBe(brokerLogin)
+    await api.resolveThread(remotePr, remoteThread.id, false)
+  })
+
+  test('addReaction on a fixture comment still returns the GitHub-shaped rollup', async () => {
+    const commentId = remoteThread.comments[0].id
+    const spentBefore = store.rateInfo().used
+
+    const rollup = await api.addReaction(remotePr, commentId, 'rocket')
+    // The fixture rollups name a real github.com resource; local ones cannot.
+    expect(rollup.url).toContain('github.com')
+    expect(store.rateInfo().used).toBeGreaterThan(spentBefore)
+  })
+
+  test('submitReview on a fixture pull still stamps AND appends to mutable.reviews', async () => {
+    const snap = (await api.getSnapshot(remotePr)) as Snapshot
+    const reviewsBefore = snap.mutable.reviews.length
+    const spentBefore = store.rateInfo().used
+
+    const result = await api.submitReview({
+      prNumber: remotePr,
+      expectedHeadSha: snap.immutable.headSha,
+      event: 'COMMENT',
+      body: 'First pass done.',
+      comments: [],
+    })
+
+    expect(result.status).toBe('ok')
+    if (result.status !== 'ok') return
+    expect(result.review.body).toMatch(STAMP)
+    expect(result.review.user.login).toBe(brokerLogin)
+    expect(result.review.id).toBeGreaterThanOrEqual(ID_BASE)
+    expect(result.review.id).toBeLessThan(LOCAL_REVIEW_ID_BASE)
+
+    // The divergence that makes the two paths distinguishable at the store:
+    // a GitHub submit lands in the snapshot's reviews, a local one never does.
+    const after = (await api.getSnapshot(remotePr)) as Snapshot
+    expect(after.mutable.reviews).toHaveLength(reviewsBefore + 1)
+    expect(store.rateInfo().used).toBeGreaterThan(spentBefore)
+  })
+
+  test('listPulls still carries every fixture pull, from the fixture source', async () => {
+    const list = await api.listPulls()
+    const remoteNumbers = list.items
+      .map((i) => i.pull.number)
+      .filter((n) => !isLocalReviewId(n))
+      .sort((a, b) => a - b)
+    expect(remoteNumbers).toEqual([101, 204, 312, 347, 355, 362, 389, 401, 410, 415])
+  })
+
+  test('an id below the local band that no fixture claims is still not_found', async () => {
+    const ghost = 999_999
+    expect(isLocalReviewId(ghost)).toBe(false)
+    expect(await apiErrorCode(api.syncPull(ghost))).toBe('not_found')
+    expect(await apiErrorCode(api.replyToThread(ghost, 'PRRT_x', 'x'))).toBe('not_found')
+    expect(await apiErrorCode(api.resolveThread(ghost, 'PRRT_x', true))).toBe('not_found')
+    expect(await apiErrorCode(api.addReaction(ghost, 1, 'heart'))).toBe('not_found')
+    expect(
+      await apiErrorCode(
+        api.submitReview({
+          prNumber: ghost,
+          expectedHeadSha: 'x',
+          event: 'COMMENT',
+          body: 'x',
+          comments: [],
+        }),
+      ),
+    ).toBe('not_found')
   })
 })

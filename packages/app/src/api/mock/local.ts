@@ -1,4 +1,4 @@
-import type { BranchRef, CreateLocalReviewInput, GhRef, GhUser, Human, LocalReviewSummary, PullDetail, ReactionRollup, ReviewComment, ReviewSummary, ReviewThread, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
+import type { BranchRef, BrokerPullMeta, CreateLocalReviewInput, GhRef, GhUser, Human, LocalReviewSummary, PullDetail, ReactionKey, ReactionRollup, ReviewComment, ReviewSummary, ReviewThread, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
 import { ApiError, isValidRefName, normalizeRefName } from '@revu/shared'
 import type { FixtureDB } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
@@ -313,6 +313,54 @@ export function listLocalReviews(): LocalReviewSummary[] {
   return store.listLocalReviews().map(toSummary)
 }
 
+/** One local review projected into the two halves a pull-list row carries. */
+export interface LocalPullRow {
+  detail: PullDetail
+  broker: BrokerPullMeta
+}
+
+/**
+ * Every local review as a pull-list row.
+ *
+ * The pull list is the row source for every review the app renders — a review
+ * missing from it resolves to "this pull request isn't in this installation"
+ * on every open — so local reviews belong in it alongside pull requests. This
+ * is the ONLY way one gets there: every local review is a record in this
+ * store, whether it was seeded with the fixtures or created at runtime, so a
+ * single review can never arrive by two routes and appear twice.
+ *
+ * The broker half is derived, not stored:
+ * - `authorHumanId` is null. It names the human who drove the App identity
+ *   when a pull request was opened; no pull request was opened here, so no
+ *   surface may claim one was.
+ * - `canApprove` is true — GitHub's self-review refusal has no local analogue,
+ *   and every verdict stays available.
+ * - No reviewers can be assigned where there is no pull request to assign them
+ *   to, and `checks` is ABSENT rather than empty: nothing has reported on a
+ *   branch that was never pushed, which is neither a pass nor a failure.
+ * - The compare key is read from the ref tips as they are NOW, not from the
+ *   last sync, so a row still tells the truth about a branch that moved.
+ */
+export function listLocalPullRows(): LocalPullRow[] {
+  const reviewer = currentHuman()
+  return store.listLocalReviews().map((record) => {
+    const headSha = liveRefSha(record.repo, record.headRef)
+    const baseSha = liveRefSha(record.repo, record.baseRef)
+    const mergeBaseSha = headSha
+    return {
+      detail: synthesizePullDetail(record, reviewer, { baseSha, mergeBaseSha, headSha }),
+      broker: {
+        authorHumanId: null,
+        canApprove: true,
+        unresolvedThreads: record.threads.filter((t) => !t.isResolved).length,
+        assignedReviewerHumanIds: [],
+        compareKey: `${mergeBaseSha}...${headSha}`,
+        commitCount: 0,
+      },
+    }
+  })
+}
+
 export function getLocalReview(id: number): LocalReviewSummary | null {
   const record = store.getLocalReview(id)
   return record ? toSummary(record) : null
@@ -397,6 +445,42 @@ export function syncLocalReview(id: number): Snapshot {
   }
   store.putSnapshot(snapshot)
   return snapshot
+}
+
+/**
+ * Republish a review's materialized threads into its cached snapshot.
+ *
+ * The record is the durable home of a local thread and the snapshot is the
+ * surface reads come off, so every write updates the record first and then
+ * refreshes the snapshot from it wholesale — one direction, one truth, and the
+ * same rebuild a re-sync performs. A review with no snapshot yet has nothing
+ * to refresh; the next sync builds it from the same record.
+ *
+ * `mutable.reviews` is deliberately never written here: submitted verdicts
+ * live on the record alone.
+ */
+function refreshSnapshotThreads(record: LocalReviewRecord): void {
+  const snap = store.getSnapshot(record.id)
+  if (!snap) return
+  snap.mutable.threads = record.threads
+  snap.mutable.commentAuthors = record.commentAuthors
+  snap.mutable.pull.review_comments = record.threads.reduce(
+    (n, t) => n + t.comments.length,
+    0,
+  )
+  store.putSnapshot(snap)
+}
+
+/** The thread with this id on this review, or a typed `not_found`. */
+function requireLocalThread(record: LocalReviewRecord, threadId: string): ReviewThread {
+  const thread = record.threads.find((t) => t.id === threadId)
+  if (!thread) {
+    throw new ApiError(
+      'not_found',
+      `Thread ${threadId} was not found on local review ${record.id}.`,
+    )
+  }
+  return thread
 }
 
 /**
@@ -498,22 +582,124 @@ export function submitLocalReview(input: SubmitReviewInput): SubmitResult {
   record.submitted.push(review)
   record.updatedAt = at
   store.putLocalReview(record)
-
-  const snap = store.getSnapshot(input.prNumber)
-  if (snap) {
-    snap.mutable.threads.push(...newThreads)
-    const authors = (snap.mutable.commentAuthors ??= {})
-    for (const t of newThreads) {
-      for (const c of t.comments) authors[c.id] = human.id
-    }
-    snap.mutable.pull.review_comments += input.comments.length
-    // snap.mutable.reviews is deliberately not touched: submitted local
-    // reviews are read from the local record, and this array stays empty.
-    store.putSnapshot(snap)
-  }
+  refreshSnapshotThreads(record)
 
   // Deletion stays gated on confirmed submit success — trivially satisfied by
   // a synchronous sink, and still coded on the success path only.
   store.deleteDraft(human.id, input.prNumber)
   return { status: 'ok', review }
+}
+
+/**
+ * Reply to a materialized local thread.
+ *
+ * The comment is the thread's own anchor with a new positive entity-band id
+ * and the body exactly as written — the client swaps its optimistic entry by
+ * id, so a duplicate or negative id would orphan it. Authorship is recorded
+ * beside the comment as a key, never smuggled into the text.
+ */
+export function replyToLocalThread(
+  reviewId: number,
+  threadId: string,
+  body: string,
+): ReviewComment {
+  const record = requireLocalReview(reviewId)
+  const thread = requireLocalThread(record, threadId)
+  const root = thread.comments[0]
+  if (!root) {
+    throw new ApiError(
+      'not_found',
+      `Thread ${threadId} on local review ${reviewId} has no comment to reply to.`,
+    )
+  }
+
+  const human = currentHuman()
+  const at = nowISO()
+  const id = store.nextLocalEntityId()
+  const comment: ReviewComment = {
+    id,
+    node_id: `local:comment:${id}`,
+    pull_request_review_id: root.pull_request_review_id,
+    in_reply_to_id: root.id,
+    path: thread.path,
+    diff_hunk: root.diff_hunk,
+    commit_id: liveRefSha(record.repo, record.headRef),
+    original_commit_id: root.original_commit_id,
+    line: thread.line,
+    original_line: thread.originalLine,
+    start_line: null,
+    original_start_line: null,
+    side: thread.diffSide,
+    start_side: null,
+    subject_type: thread.subjectType === 'FILE' ? 'file' : 'line',
+    user: synthesizeLocalUser(human.name),
+    body,
+    created_at: at,
+    updated_at: at,
+    reactions: emptyLocalReactions(),
+    html_url: '',
+  }
+
+  thread.comments.push(comment)
+  record.commentAuthors[id] = human.id
+  record.updatedAt = at
+  store.putLocalReview(record)
+  refreshSnapshotThreads(record)
+  return comment
+}
+
+/**
+ * Resolve or unresolve a local thread, returning the whole normalized thread —
+ * the client copies its resolution fields back out of the response, so a
+ * partial answer would snap an optimistic flip back with no error.
+ *
+ * Resolution is attributed to the local reviewer by DISPLAY NAME: there is no
+ * bot account to name here, and an email is never rendered.
+ */
+export function resolveLocalThread(
+  reviewId: number,
+  threadId: string,
+  resolved: boolean,
+): ReviewThread {
+  const record = requireLocalReview(reviewId)
+  const thread = requireLocalThread(record, threadId)
+  thread.isResolved = resolved
+  thread.resolvedBy = resolved ? { login: currentHuman().name } : null
+  record.updatedAt = nowISO()
+  store.putLocalReview(record)
+  refreshSnapshotThreads(record)
+  return thread
+}
+
+/**
+ * React to a comment on a local review, returning the rollup the client
+ * renders — returning a stale one would silently revert the optimistic bump.
+ *
+ * One person reacts here, and a reaction is per-person per-emoji, so a repeat
+ * of the same emoji is a no-op that answers with the rollup unchanged. Adding
+ * a reaction does not float the review's `updatedAt`, matching how a reaction
+ * leaves a pull request's own timestamp alone.
+ */
+export function addLocalReaction(
+  reviewId: number,
+  commentId: number,
+  reaction: ReactionKey,
+): ReactionRollup {
+  const record = requireLocalReview(reviewId)
+  const comment = record.threads
+    .flatMap((t) => t.comments)
+    .find((c) => c.id === commentId)
+  if (!comment) {
+    throw new ApiError(
+      'not_found',
+      `Comment ${commentId} was not found on local review ${reviewId}.`,
+    )
+  }
+  if (comment.reactions[reaction] > 0) return comment.reactions
+
+  comment.reactions[reaction] += 1
+  comment.reactions.total_count += 1
+  store.putLocalReview(record)
+  refreshSnapshotThreads(record)
+  return comment.reactions
 }
