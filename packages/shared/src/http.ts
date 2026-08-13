@@ -166,6 +166,12 @@ export const HTTP_STATUS_BY_CODE: Record<Exclude<ApiErrorCode, 'network'>, numbe
   not_found: 404,
   forbidden: 403,
   /**
+   * The request was understood but cannot be satisfied as given (same ref on
+   * both sides, unrelated histories, shallow clone, invalid ref name) —
+   * HTTP's own "unprocessable content" status.
+   */
+  unprocessable: 422,
+  /**
    * The server applied the mutation in memory but could not persist it to its
    * storage — a server-side fault, so 5xx, never a 2xx the client would trust
    * as saved.

@@ -314,6 +314,83 @@ export interface PullListResponse {
 }
 
 // ————————————————————————————————————————————————————————————————
+// Broker-shaped: local-only reviews
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * One branch the local repository can offer as a review side. Local branches
+ * and remote-tracking refs are both listed — a base is often only tracked, not
+ * checked out.
+ */
+export interface BranchRef {
+  /**
+   * Fully qualified ref name (`refs/heads/…` or `refs/remotes/…`). This is the
+   * unambiguous form a creation request should carry: a bare `origin/main`
+   * cannot be told apart from a local branch literally named `origin/main`.
+   */
+  ref: string
+  /** Short display name (`feature/x`, `origin/main`). */
+  name: string
+  /** Which side of the remote boundary the ref lives on. */
+  kind: 'local' | 'remote'
+  /**
+   * True on the repository's default branch — the natural base preselection.
+   * Exactly one entry in a branch listing carries `true`.
+   */
+  isDefault: boolean
+}
+
+/**
+ * Request body for creating a local review. Branch names ride in the JSON body
+ * — never in a path segment — and are validated syntactically on both sides
+ * (see `lib/refs`) before the server's authoritative `git check-ref-format`.
+ *
+ * Deliberately carries no repo field: the server derives the repository
+ * identity itself, so a client can never write into another repo's namespace.
+ */
+export interface CreateLocalReviewInput {
+  /** Base side, ideally fully qualified; a bare name is read as a local branch. */
+  baseRef: string
+  /** Head side, ideally fully qualified; a bare name is read as a local branch. */
+  headRef: string
+  /** Optional human title; absent means "use the head branch name". */
+  title?: string
+}
+
+/**
+ * One local review as the store records it, mirrored field-for-field onto the
+ * wire so the row and the response cannot drift. Nullable columns are
+ * REQUIRED nullable keys here — the key is always present, `null` meaning
+ * "never synced" for the SHA/timestamp fields.
+ *
+ * `dirty` and `archivedPr` are the two local-only annotations: they ride this
+ * type — queried under its own key — rather than the frozen `BrokerPullMeta`,
+ * so no surface ever renders a row from two sources of truth.
+ */
+export interface LocalReviewSummary {
+  /** Synthetic review id, at or above the reserved local band. */
+  id: number
+  /** The store's recorded repository identity string, produced server-side. */
+  repo: string
+  baseRef: string
+  headRef: string
+  title: string
+  /** Tip of the base ref at last sync; null before the first sync. */
+  baseSha: string | null
+  /** Merge base of the two refs at last sync; null before the first sync. */
+  mergeBaseSha: string | null
+  /** Tip of the head ref at last sync; null before the first sync. */
+  headSha: string | null
+  /** The worktree had uncommitted changes at last sync — they are NOT in the review. */
+  dirty: boolean
+  /** PR number that superseded this review (it went read-only); null while live. */
+  archivedPr: number | null
+  createdAt: string
+  updatedAt: string
+  lastSyncedAt: string | null
+}
+
+// ————————————————————————————————————————————————————————————————
 // Broker-shaped: the snapshot (two halves, cached differently)
 // ————————————————————————————————————————————————————————————————
 
@@ -541,6 +618,16 @@ export type ApiErrorCode =
   | 'not_found'
   | 'forbidden'
   | 'conflict'
+  /**
+   * The request was well-formed but cannot be satisfied as given — the inputs
+   * themselves are the problem, not the review state (`conflict`) and not a
+   * missing resource (`not_found`). Creating a local review surfaces it for:
+   * base and head naming the same ref, refs with unrelated histories (no merge
+   * base), a shallow clone that cannot answer `git merge-base`, and a ref name
+   * failing syntactic validation. The message names the specific cause and,
+   * where one exists, the fix.
+   */
+  | 'unprocessable'
   | 'broker_unreachable'
   /**
    * The mutation was applied in memory but could not be made durable: the
