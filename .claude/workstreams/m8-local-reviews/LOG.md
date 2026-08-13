@@ -129,3 +129,57 @@ Session 1. It is the fork point: S2 (app) and S3 (daemon) both hang off it and c
 
 **Next** — unchanged: **Session 1** (M8.1, now 7 units). Note M8.1.7 lands the dispatch sweep and M8.1.4's
 exhaustiveness guard is red-first.
+
+---
+
+**update — 2026-08-13 · Session 1: the spec (M8.1) landed**
+
+**Done**
+- **M8.1 is `In Review`** — all 8 units landed on `m8.1/contract-and-mock`, PR
+  [#70](https://github.com/pat-mw/revu/pull/70) open on base `m8/local-reviews-design` (#69). Nothing was
+  committed to `main`; nothing was merged. **#69 merges first**, then GitHub retargets #70 to `main` — the
+  board and the design doc exist only on #69, and it carries zero files under `packages/`, so #70's code diff
+  is identical to a `main`-based one.
+- **Gate green after every unit, never batched**: 1181 → 1193 → 1201 → 1219 → 1230 → 1240 → **1245 pass ·
+  1 skip · 0 fail · 68 files**. Verify: `conformance:matrix` exit 0 with both required legs PASS,
+  `suite.ts` diff **0 lines**, both invariant tests **0 lines**; additionally `bun run test:e2e` exit 0 in
+  real Chrome with the local fixture seeded, and a recorded `?mock=1` walk showing **zero** `/api/*` requests.
+- **The frozen contract moved additively**: `client.ts` +39/-0, `types.ts` +93/-1, `http.ts` +27/-1 — and both
+  deletions across all three files are docstring lines that were *factually wrong* (`:n` described as a pull
+  request number; every thread id described as a GraphQL node id). No signature, type or route was edited.
+- **Eight open questions froze** with reasoning, in the ticket `## Log`: wire shapes · route spellings ·
+  branch-list shape · minting · delete boundary · rate limit (confirmed unchanged) · the error code ·
+  thread-id shape. Reversing one is now a contract change, not a preference.
+- **Spike B** ran and is captured in HANDOVER: typed-absent `DirectContext.github` breaks exactly **2** lines,
+  classified 0 mechanical / 2 needs-a-local-branch / 0 dangerous, with the identity guard **absent from the
+  break set** — the §5.6 signal is green.
+
+**Decisions**
+- **A unit was appended mid-ticket, 7 → 8.** M8.1.4 found the mock engine unreachable through the contract
+  (`requireRemote()` throws `not_found` for a local id at five sites), which made M8.1.6's walk unsatisfiable
+  as written. M8.1.8 was appended and numbered rather than absorbed into another unit or escalated as scope
+  growth — it sits inside M8.1's own Goal. Existing units were not renumbered.
+- **Two deliberate deviations from the roadmap's wave plan**, both recorded on the board: W4/W5 were resplit
+  so M8.1.8 runs alone before M8.1.5 ∥ M8.1.6 (M8.1.5 and M8.1.8 have disjoint files but a real *semantic*
+  overlap — both decide how a local review reaches `listPulls`), and M8.1.5's tier was raised sonnet → opus
+  once that ruling turned it into design-constrained work. The sequencing is what caught the conflict:
+  M8.1.8's single-path ruling **superseded M8.1.5's ticket text**.
+- **The mock's semantics are now the spec in concrete detail** — high-water minting (never a max-scan, which
+  recycles a deleted review's id), full-record deletion with drafts *orphaned rather than destroyed*, thread
+  ids spelled `local:<reviewId>:<rootCommentId>`, the local branch taken **above** the remote lookup, and the
+  record as the one truth with the snapshot rebuilt from it.
+
+**Blockers**
+- **Decision package #1 is seeded in HANDOVER and needs the owner's rulings**: M8.5 OQ1 (how local-only is
+  switched on — recommend explicit), M8.8 OQ2 (the commit-delta rewrite on the shipped PR path — recommend
+  yes; "no" is a §5.1 finding), M8.10 OQ1–OQ3 (blob-prune defaults), and M8.2 OQ1's behavioral half
+  (successor-mint vs one-way door — recommend the door, because successor-mint would require changing the
+  *mock*, which is the specification). **Session 3 ends blocked on these; Session 4 needs three of them.**
+- Two further rulings surfaced by the adversarial review, both carried in HANDOVER: whether the local reaction
+  rollup should stay shared-per-review, and whether submitting before the first sync should be **refused**
+  rather than succeeding invisibly. Both are pinned as-is so nothing can diverge silently while they wait.
+
+**Next**
+- **Sessions 2 and 3 both fork off `m8.1` and are genuinely concurrent** (zero shared files — `packages/app`
+  vs `packages/revud`); on two machines that is the plan's single largest schedulable win. **S2 needs none of
+  the rulings and can start immediately**; S3 needs three of them. S3 owns the splice.
