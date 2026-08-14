@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router'
 import {
   CheckSquare,
   FileDiff,
+  GitBranch,
   GitCommitHorizontal,
   Inbox,
   Keyboard,
@@ -56,8 +57,9 @@ function matchPrNumber(pathname: string): number | null {
  * The command palette — the app's ⌘K launcher. It registers its own chord so it
  * opens from anywhere, and groups actions by scope:
  *
- * - "Go": the inbox and every open PR (title identity-cleaned, capped at ten and
- *   filtered by cmdk's built-in matcher).
+ * - "Go": the inbox, starting a review of two local branches, and every open PR
+ *   (title identity-cleaned, capped at ten and filtered by cmdk's built-in
+ *   matcher).
  * - "This PR": the current PR's tabs, a re-sync, and the author-queue walk —
  *   present only while a PR is open.
  * - "Identity": switch which human drives the shared bot.
@@ -69,10 +71,16 @@ export function CommandPalette({
   open,
   onOpenChange,
   onOpenSheet,
+  onCreateLocalReview,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onOpenSheet: () => void
+  /**
+   * Raise the shared create-review dialog. Handed in rather than mounted here,
+   * so the palette entry and every other entry point open one dialog.
+   */
+  onCreateLocalReview: () => void
 }) {
   const navigate = useNavigate()
   const location = useLocation()
@@ -136,6 +144,14 @@ export function CommandPalette({
             <Inbox strokeWidth={1.5} aria-hidden />
             <span>Inbox</span>
             <ShortcutHint id="go-inbox" />
+          </CommandItem>
+          <CommandItem
+            value="new local review compare branches"
+            onSelect={() => run(onCreateLocalReview)}
+          >
+            <GitBranch strokeWidth={1.5} aria-hidden />
+            <span>New local review</span>
+            <ShortcutHint id="new-local-review" />
           </CommandItem>
           {openPulls.map((p) => (
             <CommandItem

@@ -12,8 +12,14 @@ import { formatKeys } from '@/lib/keyboard'
 import { SHORTCUT_CATALOG } from '@/lib/shortcuts'
 import type { ShortcutDef } from '@/lib/shortcuts'
 
-/** The order sections appear in the sheet — Global first, Review last. */
-const GROUP_ORDER: ShortcutDef['group'][] = [
+/**
+ * The order sections appear in the sheet — Global first, Review last.
+ *
+ * Exported because it is also the sheet's filter: a catalog entry whose group
+ * is missing from this list renders nowhere at all, so what the list contains
+ * is a fact worth checking against the catalog rather than one kept private.
+ */
+export const GROUP_ORDER: ShortcutDef['group'][] = [
   'Global',
   'Navigation',
   'Files',

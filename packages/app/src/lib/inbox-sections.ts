@@ -51,6 +51,62 @@ export function matchesFilter(
   return haystack.includes(needle)
 }
 
+/**
+ * Whether the keyboard column is under something and must not act.
+ *
+ * The inbox's bare `j` / `k` / `enter` are global bindings, and the guard that
+ * makes typed keys inert only exempts real text controls — a focused button, or
+ * the body of a modal sitting over the inbox, is none of those. So a key press
+ * meant for whatever is on top would otherwise also move the column behind it,
+ * or navigate away from the screen the reader is looking at.
+ */
+export interface ColumnBlocked {
+  /** Something is over the inbox, so its keys decide nothing. */
+  blocked: boolean
+}
+
+/**
+ * Where `enter` on the focused row goes, or `null` when it goes nowhere.
+ *
+ * The decision is data rather than a branch inside a handler, so that "the
+ * column is inert while something covers it" is a property that holds on its
+ * own. The registration that stops these keys from firing at all is the first
+ * line of defence and cannot be observed without a renderer; this is the one
+ * that can, and it stands even if that registration is later dropped.
+ *
+ * A held focus index can outlive the rows it pointed at — a filter narrowing
+ * the column is enough — so an index outside the column is a miss rather than
+ * an error.
+ */
+export function enterTarget(
+  rows: readonly InboxRow[],
+  index: number,
+  { blocked }: ColumnBlocked,
+): string | null {
+  if (blocked) return null
+  const row = index >= 0 && index < rows.length ? rows[index] : undefined
+  return row ? `/pr/${row.item.pull.number}` : null
+}
+
+/**
+ * Where the focus lands after a `j` / `k` step, clamped to the column.
+ *
+ * Blocked, the focus is exactly where it was: not clamped, not reset — a
+ * reader who dismisses whatever is on top finds the column as they left it.
+ * Otherwise the ends hold rather than wrap, so a long press stops at the last
+ * row instead of cycling past it, and an empty column parks at the top.
+ */
+export function nextFocusIndex(
+  index: number,
+  delta: number,
+  count: number,
+  { blocked }: ColumnBlocked,
+): number {
+  if (blocked) return index
+  if (count <= 0) return 0
+  return Math.max(0, Math.min(count - 1, index + delta))
+}
+
 /** Everything the derivation reads. Nothing here is fetched — it is all in hand. */
 export interface InboxSectionsInput {
   /** Every listed row, of any state; only the open ones are sorted. */

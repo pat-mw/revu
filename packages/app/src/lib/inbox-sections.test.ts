@@ -1,8 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import type { PullListItem, ReviewDraft } from '@revu/shared'
 import { LOCAL_REVIEW_ID_BASE } from '@revu/shared'
-import type { InboxSectionsInput, Section } from './inbox-sections'
-import { buildInboxSections, matchesFilter } from './inbox-sections'
+import type { InboxRow, InboxSectionsInput, Section } from './inbox-sections'
+import {
+  buildInboxSections,
+  enterTarget,
+  matchesFilter,
+  nextFocusIndex,
+} from './inbox-sections'
 
 /**
  * How the inbox sorts what it was handed: which section a row lands in, how
@@ -311,6 +316,55 @@ describe('a local review is listed once and only once', () => {
       hasLocalReviews: true,
     })
     expect(placement(sections, 482)).toEqual({ count: 2, ids: ['waiting', 'drafts'] })
+  })
+})
+
+describe('what the keyboard column does while something is over it', () => {
+  /** The flat keyboard column, as the inbox assembles it from its sections. */
+  function column(...numbers: number[]): InboxRow[] {
+    return numbers.map((n) => ({ item: item(n), draft: null }))
+  }
+
+  const rows = column(482, 483, 484)
+
+  test('opening the focused row is refused while the column is blocked', () => {
+    expect(enterTarget(rows, 0, { blocked: true })).toBeNull()
+  })
+
+  test('and is the focused row itself when it is not', () => {
+    // The positive control for the refusal above: without it, a helper that
+    // had been reduced to `return null` would satisfy the block forever.
+    expect(enterTarget(rows, 0, { blocked: false })).toBe('/pr/482')
+  })
+
+  test('an empty column has nothing to open', () => {
+    expect(enterTarget([], 0, { blocked: false })).toBeNull()
+  })
+
+  test('an index past the end of the column has nothing to open', () => {
+    // The focused index is held across re-derivations, so it can outlive the
+    // rows it pointed at — a filter narrowing the column is enough.
+    expect(enterTarget(rows, 3, { blocked: false })).toBeNull()
+    expect(enterTarget(rows, -1, { blocked: false })).toBeNull()
+  })
+
+  test('the focus does not move while the column is blocked', () => {
+    expect(nextFocusIndex(2, 1, 5, { blocked: true })).toBe(2)
+    expect(nextFocusIndex(2, -1, 5, { blocked: true })).toBe(2)
+  })
+
+  test('and moves by the step when it is not', () => {
+    expect(nextFocusIndex(2, 1, 5, { blocked: false })).toBe(3)
+    expect(nextFocusIndex(2, -1, 5, { blocked: false })).toBe(1)
+  })
+
+  test('the focus stops at both ends rather than wrapping', () => {
+    expect(nextFocusIndex(4, 1, 5, { blocked: false })).toBe(4)
+    expect(nextFocusIndex(0, -1, 5, { blocked: false })).toBe(0)
+  })
+
+  test('an empty column parks the focus at the top', () => {
+    expect(nextFocusIndex(3, 1, 0, { blocked: false })).toBe(0)
   })
 })
 

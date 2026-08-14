@@ -32,9 +32,15 @@ import { cn } from '@/lib/cn'
 import { buildPullTree, flattenPullTree } from '@/lib/pull-tree'
 import { buildPullTooltip } from '@/lib/pull-tooltip'
 import type { PullTooltip } from '@/lib/pull-tooltip'
-import { buildInboxSections, matchesFilter } from '@/lib/inbox-sections'
+import {
+  buildInboxSections,
+  enterTarget,
+  matchesFilter,
+  nextFocusIndex,
+} from '@/lib/inbox-sections'
 import type { InboxRow } from '@/lib/inbox-sections'
 import { isLocalReviewItem, rowIdentity } from '@/lib/local-reviews'
+import { useCreateLocalReviewControl } from '@/components/create-local-review'
 import { Button } from '@/components/ui/button'
 
 /**
@@ -156,6 +162,14 @@ export function InboxPage() {
     [view, treeRoots, sections, draftByNumber],
   )
 
+  // Starting a review is offered from two places on this screen, and both raise
+  // the shell's single dialog. While it is up the inbox is covered, so its bare
+  // keys must decide nothing — the guard that makes shortcuts inert while
+  // typing exempts text fields only, and the focus inside a modal is usually on
+  // a button.
+  const create = useCreateLocalReviewControl()
+  const blocked = create.isOpen
+
   const [focusIndex, setFocusIndex] = useState(0)
   const rowRefs = useRef<Array<HTMLAnchorElement | null>>([])
 
@@ -170,21 +184,30 @@ export function InboxPage() {
   const moveFocus = useCallback(
     (delta: number) => {
       setFocusIndex((i) => {
-        if (flatRows.length === 0) return 0
-        const next = Math.max(0, Math.min(flatRows.length - 1, i + delta))
-        rowRefs.current[next]?.scrollIntoView({ block: 'nearest' })
+        const next = nextFocusIndex(i, delta, flatRows.length, { blocked })
+        // Only when it actually moved: the column is scrolled to follow the
+        // cursor, and a cursor that stayed put has nothing to follow.
+        if (next !== i) rowRefs.current[next]?.scrollIntoView({ block: 'nearest' })
         return next
       })
     },
-    [flatRows.length],
+    [flatRows.length, blocked],
   )
 
-  useShortcut('j', () => moveFocus(1))
-  useShortcut('k', () => moveFocus(-1))
-  useShortcut('enter', () => {
-    const row = flatRows[focusIndex]
-    if (row) navigate(`/pr/${row.item.pull.number}`)
-  })
+  // Two layers, deliberately. The `enabled` option keeps the handlers from
+  // firing at all while the create dialog is up; the same flag reaches the
+  // decision itself, so the column stays inert even if that option is ever
+  // dropped.
+  useShortcut('j', () => moveFocus(1), { enabled: !blocked })
+  useShortcut('k', () => moveFocus(-1), { enabled: !blocked })
+  useShortcut(
+    'enter',
+    () => {
+      const to = enterTarget(flatRows, focusIndex, { blocked })
+      if (to) navigate(to)
+    },
+    { enabled: !blocked },
+  )
 
   // ——— loading ———
   if (pulls.isLoading) {
@@ -209,6 +232,7 @@ export function InboxPage() {
             onFilter={setFilter}
             view={view}
             onView={setView}
+            onCreate={create.open}
           />
           <ErrorState
             className="mt-4"
@@ -235,8 +259,9 @@ export function InboxPage() {
             rateResetAt={rate.data?.remaining === 0 ? rate.data.reset : undefined}
             view={view}
             onView={setView}
+            onCreate={create.open}
           />
-          <InboxZeroState />
+          <InboxZeroState onCreate={create.open} />
         </div>
       </div>
     )
@@ -258,6 +283,7 @@ export function InboxPage() {
           onFilter={setFilter}
           view={view}
           onView={setView}
+          onCreate={create.open}
         />
 
         <div className="mt-3 flex flex-col gap-5">
@@ -361,7 +387,10 @@ export function InboxPage() {
   )
 }
 
-/** The title row: name of the surface, the live-ness whisper, and the filter. */
+/**
+ * The title row: name of the surface, the live-ness whisper, the way to start a
+ * review of two branches, the arrangement control, and the filter.
+ */
 function InboxHeader({
   dataUpdatedAt,
   filter,
@@ -369,6 +398,7 @@ function InboxHeader({
   rateResetAt,
   view,
   onView,
+  onCreate,
 }: {
   dataUpdatedAt: number
   filter: string
@@ -376,6 +406,8 @@ function InboxHeader({
   rateResetAt?: string
   view: 'list' | 'tree'
   onView: (v: 'list' | 'tree') => void
+  /** Raise the shared create-review dialog. */
+  onCreate: () => void
 }) {
   const updated = dataUpdatedAt
     ? relativeTime(new Date(dataUpdatedAt).toISOString())
@@ -391,6 +423,17 @@ function InboxHeader({
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        {/* Reviewing is what this screen is for, so the way to start one that
+            needs no pull request sits in the row rather than behind the
+            palette. Quiet rather than violet: violet means pending work. */}
+        <Button
+          size="sm"
+          onClick={onCreate}
+          title="Compare two branches in this workspace — nothing is pushed"
+        >
+          <GitBranch strokeWidth={1.5} aria-hidden />
+          New local review
+        </Button>
         {/* List groups by what each PR needs from you; tree groups by what each
             PR is stacked on. Neither is a filter — both show the same PRs. */}
         <div
@@ -484,11 +527,12 @@ export function RowIdentity({ item }: { item: PullListItem }) {
  * "land here" describes an arrival that is never coming. So the copy names
  * what this workspace can do on its own, and offers it.
  *
- * The action appears only when a caller can honour it — a surface with no
- * creation flow to open shows the invitation rather than a button that goes
- * nowhere.
+ * The action is required rather than optional. This is the screen where it
+ * matters most — an empty inbox is the first thing a new workspace shows — so
+ * a call site that has no way to honour it should not be rendering the
+ * invitation at all, and cannot quietly drop it.
  */
-export function InboxZeroState({ onCreate }: { onCreate?: () => void }) {
+export function InboxZeroState({ onCreate }: { onCreate: () => void }) {
   return (
     <EmptyState
       className="mt-6"
@@ -496,12 +540,10 @@ export function InboxZeroState({ onCreate }: { onCreate?: () => void }) {
       title="Nothing open right now"
       hint="No open pull requests — a review can compare any two branches in this workspace, with or without one."
       action={
-        onCreate ? (
-          <Button onClick={onCreate}>
-            <GitBranch size={14} strokeWidth={1.5} aria-hidden />
-            New local review
-          </Button>
-        ) : undefined
+        <Button onClick={onCreate}>
+          <GitBranch size={14} strokeWidth={1.5} aria-hidden />
+          New local review
+        </Button>
       }
     />
   )
@@ -744,7 +786,15 @@ function InboxSkeleton() {
             <h1 className="font-display text-base font-semibold text-ink">Inbox</h1>
             <Skeleton className="h-3 w-48" />
           </div>
-          <Skeleton className="h-7 w-56" />
+          {/* One placeholder per header control, at its size. The header is the
+              one part of this screen that does not change between loading and
+              loaded, so a placeholder short of a control makes the whole row
+              shift sideways the moment the list arrives. */}
+          <div className="flex shrink-0 items-center gap-2">
+            <Skeleton className="h-6 w-32" />
+            <Skeleton className="h-6 w-20" />
+            <Skeleton className="h-7 w-56" />
+          </div>
         </div>
 
         <div className="mt-3 flex flex-col gap-5">

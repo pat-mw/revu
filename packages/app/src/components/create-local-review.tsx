@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useReducer } from 'react'
+import { createContext, useCallback, useContext, useEffect, useReducer } from 'react'
+import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { Check, GitBranch, Plus } from 'lucide-react'
 import { ApiError } from '@revu/shared'
@@ -58,6 +59,19 @@ import { useBranches, useCreateLocalReview } from '@/state/local-reviews'
  *
  * `CreateLocalReviewDialog` is then only wiring: the shell, the reducer and the
  * mutation, thin enough to read in one pass.
+ *
+ * ## One dialog, several doorways
+ *
+ * Starting a review is offered from unrelated places — a header control, an
+ * empty screen's invitation, the command palette, a chord pressed from any
+ * screen at all. All of them raise one mounted dialog, reached through
+ * `useCreateLocalReviewControl`. Two mounted copies would each hold their own
+ * half-typed form and their own branch listing, and dismissing one would leave
+ * the other standing.
+ *
+ * The context is declared here rather than wherever it happens to be provided,
+ * so that a screen wanting the doorway imports the dialog's own module and
+ * nothing else — not the whole application chrome that mounts it.
  */
 
 // ————————————————————————————————————————————————————————————————
@@ -390,6 +404,59 @@ CreateLocalReviewForm.displayName = 'CreateLocalReviewForm'
 // ————————————————————————————————————————————————————————————————
 // The dialog
 // ————————————————————————————————————————————————————————————————
+
+/**
+ * The shared way in, and the fact that someone is already through it.
+ *
+ * `isOpen` travels with the opener because the dialog covers whatever raised
+ * it, and a covered screen's own keyboard bindings have to fall silent while it
+ * does — the guard that makes shortcuts inert while typing exempts text fields
+ * only, and the focus inside a modal is usually on a button.
+ */
+export interface CreateLocalReviewControl {
+  /** Raise the dialog. Harmless while it is already up. */
+  open: () => void
+  /** The dialog is up, so whatever it covers decides nothing. */
+  isOpen: boolean
+}
+
+const CreateLocalReviewContext = createContext<CreateLocalReviewControl | null>(null)
+
+/**
+ * Publishes the control to everything below. Mounted once, by whoever owns the
+ * dialog's open state — which is the same component that mounts the dialog.
+ */
+export function CreateLocalReviewProvider({
+  control,
+  children,
+}: {
+  control: CreateLocalReviewControl
+  children: ReactNode
+}) {
+  return (
+    <CreateLocalReviewContext.Provider value={control}>
+      {children}
+    </CreateLocalReviewContext.Provider>
+  )
+}
+CreateLocalReviewProvider.displayName = 'CreateLocalReviewProvider'
+
+/**
+ * The shared control, for any surface that offers to start a review.
+ *
+ * Throws where none is provided rather than handing back a no-op: an opener
+ * that quietly does nothing renders a button that never opens anything, and a
+ * screen that cannot find the provider is mounted somewhere unintended.
+ */
+export function useCreateLocalReviewControl(): CreateLocalReviewControl {
+  const control = useContext(CreateLocalReviewContext)
+  if (!control) {
+    throw new Error(
+      'useCreateLocalReviewControl must be used inside <CreateLocalReviewProvider>.',
+    )
+  }
+  return control
+}
 
 export interface CreateLocalReviewDialogProps {
   open: boolean
