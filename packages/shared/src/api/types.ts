@@ -624,13 +624,18 @@ export type ApiErrorCode =
   | 'forbidden'
   | 'conflict'
   /**
-   * The request was well-formed but cannot be satisfied as given — the inputs
-   * themselves are the problem, not the review state (`conflict`) and not a
-   * missing resource (`not_found`). Creating a local review surfaces it for:
-   * base and head naming the same ref, refs with unrelated histories (no merge
-   * base), a shallow clone that cannot answer `git merge-base`, and a ref name
-   * failing syntactic validation. The message names the specific cause and,
-   * where one exists, the fix.
+   * The request was well-formed but cannot be satisfied as given — either the
+   * inputs themselves are the problem, or the target's current state cannot
+   * honor the request and the caller can put it in one that can, then retry
+   * the same request unchanged. Not `conflict`, which is reserved for
+   * concurrent modification — the target was satisfiable when the caller
+   * started and moved underneath them — and not `not_found`: the target
+   * exists. Creating a local review surfaces it for: base and head naming the
+   * same ref, refs with unrelated histories (no merge base), a shallow clone
+   * that cannot answer `git merge-base`, and a ref name failing syntactic
+   * validation. Submitting a local review surfaces it when no synced snapshot
+   * is stored for its threads to land in — syncing first is the fix. The
+   * message names the specific cause and, where one exists, the fix.
    */
   | 'unprocessable'
   | 'broker_unreachable'

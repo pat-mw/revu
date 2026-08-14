@@ -10,12 +10,14 @@
  * snapshot's `mutable.reviews`, creation is idempotent per branch pair, and
  * deletion removes the record without recycling its id or destroying drafts.
  *
- * Two of them pin behavior that reads like an accident and is not, so nothing
+ * Some of them pin behavior that reads like an accident and is not, so nothing
  * downstream "corrects" it into a divergence: the reaction rollup is shared
- * per review rather than per person, and a submit that precedes the first sync
- * is refused rather than accepted into threads no read could return. Both
- * refusal assertions carry a positive control alongside them, so a rejection
- * that fired for any reason at all could not stand in for the specified one.
+ * per review rather than per person, and a submit with no stored snapshot is
+ * refused rather than accepted into threads no read could return — keyed on
+ * the snapshot itself, not on `lastSyncedAt`, because the load path can admit
+ * a record where the two disagree. Every refusal assertion carries a positive
+ * control alongside it, so a rejection that fired for any reason at all could
+ * not stand in for the specified one.
  *
  * The last two blocks leave the engine behind and drive the API surface
  * itself, because a correct engine reached through a wrong adapter is still a
@@ -44,7 +46,7 @@ import {
 } from '@revu/shared'
 import { createMockApi } from './adapter'
 import { mockDev } from './devtools'
-import { ID_BASE, store } from './store'
+import { ID_BASE, migrateStoreDocument, store } from './store'
 import {
   addLocalReaction,
   createLocalReview,
@@ -373,6 +375,77 @@ describe('submit', () => {
     if (result.status !== 'ok') return
     expect(store.getSnapshot(created.id)?.mutable.threads).toHaveLength(1)
     expect(listLocalSubmittedReviews(created.id).map((r) => r.id)).toEqual([result.review.id])
+  })
+
+  test('the refusal keys on the missing snapshot itself, not on lastSyncedAt', () => {
+    // Two candidate guard keys exist — "is a snapshot stored?" and "is
+    // `lastSyncedAt` null?" — and every runtime path keeps them in agreement,
+    // because a sync writes both and a delete drops both. The load path is
+    // where they can split: a persisted document is admitted on its top-level
+    // fields alone, never cross-checking that a record claiming a past sync
+    // still has a snapshot beside it. On that split record the keys give
+    // OPPOSITE answers — the snapshot key refuses, a `lastSyncedAt` key would
+    // accept the submit into threads no snapshot-backed read could ever
+    // return. This pins the fail-safe answer, so no other implementation can
+    // pick the other key and still pass.
+    const created = createLocalReview({ baseRef: 'main', headRef: 'feature/split-pair' })
+    const record = store.getLocalReview(created.id)
+    expect(record).not.toBeNull()
+    if (!record) return
+
+    // A persisted document holding the record with `lastSyncedAt` set and NO
+    // snapshot entry survives the load path with the split intact — neither
+    // repaired nor refused.
+    const syncedAt = new Date().toISOString()
+    const migrated = migrateStoreDocument({
+      v: 4,
+      dev: { humanId: mockDev.get().humanId, latency: 'zero', failureMode: 'none' },
+      drafts: {},
+      viewed: {},
+      preferences: {},
+      snapshots: {},
+      blobs: {},
+      remoteMut: {},
+      syncAttempts: {},
+      rate: { remaining: 5000, reset: new Date(Date.now() + 3_600_000).toISOString() },
+      counter: 0,
+      localReviews: { [created.id]: { ...record, lastSyncedAt: syncedAt } },
+      localCounters: { review: 0, entity: 0 },
+    })
+    expect(migrated).not.toBeNull()
+    if (!migrated) return
+    expect(migrated.localReviews[created.id].lastSyncedAt).toBe(syncedAt)
+    expect(migrated.snapshots[created.id]).toBeUndefined()
+
+    // Install exactly the record the load path emitted. The review here was
+    // never synced, so the live store holds no snapshot for its id either —
+    // live state is now precisely the split document's.
+    store.putLocalReview(migrated.localReviews[created.id])
+    expect(store.getSnapshot(created.id)).toBeNull()
+    expect(store.getLocalReview(created.id)?.lastSyncedAt).toBe(syncedAt)
+
+    const input: SubmitReviewInput = {
+      prNumber: created.id,
+      // The live tip, so the head guard cannot be what fires.
+      expectedHeadSha: liveHeadShaOf(created),
+      event: 'COMMENT',
+      body: 'Submitted against a record whose snapshot is missing.',
+      comments: [pending('An inline comment with no snapshot behind it.', 7)],
+    }
+    expect(thrownCode(() => submitLocalReview(input))).toBe('unprocessable')
+
+    // Refused above every write, exactly as on a never-synced review.
+    const after = store.getLocalReview(created.id)
+    expect(after?.submitted).toEqual([])
+    expect(after?.threads).toEqual([])
+
+    // The positive control: syncing stores the snapshot — the one thing the
+    // submit was missing — and the SAME submit goes through.
+    syncLocalReview(created.id)
+    const healed = submitLocalReview(input)
+    expect(healed.status).toBe('ok')
+    if (healed.status !== 'ok') return
+    expect(store.getSnapshot(created.id)?.mutable.threads).toHaveLength(1)
   })
 })
 

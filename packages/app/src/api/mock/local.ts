@@ -519,12 +519,17 @@ export function submitLocalReview(input: SubmitReviewInput): SubmitResult {
   // is no compare behind the expected SHA, so answering `head_moved` would
   // send the reviewer to reconcile against a snapshot that does not exist.
   // Guarded on the snapshot itself rather than on `lastSyncedAt`, because the
-  // snapshot is the thing a submit needs; the two only ever move together —
-  // a sync writes both, a delete drops both.
+  // snapshot is the thing a submit actually needs. Every runtime path keeps
+  // the pair together — a sync writes both, a delete drops both — but the
+  // load path does not guarantee it: a persisted document is admitted on its
+  // top-level fields with no cross-check of the pairing, so a record can
+  // arrive claiming a past sync with no snapshot behind it. On that record a
+  // `lastSyncedAt` key would accept the submit into threads no
+  // snapshot-backed read could return; this key refuses it.
   if (!store.getSnapshot(record.id)) {
     throw new ApiError(
       'unprocessable',
-      `Local review ${record.id} has never been synced, so there is no snapshot for its threads to appear in. Sync it, then submit.`,
+      `Local review ${record.id} has no stored snapshot for its threads to appear in — sync it, then submit.`,
     )
   }
   const currentHeadSha = liveRefSha(record.repo, record.headRef)
