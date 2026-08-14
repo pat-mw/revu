@@ -12,7 +12,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 | ticket · unit | branch | tier | isolation | what it is |
 | --- | --- | --- | --- | --- |
-| **M8.7.9** — the two optimistic-path bugs | `m8.7/app-local-chrome` | opus | worktree | W3; sent back once — its fix converged only half the cases (see the ticket Log) |
+| **M8.7.4** — Conversation: threads only | `m8.7/app-local-chrome` | opus | worktree | W4; **first author of `lib/mode-copy.ts`**, which five later units extend |
 
 **The `m8.1` → `m8.6` rebase is DONE.** `m8.1` gained `8b73a77` (the adversarial review's fixes) and is pushed;
 `m8.6` was rebased onto it and verified — `git merge-base --is-ancestor` confirms `m8.6` contains the `m8.1`
@@ -39,11 +39,12 @@ fuller comment. **Every `m8.6` sha below the rebase point changed**; the table b
 | M8.6 Verify — the walk + one copy fix it found | `de14043` | `m8.6` | 1362 pass · 1 skip · 0 fail · 76 files |
 | M8.7.10 — the static-render harness | `f2ba173` | `m8.7` | 1365 pass · 1 skip · 0 fail · 77 files |
 | M8.7.1 — the mode derivation + single-call-site guard | `ad0bd54` | `m8.7` | 1373 pass · 1 skip · 0 fail · 78 files |
-| M8.7.2 — tab set: omit Checks and Description | `efd260d` | `m8.7` | **1391 pass · 1 skip · 0 fail · 79 files** |
+| M8.7.2 — tab set: omit Checks and Description | `efd260d` | `m8.7` | 1391 pass · 1 skip · 0 fail · 79 files |
+| M8.7.9 — the two optimistic-path bugs (sent back once) | `38b9bd3` | `m8.7` | **1405 pass · 1 skip · 0 fail · 80 files** |
 
-**Remaining M8.7 units, in the serial order the ticket's own wave plan fixes:** M8.7.9 (in flight) → M8.7.4 →
-M8.7.3 → M8.7.5 → M8.7.6 → M8.7.8 → M8.7.7, plus the appended **M8.7.11**. Then Verify, a fable review of the
-full diff, and the PR.
+**Remaining M8.7 units, in the serial order the ticket's own wave plan fixes:** M8.7.4 (in flight) → M8.7.3 →
+M8.7.5 → M8.7.6 → M8.7.8 → M8.7.7, plus the appended **M8.7.11**. Then Verify, a fable review of the full
+diff, and the PR. **4 of 11 landed.**
 
 **✅ M8.6 is `In Review` — PR [#71](https://github.com/pat-mw/revu/pull/71) is open on base `m8.1`.** Its
 `Verify` ran green, including the recorded browser walk. `main` remains `177068a`; nothing merged.
