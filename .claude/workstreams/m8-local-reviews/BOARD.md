@@ -12,7 +12,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 | ticket · unit | branch | tier | isolation | what it is |
 | --- | --- | --- | --- | --- |
-| **M8.6.4** — inbox section + local row variant | `m8.6/app-creation-flow` | opus | worktree | W3; `inbox.tsx` + two new lib/page tests |
+| **M8.6.5** — entry points: header button, palette, `g l` chord | `m8.6/app-creation-flow` | opus | worktree | W4, **serialized**; also inherits M8.6.4's unwired `onCreate` |
 
 **The `m8.1` → `m8.6` rebase is DONE.** `m8.1` gained `8b73a77` (the adversarial review's fixes) and is pushed;
 `m8.6` was rebased onto it and verified — `git merge-base --is-ancestor` confirms `m8.6` contains the `m8.1`
@@ -52,6 +52,13 @@ it before the brief was fixed. Any worker result produced before a fast-forward 
    work that branch does not contain. The ignore entry now lives on `m8.1`, at the bottom of the chain where
    every branch inherits it. A lint pass does not respect a `.gitignore` that is not on the branch being
    gated — which is exactly the kind of thing only a real red surfaces.
+4. **W4 is SERIALIZED, where the roadmap has M8.6.5 ∥ M8.6.6 under worktree isolation.** The roadmap flagged
+   one shared file (`inbox.tsx`); there are in fact **three** — `inbox.tsx`, `lib/inbox-sections.ts` and
+   `lib/inbox-sections.test.ts` — and the shared **test** file is what makes "different regions, trivial merge
+   expected" stop holding. Two workers restructuring the same helper is a **§5.5 semantic conflict**, which is
+   a stop condition; buying one unit of wall-clock at the price of a stop the orchestrator manufactured itself
+   is exactly the trade the roadmap's own critical-path note warns against. M8.6.5 runs first — it carries the
+   inherited `onCreate` obligation and the larger file set — then M8.6.6.
 
 **Session 2 (the app) is running.** The owner interview completed first and **decision package #1 is ruled** —
 16 standing rulings in [`HANDOVER.md`](./HANDOVER.md)'s top entry. **Session 3 is therefore unblocked** and may
