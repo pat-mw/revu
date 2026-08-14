@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { ApiError } from '@revu/shared'
 import type { BranchRef } from '@revu/shared'
 import {
   CreateLocalReviewForm,
+  createLanding,
   describeCreateLocalReviewError,
   reduceCreateLocalReview,
 } from './create-local-review'
@@ -90,6 +92,7 @@ function stateWith(overrides: Partial<CreateLocalReviewState> = {}): CreateLocal
     error: null,
     pending: false,
     createdId: null,
+    attempt: 0,
     ...overrides,
   }
 }
@@ -156,6 +159,128 @@ describe('reduceCreateLocalReview', () => {
     expect(again.createdId).toBe(1_000_000_001)
     expect(again.error).toBeNull()
     expect(again.pending).toBe(false)
+  })
+
+  it('starts over on reset, holding nothing the previous visit left behind', () => {
+    // Reopening the dialog on the last attempt's half-typed fields — or on its
+    // failure sentence — would show the human a form they already walked away
+    // from. This transition is the only thing that stops it.
+    const populated = stateWith({
+      base: TRACKED.ref,
+      head: FEATURE.ref,
+      title: 'Half-written title',
+      error: 'Could not reach the workspace.',
+      pending: true,
+      createdId: 1_000_000_001,
+    })
+
+    const after = reduceCreateLocalReview(populated, { type: 'reset' })
+
+    // Named one by one for the same reason as above: a whole-object comparison
+    // would silently stop covering any field added to the state later.
+    expect(after.base).toBe('')
+    expect(after.head).toBe('')
+    expect(after.title).toBeNull()
+    expect(after.error).toBeNull()
+    expect(after.pending).toBe(false)
+    expect(after.createdId).toBeNull()
+  })
+})
+
+/**
+ * A create the human walked away from while it was still in flight.
+ *
+ * The request is not cancellable and the review it makes is real either way —
+ * what is at stake is only whether its answer is still allowed to move the
+ * reader. Someone who dismissed the dialog went back to whatever they were
+ * doing, and landing them on a review a moment later is a teleport out of it.
+ *
+ * The attempt counter is what separates the two cases, and it is a field of the
+ * state machine rather than a private counter in the component precisely so
+ * this can be asserted without a renderer.
+ */
+describe('an attempt the human walked away from', () => {
+  const sent = stateWith({ pending: true, attempt: 4 })
+
+  it('is no longer the attempt the form is on once the dialog is dismissed', () => {
+    const after = reduceCreateLocalReview(sent, { type: 'dismissed' })
+    expect(createLanding(sent.attempt, after.attempt)).toBe('abandoned')
+  })
+
+  it('while an attempt nobody walked away from does land', () => {
+    // The control. Without it a landing rule that answered "abandoned" to
+    // everything would satisfy the assertion above and strand every create on
+    // a dialog that never closes.
+    expect(createLanding(sent.attempt, sent.attempt)).toBe('land')
+  })
+
+  it('and reopening the dialog does not resurrect it', () => {
+    const reopened = reduceCreateLocalReview(
+      reduceCreateLocalReview(sent, { type: 'dismissed' }),
+      { type: 'reset' },
+    )
+    expect(createLanding(sent.attempt, reopened.attempt)).toBe('abandoned')
+    // The reopened form is a fresh one, not the old one with its spinner still
+    // turning: reset advances the counter rather than restoring it, so the
+    // first attempt cannot come back and land on the second form.
+    expect(reopened.pending).toBe(false)
+    expect(reopened.title).toBeNull()
+  })
+
+  it('stops the form claiming a create is still in flight', () => {
+    expect(reduceCreateLocalReview(sent, { type: 'dismissed' }).pending).toBe(false)
+  })
+})
+
+/**
+ * That the dialog actually drives the two transitions above — asserted by
+ * READING ITS SOURCE rather than by running it.
+ *
+ * The transitions themselves are pure and are held directly. What no assertion
+ * can reach is the effect that dispatches them, because observing it needs the
+ * dialog rendered, and the dialog is a portal: it serializes to the empty
+ * string, so a test that rendered it would assert against `''` and pass through
+ * any regression at all.
+ *
+ * So these assert the wiring is PRESENT, which is strictly weaker than running
+ * it. An effect that dispatched into a reducer whose result went nowhere, or a
+ * guard whose early return were unreachable, would satisfy every line here.
+ * What it does catch is the deletion — the effect removed, or the guard
+ * dropped — which is what leaves a reopened dialog showing the last visit's
+ * fields, and a dismissed reader on a review they never asked to see.
+ */
+describe('what the dialog does with the form around it', () => {
+  const source = readFileSync(new URL('./create-local-review.tsx', import.meta.url), 'utf8')
+
+  /** Whether the module's source carries `pattern`, as a boolean — a failed
+   *  match against a whole file prints the whole file. */
+  const carries = (pattern: RegExp): boolean => pattern.test(source)
+
+  it('is reading the module it names', () => {
+    // The control for every match below: a path resolving to the wrong file
+    // would fail them for a reason with nothing to do with the dialog.
+    expect(carries(/export function CreateLocalReviewDialog/)).toBe(true)
+  })
+
+  it('starts the form over on open and ends the attempt on close', () => {
+    expect(carries(/dispatch\(\{ type: open \? 'reset' : 'dismissed' \}\)/)).toBe(true)
+    expect(carries(/\}, \[open\]\)/)).toBe(true)
+  })
+
+  it('and lets no abandoned attempt navigate', () => {
+    // Anchored on the dispatch each guard stands in front of, and named per
+    // path. A pattern searched loose over the file would be satisfied by the
+    // OTHER path's copy of the same line, so deleting either one on its own
+    // would go unnoticed — which is what a first draft of this did.
+    const guard = String.raw`if \(createLanding\(attempt, attemptRef\.current\) === 'abandoned'\) return`
+    expect(carries(new RegExp(`${guard}\\n\\s*dispatch\\(\\{ type: 'created'`))).toBe(true)
+    expect(carries(new RegExp(`${guard}\\n\\s*dispatch\\(\\{ type: 'create_failed'`))).toBe(true)
+  })
+
+  it('and the landing it guards is a navigation, not a no-op', () => {
+    // The control for the two above: guards standing in front of a submit path
+    // that navigated nowhere would satisfy them and protect nothing.
+    expect(carries(/navigate\(`\/pr\/\$\{review\.id\}`\)/)).toBe(true)
   })
 })
 

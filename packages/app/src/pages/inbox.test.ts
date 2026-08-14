@@ -18,6 +18,7 @@
  * suite resets it before and after itself.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { PullListItem } from '@revu/shared'
@@ -147,6 +148,73 @@ describe('the hover card over a local review', () => {
       },
     }
     expect(buildPullTooltip(forked).branches.crossRepo).toBe(true)
+  })
+})
+
+/**
+ * That the keyboard column actually falls silent while the create dialog
+ * covers it — asserted by READING THE PAGE'S SOURCE rather than by running it,
+ * which is worth naming precisely.
+ *
+ * Both halves of the gate are already held elsewhere and neither is in doubt:
+ * `enterTarget` and `nextFocusIndex` are pure, and their blocked behaviour is
+ * asserted directly against them; the control that reports whether the dialog
+ * is up is a context with its own coverage. What nothing holds is the single
+ * line joining the two — and observing that line needs the page rendered,
+ * which cannot happen here: the page's shell reads
+ * `document.documentElement.classList` at module scope, and the headless
+ * document has no such property.
+ *
+ * So these assert the wiring is PRESENT. That is strictly weaker than running
+ * it, and the gap is real: a `blocked` computed and then handed nowhere, or a
+ * key binding whose `enabled` option were ignored by the hook, would satisfy
+ * every line below while the column kept moving under the dialog. What this
+ * does catch is the change these were written after — the gate quietly
+ * replaced by a constant, which no other test in the suite notices.
+ */
+describe('the keyboard column while the create dialog covers it', () => {
+  const source = readFileSync(new URL('./inbox.tsx', import.meta.url), 'utf8')
+
+  /**
+   * Whether the page's source carries `pattern`, as a boolean — a failed
+   * `toMatch` against a whole file prints the whole file, and a wiring pin that
+   * buries its own claim under thirty kilobytes of unrelated source is no
+   * easier to act on than no pin at all.
+   */
+  const carries = (pattern: RegExp): boolean => pattern.test(source)
+
+  /** The line the gate is derived on, or a sentence saying there is not one. */
+  const gateLine = (): string =>
+    source.split('\n').find((line) => line.includes('const blocked'))?.trim() ??
+    'the page derives no blocked flag at all'
+
+  test('the read is looking at the page it names', () => {
+    // The control for every match below: a path resolving to the wrong file, or
+    // to an empty one, would fail them for a reason with nothing to do with the
+    // gate.
+    expect(carries(/export function InboxPage/)).toBe(true)
+  })
+
+  test('the gate hangs from the shared create-dialog control', () => {
+    expect(carries(/const create = useCreateLocalReviewControl\(\)/)).toBe(true)
+    // Pinned as the whole line rather than as a pattern found somewhere in the
+    // file: replacing the derivation with a constant is exactly the change this
+    // exists to catch, and the line itself is what a failure should print.
+    expect(gateLine()).toBe('const blocked = create.isOpen')
+  })
+
+  test('and it reaches both pure decisions the column makes', () => {
+    expect(carries(/nextFocusIndex\([^)]*\{ blocked \}\)/)).toBe(true)
+    expect(carries(/enterTarget\([^)]*\{ blocked \}\)/)).toBe(true)
+  })
+
+  test('and every bare key the column binds', () => {
+    // The second layer: the handlers do not fire at all while the dialog is up.
+    // Each binding is named on its own, so dropping the option from one of the
+    // three is not covered for by the other two still having it.
+    expect(carries(/useShortcut\('j',[\s\S]*?\{ enabled: !blocked \}\)/)).toBe(true)
+    expect(carries(/useShortcut\('k',[\s\S]*?\{ enabled: !blocked \}\)/)).toBe(true)
+    expect(carries(/useShortcut\(\s*'enter',[\s\S]*?\{ enabled: !blocked \},/)).toBe(true)
   })
 })
 

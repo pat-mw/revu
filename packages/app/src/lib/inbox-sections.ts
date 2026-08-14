@@ -15,7 +15,7 @@
  */
 import type { PullListItem, ReviewDraft } from '@revu/shared'
 import { parseCommentIdentity } from '@revu/shared'
-import { partitionInbox } from './local-reviews'
+import { partitionInbox, rowIdentity } from './local-reviews'
 import { buildPullTree } from './pull-tree'
 import type { PullTreeRoot } from './pull-tree'
 
@@ -34,8 +34,8 @@ export interface Section {
 }
 
 /**
- * Case-insensitive match over what a row is called: its title, its number, its
- * author's display name, and the two branches it compares.
+ * Case-insensitive match over what a row is called: its title, its identity
+ * slot, its author's display name, and the two branches it compares.
  *
  * The branch pair is searchable for every row, not only for the rows that need
  * it. Some rows have nothing else usable — a review with no pull request behind
@@ -45,6 +45,13 @@ export interface Section {
  * widening to those rows would mean the filter box searched different fields
  * depending on which row it was looking at, which is harder to explain than
  * "it searches the branch names" and no easier to predict.
+ *
+ * The NUMBER is the one field that does narrow, and for the opposite reason: it
+ * is searched exactly where it is shown. A local review's number is a synthetic
+ * key drawn nowhere, so a filter that matched it would hand the reader a hit
+ * they cannot account for from anything on the screen — a row found by a string
+ * it does not contain. Taking the token from the identity slot rather than from
+ * the number directly is what keeps the two answers the same one.
  */
 export function matchesFilter(
   item: PullListItem,
@@ -61,8 +68,13 @@ export function matchesFilter(
   )
   const authorName =
     identity.kind === 'human' ? identity.name : item.pull.user.login
+  const slot = rowIdentity(item)
+  // A local slot's own text is the branch pair, which the haystack already
+  // carries below — so the local arm contributes nothing rather than repeating
+  // it, and the number never reaches the string at all.
+  const numberToken = slot.kind === 'github' ? slot.text : ''
   const haystack =
-    `${item.pull.title} #${item.pull.number} ${authorName} ${item.pull.head.ref} ${item.pull.base.ref}`.toLowerCase()
+    `${item.pull.title} ${numberToken} ${authorName} ${item.pull.head.ref} ${item.pull.base.ref}`.toLowerCase()
   return haystack.includes(needle)
 }
 

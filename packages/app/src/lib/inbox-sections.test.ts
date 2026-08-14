@@ -164,6 +164,24 @@ describe('filtering a row by what the reader typed', () => {
     // was written.
     expect(matchesFilter(item(482, { head: 'feature/y' }), 'feature/y', BOT)).toBe(true)
   })
+
+  test('and never by the synthetic number it does not show', () => {
+    // A token nobody can see is a way to find a row by a string it does not
+    // contain: the reader gets a hit they cannot explain from anything on
+    // screen. Both the whole id and a run of it, because a value carrying only
+    // the id's tail would satisfy a search for the whole of it.
+    expect(matchesFilter(sweep, String(LOCAL_REVIEW_ID_BASE), BOT)).toBe(false)
+    expect(matchesFilter(sweep, '00000', BOT)).toBe(false)
+  })
+
+  test('while a pull request is still found by its number, however long', () => {
+    // The control for the absence above, which dropping the number token from
+    // every row would otherwise satisfy. The second needle is a genuine pull
+    // request number with as many digits as a synthetic one has zeros, so the
+    // rule cannot have degenerated into "long numbers are not searchable".
+    expect(matchesFilter(item(482), '482', BOT)).toBe(true)
+    expect(matchesFilter(item(1_000_000), '1000000', BOT)).toBe(true)
+  })
 })
 
 describe('sorting reviews into the intent buckets', () => {

@@ -19,8 +19,13 @@
  * query layer imports that predicate, and none compares a review number to the
  * band's base constant — they ask `isLocal` or `isLocalReviewItem` here,
  * including modules that derive further vocabulary (a review "mode", say) from
- * the same answer. A source-scanning test enforces this and turns the suite red
- * the moment a second such call site appears.
+ * the same answer.
+ *
+ * NOTHING CHECKS THIS. It is held by reading, and a second call site added
+ * anywhere would compile, pass and go unnoticed. That is an argument for a
+ * source-scanning guard, not a description of one: the rule below says why such
+ * a guard would be worth its cost, and until it exists the rule is only as
+ * strong as the next reviewer's attention.
  *
  * A transport adapter is the deliberate exception, not an oversight: it MINTS
  * ids in the band and routes on them, so it implements the boundary rather than

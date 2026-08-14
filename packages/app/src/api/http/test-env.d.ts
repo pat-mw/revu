@@ -1,11 +1,16 @@
 /**
- * Minimal ambient declarations for the Bun + Node surface the co-located
- * integration test uses to spawn a real `revud` child process. Declared by hand
- * so the app type-checks without pulling in `@types/bun` (zero new
- * dependencies), mirroring `packages/revud/src/bun-env.d.ts`. Only the members
- * the test actually calls are declared; Bun/Node supply the real
- * implementations at runtime. Web globals (`fetch`, `Response`, `Headers`,
- * `AbortController`, `TextDecoder`, `DOMException`) come from the DOM lib.
+ * Minimal ambient declarations for the Bun + Node surface the app's co-located
+ * suites reach for — spawning a real `revud` child process, and reading a
+ * module's own source off disk.
+ *
+ * Declared by hand so the app type-checks without pulling in `@types/bun` (zero
+ * new dependencies), mirroring `packages/revud/src/bun-env.d.ts`. Hand-writing
+ * them is also what keeps the widening to the tests: the app is a browser
+ * bundle, and adding Node to this package's `types` would hand every source
+ * file in it a filesystem. Only the members the suites actually call are
+ * declared; Bun/Node supply the real implementations at runtime. Web globals
+ * (`fetch`, `Response`, `Headers`, `AbortController`, `TextDecoder`,
+ * `DOMException`) come from the DOM lib.
  */
 
 /** A spawned child process handle — the subset the integration test reads. */
@@ -43,6 +48,13 @@ declare module 'node:fs' {
   export function mkdtempSync(prefix: string): string
   export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void
   export function writeFileSync(path: string, data: string, encoding?: string): void
+  /**
+   * Read by the suites that assert on a module's SOURCE — wiring that only a
+   * renderer could execute, pinned as text so its deletion is not silent. The
+   * `URL` overload is what lets a caller resolve a sibling file from
+   * `import.meta.url` rather than by counting directories up from the root.
+   */
+  export function readFileSync(path: string | URL, encoding: 'utf8'): string
 }
 
 declare module 'node:os' {

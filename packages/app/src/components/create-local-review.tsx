@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useReducer } from 'react'
+import { createContext, useCallback, useContext, useEffect, useReducer, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { Check, GitBranch, Plus } from 'lucide-react'
@@ -56,6 +56,19 @@ import { useBranches, useCreateLocalReview } from '@/state/local-reviews'
  * - `reduceCreateLocalReview` is the state machine, pure and driveable without
  *   a renderer — which is where the promise that a failed create loses nothing
  *   the human wrote is actually kept.
+ * - `createLanding` decides whether a create that has come back is still the
+ *   one the form is on, so "an attempt the human walked away from moves nobody"
+ *   is a property of a function rather than of a closure.
+ *
+ * ## A visit, not a session
+ *
+ * The dialog is mounted once and reused, so every raising of it is a fresh
+ * visit: the form starts over on open and the attempt ends on close. That
+ * matters beyond tidiness because the create request cannot be recalled. Esc
+ * during a create does not stop it — the review is made — so what is guarded is
+ * the ANSWER: an attempt from a visit that is over neither navigates nor writes
+ * back into the form. Without that, dismissing the dialog and going back to
+ * work ends a moment later on a review page nobody asked for.
  *
  * `CreateLocalReviewDialog` is then only wiring: the shell, the reducer and the
  * mutation, thin enough to read in one pass.
@@ -135,11 +148,24 @@ export interface CreateLocalReviewState {
    * whether the review was minted by this attempt or already existed.
    */
   createdId: number | null
+  /**
+   * Which visit to the form this is. Not a field of the form and never shown:
+   * it exists so that a request sent on one visit can tell whether it is coming
+   * back to the same one.
+   *
+   * It is the one thing `reset` does not clear — clearing it would defeat its
+   * whole purpose, which is to differ afterwards. Raising the dialog and
+   * dismissing it both advance it, so an attempt sent before either is on a
+   * number the form has since left behind.
+   */
+  attempt: number
 }
 
 export type CreateLocalReviewEvent =
   /** The form was opened: start over, holding nothing from a previous visit. */
   | { type: 'reset' }
+  /** The form was dismissed: whatever it was doing is no longer wanted. */
+  | { type: 'dismissed' }
   /** A base was preselected for a form the human has not touched yet. */
   | { type: 'base_defaulted'; ref: string }
   | { type: 'base_picked'; ref: string }
@@ -157,6 +183,27 @@ const EMPTY_STATE: CreateLocalReviewState = {
   error: null,
   pending: false,
   createdId: null,
+  attempt: 0,
+}
+
+/** What a create that has come back is still allowed to do. */
+export type CreateLanding = 'land' | 'abandoned'
+
+/**
+ * Whether a create that has just resolved is still the one the form is on.
+ *
+ * `startedOn` is the attempt number the request captured when it was sent;
+ * `now` is the one the form holds when the answer arrives. They differ exactly
+ * when the human left in between — dismissing the dialog, or dismissing it and
+ * opening it again — and an answer from a visit that is over must not act: the
+ * reader went back to whatever the dialog was covering, and navigating them
+ * onto a review a moment later takes them out of it with no warning.
+ *
+ * The review itself is made either way. Nothing is lost by refusing to land on
+ * it; it is listed in the inbox like any other.
+ */
+export function createLanding(startedOn: number, now: number): CreateLanding {
+  return startedOn === now ? 'land' : 'abandoned'
 }
 
 /**
@@ -170,6 +217,12 @@ const EMPTY_STATE: CreateLocalReviewState = {
  * existed for the same pair — asking twice for the same two branches is a
  * success that resolves onto the review already there, never a conflict, so a
  * second attempt lands exactly where the first did.
+ *
+ * `reset` and `dismissed` are the two ends of a visit, and both advance the
+ * attempt counter. That is what lets a request sent during one visit be
+ * recognised as belonging to it once it comes back — including the case where
+ * the human dismissed the dialog and opened it again while the first request
+ * was still out.
  */
 export function reduceCreateLocalReview(
   state: CreateLocalReviewState,
@@ -177,7 +230,12 @@ export function reduceCreateLocalReview(
 ): CreateLocalReviewState {
   switch (event.type) {
     case 'reset':
-      return EMPTY_STATE
+      return { ...EMPTY_STATE, attempt: state.attempt + 1 }
+    case 'dismissed':
+      // The fields are left as they are — reset on the next open is what clears
+      // them, and doing it here as well would only mean doing it twice. What
+      // must not survive is the claim that something is still in flight.
+      return { ...state, pending: false, attempt: state.attempt + 1 }
     case 'base_defaulted':
       // A preselection, not an override: once there is a base, the branch
       // listing arriving (or arriving again) must not move it.
@@ -485,8 +543,11 @@ export function CreateLocalReviewDialog({ open, onOpenChange }: CreateLocalRevie
 
   const defaultBase = branches.data?.find((branch) => branch.isDefault)?.ref ?? ''
 
+  // Both ends of a visit, in one place. Opening starts a fresh form; closing
+  // ends the attempt, so a request still out when the human left is recognised
+  // as belonging to a visit that is over.
   useEffect(() => {
-    if (open) dispatch({ type: 'reset' })
+    dispatch({ type: open ? 'reset' : 'dismissed' })
   }, [open])
 
   useEffect(() => {
@@ -494,7 +555,16 @@ export function CreateLocalReviewDialog({ open, onOpenChange }: CreateLocalRevie
     dispatch({ type: 'base_defaulted', ref: defaultBase })
   }, [open, defaultBase])
 
+  // The attempt the form is on NOW, readable from a callback whose closure was
+  // built before the human could dismiss the dialog. A request in flight has to
+  // compare against the present, and `state` in its closure is the past.
+  const attemptRef = useRef(state.attempt)
+  useEffect(() => {
+    attemptRef.current = state.attempt
+  }, [state.attempt])
+
   const submit = useCallback(async () => {
+    const attempt = state.attempt
     dispatch({ type: 'create_started' })
     const typed = state.title?.trim() ?? ''
     try {
@@ -503,13 +573,18 @@ export function CreateLocalReviewDialog({ open, onOpenChange }: CreateLocalRevie
         headRef: state.head,
         ...(typed === '' ? {} : { title: typed }),
       })
+      // The request cannot be recalled, so what is guarded is its effect: an
+      // answer from a visit the human already left changes nothing and moves
+      // nobody. The review was still made and is listed like any other.
+      if (createLanding(attempt, attemptRef.current) === 'abandoned') return
       dispatch({ type: 'created', id: review.id })
       onOpenChange(false)
       navigate(`/pr/${review.id}`)
     } catch (err) {
+      if (createLanding(attempt, attemptRef.current) === 'abandoned') return
       dispatch({ type: 'create_failed', error: describeCreateLocalReviewError(err) })
     }
-  }, [create, navigate, onOpenChange, state.base, state.head, state.title])
+  }, [create, navigate, onOpenChange, state.attempt, state.base, state.head, state.title])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
