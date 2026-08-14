@@ -1,7 +1,10 @@
 import type {
+  BranchRef,
+  CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  LocalReviewSummary,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -113,4 +116,40 @@ export interface RevuApi {
 
   /** Current shared-bucket status, for honest error copy. */
   getRateLimit(): Promise<RateLimitInfo>
+
+  // ——— local-only reviews (a branch pair with no pull request; nothing reaches GitHub) ———
+
+  /**
+   * The branches this workspace can review: local branches AND remote-tracking
+   * refs, because a base is often only tracked, never checked out. Exactly one
+   * entry carries `isDefault`. Reading them costs nothing against the shared
+   * bucket — it is a read of the local repository, not of GitHub.
+   */
+  listBranches(): Promise<BranchRef[]>
+
+  /**
+   * Open a review of `headRef` against `baseRef` with no pull request behind it.
+   * Idempotent per branch pair: creating the same one twice returns the review
+   * that already exists rather than a second one. The repository identity is
+   * derived server-side, never sent by the client.
+   *
+   * Once created, the review is addressed by its id through the ordinary PR
+   * methods above — `syncPull`, `getSnapshot`, `submitReview` and the rest all
+   * take a local id unchanged.
+   */
+  createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary>
+
+  /**
+   * Every local review in this workspace, carrying the annotations that exist
+   * only locally (`dirty`, `archivedPr`). The PR list remains the row source
+   * for rendering; this is the management and annotation surface.
+   */
+  listLocalReviews(): Promise<LocalReviewSummary[]>
+
+  /**
+   * Delete a local review and everything synthesized for it. Per-human drafts
+   * and viewed state are deliberately left behind — user-written text is never
+   * destroyed — and the id is never minted again, so nothing inherits them.
+   */
+  deleteLocalReview(reviewId: number): Promise<void>
 }

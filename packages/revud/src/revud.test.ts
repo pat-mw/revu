@@ -627,7 +627,7 @@ describe('cross-version durability: an older document is migrated, not wiped', (
   })
 })
 
-describe('cross-version durability: a v2 document upgrades to v3 without wiping drafts', () => {
+describe('cross-version durability: a v2 document upgrades to the current version without wiping drafts', () => {
   // Draft comments gained an optional `anchor.startLineText` (reconcile uses it
   // to validate a ranged comment's start line). That store change bumps the
   // version 2 → 3. A v2 document's draft comments have NO `startLineText`; if
@@ -721,7 +721,7 @@ describe('cross-version durability: a v2 document upgrades to v3 without wiping 
     expect(loadedComment?.anchor.startLineText).toBeUndefined()
 
     // Force a flush (any mutation persists) and confirm the on-disk document
-    // upgraded to v3 while STILL holding the draft.
+    // upgraded to the current store version while STILL holding the draft.
     const put = await fetch(`${migDaemon.base}/api/preferences`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
@@ -734,7 +734,7 @@ describe('cross-version durability: a v2 document upgrades to v3 without wiping 
       v: number
       drafts: Record<string, Record<string, ReviewDraft>>
     }
-    expect(onDisk.v).toBe(3)
+    expect(onDisk.v).toBe(4)
     expect(onDisk.drafts['h-priya']?.['204']?.body).toContain('must survive the upgrade to v3')
     expect(onDisk.drafts['h-priya']?.['204']?.comments[0]?.start_line).toBe(8)
   })

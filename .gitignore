@@ -27,6 +27,11 @@ out/
 # e2e failure screenshots are build output, never committed
 e2e/artifacts/
 
+# Scratch git worktrees used to isolate concurrent work; never part of a change.
+# Also keeps the lint pass out of an in-progress agent's tree — an unfinished
+# worktree would otherwise fail the gate on a branch that does not contain it.
+.claude/worktrees/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
