@@ -12,7 +12,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 | ticket · unit | branch | tier | isolation | what it is |
 | --- | --- | --- | --- | --- |
-| **M8.6.6** — tree exclusion + filter widening | `m8.6/app-creation-flow` | opus | worktree | W4, serialized; **last M8.6 unit**. Also carries the inherited approvable-badge assertion |
+| **M8.7.10** — the static-render harness | `m8.7/app-local-chrome` | opus | worktree | W1; nothing render-shaped in M8.7 is assertable without it |
 
 **The `m8.1` → `m8.6` rebase is DONE.** `m8.1` gained `8b73a77` (the adversarial review's fixes) and is pushed;
 `m8.6` was rebased onto it and verified — `git merge-base --is-ancestor` confirms `m8.6` contains the `m8.1`
@@ -33,7 +33,13 @@ fuller comment. **Every `m8.6` sha below the rebase point changed**; the table b
 | board — the adversarial review record | `2c0538c` | `m8.6` | — (no code) |
 | M8.6.3 — the create dialog | `eb20f17` | `m8.6` | 1277 pass · 1 skip · 0 fail · 72 files |
 | M8.6.4 — inbox section + local row variant | `be9442a` | `m8.6` | 1310 pass · 1 skip · 0 fail · 74 files |
-| M8.6.5 — entry points + the `g l` chord | `836b841` | `m8.6` | **1323 pass · 1 skip · 0 fail · 75 files** |
+| M8.6.5 — entry points + the `g l` chord | `836b841` | `m8.6` | 1323 pass · 1 skip · 0 fail · 75 files |
+| M8.6.6 — tree exclusion + filter widening | `59e3e75` | `m8.6` | 1335 pass · 1 skip · 0 fail · 75 files |
+| **M8.6 review fixes** — palette id, filter token, gate pin, dismiss guard, docstring | `a637522` | `m8.6` | 1362 pass · 1 skip · 0 fail · 76 files |
+| M8.6 Verify — the walk + one copy fix it found | `de14043` | `m8.6` | **1362 pass · 1 skip · 0 fail · 76 files** |
+
+**✅ M8.6 is `In Review` — PR [#71](https://github.com/pat-mw/revu/pull/71) is open on base `m8.1`.** Its
+`Verify` ran green, including the recorded browser walk. `main` remains `177068a`; nothing merged.
 
 **Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
 one. **Worktree hazard, now in the memories and in every dispatch brief:** an isolated agent worktree is created
@@ -143,8 +149,8 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
 | [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
-| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Progress | 7 | app | M8.1 | `m8.6/app-creation-flow` | — |
-| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | Todo | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
+| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
+| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Progress | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
