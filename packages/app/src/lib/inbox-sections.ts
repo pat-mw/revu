@@ -16,6 +16,8 @@
 import type { PullListItem, ReviewDraft } from '@revu/shared'
 import { parseCommentIdentity } from '@revu/shared'
 import { partitionInbox } from './local-reviews'
+import { buildPullTree } from './pull-tree'
+import type { PullTreeRoot } from './pull-tree'
 
 /** A row as it will render, carrying the section it belongs to and any draft. */
 export interface InboxRow {
@@ -31,7 +33,19 @@ export interface Section {
   rows: InboxRow[]
 }
 
-/** Case-insensitive match over a PR's title, number, and author display name. */
+/**
+ * Case-insensitive match over what a row is called: its title, its number, its
+ * author's display name, and the two branches it compares.
+ *
+ * The branch pair is searchable for every row, not only for the rows that need
+ * it. Some rows have nothing else usable — a review with no pull request behind
+ * it never shows a number, and its author is a stand-in for the workspace
+ * rather than a person, so the only thing left is a title the reader chose and
+ * may well have written in different words from the branch. But narrowing the
+ * widening to those rows would mean the filter box searched different fields
+ * depending on which row it was looking at, which is harder to explain than
+ * "it searches the branch names" and no easier to predict.
+ */
 export function matchesFilter(
   item: PullListItem,
   needle: string,
@@ -47,7 +61,8 @@ export function matchesFilter(
   )
   const authorName =
     identity.kind === 'human' ? identity.name : item.pull.user.login
-  const haystack = `${item.pull.title} #${item.pull.number} ${authorName}`.toLowerCase()
+  const haystack =
+    `${item.pull.title} #${item.pull.number} ${authorName} ${item.pull.head.ref} ${item.pull.base.ref}`.toLowerCase()
   return haystack.includes(needle)
 }
 
@@ -107,6 +122,62 @@ export function nextFocusIndex(
   return Math.max(0, Math.min(count - 1, index + delta))
 }
 
+/**
+ * The rows either arrangement is allowed to draw from.
+ *
+ * Shared by both on purpose. The arrangements are two ways of grouping one set
+ * of reviews, never two selections of which reviews count — a reader switching
+ * between them is re-sorting the screen, not re-querying it, and a row that
+ * appeared in one and not the other would make the control a filter in
+ * disguise.
+ */
+function visibleRows(
+  items: readonly PullListItem[],
+  needle: string,
+  botLogin: string,
+): PullListItem[] {
+  return items.filter(
+    (it) => it.pull.state === 'open' && matchesFilter(it, needle, botLogin),
+  )
+}
+
+/** Everything the tree arrangement reads. */
+export interface InboxTreeInput {
+  /** Every listed row, of any state; only the open ones are arranged. */
+  items: readonly PullListItem[]
+  /** The filter box's contents, already trimmed and lowercased. */
+  needle: string
+  /** The broker bot's login, so a smuggled author name is read back out. */
+  botLogin: string
+}
+
+/**
+ * The other arrangement: pull requests grouped by what each one is stacked on.
+ *
+ * Local reviews are held back from it. A stack is a chain of pull requests each
+ * opened against the one below it, and a review of two branches that were never
+ * pushed is in no such chain — nothing points at it and it points at nothing.
+ *
+ * Holding them back is not tidiness. Parentage is read from branch names and
+ * nothing else, so a pull request whose base branch happens to be a local
+ * review's head branch would be drawn as stacked on it: a real pull request
+ * filed under something that exists on one machine and nowhere else. The tree
+ * builder is right to know nothing about where a review came from, so the rows
+ * it should not see are taken out before it sees them rather than by teaching
+ * it a distinction that is not its business.
+ *
+ * Held back is not dropped. The caller draws them as their own group, so the
+ * two arrangements account for the same reviews and the control that switches
+ * between them stays a re-sort rather than a filter.
+ */
+export function buildInboxTree({
+  items,
+  needle,
+  botLogin,
+}: InboxTreeInput): PullTreeRoot[] {
+  return buildPullTree(partitionInbox(visibleRows(items, needle, botLogin)).github)
+}
+
 /** Everything the derivation reads. Nothing here is fetched — it is all in hand. */
 export interface InboxSectionsInput {
   /** Every listed row, of any state; only the open ones are sorted. */
@@ -161,8 +232,7 @@ export function buildInboxSections({
   draftByNumber,
   hasLocalReviews,
 }: InboxSectionsInput): Section[] {
-  const open = items.filter((it) => it.pull.state === 'open')
-  const filtered = open.filter((it) => matchesFilter(it, needle, botLogin))
+  const filtered = visibleRows(items, needle, botLogin)
 
   // Every intent bucket derives from the pull requests alone. Excluding local
   // reviews only from the catch-all would not be enough: the catch-all takes

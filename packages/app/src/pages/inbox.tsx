@@ -29,13 +29,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { useShortcut } from '@/lib/keyboard'
 import { relativeTime, minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
-import { buildPullTree, flattenPullTree } from '@/lib/pull-tree'
+import { flattenPullTree } from '@/lib/pull-tree'
 import { buildPullTooltip } from '@/lib/pull-tooltip'
 import type { PullTooltip } from '@/lib/pull-tooltip'
 import {
   buildInboxSections,
+  buildInboxTree,
   enterTarget,
-  matchesFilter,
   nextFocusIndex,
 } from '@/lib/inbox-sections'
 import type { InboxRow } from '@/lib/inbox-sections'
@@ -140,26 +140,38 @@ export function InboxPage() {
     [view, setPreferencesMutate],
   )
 
-  // The same open PRs the sections draw from, arranged by what they are stacked
-  // on. Built from the list already in hand — a stack's shape is implied by
-  // every PR's base ref, so this costs no request.
-  const treeRoots = useMemo(() => {
-    const open = items.filter((it) => it.pull.state === 'open')
-    const filtered = open.filter((it) => matchesFilter(it, needle, session.brokerLogin))
-    return buildPullTree(filtered)
-  }, [items, needle, session.brokerLogin])
+  // The same open reviews the sections draw from, arranged by what they are
+  // stacked on. Built from the list already in hand — a stack's shape is
+  // implied by every PR's base ref, so this costs no request.
+  const treeRoots = useMemo(
+    () => buildInboxTree({ items, needle, botLogin: session.brokerLogin }),
+    [items, needle, session.brokerLogin],
+  )
 
-  // A single flat list of every visible row, in section order, so keyboard
-  // navigation crosses section boundaries as one continuous column.
+  // The reviews the tree does not draw, taken from the same derivation the list
+  // arrangement uses so the two cannot come to different answers about which
+  // rows exist. Read here rather than derived again: one source, two layouts.
+  const localRows = useMemo(
+    () => sections.find((s) => s.id === 'local')?.rows ?? [],
+    [sections],
+  )
+
+  // A single flat list of every visible row, in the order it is drawn, so
+  // keyboard navigation crosses group boundaries as one continuous column. In
+  // the tree arrangement the local group is drawn first and so comes first
+  // here — a row the column skipped would be unreachable by keyboard alone.
   const flatRows = useMemo(
     () =>
       view === 'tree'
-        ? flattenPullTree(treeRoots).map((n) => ({
-            item: n.item,
-            draft: draftByNumber.get(n.item.pull.number) ?? null,
-          }))
+        ? [
+            ...localRows,
+            ...flattenPullTree(treeRoots).map((n) => ({
+              item: n.item,
+              draft: draftByNumber.get(n.item.pull.number) ?? null,
+            })),
+          ]
         : sections.flatMap((s) => s.rows),
-    [view, treeRoots, sections, draftByNumber],
+    [view, treeRoots, localRows, sections, draftByNumber],
   )
 
   // Starting a review is offered from two places on this screen, and both raise
@@ -287,6 +299,34 @@ export function InboxPage() {
         />
 
         <div className="mt-3 flex flex-col gap-5">
+          {/* Above the stacks rather than inside one. A review of two local
+              branches is not stacked on anything and nothing is stacked on it,
+              so it is its own group — and grouping it separately is also what
+              keeps each group's identity column one width instead of two. */}
+          {view === 'tree' && localRows.length > 0 && (
+            <section>
+              <SectionHeader title="Local reviews" count={localRows.length} />
+              <div className="hairline-t">
+                {localRows.map((row) => {
+                  const index = runningIndex
+                  runningIndex += 1
+                  return (
+                    <InboxRowView
+                      key={row.item.pull.number}
+                      ref={(el) => {
+                        rowRefs.current[index] = el
+                      }}
+                      row={row}
+                      showUnresolvedNumber={false}
+                      dirty={dirtyReviews.has(row.item.pull.number)}
+                      focused={index === focusIndex}
+                      onFocus={() => setFocusIndex(index)}
+                    />
+                  )
+                })}
+              </div>
+            </section>
+          )}
           {view === 'tree' &&
             treeRoots.map((root) => {
               const nodes = flattenPullTree([root])
@@ -468,8 +508,8 @@ function InboxHeader({
           type="search"
           value={filter}
           onChange={(e) => onFilter(e.target.value)}
-          placeholder="filter by title, number, author…"
-          aria-label="Filter pull requests"
+          placeholder="filter by title, branch, author…"
+          aria-label="Filter reviews"
         />
         <span className="hidden items-center gap-1 text-2xs text-ink-faint sm:inline-flex">
           <Kbd keys={['j']} />
@@ -516,6 +556,59 @@ export function RowIdentity({ item }: { item: PullListItem }) {
       <ArrowLeft size={11} strokeWidth={1.5} className="shrink-0" aria-hidden />
       <span className="min-w-0 truncate">{identity.head}</span>
     </span>
+  )
+}
+
+/**
+ * What a row claims about itself, in the cluster at its right edge.
+ *
+ * Every badge here is a claim someone could act on, and one of them is a claim
+ * about GitHub: that this is a pull request in an organization the reader is
+ * allowed to approve. A review of two local branches is not that. No pull
+ * request was opened, no organization ever saw the branch, and the row's own
+ * approvability flag says only that nothing local forbids a verdict — so the
+ * organizational claim is withheld rather than repeated.
+ *
+ * The cluster is a component of its own for the same reason the identity slot
+ * is: an absence has to be assertable. Left inline in the row it could only be
+ * checked by reading the code, and the badge it must not draw is exactly the
+ * kind of thing a later edit re-enables without noticing.
+ */
+export function RowBadges({ row, dirty = false }: { row: InboxRow; dirty?: boolean }) {
+  const { broker } = row.item
+  const isLocal = isLocalReviewItem(row.item)
+  return (
+    <>
+      {row.draft && (
+        <Badge variant="draft" className="shrink-0">
+          {row.draft.comments.length} pending · {relativeTime(row.draft.updatedAt)}
+        </Badge>
+      )}
+
+      {/* Where this review came from, not what it is waiting for — so a quiet
+          outline rather than the violet that means pending work. */}
+      {isLocal && (
+        <Badge variant="outline" className="shrink-0">
+          local
+        </Badge>
+      )}
+
+      {dirty && (
+        <Badge
+          variant="stale"
+          className="shrink-0"
+          title="The worktree had uncommitted changes at the last sync — they are not in this review."
+        >
+          worktree dirty
+        </Badge>
+      )}
+
+      {!isLocal && broker.canApprove && (
+        <Badge variant="outline" className="shrink-0">
+          org PR — approvable
+        </Badge>
+      )}
+    </>
   )
 }
 
@@ -603,7 +696,6 @@ const InboxRowView = forwardRef<
     parsed.identity.kind === 'human' ? parsed.identity.name : pull.user.login
   const labels = pull.labels.slice(0, 2)
   const hasDraft = !!row.draft
-  const isLocal = isLocalReviewItem(row.item)
   const unresolved = broker.unresolvedThreads
   const tip = useMemo(() => buildPullTooltip(row.item), [row.item])
 
@@ -659,38 +751,7 @@ const InboxRowView = forwardRef<
           </div>
 
           <div className="flex shrink-0 items-center gap-2.5">
-            {hasDraft && row.draft && (
-              <Badge variant="draft" className="shrink-0">
-                {row.draft.comments.length} pending · {relativeTime(row.draft.updatedAt)}
-              </Badge>
-            )}
-
-            {/* Where this review came from, not what it is waiting for — so a
-                quiet outline rather than the violet that means pending work. */}
-            {isLocal && (
-              <Badge variant="outline" className="shrink-0">
-                local
-              </Badge>
-            )}
-
-            {dirty && (
-              <Badge
-                variant="stale"
-                className="shrink-0"
-                title="The worktree had uncommitted changes at the last sync — they are not in this review."
-              >
-                worktree dirty
-              </Badge>
-            )}
-
-            {/* Approvability is a statement about a pull request in an
-                organization. There is no pull request behind a local review and
-                no organization saw the branch, so the claim is not made. */}
-            {!isLocal && broker.canApprove && (
-              <Badge variant="outline" className="shrink-0">
-                org PR — approvable
-              </Badge>
-            )}
+            <RowBadges row={row} dirty={dirty} />
 
             {showUnresolvedNumber ? (
               <div className="flex w-16 shrink-0 flex-col items-end leading-none">

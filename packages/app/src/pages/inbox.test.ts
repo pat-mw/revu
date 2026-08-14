@@ -25,7 +25,7 @@ import { createMockApi } from '@/api/mock/adapter'
 import { mockDev } from '@/api/mock/devtools'
 import { fixtureDB } from '@/fixtures'
 import { buildPullTooltip, checksSummary } from '@/lib/pull-tooltip'
-import { InboxZeroState, RowIdentity } from './inbox'
+import { InboxZeroState, RowBadges, RowIdentity } from './inbox'
 
 const api = createMockApi()
 const fixture = fixtureDB.localReviews[0]
@@ -79,6 +79,40 @@ describe('the identity slot on a local review row', () => {
       createElement(RowIdentity, { item: asPullRequest(localRow, 482) }),
     )
     expect(markup).toContain('#482')
+  })
+})
+
+describe('what a local review row claims about itself', () => {
+  /** The badge cluster as HTML, for a row with no draft and a clean worktree. */
+  function badges(item: PullListItem): string {
+    return renderToStaticMarkup(createElement(RowBadges, { row: { item, draft: null } }))
+  }
+
+  test('the row does carry the approvability flag the badge reads', () => {
+    // Stated first because it is what makes the absence below mean something:
+    // the flag is true on this row, so the badge is withheld by a decision
+    // about what the flag means here and not by the flag being unset.
+    expect(localRow.broker.canApprove).toBe(true)
+  })
+
+  test('and still makes no claim about approving a pull request', () => {
+    // There is no pull request and no organization ever saw the branch, so the
+    // sentence would be about something that does not exist. Searched for the
+    // bare word, which is a substring of the control's needle below — so the
+    // control passing proves this search reaches this markup.
+    expect(badges(localRow)).not.toContain('approvable')
+  })
+
+  test('a pull request that can be approved does say so', () => {
+    // The positive control: the same row renumbered below the reserved band,
+    // identical in every other respect, so the withheld badge is the band's
+    // doing rather than a cluster that renders nothing.
+    expect(badges(asPullRequest(localRow, 482))).toContain('org PR — approvable')
+  })
+
+  test('the local seal is drawn instead', () => {
+    // The cluster is not simply empty for a local row: it says what the row is.
+    expect(visibleText(badges(localRow))).toContain('local')
   })
 })
 

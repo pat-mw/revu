@@ -4,10 +4,14 @@ import { LOCAL_REVIEW_ID_BASE } from '@revu/shared'
 import type { InboxRow, InboxSectionsInput, Section } from './inbox-sections'
 import {
   buildInboxSections,
+  buildInboxTree,
   enterTarget,
   matchesFilter,
   nextFocusIndex,
 } from './inbox-sections'
+import { buildPullTree, flattenPullTree } from './pull-tree'
+import type { PullTreeNode } from './pull-tree'
+import { isLocal, partitionInbox } from './local-reviews'
 
 /**
  * How the inbox sorts what it was handed: which section a row lands in, how
@@ -133,6 +137,32 @@ describe('filtering a row by what the reader typed', () => {
     expect(matchesFilter(row, '482', BOT)).toBe(true)
     expect(matchesFilter(row, 'someone', BOT)).toBe(true)
     expect(matchesFilter(row, 'nothing here', BOT)).toBe(false)
+  })
+
+  // A local review has no number on screen and its author is a stand-in, so
+  // its title is the only token the reader could have typed — and the title is
+  // whatever they called it, which need not be the branch. Searching the pair
+  // of branch names is what makes one findable by the thing it actually is.
+  const sweep = localItem(0, { title: 'Local sweep', head: 'feature/x', base: 'main' })
+
+  test('a review is found by either of the branches it compares', () => {
+    expect(matchesFilter(sweep, 'feature/x', BOT)).toBe(true)
+    expect(matchesFilter(sweep, 'main', BOT)).toBe(true)
+  })
+
+  test('a branch it does not compare does not find it', () => {
+    // The control for the two above: a haystack that had quietly become
+    // "everything" would satisfy them and fail here. The needle is a real
+    // branch name from another row, so this is a miss rather than a nonsense
+    // string no haystack could hold.
+    expect(matchesFilter(sweep, 'feature/y', BOT)).toBe(false)
+  })
+
+  test('a pull request is found by its branch too', () => {
+    // Branch names became searchable for every row, not only for the rows that
+    // needed it. Asserted rather than left as an accident of where the widening
+    // was written.
+    expect(matchesFilter(item(482, { head: 'feature/y' }), 'feature/y', BOT)).toBe(true)
   })
 })
 
@@ -393,5 +423,73 @@ describe('the derivation loses nothing and invents nothing', () => {
   test('no section lists a review that was never input', () => {
     const input = new Set(items.map((i) => i.pull.number))
     for (const number of listed) expect(input.has(number)).toBe(true)
+  })
+})
+
+describe('arranging reviews by what they are stacked on', () => {
+  /**
+   * The exact collision the arrangement exists to prevent: a local review whose
+   * head branch is the base branch of a real pull request. Stacking is read from
+   * branch names alone, so on names alone these two look like a stack.
+   *
+   * A third row that collides with nothing is here so the counts below are not
+   * satisfied by a fixture of one row per side.
+   */
+  const LOCAL = LOCAL_REVIEW_ID_BASE
+  const STACKED = 482
+  const UNRELATED = 347
+
+  const collision = [
+    item(UNRELATED, { head: 'feature/z', base: 'main' }),
+    localItem(0, { head: 'feature/x', base: 'main' }),
+    item(STACKED, { head: 'feature/y', base: 'feature/x' }),
+  ]
+
+  const input = { items: collision, needle: '', botLogin: BOT }
+
+  const nodes = (roots: ReturnType<typeof buildInboxTree>): PullTreeNode[] =>
+    flattenPullTree(roots)
+  const numbersIn = (roots: ReturnType<typeof buildInboxTree>): number[] =>
+    nodes(roots).map((n) => n.item.pull.number)
+  const nodeFor = (
+    roots: ReturnType<typeof buildInboxTree>,
+    number: number,
+  ): PullTreeNode | undefined => nodes(roots).find((n) => n.item.pull.number === number)
+
+  test('handed every row, the tree files a real pull request under a local review', () => {
+    // Not a regression to fix — a statement of what the tree builder does, and
+    // the reason the rows are separated before it runs. It reads parentage from
+    // branch names and nothing else, which is the right thing for it to know;
+    // this assertion is what proves the fixture above genuinely collides, so
+    // the exclusion below cannot pass because the collision was never there.
+    const roots = buildPullTree(collision)
+    expect(nodeFor(roots, LOCAL)?.children.map((c) => c.item.pull.number)).toEqual([
+      STACKED,
+    ])
+  })
+
+  test('the arrangement keeps local reviews out of the tree entirely', () => {
+    expect(numbersIn(buildInboxTree(input)).filter((n) => isLocal(n))).toEqual([])
+  })
+
+  test('so the pull request it would have parented stands on its own base branch', () => {
+    expect(nodeFor(buildInboxTree(input), STACKED)?.depth).toBe(0)
+  })
+
+  test('and no row is lost between the tree and the group beside it', () => {
+    const open = collision.filter((it) => it.pull.state === 'open')
+    const { local } = partitionInbox(open)
+    expect(numbersIn(buildInboxTree(input)).length + local.length).toBe(open.length)
+  })
+
+  test('both arrangements account for exactly the same reviews', () => {
+    // The promise the List/Tree control makes: it re-sorts the screen, it does
+    // not narrow it. The rows the tree does not draw are exactly the rows the
+    // local group does, so switching arrangement can never hide a review.
+    const sections = build({ items: collision, hasLocalReviews: true })
+    const listed = sections.flatMap((s) => s.rows.map((r) => r.item.pull.number))
+    const localGroup = shape(sections).local ?? []
+    const arranged = [...numbersIn(buildInboxTree(input)), ...localGroup]
+    expect([...new Set(arranged)].sort()).toEqual([...new Set(listed)].sort())
   })
 })
