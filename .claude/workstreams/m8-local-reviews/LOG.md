@@ -234,3 +234,33 @@ exhaustiveness guard is red-first.
 
 **Next**
 - Finish M8.6's waves, open its PR the moment its Verify is green, then `m8.7` off it starting with M8.7.10.
+
+---
+
+**update — 2026-08-14 (Session 2 — the app) — paused at a unit boundary**
+
+**Done**
+- **The owner interview ran first and decision package #1 is closed** — 14 decisions, each with its tradeoff
+  and downstream cost, all recorded as standing rulings. **Session 3 is unblocked.** The roadmap's pre-flight
+  defaults for M8.6/M8.7 were deliberately not applied; each of those questions went to the owner too.
+- **M8.6 complete, PR [#71](https://github.com/pat-mw/revu/pull/71) open** on base `m8.1` — 7 units, Verify
+  green including a recorded browser walk.
+- **M8.1 reopened to 9 units** (`4fbc5fb`, `8b73a77`) — a ruling changed the mock, and the mock is the spec.
+- **M8.7 at 6 of 12 units**, branch pushed, **no PR** — its Verify has not run.
+- Gate green after every unit, never batched: **1246 → 1440 pass · 1 skip · 0 fail · 81 files**, each re-run
+  in the main tree rather than trusted from a worker's isolated one.
+
+**Decisions**
+- Sixteen owner rulings plus R11–R15 from the work itself. Three rulings were later **corrected by the units
+  that consumed them** — R11 missed a file inside its own scope, R6 was not expressible in the signature it
+  prescribed, and **R14's banned-regex list contained a member that never fires**.
+- Five recorded deviations from the roadmap's S2 plan, each with its reason (see HANDOVER).
+
+**Blockers**
+- **M8.12 OQ1** — the frozen route set gives `DELETE /api/local-reviews/:n` no body and no query parameter, so
+  a server-authoritative delete force has nowhere to live. Client-side-only (weaker) or a frozen-contract
+  change and a §5.2 stop. **Settle with M8.10 before either dispatches.**
+
+**Next**
+- Finish M8.7: **M8.7.5 → .6 → .8 → .7**, plus appended **M8.7.11** and **M8.7.12**. Then Verify, a fable
+  review of the full diff, and the PR on base `m8.6`. R14/R15 bind every one of those units.

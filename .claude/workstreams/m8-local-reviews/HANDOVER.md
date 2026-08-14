@@ -5,6 +5,120 @@ act from it alone.
 
 ---
 
+## 2026-08-14 — Session 2 (the app) — **PAUSED at a unit boundary; M8.6 done, M8.7 half done**
+
+> **Read this section and _Standing rulings_ below; both are live.** The session paused for context, not for a
+> stop condition — no §5 condition was hit. **Nothing is in flight, no worktree exists, the tree is clean, and
+> everything landed is committed and pushed.**
+
+### Start here
+
+1. `git checkout m8.7/app-local-chrome` (it is pushed; `main` is untouched at `177068a`).
+2. Run `bun run check` — expect **1440 pass · 1 skip · 0 fail · 81 files**. The 1 skip is pre-existing.
+3. Read `BOARD.md`'s In-flight section: it lists **exactly** which M8.7 units landed and which did not.
+4. Continue with **M8.7.5**, then .6, .8, .7, plus the appended **M8.7.11** and **M8.7.12**.
+
+**The remaining M8.7 units are serial by FILE CONTENTION, not by dependency** — `lib/mode-copy.ts` has five
+writers, `lib/review-mode.ts` four, `pr-layout.tsx` three. The full reasoning, and why the roadmap's parallel
+wave table cannot be used as written, is in the ticket's `## Wave plan as actually run`. **Do not re-derive
+it.** Every worker so far has been dispatched to an isolated worktree and the orchestrator has integrated by
+copying whole files back — which is exactly why two workers on one file is unsafe here.
+
+### ⚠️ Four things the next session must carry, or it will pay for them
+
+1. **R14/R15 bind every remaining unit.** M8.7.5, .6, .7 and .8 all assert copy mostly by what it must *not*
+   contain — and this session proved **twice** that such an assertion passes against a function that ignores
+   its `mode` argument entirely, because today's GitHub literal already happens to satisfy the ban. **Pair
+   every absence with a positive `toBe` on BOTH modes' exact literals, copied from the tree.** And run the
+   mode-blind control to see which banned patterns actually fire: R14's own list contained a member
+   (`/github\.com/i`) that never fires, because the literal says "GitHub **App**".
+2. **One absence per test body.** Two `not.toContain` in one test means the runner aborts at the first, so the
+   second is never independently falsifiable and its control only *looks* like it bit.
+3. **Two confirmed-live defects M8.7 still owns**, both reproduced in a real browser, not predicted:
+   - **`title="org member · reviews on github.com"` on a local row** (R13). It is an **attribute**, so a
+     sweep over rendered text will miss it entirely — assert on the attribute, with a positive control that a
+     genuine GitHub row still carries it. **M8.7.6 owns `avatar.tsx` / `comment-view.tsx`.** (The PR header's
+     `#1000000002`, reproduced in the same browser walk, was fixed by M8.7.3.)
+   - The **rate chip** is workspace-scoped by ruling 9, so it legitimately renders under `?mock=1`. The real
+     work in M8.7.6 is distinguishing *loading* from *unavailable* so the chip **omits** rather than
+     skeletons forever.
+4. **The `?mock=1` walk must be driven from the orchestrator's tree, never a worker's.** Two workers correctly
+   declined to run it because the preview server serves the parent checkout. Also: **synthetic key injection
+   does not reach the app's global handlers** — ⌘K will not open the palette — so keyboard legs cannot be
+   driven and must be recorded as *not run* rather than claimed.
+
+### What this session did
+
+**M8.6 is complete and PR [#71](https://github.com/pat-mw/revu/pull/71) is open** (base `m8.1`), Verify green
+including a recorded browser walk whose network claim carries its own control — the recorder was fired at a
+deliberate request and confirmed to catch it before being reset, because an empty log from a never-installed
+recorder is what a broken one produces. Zero requests across creation, duplicate creation and both
+arrangements.
+
+**M8.1 was reopened and is at 9 units.** Ruling 6 (refuse submit before first sync) changes the mock, and the
+mock is the specification, so it had to land there. #70 is unmerged, so it is an added commit.
+
+**Gate green after every unit, never batched: 1246 → 1440 pass · 1 skip · 0 fail · 81 files.**
+
+### The reviews and the workers found real defects — six of them
+
+Worth stating plainly, because it is the argument for keeping both mechanisms running:
+
+- **The frozen `unprocessable` docstring excluded the meaning the new refusal gives it** — a daemon author
+  reading that discriminator would emit `conflict`/409 and **pass the entire conformance suite**, which has no
+  local-review coverage.
+- **The command palette rendered `#1000000001`** and made a review findable by typing an id no user is ever
+  shown — never asserted, because a command dialog serializes to nothing through its portal.
+- **Local rows claimed `org PR — approvable`**, a GitHub organisation claim about a branch that never left the
+  machine.
+- **The tree filed a real pull request under a local review** — and not hypothetically: the seeded fixture's
+  head ref is `release/0.41` and PR #415's base ref is `release/0.41`.
+- **A guard's key was invisible to the suite** — swapping it left all 1246 tests green, though the two keys
+  disagree with *opposite* outcomes on a split document.
+- **A docstring claimed a guard nobody had written**, which is worse than no claim: it stops the next reader
+  from adding it.
+
+> **The recurring lesson, now in `memories/known-landmines.md` as its own entry: a guard is exactly as strong
+> as the control that proves it can fail.** Four distinct shapes of vacuous guard were found in this one
+> session — a comparison between quantities that move together; a loose regex matching a duplicate of its own
+> target; a negative regex whose current literal already satisfies the ban; and a control placed outside the
+> scope it tests. Three of the four were caught by an adversarial reviewer or by a worker **doubting its own
+> brief**, not by the author.
+
+### Deviations from the roadmap's S2 plan — five, all recorded with reasons
+
+1. **W1 ran as M8.6.7 alone**, not `∥ M8.7.10` — the latter's files belong to `m8.7`, which did not exist yet.
+2. **W2/W3 ran worktree-isolated** where the roadmap says "none": two agents in one tree cannot each run a
+   gate that ends in `vite build`.
+3. **W4 was serialized** — the roadmap flagged one shared file; there were three, one of them the shared test.
+4. **M8.1 was reopened** for the ruling that changes the mock.
+5. **M8.7's waves are serial**, because the roadmap's "orchestrator owns `mode-copy.ts`" assumes a merge
+   capability this session does not have.
+
+### Scope appended, never absorbed
+
+**M8.12** (delete-confirm dialog) · **M8.7.11** (the optimistic reply's author is an empty-login bot) ·
+**M8.7.12** (the header now draws the branch pair twice — a direct consequence of M8.7.3). Board is at
+**93 units across 12 tickets**.
+
+⚠️ **M8.12's open question 1 is a real blocker for later:** the frozen route set has
+`DELETE /api/local-reviews/:n` with **no body and no query parameter**, so a *server-authoritative* delete
+force has nowhere to live. Either the confirmation is client-side only (weaker) or it is a frozen-contract
+change and a §5.2 stop. **Must be settled with M8.10 before either ticket dispatches.**
+
+### Harness hazards this session paid for — all in `memories/known-landmines.md`
+
+1. **An isolated agent worktree is created at the repo's BASE commit, not the branch tip, and has no
+   `node_modules`.** Every dispatch brief now opens with a mandatory STEP ZERO; any result from before it is
+   void.
+2. **The lint pass reads an agent worktree unless `.gitignore` covers it *on the branch being gated*.**
+3. **The preload's `document` stub has no `documentElement`** — the second import-time wall. Anything
+   importing `app-shell.tsx` is still unimportable from a test.
+4. **`test/preload.ts` is not in the `tsc -b` build graph**, which falsifies M8.11.8's claim to land before
+   anything writes there. Recorded against M8.11.
+
+---
+
 ## 2026-08-14 — Session 2 (the app) — **decision package #1 is RULED; 16 standing rulings below**
 
 > **These rulings are settled. No later session relitigates them.** Decision package #1 is complete, so
