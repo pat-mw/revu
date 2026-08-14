@@ -140,7 +140,7 @@ line the moment it lands. This section is the first thing an interrupted session
 
 ## Tickets
 
-**91 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**92 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
 count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
 from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14).
@@ -153,7 +153,7 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
-| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Progress | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
+| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Progress | 11 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
