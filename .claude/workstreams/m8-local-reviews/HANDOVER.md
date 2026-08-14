@@ -12,12 +12,79 @@ act from it alone.
 > text or the roadmap's exit condition, the amendment is stated under _Amendments the rulings force_ — the
 > ruling wins over the ticket, exactly as M8.1.8's ruling superseded M8.1.5's text.
 
-### State
+### State — live
 
-Branch `m8.1/contract-and-mock`; `main` untouched at `177068a`; PRs [#69](https://github.com/pat-mw/revu/pull/69)
-(design/board, base `main`) and [#70](https://github.com/pat-mw/revu/pull/70) (M8.1, base
-`m8/local-reviews-design`) open, neither merged. The merge protocol in the entry below is unchanged: nothing
-merges until the whole workstream lands.
+Branch **`m8.7/app-local-chrome`**, based on `m8.6`. `main` untouched at **`177068a`**; nothing merged.
+The merge protocol in the entry below is unchanged: **nothing merges until the whole workstream lands.**
+
+**The chain, bottom-up:** `main` → `m8/local-reviews-design` ([#69](https://github.com/pat-mw/revu/pull/69))
+→ `m8.1/contract-and-mock` ([#70](https://github.com/pat-mw/revu/pull/70)) →
+`m8.6/app-creation-flow` ([#71](https://github.com/pat-mw/revu/pull/71)) → `m8.7/app-local-chrome` (no PR yet).
+
+| ticket | state | PR |
+| --- | --- | --- |
+| M8.1 | `In Review` — **9 units** (M8.1.9 appended by a ruling this session) | [#70](https://github.com/pat-mw/revu/pull/70) |
+| M8.6 | `In Review` — 7 units, `Verify` green incl. the recorded browser walk | [#71](https://github.com/pat-mw/revu/pull/71) |
+| M8.7 | `In Progress` — M8.7.10 (the static-render harness) in flight, nothing landed | — |
+
+**Gate after every unit, never batched: 1246 → 1362 pass · 1 skip · 0 fail · 76 files**, and **every gate was
+re-run by the orchestrator in the main tree** rather than trusted from a worker's isolated one.
+
+> ⚠️ **If `BOARD.md`'s In-flight section is not empty when you read this, the session died mid-wave.** Nothing
+> on `m8.7` has landed; discard any uncommitted worktree and re-dispatch from M8.7.10. Do not archaeologize
+> unlanded work.
+
+### What the two adversarial reviews found — the reason to keep running them
+
+Both found **real defects**, not nits, and one falsified an assertion that had been recorded as passing.
+
+- **M8.1.9's review** proved the refusal real (neutralize the guard → exactly its two assertions fail; blanket
+  throw → both fail *at their controls*) but found the frozen `unprocessable` docstring **excluding the
+  meaning the refusal gives it** — a daemon author reading that discriminator would emit `conflict`/409 and
+  **pass the entire conformance suite**, which has no local-review coverage. Also that the guard's key was
+  invisible to the suite: swapping it left all 1246 tests green, though the two keys disagree with **opposite**
+  outcomes on a split document. Both fixed in `8b73a77`.
+- **M8.6's review** found the **command palette rendering `#1000000001`** and making a review findable by
+  typing an id no user is ever shown — on a surface the ticket's own text says shows the branch pair. It was
+  never asserted because a command dialog serializes to `''` through its portal: **the same blind spot the row
+  tests were split apart to avoid, one surface over.** It also found the keyboard gate's one-line derivation
+  deletable with the whole suite green, reset-on-open asserted by nothing, and a docstring **claiming a guard
+  nobody had written**. All fixed in `a637522`.
+
+> **The single most instructive observation of the session:** a source pin's first draft **passed with its
+> guard deleted** — a loose regex matched an identical line in the `catch` branch. Only the mandatory negative
+> control caught it. **A source pin is exactly as strong as the control that proves it can fail**, and this was
+> the second time in the session a guard was found asserting nothing.
+
+### Deviations from the roadmap's S2 plan — all four recorded with reasons
+
+1. **W1 ran as M8.6.7 alone, not `∥ M8.7.10`.** M8.7.10's files belong to `m8.7`, which did not exist yet;
+   running it early means holding an uncommitted diff across seven units — the unlanded work §7 says to
+   discard rather than reconstruct. It runs first on `m8.7` instead.
+2. **W2/W3 run worktree-isolated where the roadmap says "none".** Two agents in one tree cannot each run
+   `bun run check` — it ends in `vite build` and concurrent builds race on the same `dist`. "None" assumed the
+   wave was sequenced; per-unit gating is the harder requirement.
+3. **W4 was serialized rather than parallel.** The roadmap flagged one shared file; there are **three**, one of
+   them the shared test — where "different regions, trivial merge" stops holding. Two workers restructuring the
+   same helper is a §5.5 stop, and manufacturing one to buy a single unit of wall-clock is the trade the
+   roadmap's own critical-path note warns against.
+4. **M8.1 was reopened.** Ruling 6 changes the mock, and the mock is the specification, so the refusal had to
+   land there rather than in the daemon. #70 is unmerged, so it is an added commit, not rewritten history.
+
+### Harness hazards this session paid for — all now in `memories/known-landmines.md`
+
+1. **An isolated agent worktree is created at the repo's BASE commit, not the branch tip, and has no
+   `node_modules`.** Two agents lost real time before every brief carried a mandatory STEP ZERO
+   (`git log` → `git merge --ff-only <tip>` → `bun install`, and any result from before it is void).
+2. **The lint pass reads an agent worktree unless `.gitignore` covers it *on the branch being gated*.** Gating
+   `m8.1` linted a running agent's half-finished file and failed on work that branch does not contain. The
+   ignore entry now sits at the bottom of the chain where every branch inherits it.
+3. **The preload's `document` stub has no `documentElement`** — the *second* import-time wall, after the
+   missing `location`. `@/state/theme` → `@/lib/highlight` reads it at module scope, so **anything importing
+   `app-shell.tsx` is still unimportable from a test.** M8.7 renders far more chrome and will meet this.
+4. **Synthetic key injection does not reach the app's global handlers** in the browser harness (⌘K will not
+   open the palette), so keyboard legs of a walk cannot be driven. M8.6's Verify step 6 is recorded as **not
+   run**, not as passed.
 
 ### Standing rulings — owner, 2026-08-14
 
