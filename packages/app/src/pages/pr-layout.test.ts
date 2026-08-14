@@ -1,5 +1,7 @@
 /**
- * The review header's tab strip, rendered as real HTML in both kinds of review.
+ * The review header — its identity row and its tab strip — rendered as real
+ * HTML in both kinds of review, plus the pure decision behind the one banner
+ * the header hangs beneath them.
  *
  * A review of two local branches has no continuous integration behind it and no
  * body someone typed into a form, so a Checks tab and a Description tab there
@@ -10,14 +12,24 @@
  * asserted PRESENT in the other mode, from the same component and the same
  * harness.
  *
- * `PrTabs` is props-only for exactly this reason: the layout around it needs a
- * query client, a session and a populated pull list before it renders a single
- * element, while the strip needs only the mode and two counts.
+ * `PrTabs` and `PrIdentityRow` are props-only for exactly this reason: the
+ * layout around them needs a query client, a session and a populated pull list
+ * before it renders a single element, while the strip needs only the mode and
+ * two counts and the identity row needs only the mode and the review itself.
+ *
+ * The reviews are read out of the fixture set rather than assembled here. What
+ * is under test is what the header does with a real review — a branch pair
+ * whose head is `release/0.41` is exactly the kind of name a careless identity
+ * assertion mistakes for a leaked key — and a review built by the test would
+ * prove only that the test built it that way.
  */
 import { describe, expect, test } from 'bun:test'
 import { createElement } from 'react'
+import type { PullDetail, PullSummary } from '@revu/shared'
+import { fixtureDB } from '@/fixtures'
 import { renderStatic } from '@/lib/render-test'
-import { PrTabs } from './pr-layout'
+import { authorBannerVisible } from '@/components/author/author-banner'
+import { PrIdentityRow, PrTabs } from './pr-layout'
 
 /** The strip as HTML, with counts that make both count slots render. */
 function strip(mode: 'github' | 'local'): string {
@@ -108,5 +120,177 @@ describe('the tabs that survive the omission', () => {
     )
     expect(quiet).toContain('Conversation')
     expect(quiet).not.toContain('>0<')
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The identity row
+// ————————————————————————————————————————————————————————————————
+
+/** The seeded pull request with this number, or a failure naming it. */
+function pullNumbered(n: number): PullDetail {
+  const found = fixtureDB.pulls.find((p) => p.detail.number === n)
+  if (found === undefined) throw new Error(`the fixture set holds no pull request ${n}`)
+  return found.detail
+}
+
+const GITHUB_PULL = pullNumbered(347)
+const LOCAL_PULL = fixtureDB.localReviews[0].snapshot.mutable.pull
+
+/** One review's identity row as HTML. */
+function identityRow(mode: 'github' | 'local', pull: PullSummary): string {
+  return renderStatic(createElement(PrIdentityRow, { mode, pull }))
+}
+
+/** Rendered text with the markup taken out, so an assertion reads what a reader would. */
+function visibleText(markup: string): string {
+  return markup.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** The identity slot's accessible name, or a sentence saying it has none. */
+function identityLabel(markup: string): string {
+  const match = /\saria-label="([^"]*)"/.exec(markup)
+  return match === null ? 'the identity slot has no accessible name' : match[1]
+}
+
+const GITHUB_ROW = identityRow('github', GITHUB_PULL)
+const LOCAL_ROW = identityRow('local', LOCAL_PULL)
+
+describe('what a review is called in its own header', () => {
+  test('a pull request is called by its number', () => {
+    // The positive control for both absences below: this search does find a
+    // number in this component's markup when there is one to find.
+    expect(visibleText(GITHUB_ROW)).toContain('#347')
+  })
+
+  test('a branch pair is called by the two branches it compares', () => {
+    expect(visibleText(LOCAL_ROW)).toContain(
+      `${LOCAL_PULL.base.ref} ← ${LOCAL_PULL.head.ref}`,
+    )
+  })
+
+  test('and renders no number anywhere in its markup', () => {
+    // The rule as a regex over real markup rather than as a promise about one
+    // element, so it stays true if a later edit reintroduces the number
+    // through a different one — a heading, a title, an attribute. Searched
+    // over the raw HTML for that reason, not over the visible text.
+    expect(LOCAL_ROW).not.toMatch(/#\d+/)
+  })
+
+  test('nor the key itself, unadorned', () => {
+    // Searched WHOLE. Hunting for digits of the key would collapse to "names
+    // no 0 and no 1", which this fixture's own `release/0.41` trips with
+    // nothing leaked at all.
+    expect(LOCAL_ROW).not.toContain(String(LOCAL_PULL.number))
+  })
+
+  test('the pair is named as one thing, because an arrow has no spoken form', () => {
+    expect(identityLabel(LOCAL_ROW)).toBe(
+      `Local review of ${LOCAL_PULL.head.ref} against ${LOCAL_PULL.base.ref}`,
+    )
+  })
+
+  test('a branch pair says where it came from, and a pull request does not', () => {
+    // The marker is a provenance fact, so it is the quiet outline chip rather
+    // than the violet reserved for pending work or the gold for a snapshot
+    // time moved underneath.
+    expect(LOCAL_ROW).toContain('>local<')
+    expect(GITHUB_ROW).not.toContain('>local<')
+  })
+
+  test('both kinds of review still say what state they are in', () => {
+    // Dropping the chip on one path would make a review still taking comments
+    // look exactly like one that is finished with them.
+    expect(visibleText(GITHUB_ROW)).toContain('open')
+    expect(visibleText(LOCAL_ROW)).toContain('in review')
+  })
+
+  test('and both draw the title they were given', () => {
+    expect(visibleText(GITHUB_ROW)).toContain(GITHUB_PULL.title)
+    expect(visibleText(LOCAL_ROW)).toContain(LOCAL_PULL.title)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The banner beneath the header
+// ————————————————————————————————————————————————————————————————
+
+describe('who the thread-queue banner is for', () => {
+  test('a pull request shows it to the human who drove the identity that opened it', () => {
+    // Pinned with an empty queue on purpose: this path shows the banner to its
+    // author whether or not anything is waiting, and that is the rule the
+    // local answer below must not leak into.
+    expect(
+      authorBannerVisible({
+        mode: 'github',
+        authorHumanId: 'h-1',
+        humanId: 'h-1',
+        state: 'open',
+        unresolved: 0,
+      }),
+    ).toBe(true)
+  })
+
+  test('and to nobody else, however much is waiting', () => {
+    expect(
+      authorBannerVisible({
+        mode: 'github',
+        authorHumanId: 'h-2',
+        humanId: 'h-1',
+        state: 'open',
+        unresolved: 3,
+      }),
+    ).toBe(false)
+  })
+
+  test('and not once the pull request is closed', () => {
+    expect(
+      authorBannerVisible({
+        mode: 'github',
+        authorHumanId: 'h-1',
+        humanId: 'h-1',
+        state: 'closed',
+        unresolved: 3,
+      }),
+    ).toBe(false)
+  })
+
+  test('a branch pair shows it whenever threads are waiting, whoever is reading', () => {
+    // Nobody drove a shared identity to open anything here, so there is no
+    // authorship to match against — the banner is warranted by the trip it
+    // offers, which is the only entry to the thread queue in the header.
+    expect(
+      authorBannerVisible({
+        mode: 'local',
+        authorHumanId: null,
+        humanId: 'h-1',
+        state: 'open',
+        unresolved: 2,
+      }),
+    ).toBe(true)
+  })
+
+  test('and withholds it when the queue is empty and there is no trip to offer', () => {
+    expect(
+      authorBannerVisible({
+        mode: 'local',
+        authorHumanId: null,
+        humanId: 'h-1',
+        state: 'open',
+        unresolved: 0,
+      }),
+    ).toBe(false)
+  })
+
+  test('and never on a review that has stopped taking comments', () => {
+    expect(
+      authorBannerVisible({
+        mode: 'local',
+        authorHumanId: null,
+        humanId: 'h-1',
+        state: 'closed',
+        unresolved: 2,
+      }),
+    ).toBe(false)
   })
 })

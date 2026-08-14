@@ -2,11 +2,13 @@ import { useCallback, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { Link, NavLink, Outlet, useParams } from 'react-router'
 import { Download, Inbox, RefreshCw } from 'lucide-react'
-import type { ApiError, Snapshot, StalenessInfo } from '@revu/shared'
+import type { ApiError, PullSummary, Snapshot, StalenessInfo } from '@revu/shared'
 import { identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
+import { notFoundCopy, stateChipCopy } from '@/lib/mode-copy'
+import type { ReviewState } from '@/lib/mode-copy'
 import { reviewMode, reviewTabs } from '@/lib/review-mode'
 import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
 import { minutesUntil, relativeTime, shortSha } from '@/lib/time'
@@ -322,12 +324,110 @@ export function PrTabs({
 PrTabs.displayName = 'PrTabs'
 
 // ————————————————————————————————————————————————————————————————
+// Identity row — what the review is, at the top of the header.
+// ————————————————————————————————————————————————————————————————
+
+/** The chip's tint per state: the review is live, it landed, or it did not. */
+const STATE_VARIANT: Record<ReviewState, 'add' | 'default' | 'danger'> = {
+  open: 'add',
+  merged: 'default',
+  closed: 'danger',
+}
+
+/**
+ * Which of the three states a review is in, read off the review itself. A
+ * merge timestamp is the only evidence one landed — a merged pull request also
+ * reports `state: 'closed'`, so the timestamp is checked first.
+ */
+function reviewState(pull: PullSummary): ReviewState {
+  if (pull.merged_at) return 'merged'
+  return pull.state === 'open' ? 'open' : 'closed'
+}
+
+/**
+ * What a review is called, in the slot at the head of its identity row.
+ *
+ * A pull request is called by its number. A review of two local branches has
+ * no pull request and so no number a reader could use — only a synthetic key
+ * from a reserved band, which exists so every route and cache entry can stay a
+ * plain integer and means nothing to anyone reading the screen. So it is
+ * called by the branch pair it compares, and the key is never drawn.
+ *
+ * The pair is named as one thing rather than read out piecemeal: the arrow
+ * carries the direction and an arrow has no spoken form, so the whole slot is
+ * labelled as a sentence and its parts are left to the eye.
+ */
+function IdentitySlot({ mode, pull }: { mode: ReviewMode; pull: PullSummary }) {
+  if (mode === 'github') {
+    return <span className="shrink-0 font-mono text-ink-faint">#{pull.number}</span>
+  }
+  return (
+    <span
+      role="img"
+      aria-label={`Local review of ${pull.head.ref} against ${pull.base.ref}`}
+      className="flex max-w-64 shrink-0 items-center gap-1 font-mono text-ink-faint"
+    >
+      <span className="min-w-0 truncate">{pull.base.ref}</span>
+      <span aria-hidden>←</span>
+      <span className="min-w-0 truncate">{pull.head.ref}</span>
+    </span>
+  )
+}
+
+/**
+ * Row 1 of the review header: the way back, what the review is, what it is
+ * called, and what it claims about itself.
+ *
+ * Props-only and exported for the reason the tab strip is: the layout around
+ * it needs a query client, a session and a loaded list before it renders a
+ * single element, while this row needs only the mode and the review itself —
+ * so "the synthetic key never reaches a screen" is a property assertable
+ * against real markup rather than a promise about a branch buried in a page.
+ *
+ * The local marker is the quiet outline chip, not the seal one row below and
+ * not the violet: where a review came from is a fact about its provenance,
+ * while the seal reports that time moved underneath a snapshot and violet is
+ * reserved for work that is still pending.
+ */
+export function PrIdentityRow({ mode, pull }: { mode: ReviewMode; pull: PullSummary }) {
+  const state = reviewState(pull)
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <Link to="/" className="shrink-0 text-2xs text-ink-faint hover:text-ink-mut">
+        ← inbox
+      </Link>
+      <IdentitySlot mode={mode} pull={pull} />
+      <h1 className="min-w-0 truncate text-base font-semibold text-ink" title={pull.title}>
+        {pull.title}
+      </h1>
+      {mode === 'local' && (
+        <Badge className="shrink-0" variant="outline">
+          local
+        </Badge>
+      )}
+      <Badge className="shrink-0" variant={STATE_VARIANT[state]}>
+        {stateChipCopy(mode, state)}
+      </Badge>
+      {pull.draft && (
+        <Badge className="shrink-0" variant="draft">
+          draft
+        </Badge>
+      )}
+    </div>
+  )
+}
+PrIdentityRow.displayName = 'PrIdentityRow'
+
+// ————————————————————————————————————————————————————————————————
 // Layout
 // ————————————————————————————————————————————————————————————————
 
 export function PrLayout() {
   const params = useParams<{ n: string }>()
   const prNumber = Number(params.n)
+  // Derived once for the whole subtree and threaded down as a prop, so no two
+  // surfaces inside one review can disagree about which kind it is.
+  const mode = reviewMode(prNumber)
 
   const session = useSession()
   const list = usePullList()
@@ -393,8 +493,12 @@ export function PrLayout() {
     )
   }
 
-  // The list is loaded and this PR genuinely isn't in it.
+  // The list is loaded and this review genuinely isn't in it. Which sentence
+  // explains that depends on the kind of review the path named, so the copy is
+  // read from the mode rather than from the one kind that has an installation
+  // behind it.
   if (!item) {
+    const copy = notFoundCopy(mode, params.n ?? '')
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="hairline-b px-4 py-2">
@@ -405,11 +509,11 @@ export function PrLayout() {
         <div className="flex flex-1 items-center justify-center">
           <EmptyState
             icon={<Inbox size={20} strokeWidth={1.5} />}
-            title={`PR #${params.n} isn't in this installation`}
-            hint="The broker only sees pull requests in repos this GitHub App is installed on."
+            title={copy.title}
+            hint={copy.hint}
             action={
               <Button asChild variant="outline" size="sm">
-                <Link to="/">Back to inbox</Link>
+                <Link to="/">{copy.action}</Link>
               </Button>
             }
           />
@@ -433,36 +537,12 @@ export function PrLayout() {
         : rollup.running > 0
           ? 'animate-pulse bg-stale'
           : 'bg-add'
-  const stateBadge = pull.merged_at
-    ? { label: 'merged', variant: 'default' as const }
-    : pull.state === 'open'
-      ? { label: 'open', variant: 'add' as const }
-      : { label: 'closed', variant: 'danger' as const }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="hairline-b px-4 pt-3">
-        {/* Row 1 — identity of the PR itself */}
-        <div className="flex min-w-0 items-center gap-2">
-          <Link to="/" className="shrink-0 text-2xs text-ink-faint hover:text-ink-mut">
-            ← inbox
-          </Link>
-          <span className="shrink-0 font-mono text-ink-faint">#{pull.number}</span>
-          <h1
-            className="min-w-0 truncate text-base font-semibold text-ink"
-            title={pull.title}
-          >
-            {pull.title}
-          </h1>
-          <Badge className="shrink-0" variant={stateBadge.variant}>
-            {stateBadge.label}
-          </Badge>
-          {pull.draft && (
-            <Badge className="shrink-0" variant="draft">
-              draft
-            </Badge>
-          )}
-        </div>
+        {/* Row 1 — identity of the review itself */}
+        <PrIdentityRow mode={mode} pull={pull} />
 
         {/* Row 2 — meta: author, refs, mergeability, checks, diff size */}
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-mut">
@@ -496,9 +576,16 @@ export function PrLayout() {
           )}
         </div>
 
-        {/* PR-author banner: its own logic decides whether it shows anything. */}
-        <div className="pt-2 empty:hidden">
-          <AuthorBanner prNumber={prNumber} />
+        {/* The header's banner stack. Each member decides its own visibility
+            and renders nothing when it has none, so the slot collapses
+            entirely when they all do and a member can be added without any of
+            the others knowing about it.
+
+            The order is fixed rather than incidental, from the widest claim
+            about the review down to the narrowest: what has superseded it,
+            then what it does not cover, then what it is waiting on. */}
+        <div className="flex flex-col gap-2 py-2 empty:hidden">
+          <AuthorBanner prNumber={prNumber} mode={mode} />
         </div>
 
         {/* Row 3 — the seal on the left, section tabs on the right */}
@@ -513,7 +600,7 @@ export function PrLayout() {
             />
           </div>
           <PrTabs
-            mode={reviewMode(prNumber)}
+            mode={mode}
             changedFiles={detail?.changed_files}
             unresolved={item.broker.unresolvedThreads}
           />
