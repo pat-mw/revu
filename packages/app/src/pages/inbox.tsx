@@ -2,6 +2,7 @@ import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'r
 import { Link, useNavigate } from 'react-router'
 import { useQueries } from '@tanstack/react-query'
 import {
+  ArrowLeft,
   ArrowRight,
   CircleCheck,
   CircleDot,
@@ -12,6 +13,7 @@ import {
 
 import { api } from '@/api'
 import { qk, usePullList, useRateLimit } from '@/state/queries'
+import { hasAnyLocalReview, useLocalReviewAnnotations } from '@/state/local-reviews'
 import { usePreferences, useSetPreferences } from '@/state/preferences'
 import { useSession } from '@/state/session'
 import type { PullListItem, ReviewDraft } from '@revu/shared'
@@ -30,6 +32,9 @@ import { cn } from '@/lib/cn'
 import { buildPullTree, flattenPullTree } from '@/lib/pull-tree'
 import { buildPullTooltip } from '@/lib/pull-tooltip'
 import type { PullTooltip } from '@/lib/pull-tooltip'
+import { buildInboxSections, matchesFilter } from '@/lib/inbox-sections'
+import type { InboxRow } from '@/lib/inbox-sections'
+import { isLocalReviewItem, rowIdentity } from '@/lib/local-reviews'
 import { Button } from '@/components/ui/button'
 
 /**
@@ -37,7 +42,9 @@ import { Button } from '@/components/ui/button'
  * list. It sorts every open PR into four intent-ordered buckets — what's waiting
  * on you, what you owe a review, what you've left half-written, and everything
  * else — and makes the one number that matters (unresolved comments on your own
- * PRs) the loudest thing on the screen.
+ * PRs) the loudest thing on the screen. Reviews of a branch pair with no pull
+ * request behind them get a section of their own, because they answer to
+ * nobody's attention but the reader's.
  *
  * The PR list is the app's single live surface: it polls on a schedule, so the
  * whisper under the title states liveness and freshness quietly rather than
@@ -45,36 +52,6 @@ import { Button } from '@/components/ui/button'
  * concern and stays out of the copy — the only budget the reader can act on is
  * the one the rate chip shows.
  */
-
-/** A row as it will render, carrying the section it belongs to and any draft. */
-interface InboxRow {
-  item: PullListItem
-  draft?: ReviewDraft | null
-}
-
-interface Section {
-  id: SectionId
-  title: string
-  rows: InboxRow[]
-}
-
-type SectionId = 'waiting' | 'review' | 'drafts' | 'everything'
-
-/** Case-insensitive match over a PR's title, number, and author display name. */
-function matchesFilter(item: PullListItem, needle: string, botLogin: string): boolean {
-  if (!needle) return true
-  const { identity } = parseCommentIdentity(
-    {
-      user: item.pull.user,
-      body: item.pull.body ?? '',
-    },
-    botLogin,
-  )
-  const authorName =
-    identity.kind === 'human' ? identity.name : item.pull.user.login
-  const haystack = `${item.pull.title} #${item.pull.number} ${authorName}`.toLowerCase()
-  return haystack.includes(needle)
-}
 
 export function InboxPage() {
   const navigate = useNavigate()
@@ -118,43 +95,32 @@ export function InboxPage() {
     [items, human.id],
   )
 
-  const sections = useMemo<Section[]>(() => {
-    const open = items.filter((it) => it.pull.state === 'open')
-    const filtered = open.filter((it) => matchesFilter(it, needle, session.brokerLogin))
+  // What only a local review has, and what the list row cannot carry: whether
+  // its worktree is dirty, and whether the reader holds any local review at
+  // all. Its own read on purpose, and one that must stay eager — the list's
+  // ETag is a function of the reviews' compare keys, so a worktree picking up
+  // uncommitted changes does not move it and no amount of polling the list
+  // would ever reveal one.
+  const annotations = useLocalReviewAnnotations()
+  const localAnnotations = annotations.data
+  const hasLocalReviews = hasAnyLocalReview(localAnnotations)
+  const dirtyReviews = useMemo(
+    () => new Set((localAnnotations ?? []).filter((s) => s.dirty).map((s) => s.id)),
+    [localAnnotations],
+  )
 
-    const waiting = filtered.filter(
-      (it) =>
-        it.broker.authorHumanId === human.id && it.broker.unresolvedThreads > 0,
-    )
-    const toReview = filtered.filter(
-      (it) =>
-        it.broker.authorHumanId !== human.id &&
-        it.broker.assignedReviewerHumanIds.includes(human.id),
-    )
-    const drafts = filtered.filter((it) => draftByNumber.has(it.pull.number))
-
-    // "Everything else" is what none of the intent buckets claimed. A PR can be
-    // both a draft-in-progress and something you owe a review; it appears in
-    // every bucket it qualifies for but is excluded from the catch-all once any
-    // earlier bucket named it.
-    const claimed = new Set<number>()
-    for (const it of [...waiting, ...toReview, ...drafts]) {
-      claimed.add(it.pull.number)
-    }
-    const everything = filtered.filter((it) => !claimed.has(it.pull.number))
-
-    const toRow = (it: PullListItem): InboxRow => ({
-      item: it,
-      draft: draftByNumber.get(it.pull.number) ?? null,
-    })
-
-    return [
-      { id: 'waiting' as const, title: 'Waiting on you', rows: waiting.map(toRow) },
-      { id: 'review' as const, title: 'To review', rows: toReview.map(toRow) },
-      { id: 'drafts' as const, title: 'Drafts in progress', rows: drafts.map(toRow) },
-      { id: 'everything' as const, title: 'Everything else', rows: everything.map(toRow) },
-    ]
-  }, [items, needle, human.id, draftByNumber, session.brokerLogin])
+  const sections = useMemo(
+    () =>
+      buildInboxSections({
+        items,
+        needle,
+        humanId: human.id,
+        botLogin: session.brokerLogin,
+        draftByNumber,
+        hasLocalReviews,
+      }),
+    [items, needle, human.id, draftByNumber, session.brokerLogin, hasLocalReviews],
+  )
 
   // How the inbox is arranged is a per-human preference, persisted behind the
   // adapter like the diff layout, so it survives a reload and a rebuild.
@@ -270,12 +236,7 @@ export function InboxPage() {
             view={view}
             onView={setView}
           />
-          <EmptyState
-            className="mt-6"
-            icon={<Inbox strokeWidth={1.5} />}
-            title="Nothing open right now"
-            hint="No open pull requests — when a contractor pushes a branch, it lands here."
-          />
+          <InboxZeroState />
         </div>
       </div>
     )
@@ -321,6 +282,7 @@ export function InboxPage() {
                             draft: draftByNumber.get(node.item.pull.number) ?? null,
                           }}
                           showUnresolvedNumber={false}
+                          dirty={dirtyReviews.has(node.item.pull.number)}
                           focused={index === focusIndex}
                           onFocus={() => setFocusIndex(index)}
                           depth={node.depth}
@@ -340,7 +302,9 @@ export function InboxPage() {
             sections.map((section) => {
             const isWaiting = section.id === 'waiting'
             // Empty sections are omitted — except "Waiting on you", which stays
-            // as a quiet reassurance when the human has authored open PRs.
+            // as a quiet reassurance when the human has authored open PRs, and
+            // "Local reviews", which the derivation only includes when there
+            // are some to account for and which then says where they went.
             if (section.rows.length === 0) {
               if (isWaiting && hasAuthored) {
                 return (
@@ -348,6 +312,17 @@ export function InboxPage() {
                     <SectionHeader title={section.title} count={0} />
                     <p className="px-1 py-2 text-sm text-ink-mut">
                       Nothing waiting on you — no unresolved comments on your PRs.
+                    </p>
+                  </section>
+                )
+              }
+              if (section.id === 'local') {
+                return (
+                  <section key={section.id}>
+                    <SectionHeader title={section.title} count={0} />
+                    <p className="px-1 py-2 text-sm text-ink-mut">
+                      Nothing open here — every local review you have is either closed or
+                      filtered out.
                     </p>
                   </section>
                 )
@@ -370,6 +345,7 @@ export function InboxPage() {
                         }}
                         row={row}
                         showUnresolvedNumber={isWaiting}
+                        dirty={dirtyReviews.has(row.item.pull.number)}
                         focused={index === focusIndex}
                         onFocus={() => setFocusIndex(index)}
                       />
@@ -462,6 +438,75 @@ function InboxHeader({
   )
 }
 
+/**
+ * What a row is called, in the narrow slot at its left edge.
+ *
+ * A pull request is called by its number. A local review has no pull request
+ * and no GitHub number — only a synthetic key from a reserved band, which
+ * exists so routes and cache keys can stay plain integers and means nothing to
+ * anyone reading the screen. So a local row is called by the branch pair it
+ * compares, and the key is never drawn.
+ *
+ * The slot routes entirely through one pure reading of the row. That is what
+ * makes "the synthetic key is never on screen" something a test can hold,
+ * rather than a branch inside a component that a later edit can quietly widen.
+ */
+export function RowIdentity({ item }: { item: PullListItem }) {
+  const identity = rowIdentity(item)
+  if (identity.kind === 'github') {
+    return (
+      <span className="w-12 shrink-0 font-mono text-xs text-ink-faint">
+        {identity.text}
+      </span>
+    )
+  }
+  // Named as one thing rather than read out piecemeal: the arrow carries the
+  // direction, and an arrow has no spoken form, so the pair is labelled as a
+  // sentence and its parts are left to the eye.
+  return (
+    <span
+      role="img"
+      aria-label={`Local review of ${identity.head} against ${identity.base}`}
+      className="flex w-40 shrink-0 items-center gap-1 font-mono text-xs text-ink-faint"
+    >
+      <span className="min-w-0 truncate">{identity.base}</span>
+      <ArrowLeft size={11} strokeWidth={1.5} className="shrink-0" aria-hidden />
+      <span className="min-w-0 truncate">{identity.head}</span>
+    </span>
+  )
+}
+
+/**
+ * The inbox with nothing open in it.
+ *
+ * The reason there is nothing open is not always that nobody has pushed yet:
+ * a workspace may have no remote at all, and promising that a branch will
+ * "land here" describes an arrival that is never coming. So the copy names
+ * what this workspace can do on its own, and offers it.
+ *
+ * The action appears only when a caller can honour it — a surface with no
+ * creation flow to open shows the invitation rather than a button that goes
+ * nowhere.
+ */
+export function InboxZeroState({ onCreate }: { onCreate?: () => void }) {
+  return (
+    <EmptyState
+      className="mt-6"
+      icon={<Inbox strokeWidth={1.5} />}
+      title="Nothing open right now"
+      hint="No open pull requests — a review can compare any two branches in this workspace, with or without one."
+      action={
+        onCreate ? (
+          <Button onClick={onCreate}>
+            <GitBranch size={14} strokeWidth={1.5} aria-hidden />
+            New local review
+          </Button>
+        ) : undefined
+      }
+    />
+  )
+}
+
 /** Uppercase section label with a live count of the rows beneath it. */
 function SectionHeader({ title, count }: { title: string; count: number }) {
   return (
@@ -488,6 +533,14 @@ const InboxRowView = forwardRef<
   {
     row: InboxRow
     showUnresolvedNumber: boolean
+    /**
+     * The workspace had uncommitted changes when this local review last synced,
+     * so what it shows is behind what is on disk. Read from the local-review
+     * annotations rather than from the row: the list payload is frozen and
+     * carries no such field, and its ETag would not move when a worktree
+     * changed anyway.
+     */
+    dirty?: boolean
     focused: boolean
     onFocus: () => void
     /**
@@ -497,7 +550,7 @@ const InboxRowView = forwardRef<
      */
     depth?: number
   }
->(({ row, showUnresolvedNumber, focused, onFocus, depth = 0 }, ref) => {
+>(({ row, showUnresolvedNumber, dirty = false, focused, onFocus, depth = 0 }, ref) => {
   const session = useSession()
   const { pull, broker } = row.item
   const parsed = parseCommentIdentity(
@@ -508,6 +561,7 @@ const InboxRowView = forwardRef<
     parsed.identity.kind === 'human' ? parsed.identity.name : pull.user.login
   const labels = pull.labels.slice(0, 2)
   const hasDraft = !!row.draft
+  const isLocal = isLocalReviewItem(row.item)
   const unresolved = broker.unresolvedThreads
   const tip = useMemo(() => buildPullTooltip(row.item), [row.item])
 
@@ -540,9 +594,7 @@ const InboxRowView = forwardRef<
               └
             </span>
           )}
-          <span className="w-12 shrink-0 font-mono text-xs text-ink-faint">
-            #{pull.number}
-          </span>
+          <RowIdentity item={row.item} />
 
           <IdentityAvatar identity={parsed.identity} size="sm" />
 
@@ -571,7 +623,28 @@ const InboxRowView = forwardRef<
               </Badge>
             )}
 
-            {broker.canApprove && (
+            {/* Where this review came from, not what it is waiting for — so a
+                quiet outline rather than the violet that means pending work. */}
+            {isLocal && (
+              <Badge variant="outline" className="shrink-0">
+                local
+              </Badge>
+            )}
+
+            {dirty && (
+              <Badge
+                variant="stale"
+                className="shrink-0"
+                title="The worktree had uncommitted changes at the last sync — they are not in this review."
+              >
+                worktree dirty
+              </Badge>
+            )}
+
+            {/* Approvability is a statement about a pull request in an
+                organization. There is no pull request behind a local review and
+                no organization saw the branch, so the claim is not made. */}
+            {!isLocal && broker.canApprove && (
               <Badge variant="outline" className="shrink-0">
                 org PR — approvable
               </Badge>
