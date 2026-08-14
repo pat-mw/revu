@@ -10,13 +10,29 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-| ticket · unit | branch | tier | what it is |
-| --- | --- | --- | --- |
-| **M8.6.7** — the headless-render seam (`location` shim) | `m8.6/app-creation-flow` | opus | W1; the harness every later query- and render-shaped Check rests on |
-| **M8.1.9 review** — fable adversarial pass on `4fbc5fb` | `m8.1/contract-and-mock` | fable | read-only; no files held |
+| ticket · unit | branch | tier | isolation | what it is |
+| --- | --- | --- | --- | --- |
+| **M8.6.1** — pure view-model (identity, partition, label, validation) | `m8.6/app-creation-flow` | opus | worktree | W2; needs nothing from the shim |
+| **M8.6.2** — query layer (branches, create, list invalidation) | `m8.6/app-creation-flow` | opus | worktree | W2; needs M8.6.7's shim, which has landed |
+| **M8.1.9 review** — fable adversarial pass on `4fbc5fb` | `m8.1/contract-and-mock` | fable | read-only | no files held |
 
-**M8.1.9 has landed and is pushed** — commit `4fbc5fb`, gate exit 0 at **1246 pass · 1 skip · 0 fail · 68
-files**, on PR [#70](https://github.com/pat-mw/revu/pull/70). Its adversarial review is still running.
+**Landed this session, in chain order:**
+
+| unit | commit | branch | gate at that commit |
+| --- | --- | --- | --- |
+| M8.1.9 — refuse submit before first sync | `4fbc5fb` | `m8.1` (pushed, on [#70](https://github.com/pat-mw/revu/pull/70)) | 1246 pass · 1 skip · 0 fail · 68 files |
+| board — the owner's rulings + M8.12 + `.gitignore` | `fd525f8` | `m8.6` | — (no code) |
+| M8.6.7 — the headless-render seam | `e9f2303` | `m8.6` | 1251 pass · 1 skip · 0 fail · 69 files |
+
+**Two deviations from the roadmap's S2 wave plan, both recorded with reasons.**
+1. **W1 was M8.6.7 ∥ M8.7.10; it ran as M8.6.7 alone.** M8.7.10's files belong to `m8.7`, which branches off
+   `m8.6` and does not exist yet — running it now means holding an uncommitted diff across all seven M8.6
+   units, which is exactly the unlanded work §7 says to discard rather than archaeologize. M8.7.10 runs first
+   on `m8.7` instead; it is compact and the wall-clock cost is small against the resumability risk.
+2. **W2 runs with worktree isolation, which the roadmap marks "none".** Two agents sharing one tree cannot each
+   run `bun run check` — the gate ends in `vite build`, and concurrent builds race on the same `dist`. The
+   roadmap's "none" assumed the wave was sequenced; per-unit gating is the harder requirement, so the units are
+   isolated instead. M8.6.1 additionally needs nothing from M8.6.7's shim, so it started before it landed.
 
 **Session 2 (the app) is running.** The owner interview completed first and **decision package #1 is ruled** —
 16 standing rulings in [`HANDOVER.md`](./HANDOVER.md)'s top entry. **Session 3 is therefore unblocked** and may
