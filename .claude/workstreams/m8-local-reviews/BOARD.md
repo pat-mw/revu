@@ -12,7 +12,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 | ticket · unit | branch | tier | isolation | what it is |
 | --- | --- | --- | --- | --- |
-| **M8.6.5** — entry points: header button, palette, `g l` chord | `m8.6/app-creation-flow` | opus | worktree | W4, **serialized**; also inherits M8.6.4's unwired `onCreate` |
+| **M8.6.6** — tree exclusion + filter widening | `m8.6/app-creation-flow` | opus | worktree | W4, serialized; **last M8.6 unit**. Also carries the inherited approvable-badge assertion |
 
 **The `m8.1` → `m8.6` rebase is DONE.** `m8.1` gained `8b73a77` (the adversarial review's fixes) and is pushed;
 `m8.6` was rebased onto it and verified — `git merge-base --is-ancestor` confirms `m8.6` contains the `m8.1`
@@ -31,7 +31,9 @@ fuller comment. **Every `m8.6` sha below the rebase point changed**; the table b
 | M8.6.1 — pure view-model | `8385bdf` | `m8.6` | 1263 pass · 1 skip · 0 fail · 70 files |
 | M8.6.2 — query layer | `113aee8` | `m8.6` | 1269 pass · 1 skip · 0 fail · 71 files |
 | board — the adversarial review record | `2c0538c` | `m8.6` | — (no code) |
-| M8.6.3 — the create dialog | `eb20f17` | `m8.6` | **1277 pass · 1 skip · 0 fail · 72 files** |
+| M8.6.3 — the create dialog | `eb20f17` | `m8.6` | 1277 pass · 1 skip · 0 fail · 72 files |
+| M8.6.4 — inbox section + local row variant | `be9442a` | `m8.6` | 1310 pass · 1 skip · 0 fail · 74 files |
+| M8.6.5 — entry points + the `g l` chord | `836b841` | `m8.6` | **1323 pass · 1 skip · 0 fail · 75 files** |
 
 **Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
 one. **Worktree hazard, now in the memories and in every dispatch brief:** an isolated agent worktree is created
