@@ -183,3 +183,12 @@ exhaustiveness guard is red-first.
 - **Sessions 2 and 3 both fork off `m8.1` and are genuinely concurrent** (zero shared files — `packages/app`
   vs `packages/revud`); on two machines that is the plan's single largest schedulable win. **S2 needs none of
   the rulings and can start immediately**; S3 needs three of them. S3 owns the splice.
+
+**addendum — 2026-08-13 (owner, after the session closed)**
+- **Nothing merges until the whole M8 workstream lands.** Every session keeps stacking; `main` stays at
+  `177068a` for the milestone and #70 stays based on #69. `SESSION_PROTOCOL.md` §6's rebase-after-a-base-merge
+  step never fires, which makes `ROADMAP.md`'s chain order load-bearing for the whole milestone rather than
+  only until the first merge. Supersedes this entry's "**#69 merges first**" bullet above.
+- **The owner will be interviewed on the open questions rather than having recommendations applied.** The next
+  session opens by putting decision package #1 — plus the two rulings the adversarial review surfaced — to the
+  owner interactively, and records each answer as a standing ruling.

@@ -16,8 +16,26 @@ act from it alone.
 **`m8/local-reviews-design`** (PR [#69](https://github.com/pat-mw/revu/pull/69)), **not** `main`. That is
 deliberate: the board and `docs/agent/LOCAL_REVIEWS.md` exist only on that branch, so a `main`-based branch
 would strand every board write. #69 carries **zero files under `packages/`**, so #70's code diff is identical
-to a `main`-based one, and GitHub retargets #70 to `main` automatically when #69 merges. **Merge #69 first,
-then #70.** Nothing was committed to `main`; nothing was merged. Working tree clean, In flight empty.
+to a `main`-based one. Nothing was committed to `main`; nothing was merged. Working tree clean, In flight
+empty.
+
+> ### ⚠️ Merge protocol for the rest of M8 — set by the owner 2026-08-13
+>
+> **Nothing merges until the whole workstream lands.** Every session **keeps stacking**: branch off the
+> previous ticket's branch, open the PR with that branch as its base, never merge, never retarget to `main`.
+> The chain reaches ~12 PRs before anything merges, and `main` stays at `177068a` throughout.
+>
+> Consequences a cold agent must not rediscover:
+> - **#70 will NOT auto-retarget to `main`** — it stays based on #69 for the duration. Any handover text
+>   assuming an early merge is stale.
+> - **Rebase-on-merge never happens mid-workstream**, so the "when a base merges, rebase the rest of the
+>   stack" step in `SESSION_PROTOCOL.md` §6 simply does not fire. The chain order in `ROADMAP.md` is
+>   therefore load-bearing for the whole milestone, not just until the first merge — it is what keeps every
+>   later rebase mechanical.
+> - **The concurrent S2 ∥ S3 splice matters more, not less.** With no merges thinning the chain, whichever
+>   of the two finishes second rebases its lane onto the other's tip before opening PRs (S3 owns the splice,
+>   per `ROADMAP.md` §6).
+> - The exit-criteria walk at the end of S5 runs against the assembled chain head, never against `main`.
 
 The chain is therefore `main → m8/local-reviews-design (#69) → m8.1 → …`, which is the same linear chain the
 roadmap specifies with one extra (docs-only) link at the bottom.
@@ -221,12 +239,28 @@ as-is** so nothing can diverge while they wait — neither blocks a session, but
 
 ### Next
 
-1. Merge **#69**, then **#70**.
-2. Rule decision package #1 above.
-3. **Sessions 2 and 3 both fork off `m8.1` and are genuinely concurrent** (zero shared files — `packages/app`
-   vs `packages/revud`). On two machines that is the single largest schedulable win in the plan. S3 owns the
-   splice. S3 needs rulings 1, 2 and 4; S2 needs none of them and can start immediately.
-4. `ROADMAP.md` → Session 2 / Session 3 carry the wave plans; `SESSION_PROTOCOL.md` is unchanged and settled.
+1. **Interview the owner interactively on the open questions before dispatching anything that consumes them.**
+   The owner has asked to be asked rather than to have recommendations applied — so decision package #1 above
+   (M8.5 OQ1, M8.8 OQ2, M8.10 OQ1–OQ3, M8.2 OQ1's behavioral half) **and** the two rulings the adversarial
+   review surfaced (the shared reaction rollup; whether submit-before-first-sync should be refused) are put to
+   them directly at the **start** of the next session. The recommendations above are the starting position for
+   that conversation, not a default to apply. Record each answer in `HANDOVER.md` as a standing ruling so no
+   later session relitigates it.
+2. **Then run Session 2 — the app** ([M8.6](./tickets/M8.6-app-creation-flow.md),
+   [M8.7](./tickets/M8.7-app-local-chrome.md)), stacked on `m8.1`. It is the natural next link in the chain
+   (`m8.6` sits directly above `m8.1`) and it consumes **none** of the rulings, so it proceeds regardless of
+   how the interview goes.
+3. **Session 3 — the daemon core** is unblocked the moment rulings 1, 2 and 4 are given. S2 and S3 are
+   genuinely concurrent (zero shared files — `packages/app` vs `packages/revud`); on two machines that is the
+   single largest schedulable win in the plan, and S3 owns the splice.
+4. `ROADMAP.md` → Session 2 / Session 3 carry the wave plans; `SESSION_PROTOCOL.md` is unchanged and settled,
+   **except** that §6's "when a base merges, rebase the rest of the stack" never fires this milestone — see
+   the merge protocol above.
+
+**What Session 1 confirmed the app work will find** (from the recorded `?mock=1` walk, not speculation): a
+local review today renders the synthetic id `#1000000001`, a `Description` tab, a `Checks` tab, an `open`
+state chip and an "org PR — approvable" chip. Every one is a GitHub-flavored affordance M8.7 exists to
+remove, so S2's exit condition is genuinely unmet rather than accidentally already satisfied.
 
 ---
 

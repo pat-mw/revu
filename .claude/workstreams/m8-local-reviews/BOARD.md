@@ -22,7 +22,13 @@ line the moment it lands. This section is the first thing an interrupted session
 Branch `m8.1/contract-and-mock`, based on `m8/local-reviews-design`
 (PR [#69](https://github.com/pat-mw/revu/pull/69)) rather than `main`, because the board and
 `docs/agent/LOCAL_REVIEWS.md` exist only on that branch; #69 carries zero files under `packages/`, so the code
-diff is identical to a `main` base and GitHub retargets `m8.1` to `main` when #69 merges. **Merge #69 first.**
+diff is identical to a `main` base.
+
+> **Merge protocol for the rest of M8 (owner, 2026-08-13): nothing merges until the whole workstream lands.**
+> Every session keeps stacking — branch off the previous ticket's branch, base the PR on it, never merge,
+> never retarget to `main`. `main` stays at `177068a` for the milestone, #70 stays based on #69, and
+> `SESSION_PROTOCOL.md` §6's rebase-after-merge step never fires. The chain order in `ROADMAP.md` is therefore
+> load-bearing for the whole milestone.
 
 | unit | tier | commit |
 | --- | --- | --- |
