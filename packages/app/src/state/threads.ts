@@ -3,6 +3,8 @@ import type { UseMutationResult } from '@tanstack/react-query'
 import { api } from '@/api'
 import type { ApiError, GhUser, ReactionKey, ReactionRollup, ReviewComment, ReviewThread, Session, Snapshot } from '@revu/shared'
 import { prefixBody } from '@revu/shared'
+import type { ReviewMode } from '@/lib/review-mode'
+import { reviewMode } from '@/lib/review-mode'
 import { qk, useSnapshot } from './queries'
 import { useSession } from './session'
 
@@ -128,14 +130,72 @@ function brokerUser(login: string): GhUser {
 }
 
 /**
- * Builds the reply exactly as the server would return it: authored by the
- * broker bot, with the human identity smuggled into the body prefix — so the
- * render pipeline (identity parsing included) treats the optimistic comment
+ * Whether writes from this session go out as a shared bot, and therefore carry
+ * the human's smuggled `**Name** (role)` prefix.
+ *
+ * `brokerLogin` is the fact: it is the empty "no bot" sentinel when the session
+ * writes as a real GitHub user or has no write identity at all, and the bot's
+ * login when one shared account fronts many humans. That is the same fact the
+ * write path branches on when it decides whether to stamp a body, so reading it
+ * here keeps the optimistic body and the stored body derived from one condition
+ * instead of two that can drift apart.
+ */
+function stampsWrites(session: Session): boolean {
+  return session.brokerLogin !== ''
+}
+
+/**
+ * The body an optimistic reply should carry: stamped only when the session
+ * stamps AND the reply lands on a pull request.
+ *
+ * A stamp exists solely to distinguish humans who share one account. Applying
+ * it where nothing is shared puts `**Name** (role)` into the rendered comment
+ * as literal markdown until the unstamped stored comment replaces it, because
+ * the identity parser only strips a prefix off a comment authored by the bot.
+ *
+ * Both halves of the condition are real. A session with no bot never stamps
+ * anything. A local review is never stamped even under a session that carries
+ * a bot, because a local write is never mediated by an account at all: it is
+ * stored verbatim beside a record of who wrote it, so the identity a stamp
+ * would smuggle is already held structurally.
+ */
+export function optimisticBody(session: Session, mode: ReviewMode, body: string): string {
+  if (mode === 'local' || !stampsWrites(session)) return body
+  return prefixBody(session.human, body)
+}
+
+/**
+ * Who an optimistic resolve is attributed to: the identity the write records,
+ * which is a different identity on a local review than on a pull request.
+ *
+ * A local resolution names the reviewer's display name, because there is no
+ * account behind it to name and an email is never rendered. On a pull request
+ * the session's own login is what lands: with a shared bot it IS the bot login,
+ * and without one it is the real authenticated user. The display name is also
+ * the last resort for a session carrying no login at all — that shape cannot
+ * write, but a derivation that can return an empty login is one an empty login
+ * can reach the screen through, and the resolved-by line renders whatever it is
+ * given.
+ */
+export function optimisticResolvedBy(session: Session, mode: ReviewMode): { login: string } {
+  if (mode === 'local') return { login: session.human.name }
+  if (session.viewerLogin !== undefined && session.viewerLogin !== '') {
+    return { login: session.viewerLogin }
+  }
+  if (session.brokerLogin !== '') return { login: session.brokerLogin }
+  return { login: session.human.name }
+}
+
+/**
+ * Builds the reply exactly as the write path would return it: authored by the
+ * broker bot, and stamped only where that write path stamps — so the render
+ * pipeline (identity parsing included) treats the optimistic comment
  * identically to the real one that replaces it.
  */
 function syntheticReply(
   thread: ReviewThread,
   session: Session,
+  mode: ReviewMode,
   body: string,
   id: number,
 ): ReviewComment {
@@ -158,7 +218,7 @@ function syntheticReply(
     start_side: null,
     subject_type: thread.subjectType === 'FILE' ? 'file' : 'line',
     user: brokerUser(session.brokerLogin),
-    body: prefixBody(session.human, body),
+    body: optimisticBody(session, mode, body),
     created_at: at,
     updated_at: at,
     reactions: emptyRollup(),
@@ -211,7 +271,7 @@ export function useReplyToThread(
       if (previousSnapshot) {
         const thread = previousSnapshot.mutable.threads.find((t) => t.id === threadId)
         if (thread) {
-          const synthetic = syntheticReply(thread, session, body, syntheticId)
+          const synthetic = syntheticReply(thread, session, reviewMode(prNumber), body, syntheticId)
           const withReply = withThread(previousSnapshot, threadId, (t) => ({
             ...t,
             comments: [...t.comments, synthetic],
@@ -288,8 +348,10 @@ export function useResolveThread(
           withThread(previousSnapshot, threadId, (t) => ({
             ...t,
             isResolved: resolved,
-            // GitHub records the resolver as the shared bot — mirror that.
-            resolvedBy: resolved ? { login: session.brokerLogin } : null,
+            // Attribute to the acting identity, which is what the write records
+            // — an optimistic resolver that disagrees swaps under the reader on
+            // success, because `onSuccess` copies `resolvedBy` from the response.
+            resolvedBy: resolved ? optimisticResolvedBy(session, reviewMode(prNumber)) : null,
           })),
         )
       }
