@@ -7,6 +7,8 @@ import { identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
+import { reviewMode, reviewTabs } from '@/lib/review-mode'
+import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
 import { minutesUntil, relativeTime, shortSha } from '@/lib/time'
 import { useShortcut } from '@/lib/keyboard'
 import { cn } from '@/lib/cn'
@@ -232,6 +234,25 @@ function SnapshotSeal({
 // Tab strip — NavLinks styled like the underline TabsTrigger.
 // ————————————————————————————————————————————————————————————————
 
+/** What each section is called where a reader can see it. */
+const TAB_LABELS: Record<ReviewTab, string> = {
+  description: 'Description',
+  conversation: 'Conversation',
+  files: 'Files',
+  commits: 'Commits',
+  checks: 'Checks',
+}
+
+/**
+ * The strip's accessible name. It is the header's only landmark, so it keeps
+ * one in both kinds of review — a review of two local branches simply has no
+ * pull request to name.
+ */
+const TAB_STRIP_LABEL: Record<ReviewMode, string> = {
+  github: 'Pull request sections',
+  local: 'Review sections',
+}
+
 function TabLink({ to, label, count }: { to: string; label: string; count?: number }) {
   return (
     <NavLink
@@ -261,6 +282,44 @@ function TabLink({ to, label, count }: { to: string; label: string; count?: numb
     </NavLink>
   )
 }
+
+/**
+ * The section tabs for one review.
+ *
+ * Props-only and exported on purpose: the layout around it needs a query
+ * client, a session and a loaded pull list before it renders anything, while
+ * the strip needs the mode and two counts — so which sections a review offers
+ * is assertable against real markup rather than against a promise.
+ *
+ * Which tabs exist is read from `reviewTabs`, the same table the route guard
+ * consults, so a section the strip omits and a section the router redirects
+ * away from can never disagree.
+ */
+export function PrTabs({
+  mode,
+  changedFiles,
+  unresolved,
+}: {
+  mode: ReviewMode
+  /** Files in the diff, or `undefined` until the snapshot has been read. */
+  changedFiles: number | undefined
+  /** Threads still open. Zero draws no chip — a quiet tab is not a busy one. */
+  unresolved: number
+}) {
+  const countFor = (tab: ReviewTab): number | undefined => {
+    if (tab === 'files') return changedFiles
+    if (tab === 'conversation') return unresolved > 0 ? unresolved : undefined
+    return undefined
+  }
+  return (
+    <nav className="-mb-px flex items-end gap-4" aria-label={TAB_STRIP_LABEL[mode]}>
+      {reviewTabs(mode).map((tab) => (
+        <TabLink key={tab} to={tab} label={TAB_LABELS[tab]} count={countFor(tab)} />
+      ))}
+    </nav>
+  )
+}
+PrTabs.displayName = 'PrTabs'
 
 // ————————————————————————————————————————————————————————————————
 // Layout
@@ -453,21 +512,11 @@ export function PrLayout() {
               onSync={runSync}
             />
           </div>
-          <nav className="-mb-px flex items-end gap-4" aria-label="Pull request sections">
-            <TabLink to="description" label="Description" />
-            <TabLink
-              to="conversation"
-              label="Conversation"
-              count={
-                item.broker.unresolvedThreads > 0
-                  ? item.broker.unresolvedThreads
-                  : undefined
-              }
-            />
-            <TabLink to="files" label="Files" count={detail?.changed_files} />
-            <TabLink to="commits" label="Commits" />
-            <TabLink to="checks" label="Checks" />
-          </nav>
+          <PrTabs
+            mode={reviewMode(prNumber)}
+            changedFiles={detail?.changed_files}
+            unresolved={item.broker.unresolvedThreads}
+          />
         </div>
       </header>
 

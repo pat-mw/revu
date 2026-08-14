@@ -1,13 +1,15 @@
 /**
- * The review-mode derivation, the path matcher it shares with the chrome, and
- * the two structural rules that keep both defined exactly once.
+ * The review-mode derivation, the path matcher it shares with the chrome, the
+ * per-mode data every gate reads, and the structural rules that keep all of it
+ * defined and consulted exactly once.
  *
  * The behavioural half is small on purpose — a review number is either in the
- * reserved local band or it is a pull request, and a path either has a review
- * open or it does not. The interesting half is structural, and reads SOURCE
- * rather than behaviour, because both rules it holds are ABSENCES: a second
- * copy of the path matcher, and a second reader of the band predicate, both
- * compile, pass every other test in the suite, and ship. Nothing but a scan
+ * reserved local band or it is a pull request, a path either has a review open
+ * or it does not, and which sections a review offers is a table. The
+ * interesting half is structural, and reads SOURCE rather than behaviour,
+ * because the rules it holds are ABSENCES: a second copy of the path matcher, a
+ * second reader of the band predicate, and a route guard someone tidied away
+ * all compile, pass every other test in the suite, and ship. Nothing but a scan
  * over the tree can hold them, so the scan lives here beside the derivation it
  * protects.
  *
@@ -39,7 +41,14 @@ import { join } from 'node:path'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { StaticRouter } from 'react-router'
-import { matchPrNumber, reviewMode, useRouteReviewMode } from './review-mode'
+import {
+  matchPrNumber,
+  prPaletteCommands,
+  redirectTargetFor,
+  reviewMode,
+  reviewTabs,
+  useRouteReviewMode,
+} from './review-mode'
 
 describe('the mode a review number is in', () => {
   test('a pull request number is github and a reserved-band id is local', () => {
@@ -88,6 +97,96 @@ describe('the mode of the review the current path has open', () => {
     expect(modeAt('/pr/347/files')).toBe('github')
     expect(modeAt('/pr/1000000001/conversation')).toBe('local')
     expect(modeAt('/inbox')).toBe('null')
+  })
+})
+
+describe('which sections a review offers', () => {
+  test('a pull request offers all five, in the order the strip draws them', () => {
+    // Pinned as a whole list rather than probed for two memberships: the order
+    // is what a reader scans and the set is what the route guard reads, and an
+    // exact value is the only form in which "and nothing else" can be read off.
+    const githubTabs = ['description', 'conversation', 'files', 'commits', 'checks']
+    expect(reviewTabs('github')).toEqual(githubTabs)
+  })
+
+  test('a local review offers only the three that mean something on a branch', () => {
+    // No continuous integration runs against a branch pair and no body was
+    // typed into a form for it, so those two sections have nothing true to say.
+    const localTabs = ['conversation', 'files', 'commits']
+    expect(reviewTabs('local')).toEqual(localTabs)
+  })
+})
+
+describe('which of the current review the palette offers', () => {
+  test('a local review is offered no Checks command', () => {
+    expect(prPaletteCommands('local')).not.toContain('checks')
+  })
+
+  test('a pull request is — the control that the command exists at all', () => {
+    // Without this, the absence above is satisfied by a palette group that
+    // lost its Checks entry on both paths, which is a different change.
+    expect(prPaletteCommands('github')).toContain('checks')
+  })
+
+  test('everything else the group offers is offered in both', () => {
+    // The omission is one entry wide. A gate that swept the whole group off
+    // the local path would still satisfy the assertion above.
+    const shared = ['files', 'conversation', 'commits', 'resync', 'walk-threads']
+    for (const command of shared) {
+      expect(prPaletteCommands('local')).toContain(command)
+      expect(prPaletteCommands('github')).toContain(command)
+    }
+  })
+})
+
+describe('a tab reached by bookmark that the strip no longer offers', () => {
+  test('a local review sends the two omitted tabs to Files', () => {
+    // Omitting a link does not omit its route: both paths stay typeable and
+    // bookmarkable, and both would otherwise render a screen whose entire
+    // content is a claim about a service this workspace is not talking to.
+    expect(redirectTargetFor('local', 'checks')).toBe('files')
+    expect(redirectTargetFor('local', 'description')).toBe('files')
+  })
+
+  test('a tab the review does offer is left alone', () => {
+    // The control for the two redirects: a guard that redirected everything
+    // would satisfy them and make the whole review one tab deep.
+    expect(redirectTargetFor('github', 'checks')).toBe(null)
+    expect(redirectTargetFor('github', 'description')).toBe(null)
+    expect(redirectTargetFor('local', 'files')).toBe(null)
+    expect(redirectTargetFor('local', 'conversation')).toBe(null)
+    expect(redirectTargetFor('local', 'commits')).toBe(null)
+  })
+})
+
+/**
+ * The router's source. Read as text because the claim below is about WIRING
+ * that only a renderer could execute — the predicate above can be correct and
+ * still be consulted by nobody.
+ */
+const APP_SOURCE = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8')
+
+describe('the route table consults the redirect decision', () => {
+  test('the read is looking at the router it names', () => {
+    // The control for the pin below: a path resolving to the wrong file, or to
+    // an empty one, would fail it for a reason with nothing to do with wiring.
+    expect(/export function App\(\)/.test(APP_SOURCE)).toBe(true)
+  })
+
+  test('the router imports the redirect decision by name', () => {
+    // PRESENCE, not execution. This does not prove the guard runs on the two
+    // omitted tabs; the assertions above prove only that the decision is
+    // right. What it does turn red is the change it exists to catch — the
+    // route guard tidied away as dead-looking indirection, which silently
+    // re-exposes both screens to anyone holding a bookmark and is invisible to
+    // every other test in the suite.
+    //
+    // Anchored to the import STATEMENT and to the module it comes from, so a
+    // mention of the name in a comment, a string, or a leftover local does not
+    // satisfy it.
+    const imported =
+      /import\s*\{[^}]*\bredirectTargetFor\b[^}]*\}\s*from\s*'@\/lib\/review-mode'/
+    expect(imported.test(APP_SOURCE)).toBe(true)
   })
 })
 

@@ -59,3 +59,82 @@ export function useRouteReviewMode(): ReviewMode | null {
   const n = matchPrNumber(pathname)
   return n === null ? null : reviewMode(n)
 }
+
+// ————————————————————————————————————————————————————————————————
+// Which chrome a review carries — as data, so gates read a table.
+// ————————————————————————————————————————————————————————————————
+
+/** One section of a review, named by the path segment that opens it. */
+export type ReviewTab = 'description' | 'conversation' | 'files' | 'commits' | 'checks'
+
+/**
+ * The tab a review opens on when the path names none, and the tab an omitted
+ * one falls back to. Files is where the work is.
+ */
+const DEFAULT_TAB: ReviewTab = 'files'
+
+/** Every section, in the order the strip draws them. */
+const GITHUB_TABS: readonly ReviewTab[] = [
+  'description',
+  'conversation',
+  'files',
+  'commits',
+  'checks',
+]
+
+/**
+ * The sections a branch pair has. Checks and Description are absent because
+ * nothing behind a local review can fill them: no continuous integration runs
+ * against a branch pair, and there is no body someone typed into a form. The
+ * screens exist and would render — each one's entire content would be a claim
+ * about a service this workspace is not talking to.
+ */
+const LOCAL_TABS: readonly ReviewTab[] = ['conversation', 'files', 'commits']
+
+/**
+ * The sections a review of this kind offers, in draw order.
+ *
+ * Returned as data rather than decided inside the strip so the omission is a
+ * value a test reads, and so the route guard and the tab strip cannot come to
+ * different conclusions about the same review.
+ */
+export function reviewTabs(mode: ReviewMode): readonly ReviewTab[] {
+  return mode === 'local' ? LOCAL_TABS : GITHUB_TABS
+}
+
+/**
+ * Where a request for `tab` should land instead, or null to render it.
+ *
+ * Omitting a link does not omit its route: every tab path stays typeable and
+ * bookmarkable whatever the strip draws, so the sections a review does not
+ * offer are answered here rather than left to render. Total over the tab set —
+ * a tab the review offers is always rendered, so this cannot quietly flatten a
+ * review to one screen.
+ */
+export function redirectTargetFor(mode: ReviewMode, tab: ReviewTab): string | null {
+  return reviewTabs(mode).includes(tab) ? null : DEFAULT_TAB
+}
+
+/** One action the palette offers for the review that is currently open. */
+export type PrPaletteCommand =
+  | 'files'
+  | 'conversation'
+  | 'commits'
+  | 'checks'
+  | 'resync'
+  | 'walk-threads'
+
+/**
+ * The actions the palette's current-review group offers, in the order it lists
+ * them.
+ *
+ * Pure and separate from the palette because the palette is a dialog: it
+ * renders through a portal and serializes to nothing, so "the Checks command is
+ * not offered on a local review" is assertable here and nowhere in its markup.
+ */
+export function prPaletteCommands(mode: ReviewMode): PrPaletteCommand[] {
+  const commands: PrPaletteCommand[] = ['files', 'conversation', 'commits']
+  if (reviewTabs(mode).includes('checks')) commands.push('checks')
+  commands.push('resync', 'walk-threads')
+  return commands
+}

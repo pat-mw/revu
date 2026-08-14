@@ -36,7 +36,7 @@ import { ApiError } from '@revu/shared'
 import type { PullListItem } from '@revu/shared'
 import { partitionInbox, rowIdentity } from '@/lib/local-reviews'
 import type { RowIdentity } from '@/lib/local-reviews'
-import { matchPrNumber } from '@/lib/review-mode'
+import { matchPrNumber, prPaletteCommands, reviewMode } from '@/lib/review-mode'
 
 /** Look up a chord's formatted chips by catalog id, for CommandShortcut hints. */
 function chordChips(id: string): string[] | null {
@@ -174,8 +174,8 @@ PaletteReviewLabel.displayName = 'PaletteReviewLabel'
  *   matcher).
  * - "Local reviews": the open reviews with no pull request behind them, drawn
  *   and searched by their branch pair. Present only when there is one.
- * - "This PR": the current PR's tabs, a re-sync, and the author-queue walk —
- *   present only while a PR is open.
+ * - "This PR": the sections the open review actually has, a re-sync, and the
+ *   author-queue walk — present only while a review is open.
  * - "Identity": switch which human drives the shared bot.
  * - "Help": open the keyboard sheet.
  *
@@ -206,6 +206,16 @@ export function CommandPalette({
 
   const prNumber = matchPrNumber(location.pathname)
   const sync = useSyncPull(prNumber ?? 0)
+
+  // Which of this group's entries the open review actually has. A review of two
+  // local branches has no continuous integration behind it, so offering a jump
+  // to its Checks screen is offering a jump to a sentence about a service this
+  // workspace is not talking to. Read from the shared table rather than decided
+  // here, so the palette and the tab strip cannot disagree.
+  const prCommands = useMemo(
+    () => (prNumber === null ? [] : prPaletteCommands(reviewMode(prNumber))),
+    [prNumber],
+  )
 
   // A review title never carries the broker's smuggled `**Name** (role)`
   // prefix — that convention lives in comment/description bodies — so titles
@@ -323,13 +333,15 @@ export function CommandPalette({
                 <GitCommitHorizontal strokeWidth={1.5} aria-hidden />
                 <span>Commits</span>
               </CommandItem>
-              <CommandItem
-                value="checks this pr"
-                onSelect={() => run(() => navigate(`/pr/${prNumber}/checks`))}
-              >
-                <ListChecks strokeWidth={1.5} aria-hidden />
-                <span>Checks</span>
-              </CommandItem>
+              {prCommands.includes('checks') && (
+                <CommandItem
+                  value="checks this pr"
+                  onSelect={() => run(() => navigate(`/pr/${prNumber}/checks`))}
+                >
+                  <ListChecks strokeWidth={1.5} aria-hidden />
+                  <span>Checks</span>
+                </CommandItem>
+              )}
               <CommandItem
                 value="resync snapshot re-sync"
                 onSelect={() => run(resync)}
