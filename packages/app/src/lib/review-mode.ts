@@ -115,6 +115,44 @@ export function redirectTargetFor(mode: ReviewMode, tab: ReviewTab): string | nu
   return reviewTabs(mode).includes(tab) ? null : DEFAULT_TAB
 }
 
+/** One block of the Conversation tab, named for what it holds. */
+export type ConversationSection = 'description' | 'timeline' | 'threads'
+
+/** Every block, in the order the tab stacks them down the page. */
+const GITHUB_CONVERSATION: readonly ConversationSection[] = [
+  'description',
+  'timeline',
+  'threads',
+]
+
+/**
+ * The blocks a branch pair's conversation has.
+ *
+ * The description block is the one that would say something false: it names an
+ * author who "opened this pull request" above a body nobody ever typed into a
+ * form. The timeline is different — it is fed by issue comments and submitted
+ * reviews, and a branch pair accumulates neither, because a review submitted
+ * against one is persisted to its own record rather than appended to the
+ * snapshot it was read from. So it is inert by construction rather than by
+ * policy, and omitting it states that fact instead of relying on it.
+ */
+const LOCAL_CONVERSATION: readonly ConversationSection[] = ['threads']
+
+/**
+ * The blocks the Conversation tab renders for a review of this kind, in stack
+ * order.
+ *
+ * Returned as data for the same reason the tab list is: the page would
+ * otherwise carry one inline mode test per block, and three conditionals can
+ * disagree with each other in a way one table cannot. It also makes "threads
+ * only" a value a test reads, so re-adding the description block to the local
+ * path turns a suite red instead of shipping a pull request that does not
+ * exist onto a branch.
+ */
+export function conversationSections(mode: ReviewMode): readonly ConversationSection[] {
+  return mode === 'local' ? LOCAL_CONVERSATION : GITHUB_CONVERSATION
+}
+
 /** One action the palette offers for the review that is currently open. */
 export type PrPaletteCommand =
   | 'files'

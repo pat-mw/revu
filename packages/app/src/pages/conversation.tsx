@@ -7,6 +7,8 @@ import type { CommentIdentity } from '@revu/shared'
 import { useSnapshot } from '@/state/queries'
 import { useThreads } from '@/state/threads'
 import { useSession } from '@/state/session'
+import { conversationEmptyCopy } from '@/lib/mode-copy'
+import { conversationSections, useRouteReviewMode } from '@/lib/review-mode'
 import { relativeTime } from '@/lib/time'
 import { IdentityAvatar } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +25,15 @@ import { SyncEmptyState } from './pr-layout'
  * reviews merged into one chronological timeline, then review threads grouped
  * by file path. Everything renders from the cached snapshot — this page never
  * touches the network, which is why an unsynced PR shows a sync gate instead.
+ *
+ * Which of those three blocks a review actually stacks is read from
+ * `conversationSections` rather than decided here, so the omission is a value a
+ * test can read. A review of two local branches keeps only the threads: there
+ * is no pull request for the description block to attribute and no form anyone
+ * typed a body into, and neither issue comments nor submitted reviews ever
+ * reach that snapshot, so the timeline block has nothing to draw. `ReviewRow`
+ * and `asReviewCommentShape` below stay — they are unreachable on that path,
+ * which is not the same as being wrong.
  */
 
 // ————————————————————————————————————————————————————————————————
@@ -150,6 +161,12 @@ function threadRank(t: ReviewThread): number {
 export function ConversationPage() {
   const prNumber = Number(useParams<{ n: string }>().n)
   const session = useSession()
+  // This page is routed under the review, not handed props by it, so the mode
+  // comes off the path. No path that opens no review reaches this component,
+  // and the fallback is the reading that stacks every block, so a degenerate
+  // path can only ever show too much rather than silently hide the threads.
+  const mode = useRouteReviewMode() ?? 'github'
+  const sections = conversationSections(mode)
   const snapshot = useSnapshot(prNumber).data
   const threads = useThreads(prNumber)
 
@@ -246,49 +263,57 @@ export function ConversationPage() {
     session.brokerLogin,
   )
   const descriptionBody = description.body.trim()
-  const isEmpty = timeline.length === 0 && (threads?.length ?? 0) === 0
+  const emptyCopy = conversationEmptyCopy(mode)
+  // Emptiness is a claim about what this page draws, not about what the
+  // snapshot happens to hold: entries belonging to a block this review does not
+  // stack are not on the page, so counting them would leave a reader looking at
+  // neither a conversation nor an invitation to start one.
+  const drawnTimeline = sections.includes('timeline') ? timeline : []
+  const isEmpty = drawnTimeline.length === 0 && (threads?.length ?? 0) === 0
 
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-3xl px-4 py-4">
-        <article className="rounded-(--radius-sm) border border-line bg-panel">
-          <header className="hairline-b flex min-w-0 items-center gap-2 px-3 py-2">
-            <IdentityAvatar identity={description.identity} size="xs" />
-            <span className="truncate text-sm font-medium text-ink">
-              {identityName(description.identity)}
-            </span>
-            <span className="shrink-0 text-2xs text-ink-mut">
-              opened this pull request
-            </span>
-            <span className="ml-auto shrink-0 text-2xs text-ink-faint">
-              {relativeTime(pull.created_at)}
-            </span>
-          </header>
-          <div className="px-3 py-2">
-            {descriptionBody !== '' ? (
-              <Markdown>{descriptionBody}</Markdown>
-            ) : (
-              <p className="text-sm italic text-ink-faint">No description provided.</p>
-            )}
-          </div>
-        </article>
+        {sections.includes('description') && (
+          <article className="rounded-(--radius-sm) border border-line bg-panel">
+            <header className="hairline-b flex min-w-0 items-center gap-2 px-3 py-2">
+              <IdentityAvatar identity={description.identity} size="xs" />
+              <span className="truncate text-sm font-medium text-ink">
+                {identityName(description.identity)}
+              </span>
+              <span className="shrink-0 text-2xs text-ink-mut">
+                opened this pull request
+              </span>
+              <span className="ml-auto shrink-0 text-2xs text-ink-faint">
+                {relativeTime(pull.created_at)}
+              </span>
+            </header>
+            <div className="px-3 py-2">
+              {descriptionBody !== '' ? (
+                <Markdown>{descriptionBody}</Markdown>
+              ) : (
+                <p className="text-sm italic text-ink-faint">No description provided.</p>
+              )}
+            </div>
+          </article>
+        )}
 
         {isEmpty ? (
           <EmptyState
             className="mt-2"
-            title="No discussion yet"
-            hint="Open Files and leave the first comment (c on any line)."
+            title={emptyCopy.title}
+            hint={emptyCopy.hint}
             action={
               <Button asChild variant="outline" size="sm">
-                <Link to="../files">Open files</Link>
+                <Link to="../files">{emptyCopy.action}</Link>
               </Button>
             }
           />
         ) : (
           <>
-            {timeline.length > 0 && (
+            {drawnTimeline.length > 0 && (
               <div className="mt-3 space-y-2">
-                {timeline.map((entry) =>
+                {drawnTimeline.map((entry) =>
                   entry.kind === 'comment' ? (
                     <div
                       key={`comment-${entry.comment.id}`}

@@ -42,6 +42,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { StaticRouter } from 'react-router'
 import {
+  conversationSections,
   matchPrNumber,
   prPaletteCommands,
   redirectTargetFor,
@@ -114,6 +115,28 @@ describe('which sections a review offers', () => {
     // typed into a form for it, so those two sections have nothing true to say.
     const localTabs = ['conversation', 'files', 'commits']
     expect(reviewTabs('local')).toEqual(localTabs)
+  })
+})
+
+describe('which blocks the conversation tab stacks', () => {
+  test('a pull request stacks the description, the timeline and the threads', () => {
+    // The whole list rather than three memberships: the order is the order the
+    // page stacks them, and an exact value is the only form in which "and
+    // nothing else" can be read off.
+    const githubSections = ['description', 'timeline', 'threads']
+    expect(conversationSections('github')).toEqual(githubSections)
+  })
+
+  test('a local review stacks the threads and nothing else', () => {
+    // The description block names an author who "opened this pull request"
+    // over a body nobody typed, and the timeline is fed by issue comments and
+    // submitted reviews — neither of which a branch pair ever accumulates,
+    // because a review submitted against one is persisted to its own record
+    // rather than appended to the snapshot. So the description block is the
+    // only one that would assert something untrue, and the timeline is inert
+    // by construction. Re-adding either to this list is what this assertion
+    // exists to turn red.
+    expect(conversationSections('local')).toEqual(['threads'])
   })
 })
 
