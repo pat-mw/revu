@@ -10,9 +10,23 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing.** No unit is dispatched, no agent is running. **M8.1 is `In Review`** — all 8 units landed, its
-`Verify` ran green, PR open. Session 1 is complete; the next session picks up from
-[`HANDOVER.md`](./HANDOVER.md)'s top entry, which carries **decision package #1 awaiting the owner's rulings**.
+| ticket · unit | branch | tier | what it is |
+| --- | --- | --- | --- |
+| **M8.6.7** — the headless-render seam (`location` shim) | `m8.6/app-creation-flow` | opus | W1; the harness every later query- and render-shaped Check rests on |
+| **M8.1.9 review** — fable adversarial pass on `4fbc5fb` | `m8.1/contract-and-mock` | fable | read-only; no files held |
+
+**M8.1.9 has landed and is pushed** — commit `4fbc5fb`, gate exit 0 at **1246 pass · 1 skip · 0 fail · 68
+files**, on PR [#70](https://github.com/pat-mw/revu/pull/70). Its adversarial review is still running.
+
+**Session 2 (the app) is running.** The owner interview completed first and **decision package #1 is ruled** —
+16 standing rulings in [`HANDOVER.md`](./HANDOVER.md)'s top entry. **Session 3 is therefore unblocked** and may
+start concurrently on another machine.
+
+M8.1 is still `In Review` with PR [#70](https://github.com/pat-mw/revu/pull/70) open; **its unit count is
+8 → 9**. Ruling 6 (submit-before-first-sync is refused) changes the mock, and the mock is the specification, so
+the change belongs inside M8.1's own Goal — appended as M8.1.9, existing units not renumbered, same precedent
+as M8.1.8. #70 is unmerged, so this is an added commit rather than rewritten history, and it gets its own
+fable-tier review.
 
 _When work starts, list here exactly what is actually running — ticket, unit, branch, agent — and remove each
 line the moment it lands. This section is the first thing an interrupted session re-checks._
@@ -73,23 +87,25 @@ line the moment it lands. This section is the first thing an interrupted session
 
 ## Tickets
 
-**87 units across 11 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**91 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
-count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner.
+count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
+from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14).
 
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 8 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
+| [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
 | [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | Todo | 7 | revud | M8.1 | `m8.2/store-v4` | — |
 | [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
 | [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
-| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | Todo | 7 | app | M8.1 | `m8.6/app-creation-flow` | — |
+| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Progress | 7 | app | M8.1 | `m8.6/app-creation-flow` | — |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | Todo | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
+| [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
 
 ## Dependency graph
 
