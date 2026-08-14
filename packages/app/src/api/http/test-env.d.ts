@@ -55,6 +55,15 @@ declare module 'node:fs' {
    * `import.meta.url` rather than by counting directories up from the root.
    */
   export function readFileSync(path: string | URL, encoding: 'utf8'): string
+  /**
+   * Read by the suites that assert over a whole SOURCE TREE rather than one
+   * file — structural rules that hold an absence, where the set of files to
+   * check is exactly what must not be written down by hand. Only the recursive
+   * form is declared: it returns every descendant as a path relative to the
+   * root it was given, which is both the walk and the identity a failure
+   * reports, so no separate directory test is needed.
+   */
+  export function readdirSync(path: string, options: { recursive: true }): string[]
 }
 
 declare module 'node:os' {

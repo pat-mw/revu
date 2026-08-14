@@ -30,6 +30,7 @@ import { devControls } from '@/api/dev'
 import { useHumans } from '@/state/dev-humans'
 import { useTheme } from '@/state/theme'
 import { useSequenceShortcut, useShortcut } from '@/lib/keyboard'
+import { matchPrNumber } from '@/lib/review-mode'
 import { minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 
@@ -42,12 +43,6 @@ import { cn } from '@/lib/cn'
 function useRepoContext(): string | null {
   const list = usePullList()
   return list.data?.items[0]?.pull.base.repo.full_name ?? null
-}
-
-/** Match `/pr/:n` at the head of a path, returning the PR number or null. */
-function matchPrNumber(pathname: string): number | null {
-  const m = /^\/pr\/(\d+)(?:\/|$)/.exec(pathname)
-  return m ? Number(m[1]) : null
 }
 
 /**

@@ -21,11 +21,13 @@
  * including modules that derive further vocabulary (a review "mode", say) from
  * the same answer.
  *
- * NOTHING CHECKS THIS. It is held by reading, and a second call site added
- * anywhere would compile, pass and go unnoticed. That is an argument for a
- * source-scanning guard, not a description of one: the rule below says why such
- * a guard would be worth its cost, and until it exists the rule is only as
- * strong as the next reviewer's attention.
+ * A source-scanning test now enforces this: it walks the reading side and fails
+ * if the predicate is called anywhere but here. Two exclusions are deliberate
+ * and categorical rather than an allowlist, which would rot the moment a file
+ * was added. The transport is excluded for the reason below. Test suites are
+ * excluded because a suite asserting that the transport minted an in-band id is
+ * checking transport behaviour, not teaching the interface a second definition
+ * of what "local" means — nothing a suite says reaches a screen.
  *
  * A transport adapter is the deliberate exception, not an oversight: it MINTS
  * ids in the band and routes on them, so it implements the boundary rather than

@@ -36,6 +36,8 @@ import { ApiError } from '@revu/shared'
 import type { PullListItem } from '@revu/shared'
 import { partitionInbox, rowIdentity } from '@/lib/local-reviews'
 import type { RowIdentity } from '@/lib/local-reviews'
+import { matchPrNumber } from '@/lib/review-mode'
+
 /** Look up a chord's formatted chips by catalog id, for CommandShortcut hints. */
 function chordChips(id: string): string[] | null {
   const def = SHORTCUT_CATALOG.find((d) => d.id === id)
@@ -48,12 +50,6 @@ function ShortcutHint({ id }: { id: string }) {
   const chips = chordChips(id)
   if (!chips) return null
   return <CommandShortcut>{chips.join(' ')}</CommandShortcut>
-}
-
-/** Match `/pr/:n` at the head of a path, returning the PR number or null. */
-function matchPrNumber(pathname: string): number | null {
-  const m = /^\/pr\/(\d+)(?:\/|$)/.exec(pathname)
-  return m ? Number(m[1]) : null
 }
 
 /**
