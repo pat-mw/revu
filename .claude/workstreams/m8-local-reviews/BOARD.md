@@ -12,9 +12,14 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 | ticket · unit | branch | tier | isolation | what it is |
 | --- | --- | --- | --- | --- |
-| **M8.6.1** — pure view-model (identity, partition, label, validation) | `m8.6/app-creation-flow` | opus | worktree | W2; needs nothing from the shim |
-| **M8.6.2** — query layer (branches, create, list invalidation) | `m8.6/app-creation-flow` | opus | worktree | W2; needs M8.6.7's shim, which has landed |
-| **M8.1.9 review** — fable adversarial pass on `4fbc5fb` | `m8.1/contract-and-mock` | fable | read-only | no files held |
+| **M8.6.3** — the create dialog | `m8.6/app-creation-flow` | opus | worktree | W3; new files only |
+| **M8.6.4** — inbox section + local row variant | `m8.6/app-creation-flow` | opus | worktree | W3; `inbox.tsx` + two new lib/page tests |
+| **M8.1.9 review fixes** — the three findings from the adversarial pass | `m8.1/contract-and-mock` | fable | worktree | widens a frozen **docstring**; pins the guard's key; corrects a false sentence |
+
+⚠️ **The review-fix agent works off `4fbc5fb` (the `m8.1` tip), not the `m8.6` tip.** When it lands, `m8.1`
+gains a commit and **`m8.6` must be rebased onto the new `m8.1` tip** before its PR opens. The rebase is
+mechanical — `m8.6`'s commits touch none of `types.ts`, `mock/local.ts` or `mock/local.test.ts`. A cold session
+picking this up mid-flight must do that rebase before anything else.
 
 **Landed this session, in chain order:**
 
@@ -23,6 +28,14 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 | M8.1.9 — refuse submit before first sync | `4fbc5fb` | `m8.1` (pushed, on [#70](https://github.com/pat-mw/revu/pull/70)) | 1246 pass · 1 skip · 0 fail · 68 files |
 | board — the owner's rulings + M8.12 + `.gitignore` | `fd525f8` | `m8.6` | — (no code) |
 | M8.6.7 — the headless-render seam | `e9f2303` | `m8.6` | 1251 pass · 1 skip · 0 fail · 69 files |
+| board — harness landing + wave deviations | `c494265` | `m8.6` | — (no code) |
+| M8.6.1 — pure view-model | `0829a6e` | `m8.6` | 1263 pass · 1 skip · 0 fail · 70 files |
+| M8.6.2 — query layer | `85e0ae4` | `m8.6` | 1269 pass · 1 skip · 0 fail · 71 files |
+
+**Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
+one. **Worktree hazard, now in the memories and in every dispatch brief:** an isolated agent worktree is created
+at the repo's **base** commit, not the branch tip, and carries no `node_modules` — two agents lost real time to
+it before the brief was fixed. Any worker result produced before a fast-forward + `bun install` is void.
 
 **Two deviations from the roadmap's S2 wave plan, both recorded with reasons.**
 1. **W1 was M8.6.7 ∥ M8.7.10; it ran as M8.6.7 alone.** M8.7.10's files belong to `m8.7`, which branches off
