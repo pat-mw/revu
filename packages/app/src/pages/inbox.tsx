@@ -361,7 +361,7 @@ export function InboxPage() {
             })}
           {view === 'tree' && treeRoots.length === 0 && (
             <p className="px-1 py-2 text-sm text-ink-mut">
-              No open pull requests match the filter.
+              Nothing open matches the filter.
             </p>
           )}
           {view === 'list' &&
