@@ -486,9 +486,21 @@ function requireLocalThread(record: LocalReviewRecord, threadId: string): Review
 /**
  * Submit a review against a local branch pair.
  *
- * Mirrors the transport semantics of every other submit path: a moved head is
- * a RETURNED `head_moved` value, never a throw, and it leaves the draft
- * untouched. On success each pending comment is materialized into a thread
+ * A review with no snapshot is REFUSED as `unprocessable`. Submitting
+ * materializes threads, and threads are read off the snapshot; with none to
+ * publish into, the verdict and its comments would land on the record while
+ * every snapshot-backed read kept answering empty — a list row counting
+ * unresolved threads that nothing can open. Nothing would be lost, but the
+ * state would be invisible, so the request is turned away rather than half
+ * honored. `unprocessable` is its exact shape: the request is well-formed and
+ * the review exists, but its current state cannot satisfy the request —
+ * syncing puts it in one that can, which is what the message tells the caller.
+ * The check precedes every write, so a refusal never leaves the record
+ * partially updated.
+ *
+ * Otherwise it mirrors the transport semantics of every other submit path: a
+ * moved head is a RETURNED `head_moved` value, never a throw, and it leaves the
+ * draft untouched. On success each pending comment is materialized into a thread
  * whose comment ids come from the positive local entity band (negatives
  * belong to the UI's optimistic synthetics), bodies are stored verbatim with
  * authorship recorded as a key beside them, the summary is persisted on the
@@ -503,6 +515,18 @@ function requireLocalThread(record: LocalReviewRecord, threadId: string): Review
  */
 export function submitLocalReview(input: SubmitReviewInput): SubmitResult {
   const record = requireLocalReview(input.prNumber)
+  // Ahead of the head guard as well as of every write: with no snapshot there
+  // is no compare behind the expected SHA, so answering `head_moved` would
+  // send the reviewer to reconcile against a snapshot that does not exist.
+  // Guarded on the snapshot itself rather than on `lastSyncedAt`, because the
+  // snapshot is the thing a submit needs; the two only ever move together —
+  // a sync writes both, a delete drops both.
+  if (!store.getSnapshot(record.id)) {
+    throw new ApiError(
+      'unprocessable',
+      `Local review ${record.id} has never been synced, so there is no snapshot for its threads to appear in. Sync it, then submit.`,
+    )
+  }
   const currentHeadSha = liveRefSha(record.repo, record.headRef)
 
   if (input.expectedHeadSha !== currentHeadSha) {

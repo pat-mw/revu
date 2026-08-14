@@ -13,7 +13,9 @@
  * Two of them pin behavior that reads like an accident and is not, so nothing
  * downstream "corrects" it into a divergence: the reaction rollup is shared
  * per review rather than per person, and a submit that precedes the first sync
- * succeeds while the threads it materializes stay unreadable until that sync.
+ * is refused rather than accepted into threads no read could return. Both
+ * refusal assertions carry a positive control alongside them, so a rejection
+ * that fired for any reason at all could not stand in for the specified one.
  *
  * The last two blocks leave the engine behind and drive the API surface
  * itself, because a correct engine reached through a wrong adapter is still a
@@ -48,6 +50,7 @@ import {
   createLocalReview,
   deleteLocalReview,
   getLocalReview,
+  listLocalPullRows,
   listLocalReviews,
   listLocalSubmittedReviews,
   localThreadId,
@@ -88,6 +91,17 @@ function pending(body: string, line: number): PendingComment {
     updatedAt: at,
     anchor: { lineText: 'const x = compute()', contextBefore: [], contextAfter: [] },
   }
+}
+
+/**
+ * The current head tip of a review, read from its list row — the one source
+ * that answers before a first sync, because rows read the ref tips as they are
+ * now rather than off a snapshot.
+ */
+function liveHeadShaOf(review: LocalReviewSummary): string {
+  const row = listLocalPullRows().find((r) => r.detail.number === review.id)
+  if (!row) throw new Error(`local review ${review.id} has no pull row`)
+  return row.detail.head.sha
 }
 
 function draftFor(humanId: string, prNumber: number, snap: Snapshot): ReviewDraft {
@@ -321,6 +335,44 @@ describe('submit', () => {
 
     // Nothing on the local path ever spends the shared GitHub rate bucket.
     expect(store.rateInfo().used).toBe(0)
+  })
+
+  test('a submit before the first sync is refused, and the same submit succeeds after it', () => {
+    // The refusal is a precondition on the review, not a bug to route around:
+    // with no snapshot there is nowhere to publish the threads a submit
+    // materializes, so accepting it would record a verdict and comments that
+    // no snapshot-backed read can ever return. Syncing first is the fix, and
+    // the message has to say so.
+    const created = createLocalReview({ baseRef: 'main', headRef: 'feature/submit-unsynced' })
+    expect(store.getSnapshot(created.id)).toBeNull()
+
+    const input: SubmitReviewInput = {
+      prNumber: created.id,
+      // The head guard cannot be what fires: this is the live tip, exactly
+      // what a synced submit would carry.
+      expectedHeadSha: liveHeadShaOf(created),
+      event: 'COMMENT',
+      body: 'Submitted before this review was ever synced.',
+      comments: [pending('An inline comment with no snapshot behind it.', 12)],
+    }
+    expect(thrownCode(() => submitLocalReview(input))).toBe('unprocessable')
+
+    // Refused above any write: the record is exactly as it was created, with
+    // nothing half-applied for a later sync to publish.
+    const record = store.getLocalReview(created.id)
+    expect(record?.submitted).toEqual([])
+    expect(record?.threads).toEqual([])
+    expect(listLocalSubmittedReviews(created.id)).toEqual([])
+
+    // The positive control, without which a blanket throw in the engine would
+    // satisfy every assertion above: the SAME submit goes through once the
+    // review has been synced.
+    syncLocalReview(created.id)
+    const result = submitLocalReview(input)
+    expect(result.status).toBe('ok')
+    if (result.status !== 'ok') return
+    expect(store.getSnapshot(created.id)?.mutable.threads).toHaveLength(1)
+    expect(listLocalSubmittedReviews(created.id).map((r) => r.id)).toEqual([result.review.id])
   })
 })
 
@@ -810,12 +862,13 @@ describe('every id-taking method serves a local review id', () => {
     ).toBe('not_found')
   })
 
-  test('submitting before the first sync succeeds, and its threads surface only at the next sync', async () => {
-    // A description of what happens today, pinned in both directions so any
-    // divergence is loud. Submit requires no snapshot, and the snapshot
-    // refresh a write performs finds none to refresh, so the review lands on
-    // the record while every read that comes off a snapshot still answers
-    // empty. Nothing is lost — the next sync republishes it.
+  test('submitting before the first sync is refused, and the same submit lands after it', async () => {
+    // Reached through the API surface rather than the engine, because the
+    // refusal has to survive the adapter: a submit on a never-synced review
+    // would otherwise resolve `ok` while the threads it materialized stayed
+    // unreadable, leaving a list row counting unresolved threads that nothing
+    // could open. The refusal is the specified behavior, so a later reader
+    // does not "repair" it back into a success.
     const fresh = await api.createLocalReview({
       baseRef: 'main',
       headRef: 'feature/submit-before-sync',
@@ -823,42 +876,44 @@ describe('every id-taking method serves a local review id', () => {
     expect(await api.getSnapshot(fresh.id)).toBeNull()
 
     // The head sha a caller can name without syncing: list rows read the ref
-    // tips as they are now, so the head guard can be satisfied here.
+    // tips as they are now, so the head guard is satisfied and the refusal is
+    // the only thing that can fire.
     const row = (await api.listPulls()).items.find((i) => i.pull.number === fresh.id)
     expect(row).toBeDefined()
     if (!row) return
 
-    const result = await api.submitReview({
+    const input: SubmitReviewInput = {
       prNumber: fresh.id,
       expectedHeadSha: row.pull.head.sha,
       event: 'COMMENT',
       body: 'Submitted before this review was ever synced.',
       comments: [pending('An inline comment with no snapshot behind it.', 12)],
-    })
+    }
+    expect(await apiErrorCode(api.submitReview(input))).toBe('unprocessable')
 
-    // A full success, and still no snapshot: submit does not create one.
+    // Nothing was written on the way to the refusal: no snapshot appeared, no
+    // verdict was recorded, and the list row counts no thread nobody can open.
+    expect(await api.getSnapshot(fresh.id)).toBeNull()
+    expect(await api.listReviewThreads(fresh.id)).toEqual([])
+    expect(listLocalSubmittedReviews(fresh.id)).toEqual([])
+    const rowAfter = (await api.listPulls()).items.find((i) => i.pull.number === fresh.id)
+    expect(rowAfter?.broker.unresolvedThreads).toBe(0)
+
+    // The positive control: the refusal is a precondition, not a blanket
+    // rejection — the identical submit succeeds once the review is synced,
+    // and everything it materializes is immediately readable.
+    await api.syncPull(fresh.id)
+    const result = await api.submitReview(input)
     expect(result.status).toBe('ok')
     if (result.status !== 'ok') return
     expect(result.review.id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
-    expect(await api.getSnapshot(fresh.id)).toBeNull()
 
-    // So the thread reads empty — the threads come off the snapshot…
-    expect(await api.listReviewThreads(fresh.id)).toEqual([])
-    // …while the record already holds both the verdict and the thread, which
-    // the list row counts: an unresolved count with nothing yet to open.
+    const threads = await api.listReviewThreads(fresh.id)
+    expect(threads).toHaveLength(1)
+    expect(threads[0].comments[0].body).toBe('An inline comment with no snapshot behind it.')
     expect(listLocalSubmittedReviews(fresh.id).map((r) => r.id)).toEqual([result.review.id])
-    const rowAfter = (await api.listPulls()).items.find((i) => i.pull.number === fresh.id)
-    expect(rowAfter?.broker.unresolvedThreads).toBe(1)
-
-    // The first sync publishes what the record was already holding, verbatim.
-    const snap = await api.syncPull(fresh.id)
-    expect(snap.mutable.threads).toHaveLength(1)
-    expect(snap.mutable.threads[0].comments[0].body).toBe(
-      'An inline comment with no snapshot behind it.',
-    )
-    expect(await api.listReviewThreads(fresh.id)).toHaveLength(1)
-    // The verdict stays on the record even then, as on every local review.
-    expect(snap.mutable.reviews).toEqual([])
+    // The verdict stays on the record, as on every local review.
+    expect((await api.getSnapshot(fresh.id))?.mutable.reviews).toEqual([])
   })
 })
 
