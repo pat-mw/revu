@@ -2,11 +2,19 @@ import { useCallback, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { Link, NavLink, Outlet, useParams } from 'react-router'
 import { Download, Inbox, RefreshCw } from 'lucide-react'
-import type { ApiError, PullSummary, Snapshot, StalenessInfo } from '@revu/shared'
+import type {
+  ApiError,
+  CommentIdentity,
+  PullDetail,
+  PullSummary,
+  Snapshot,
+  StalenessInfo,
+} from '@revu/shared'
 import { identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
+import type { CheckCounts } from '@/lib/checks-rollup'
 import { notFoundCopy, stateChipCopy, syncCostCopy } from '@/lib/mode-copy'
 import type { ReviewState } from '@/lib/mode-copy'
 import { reviewMode, reviewTabs } from '@/lib/review-mode'
@@ -420,6 +428,90 @@ export function PrIdentityRow({ mode, pull }: { mode: ReviewMode; pull: PullSumm
 PrIdentityRow.displayName = 'PrIdentityRow'
 
 // ————————————————————————————————————————————————————————————————
+// Meta row — who wrote it and how big it is, under the identity row.
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The dot beside the check tally. Precedence is failure → still running →
+ * success, because a red run matters even while others are still going.
+ */
+function checksDotClass(checks: CheckCounts): string {
+  if (checks.failed > 0) return 'bg-danger'
+  if (checks.running > 0) return 'animate-pulse bg-stale'
+  return 'bg-add'
+}
+
+/**
+ * Row 2 of the review header: who wrote it, which branches it compares, how it
+ * merges, how its checks are doing and how big its diff is.
+ *
+ * Props-only and exported for the reason the tab strip and the identity row
+ * are: the layout around it needs a query client, a session and a loaded pull
+ * list before it renders a single element, while this row needs only the mode,
+ * the review and what the snapshot said — so which of these facts a given kind
+ * of review states is assertable against real markup rather than promised.
+ *
+ * The branch pair is drawn here ONLY for a pull request. A pull request is
+ * called by its number one row above, so this is the only place it says which
+ * branches it compares. A review of two local branches has no number and is
+ * called by the pair itself, so the row above already carries it — repeating it
+ * here would say the same thing twice in one header, and the row that says it
+ * is the one the reader reads as the review's name.
+ */
+export function PrMetaRow({
+  mode,
+  pull,
+  author,
+  detail,
+  checks,
+}: {
+  mode: ReviewMode
+  pull: PullSummary
+  /** Who wrote the review, already resolved against the session's write identity. */
+  author: CommentIdentity
+  /** The snapshot's fuller reading of the review, or `undefined` until it is read. */
+  detail: PullDetail | undefined
+  /** The snapshot's check runs bucketed, or `null` while there is no snapshot. */
+  checks: CheckCounts | null
+}) {
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-mut">
+      <span className="inline-flex min-w-0 items-center gap-1.5">
+        <IdentityAvatar identity={author} mode={mode} size="xs" />
+        <span className="truncate">{identityName(author)}</span>
+      </span>
+      {mode === 'github' && (
+        <span className="font-mono">
+          {pull.base.ref} ← {pull.head.ref}
+        </span>
+      )}
+      {detail?.mergeable === false ? (
+        <Badge variant="danger">merge conflict</Badge>
+      ) : detail?.mergeable_state === 'blocked' ? (
+        <Badge variant="outline">review required</Badge>
+      ) : null}
+      {checks !== null && checks.total > 0 && (
+        <Link
+          to="checks"
+          className="inline-flex items-center gap-1.5 text-ink-mut hover:text-ink"
+        >
+          <span className={cn('size-1.5 rounded-full', checksDotClass(checks))} aria-hidden />
+          {checks.passed}/{checks.total} checks
+        </Link>
+      )}
+      {detail && (
+        <span className="inline-flex items-center gap-1.5 font-mono">
+          {detail.changed_files} files
+          <span className="text-add">+{detail.additions}</span>
+          <span className="text-del">−{detail.deletions}</span>
+        </span>
+      )}
+    </div>
+  )
+}
+PrMetaRow.displayName = 'PrMetaRow'
+
+// ————————————————————————————————————————————————————————————————
 // Layout
 // ————————————————————————————————————————————————————————————————
 
@@ -530,14 +622,6 @@ export function PrLayout() {
   )
   const detail = snapshot?.mutable.pull
   const rollup = snapshot ? countChecks(snapshot.mutable.checks) : null
-  const checksDot =
-    rollup === null
-      ? ''
-      : rollup.failed > 0
-        ? 'bg-danger'
-        : rollup.running > 0
-          ? 'animate-pulse bg-stale'
-          : 'bg-add'
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -546,36 +630,13 @@ export function PrLayout() {
         <PrIdentityRow mode={mode} pull={pull} />
 
         {/* Row 2 — meta: author, refs, mergeability, checks, diff size */}
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-mut">
-          <span className="inline-flex min-w-0 items-center gap-1.5">
-            <IdentityAvatar identity={author.identity} mode={mode} size="xs" />
-            <span className="truncate">{identityName(author.identity)}</span>
-          </span>
-          <span className="font-mono">
-            {pull.base.ref} ← {pull.head.ref}
-          </span>
-          {detail?.mergeable === false ? (
-            <Badge variant="danger">merge conflict</Badge>
-          ) : detail?.mergeable_state === 'blocked' ? (
-            <Badge variant="outline">review required</Badge>
-          ) : null}
-          {rollup !== null && rollup.total > 0 && (
-            <Link
-              to="checks"
-              className="inline-flex items-center gap-1.5 text-ink-mut hover:text-ink"
-            >
-              <span className={cn('size-1.5 rounded-full', checksDot)} aria-hidden />
-              {rollup.passed}/{rollup.total} checks
-            </Link>
-          )}
-          {detail && (
-            <span className="inline-flex items-center gap-1.5 font-mono">
-              {detail.changed_files} files
-              <span className="text-add">+{detail.additions}</span>
-              <span className="text-del">−{detail.deletions}</span>
-            </span>
-          )}
-        </div>
+        <PrMetaRow
+          mode={mode}
+          pull={pull}
+          author={author.identity}
+          detail={detail}
+          checks={rollup}
+        />
 
         {/* The header's banner stack. Each member decides its own visibility
             and renders nothing when it has none, so the slot collapses

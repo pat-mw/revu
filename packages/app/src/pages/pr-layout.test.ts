@@ -1,7 +1,7 @@
 /**
- * The review header — its identity row and its tab strip — rendered as real
- * HTML in both kinds of review, plus the pure decision behind the one banner
- * the header hangs beneath them.
+ * The review header — its identity row, its meta row and its tab strip —
+ * rendered as real HTML in both kinds of review, plus the pure decision behind
+ * the one banner the header hangs beneath them.
  *
  * A review of two local branches has no continuous integration behind it and no
  * body someone typed into a form, so a Checks tab and a Description tab there
@@ -12,10 +12,11 @@
  * asserted PRESENT in the other mode, from the same component and the same
  * harness.
  *
- * `PrTabs` and `PrIdentityRow` are props-only for exactly this reason: the
- * layout around them needs a query client, a session and a populated pull list
- * before it renders a single element, while the strip needs only the mode and
- * two counts and the identity row needs only the mode and the review itself.
+ * `PrTabs`, `PrIdentityRow` and `PrMetaRow` are props-only for exactly this
+ * reason: the layout around them needs a query client, a session and a
+ * populated pull list before it renders a single element, while the strip needs
+ * only the mode and two counts, the identity row needs only the mode and the
+ * review itself, and the meta row needs those plus what the snapshot said.
  *
  * The reviews are read out of the fixture set rather than assembled here. What
  * is under test is what the header does with a real review — a branch pair
@@ -25,11 +26,13 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { createElement } from 'react'
-import type { PullDetail, PullSummary } from '@revu/shared'
+import type { CheckRun, CommentIdentity, PullDetail, PullSummary } from '@revu/shared'
+import { identityName, parseCommentIdentity } from '@revu/shared'
 import { fixtureDB } from '@/fixtures'
+import { countChecks } from '@/lib/checks-rollup'
 import { renderStatic } from '@/lib/render-test'
 import { authorBannerVisible } from '@/components/author/author-banner'
-import { PrIdentityRow, PrTabs } from './pr-layout'
+import { PrIdentityRow, PrMetaRow, PrTabs } from './pr-layout'
 
 /** The strip as HTML, with counts that make both count slots render. */
 function strip(mode: 'github' | 'local'): string {
@@ -127,15 +130,17 @@ describe('the tabs that survive the omission', () => {
 // The identity row
 // ————————————————————————————————————————————————————————————————
 
-/** The seeded pull request with this number, or a failure naming it. */
-function pullNumbered(n: number): PullDetail {
+/** The seeded pull request with this number, whole, or a failure naming it. */
+function pullNumbered(n: number): (typeof fixtureDB.pulls)[number] {
   const found = fixtureDB.pulls.find((p) => p.detail.number === n)
   if (found === undefined) throw new Error(`the fixture set holds no pull request ${n}`)
-  return found.detail
+  return found
 }
 
-const GITHUB_PULL = pullNumbered(347)
-const LOCAL_PULL = fixtureDB.localReviews[0].snapshot.mutable.pull
+const GITHUB_FIXTURE = pullNumbered(347)
+const GITHUB_PULL: PullDetail = GITHUB_FIXTURE.detail
+const LOCAL_SNAPSHOT = fixtureDB.localReviews[0].snapshot
+const LOCAL_PULL: PullDetail = LOCAL_SNAPSHOT.mutable.pull
 
 /** One review's identity row as HTML. */
 function identityRow(mode: 'github' | 'local', pull: PullSummary): string {
@@ -208,6 +213,155 @@ describe('what a review is called in its own header', () => {
   test('and both draw the title they were given', () => {
     expect(visibleText(GITHUB_ROW)).toContain(GITHUB_PULL.title)
     expect(visibleText(LOCAL_ROW)).toContain(LOCAL_PULL.title)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The meta row
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * Who a review's author resolves to, derived the way the layout derives it —
+ * from the review's own user and the session's shared write identity — so the
+ * row is rendered with the object it is actually handed rather than one the
+ * test invented to suit itself.
+ */
+function authorOf(pull: PullDetail): CommentIdentity {
+  return parseCommentIdentity(
+    { user: pull.user, body: pull.body ?? '' },
+    fixtureDB.brokerBot.login,
+  ).identity
+}
+
+/**
+ * One review's meta row as HTML.
+ *
+ * The review stands in for both of the layout's two readings of it: the list's
+ * summary and the snapshot's fuller detail are the same review, and the row
+ * draws different facts from each.
+ */
+function metaRow(mode: 'github' | 'local', pull: PullDetail, checks: CheckRun[]): string {
+  return renderStatic(
+    createElement(PrMetaRow, {
+      mode,
+      pull,
+      author: authorOf(pull),
+      detail: pull,
+      checks: countChecks(checks),
+    }),
+  )
+}
+
+/** The branch pair exactly as a reader sees it drawn. */
+function pairText(pull: PullSummary): string {
+  return `${pull.base.ref} ← ${pull.head.ref}`
+}
+
+const GITHUB_META = metaRow('github', GITHUB_PULL, GITHUB_FIXTURE.checks)
+const LOCAL_META = metaRow('local', LOCAL_PULL, LOCAL_SNAPSHOT.mutable.checks)
+
+describe('which branches the meta row names', () => {
+  test('a pull request names them here, because its own name is a number', () => {
+    expect(visibleText(GITHUB_META)).toContain(pairText(GITHUB_PULL))
+  })
+
+  test('a branch pair does not, because the row above already is the pair', () => {
+    // The positive control, first and in this same body on purpose: without it
+    // the absence below is equally satisfied by a header that names the
+    // branches NOWHERE, which is a worse defect than naming them twice — a
+    // review whose only name is its branch pair would then have no name at all.
+    expect(visibleText(LOCAL_ROW)).toContain(pairText(LOCAL_PULL))
+    expect(visibleText(LOCAL_META)).not.toContain(pairText(LOCAL_PULL))
+  })
+
+  test('and everything else in the row survives the omission', () => {
+    // The pair is the only thing dropped. Who wrote a review and how big its
+    // diff is are facts about a branch pair exactly as much as about a pull
+    // request, and a sweep that took the whole row would lose them silently.
+    expect(visibleText(LOCAL_META)).toContain(identityName(authorOf(LOCAL_PULL)))
+    expect(visibleText(LOCAL_META)).toContain(`${LOCAL_PULL.changed_files} files`)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The header as a whole
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * Every part of the review header that is handed the review itself,
+ * concatenated in the order the header draws them.
+ *
+ * The seal is the one part left out, and it is left out because it is handed a
+ * snapshot and a staleness report and never sees a ref — so it has no branch
+ * pair it could draw. Everything in the header that does see the refs is here,
+ * which is what makes a count over this string a claim about the header rather
+ * than about two components that happen to agree.
+ */
+function header(mode: 'github' | 'local', pull: PullDetail, checks: CheckRun[]): string {
+  return (
+    identityRow(mode, pull) +
+    metaRow(mode, pull, checks) +
+    renderStatic(createElement(PrTabs, { mode, changedFiles: 12, unresolved: 3 }))
+  )
+}
+
+/**
+ * How many times a reader is shown the branch pair.
+ *
+ * Counted rather than merely looked for, because presence and absence each
+ * answer only half of it: an absence is satisfied by a header that draws the
+ * pair nowhere, and a presence by one that draws it three times. A header
+ * carrying no pair at all counts 0 here and fails just as loudly as one
+ * carrying two.
+ */
+function pairCount(markup: string, pull: PullSummary): number {
+  return visibleText(markup).split(pairText(pull)).length - 1
+}
+
+const GITHUB_HEADER = header('github', GITHUB_PULL, GITHUB_FIXTURE.checks)
+const LOCAL_HEADER = header('local', LOCAL_PULL, LOCAL_SNAPSHOT.mutable.checks)
+
+describe('how often the whole header names the branch pair', () => {
+  test('a pull request: once, in the meta row', () => {
+    // Also the control for the counter itself: it does find the pair in a
+    // header that draws it, and finds it exactly once there.
+    expect(pairCount(GITHUB_HEADER, GITHUB_PULL)).toBe(1)
+  })
+
+  test('a branch pair: once, in the identity row', () => {
+    expect(pairCount(LOCAL_HEADER, LOCAL_PULL)).toBe(1)
+  })
+})
+
+/** Every accessible name the markup offers, in the order it offers them. */
+function ariaLabels(markup: string): string[] {
+  return [...markup.matchAll(/\saria-label="([^"]*)"/g)].map((m) => m[1])
+}
+
+/** The accessible names that name both of a review's branches. */
+function labelsNamingBothBranches(markup: string, pull: PullSummary): string[] {
+  return ariaLabels(markup).filter(
+    (label) => label.includes(pull.base.ref) && label.includes(pull.head.ref),
+  )
+}
+
+describe('what the header says to a reader who cannot see the arrow', () => {
+  test('a branch pair is spoken once, as a sentence', () => {
+    // An element with an accessible name is announced by that name instead of
+    // by its contents, so the local pair's spoken form is this sentence and not
+    // the arrow between two refs. Asserted as the whole list of qualifying
+    // names rather than as a search: a second row growing a label of its own
+    // would report as an extra member here instead of hiding behind a match.
+    expect(labelsNamingBothBranches(LOCAL_HEADER, LOCAL_PULL)).toEqual([
+      `Local review of ${LOCAL_PULL.head.ref} against ${LOCAL_PULL.base.ref}`,
+    ])
+  })
+
+  test('a pull request offers no such sentence, because its pair is plain text', () => {
+    // The meta row draws the pair as ordinary text with no name of its own, so
+    // it is read out as written and needs no substitute. The identity slot
+    // there is a number, which also reads as written.
+    expect(labelsNamingBothBranches(GITHUB_HEADER, GITHUB_PULL)).toEqual([])
   })
 })
 
