@@ -65,7 +65,13 @@ import type {
   Snapshot,
   SubmitReviewInput,
 } from '@revu/shared'
-import { ApiError, LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE, prefixBody } from '@revu/shared'
+import {
+  ApiError,
+  LOCAL_ENTITY_ID_BASE,
+  LOCAL_REVIEW_ID_BASE,
+  parsePrefixedBody,
+  prefixBody,
+} from '@revu/shared'
 import type {
   FakeLocalStore,
   FakeLocalStoreOptions,
@@ -2295,5 +2301,510 @@ describe('the harness cannot make a persistence assertion pass by aliasing', () 
     if (readBack === undefined) throw new Error('the written summary did not read back')
     readBack.body = 'Edited through the read.'
     expect(store.listLocalSubmittedReviews(LOCAL_ID)[0]?.body).toBe(SUMMARY_BODY)
+  })
+})
+
+/**
+ * The answer each verb owes the client's optimistic path, stated as the LIST of
+ * fields that path reads back rather than as one more comparison of values.
+ *
+ * Every verb here is called optimistically: the client paints the change into
+ * its cache before the write returns and then copies fields back out of the
+ * answer over what it painted. So an answer carrying less than a complete value
+ * does not fail — it silently reverts what the reader just did, or overwrites
+ * cached state with whatever a partly-built answer happened to hold. There is no
+ * error anywhere on that path, which is why the contract has to be pinned here.
+ *
+ * WHAT THIS ADDS OVER THE VALUE COMPARISONS ELSEWHERE IN THIS FILE, WHICH ARE
+ * ALREADY STRONGER PER FIELD. Those state what a field holds on one fixture, and
+ * a whole-object comparison among them is the sole reason a wrong value for any
+ * one of these fields fails. What none of them states is WHICH FIELDS THE
+ * CONTRACT IS ABOUT — that knowledge lives in the client, and here it lived only
+ * in the choice of what to compare. Writing it down gives a field the client
+ * starts reading back somewhere to be added, and gives an answer that stopped
+ * carrying one something to fail; the check is categorical over the list, so
+ * adding a name is the whole edit.
+ *
+ * WHAT IT CANNOT SEE, STATED RATHER THAN IMPLIED. The list is maintained beside
+ * the sink and nothing here can read the client's own source to confirm the two
+ * still agree, because the structural scan over this path allows the shared
+ * contract package and the test runner and nothing else — a filesystem read is
+ * exactly the capability that scan exists to deny. So a field ADDED to the
+ * client's copy-back and not added here is invisible, and that residue is the
+ * pre-merge review's, in the same way a coordinated edit of a pinned literal and
+ * its subject is.
+ *
+ * The submitted summary is deliberately absent from the list. The client reads
+ * one thing out of a submit — whether it succeeded — and then re-reads the
+ * review rather than copying any field of the summary into its cache. The
+ * summary's fields are a stored-record contract, asserted where the submit's own
+ * persistence cases assert it, and the one relationship no fixture there could
+ * measure has its own describe below.
+ */
+describe('every verb answers with the fields the client copies back out of it', () => {
+  /**
+   * The fields the client reads back out of each answer.
+   *
+   * Typed against the contract's own shapes, so a name that is not a field of
+   * the thing it claims to describe is a compile error rather than an entry that
+   * silently checks nothing. Both list halves matter: `reply` names the fields
+   * read individually, while the client in fact substitutes the WHOLE comment —
+   * the completeness of the rest is the separate shape case below.
+   */
+  const CLIENT_READS: {
+    readonly reply: readonly (keyof ReviewComment)[]
+    readonly resolve: readonly (keyof ReviewThread)[]
+    readonly react: readonly (keyof ReactionRollup)[]
+  } = {
+    reply: [
+      'id',
+      'in_reply_to_id',
+      'path',
+      'line',
+      'side',
+      'subject_type',
+      'reactions',
+      'user',
+      'body',
+    ],
+    resolve: ['isResolved', 'isOutdated', 'resolvedBy'],
+    react: [
+      'url',
+      'total_count',
+      '+1',
+      '-1',
+      'laugh',
+      'hooray',
+      'confused',
+      'heart',
+      'rocket',
+      'eyes',
+    ],
+  }
+
+  /**
+   * The listed fields an answer did not carry — absent, or present holding
+   * nothing. Both count as unanswered: the client assigns whatever it finds
+   * straight onto cached state, so a key explicitly holding `undefined` blanks
+   * the cached value exactly as a missing key does.
+   */
+  const unanswered = (value: object, fields: readonly string[]): string[] =>
+    fields.filter(
+      (field) =>
+        !Object.hasOwn(value, field) || (value as Record<string, unknown>)[field] === undefined,
+    )
+
+  const CONVERGENCE_PATH = 'src/retry.ts'
+  const CONVERGENCE_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 800
+  const CONVERGENCE_THREAD_ID = `local:${LOCAL_ID}:${CONVERGENCE_COMMENT_ID}`
+  const CONVERGENCE_BODY = 'Agreed — it should stop at the first 4xx rather than retrying it.'
+
+  /** A synced review carrying one outdated thread, which every case here answers about. */
+  const convergenceStore = (): FakeLocalStore =>
+    makeLocalStore({
+      snapshots: [
+        localSnapshot({
+          localId: LOCAL_ID,
+          headSha: HEAD_SHA,
+          at: FIXED_NOW,
+          mergeBaseSha: BASE_SHA,
+          paths: [CONVERGENCE_PATH],
+          threads: [
+            {
+              id: CONVERGENCE_THREAD_ID,
+              path: CONVERGENCE_PATH,
+              // Outdated, so an answer rebuilt from parts would default the one
+              // field of the three the client copies that nothing here can
+              // recompute — and the completeness check would still pass, which
+              // is the honest limit of a check about presence.
+              isOutdated: true,
+              comments: [{ id: CONVERGENCE_COMMENT_ID }],
+            },
+          ],
+        }),
+      ],
+    })
+
+  const replyHere = (body: string = CONVERGENCE_BODY): Promise<ReviewComment> =>
+    localWrites.replyToLocalThread(
+      makeLocalDeps(convergenceStore()),
+      LOCAL_ID,
+      CONVERGENCE_THREAD_ID,
+      body,
+    )
+
+  describe('the completeness check discriminates before anything is measured with it', () => {
+    test('it names a field an answer left out', () => {
+      // Without this control every case below is satisfied by a checker that
+      // reports nothing, including over an answer carrying no fields at all.
+      expect(unanswered({ isResolved: true, resolvedBy: null }, CLIENT_READS.resolve)).toEqual([
+        'isOutdated',
+      ])
+    })
+
+    test('it names a field present but holding nothing', () => {
+      // Its own case: `undefined` is what a partly-built answer carries where a
+      // field was named and never filled, and a check keyed only on presence
+      // would read that as answered and blank the cached value in silence.
+      expect(
+        unanswered({ isResolved: true, isOutdated: undefined, resolvedBy: null }, CLIENT_READS.resolve),
+      ).toEqual(['isOutdated'])
+    })
+
+    test('it names nothing on an answer that carries every field, null included', () => {
+      // The positive half, and the reason `null` is not treated as missing: an
+      // unresolved thread legitimately names nobody, and a check that read that
+      // as an incomplete answer could never be satisfied by a correct verb.
+      expect(
+        unanswered({ isResolved: false, isOutdated: false, resolvedBy: null }, CLIENT_READS.resolve),
+      ).toEqual([])
+    })
+
+    test('no list is empty, so no case below can pass by checking nothing', () => {
+      // Written-out counts. A comparison of the lists against themselves would
+      // hold however many members they had, which is the whole failure mode.
+      expect([
+        CLIENT_READS.reply.length,
+        CLIENT_READS.resolve.length,
+        CLIENT_READS.react.length,
+      ]).toEqual([9, 3, 10])
+    })
+  })
+
+  test('a reply answers with every field the client copies onto its optimistic comment', async () => {
+    expect(unanswered(await replyHere(), CLIENT_READS.reply)).toEqual([])
+  })
+
+  test('a resolve answers with every field the client copies onto its optimistic flip', async () => {
+    const returned = await localWrites.resolveLocalThread(
+      makeLocalDeps(convergenceStore()),
+      LOCAL_ID,
+      CONVERGENCE_THREAD_ID,
+      true,
+    )
+    expect(unanswered(returned, CLIENT_READS.resolve)).toEqual([])
+  })
+
+  test('an unresolve answers with them too, though one of them names nobody', async () => {
+    // Its own case: unresolving is the one answer where a listed field is
+    // legitimately empty, so it is the one that would break a completeness
+    // check written to demand a value rather than a decision.
+    const returned = await localWrites.resolveLocalThread(
+      makeLocalDeps(convergenceStore()),
+      LOCAL_ID,
+      CONVERGENCE_THREAD_ID,
+      false,
+    )
+    expect(unanswered(returned, CLIENT_READS.resolve)).toEqual([])
+  })
+
+  test('a reaction answers with every count the client overwrites its rollup with', async () => {
+    const returned = await localWrites.addLocalReaction(
+      makeLocalDeps(convergenceStore()),
+      LOCAL_ID,
+      CONVERGENCE_COMMENT_ID,
+      '+1',
+    )
+    expect(unanswered(returned, CLIENT_READS.react)).toEqual([])
+  })
+
+  test('a repeat reaction answers with them too, unchanged as it is', async () => {
+    // The idempotent answer is handed to the same assignment as the first one,
+    // so it is held to the same completeness: a repeat that answered with a
+    // partial rollup would blank counts in the cache with nothing to notice.
+    const deps = makeLocalDeps(convergenceStore())
+    await localWrites.addLocalReaction(deps, LOCAL_ID, CONVERGENCE_COMMENT_ID, '+1')
+    const repeat = await localWrites.addLocalReaction(deps, LOCAL_ID, CONVERGENCE_COMMENT_ID, '+1')
+    expect(unanswered(repeat, CLIENT_READS.react)).toEqual([])
+  })
+
+  describe('a reply is shaped like the comments it is swapped in among', () => {
+    /**
+     * The client swaps its optimistic comment for this one inside a list of
+     * comments the read path produced, so the claim is not only that the named
+     * fields are filled — it is that the answer is not a NARROWER document than
+     * the ones already beside it. A field every stored comment carries and this
+     * one omits changes the shape of exactly one entry in a rendered
+     * conversation.
+     *
+     * Compared as key SETS against stored state rather than against a written-out
+     * literal, deliberately: a literal would have to be edited in step with the
+     * shape it describes, and a field added to the read path and forgotten by
+     * this verb would then be missing from both sides and invisible. Reading the
+     * expectation off a comment the review already holds is what removes that.
+     */
+    const storedRoot = (): ReviewComment => {
+      const held = convergenceStore()
+        .getLocalSnapshot(LOCAL_ID)
+        ?.mutable.threads.find((thread) => thread.id === CONVERGENCE_THREAD_ID)?.comments[0]
+      if (held === undefined) throw new Error('the seeded thread carries no comment to compare with')
+      return held
+    }
+
+    test('it carries every field a comment already stored on the review carries', async () => {
+      const comment = await replyHere()
+      const root = storedRoot()
+      expect(Object.keys(root).filter((key) => !Object.hasOwn(comment, key))).toEqual([])
+    })
+
+    test('the only field it carries beyond those is the link to what it answers', async () => {
+      // Its own case, and the direction that keeps the one above honest: a
+      // comparison in one direction alone is satisfied by an answer that carries
+      // every stored field plus anything at all. The one legitimate difference
+      // is named rather than tolerated — a root comment answers nothing, so it
+      // is the one comment on a thread that carries no such link.
+      const comment = await replyHere()
+      const root = storedRoot()
+      expect(Object.keys(comment).filter((key) => !Object.hasOwn(root, key))).toEqual([
+        'in_reply_to_id',
+      ])
+    })
+
+    test('the comparison is made against a comment that really carries fields, not an empty one', () => {
+      // The fixture control. Both directions above are vacuously satisfied by a
+      // stored comment with no fields, which is what a seed builder that had
+      // stopped populating one would leave behind.
+      expect(Object.keys(storedRoot()).length).toBeGreaterThanOrEqual(20)
+    })
+  })
+
+  describe('no answer smuggles an identity into a body', () => {
+    /**
+     * The claim in the READER's vocabulary rather than the writer's: whatever
+     * the sink did to a body, the parser that decides who a comment is from
+     * must reach the same conclusion about the answer as about the text that was
+     * written. That is a different statement from the ban on bold-prefixed
+     * bodies elsewhere in this file, and the two were measured against each
+     * other rather than assumed to agree.
+     *
+     * THEY ARE NOT EQUIVALENT, AND THE BAN IS THE BROADER OF THE TWO. Every body
+     * the parser accepts also matches that ban — the parser's own pattern
+     * requires the same bold opener — while the converse fails: a bold opener
+     * with no blank line after it, or one whose bold text is too long to read as
+     * a name, trips the ban and parses as nothing.
+     *
+     * WHICH IS WHY THIS IS AN EQUALITY AND NOT A DEMAND FOR NOTHING. A reviewer
+     * who opens a comment with a bold word has written a body the parser reads as
+     * a name, and bodies here are stored exactly as written — so a check
+     * requiring every answer to parse as nothing would be asserting against the
+     * verbatim guarantee rather than against a stamp. What a stamp does is add a
+     * LAYER, which moves the parse whether or not the text underneath parsed.
+     *
+     * Measured as SUBSUMED for detection: bodies are compared exactly elsewhere,
+     * so every stamping mutant is already caught there, in any format. Kept as
+     * the statement of what the property MEANS to the surface that reads it.
+     */
+    const PLAIN_BODY = 'Agreed — it should stop at the first 4xx rather than retrying it.'
+    /** A body the reviewer wrote that the identity parser already reads as a name. */
+    const SELF_STAMPED_BODY = '**Nit**\n\nprefer a const here.'
+
+    test('the parser reads a real stamp as an identity and a plain body as none', () => {
+      // The control, built with the function the mediated write path stamps
+      // with rather than with an imitation of it: without this pair, "the answer
+      // parses as nothing" is satisfied by a parser that never parses anything.
+      expect(parsePrefixedBody(prefixBody(SESSION.human, PLAIN_BODY))?.name).toBe(SESSION.human.name)
+      expect(parsePrefixedBody(PLAIN_BODY)).toBeNull()
+    })
+
+    test('a replied body the reviewer wrote plain comes back reading as no identity', async () => {
+      expect(parsePrefixedBody((await replyHere(PLAIN_BODY)).body)).toBeNull()
+    })
+
+    test('a body that already reads as an identity comes back reading as the same one', async () => {
+      // The categorical form, and the one that could not be written as a demand
+      // for nothing. The precondition is asserted FIRST: with it after, two
+      // nulls would satisfy the equality and the case would measure nothing.
+      const written = parsePrefixedBody(SELF_STAMPED_BODY)
+      expect(written).not.toBeNull()
+      expect(parsePrefixedBody((await replyHere(SELF_STAMPED_BODY)).body)).toEqual(written)
+    })
+  })
+})
+
+/**
+ * Which commit a created document records as the one it was written against.
+ *
+ * Three different commits are in scope while a local write runs, and on
+ * ordinary state they are the same string — which is exactly why a case built on
+ * ordinary state proves nothing about which of them was read. The branch's head
+ * as the injected resolver reports it is the one an answer must carry: it is
+ * what the reviewer is looking at and what the write was guarded against. The
+ * stored snapshot's head is the state of the last sync, which can be older,
+ * because a local review is synced on demand while the branch moves underneath
+ * it — a comment stamped with that one claims to have been written against a
+ * commit the reviewer never saw, and nothing downstream could tell. The thread's
+ * root carries a third: the commit the conversation was opened against, which a
+ * reply does not restate.
+ *
+ * Every case here therefore runs against a review whose stored snapshot was
+ * synced at a commit the resolver no longer reports, with a fixture control
+ * asserting the three really do differ. Without that separation these are
+ * comparisons between several names for one value, and they hold however the
+ * answer was derived.
+ *
+ * ONE SUBSTITUTION IS UNFALSIFIABLE AND IS RECORDED RATHER THAN CHASED: the head
+ * the submit was ASKED to guard against. A submit reaches the point where it
+ * stamps anything only once the resolved head and the expected one are equal, so
+ * an answer derived from either is the same answer on every input that can reach
+ * the code, and no fixture can separate them.
+ */
+describe('a created document is stamped with the head the write was guarded against', () => {
+  /** The commit the last sync captured — older than the branch's head now. */
+  const LAST_SYNCED_SHA = 'e'.repeat(40)
+  /** Older still: the commit the seeded thread was opened against. */
+  const THREAD_OPENED_AT_SHA = 'f'.repeat(40)
+
+  const STALE_PATH = 'src/retry.ts'
+  const STALE_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 850
+  const STALE_THREAD_ID = `local:${LOCAL_ID}:${STALE_COMMENT_ID}`
+  const REPLY_BODY = 'Still worth stopping at the first 4xx.'
+
+  /**
+   * A thread written out rather than seeded through the shorthand, which derives
+   * a comment's commit from the snapshot's head — the agreement this fixture
+   * exists to break.
+   */
+  const openedEarlier = (): ReviewThread => ({
+    id: STALE_THREAD_ID,
+    isResolved: false,
+    isOutdated: false,
+    path: STALE_PATH,
+    line: 12,
+    originalLine: 12,
+    startLine: null,
+    originalStartLine: null,
+    diffSide: 'RIGHT',
+    startDiffSide: null,
+    subjectType: 'LINE',
+    resolvedBy: null,
+    comments: [
+      {
+        id: STALE_COMMENT_ID,
+        node_id: `seeded-comment-${STALE_COMMENT_ID}`,
+        pull_request_review_id: null,
+        path: STALE_PATH,
+        diff_hunk: '@@ -12,1 +12,1 @@\n-was\n+is\n',
+        commit_id: THREAD_OPENED_AT_SHA,
+        original_commit_id: THREAD_OPENED_AT_SHA,
+        line: 12,
+        original_line: 12,
+        start_line: null,
+        original_start_line: null,
+        side: 'RIGHT',
+        start_side: null,
+        subject_type: 'line',
+        user: SEEDED_AUTHOR,
+        body: 'The comment that opened this thread, written before the branch moved on.',
+        created_at: FIXED_NOW,
+        updated_at: FIXED_NOW,
+        reactions: zeroedReactions(),
+        html_url: '',
+      },
+    ],
+  })
+
+  /** A review last synced at one commit, carrying a thread opened at another. */
+  const staleSyncStore = (): FakeLocalStore => {
+    const store = makeLocalStore({
+      snapshots: [
+        localSnapshot({
+          localId: LOCAL_ID,
+          headSha: LAST_SYNCED_SHA,
+          at: FIXED_NOW,
+          mergeBaseSha: BASE_SHA,
+          paths: [STALE_PATH],
+        }),
+      ],
+    })
+    store.putLocalThread(LOCAL_ID, openedEarlier())
+    return store
+  }
+
+  const STALE_SUBMIT: SubmitReviewInput = {
+    prNumber: LOCAL_ID,
+    expectedHeadSha: HEAD_SHA,
+    event: 'COMMENT',
+    body: 'Two things worth another look before this goes anywhere.',
+    comments: [
+      {
+        key: 'stale-one',
+        path: STALE_PATH,
+        side: 'RIGHT',
+        start_side: null,
+        line: 20,
+        start_line: null,
+        body: 'This still retries on a 4xx.',
+        createdAt: FIXED_NOW,
+        updatedAt: FIXED_NOW,
+        anchor: { lineText: 'line 20', contextBefore: [], contextAfter: [] },
+      },
+    ],
+  }
+
+  const submitStale = async (store: FakeLocalStore): Promise<ReviewSummary> => {
+    const result = await localWrites.submitLocalReview(makeLocalDeps(store), STALE_SUBMIT)
+    if (result.status !== 'ok') {
+      throw new Error(`the submit answered '${result.status}' where 'ok' was required`)
+    }
+    return result.review
+  }
+
+  /** The comments the submit created — everything except the thread that was seeded. */
+  const createdComments = (store: FakeLocalStore): ReviewComment[] =>
+    store
+      .listLocalThreads(LOCAL_ID)
+      .filter((thread) => thread.id !== STALE_THREAD_ID)
+      .flatMap((thread) => thread.comments)
+
+  test('the fixture holds three different commits, without which every case here is vacuous', async () => {
+    // Read off the STORED state and off the injected resolver rather than off
+    // the constants, so a seed builder that quietly normalized the snapshot to
+    // the branch's head, or a resolver answering something else, is caught here
+    // rather than turning the cases below into tautologies that still pass.
+    const store = staleSyncStore()
+    const snapshot = store.getLocalSnapshot(LOCAL_ID)
+    const root = snapshot?.mutable.threads[0]?.comments[0]
+    const head = await makeLocalDeps(store).resolveHead()
+    expect([snapshot?.immutable.headSha, root?.commit_id, head.sha]).toEqual([
+      LAST_SYNCED_SHA,
+      THREAD_OPENED_AT_SHA,
+      HEAD_SHA,
+    ])
+    // The distinctness itself, as a written-out count: three values compared
+    // pairwise by hand would still hold if two of the constants became equal.
+    expect(new Set([LAST_SYNCED_SHA, THREAD_OPENED_AT_SHA, HEAD_SHA]).size).toBe(3)
+  })
+
+  test('the submitted summary names the resolved head, not the commit the review was synced at', async () => {
+    const review = await submitStale(staleSyncStore())
+    expect(review.commit_id).toBe(HEAD_SHA)
+  })
+
+  test('every comment the submit created names the resolved head on both of its commit fields', async () => {
+    // Its own case rather than a second assertion above: the summary and the
+    // comments read their commit from the same value in the same function, so a
+    // shared body would let the first abort before the second was measured.
+    const store = staleSyncStore()
+    await submitStale(store)
+    const created = createdComments(store)
+    expect(created).toHaveLength(1)
+    expect(created.map((comment) => [comment.commit_id, comment.original_commit_id])).toEqual([
+      [HEAD_SHA, HEAD_SHA],
+    ])
+  })
+
+  test('a reply names the resolved head, while the commit its thread was opened against stays the root’s', async () => {
+    // Both halves in one comparison, because they are one claim about one
+    // document: the current commit moves with the branch, the original does not.
+    const comment = await localWrites.replyToLocalThread(
+      makeLocalDeps(staleSyncStore()),
+      LOCAL_ID,
+      STALE_THREAD_ID,
+      REPLY_BODY,
+    )
+    expect([comment.commit_id, comment.original_commit_id]).toEqual([
+      HEAD_SHA,
+      THREAD_OPENED_AT_SHA,
+    ])
   })
 })
