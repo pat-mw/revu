@@ -363,6 +363,56 @@ export interface DirectStore {
    * reach disk together, or a `StoreWriteError` surfaces and neither did.
    */
   putLocalSnapshot(snapshot: Snapshot): void
+  /**
+   * One human's review draft on one local review, or `null` when that human has
+   * no draft on it — the correct empty answer, and never another human's draft.
+   *
+   * Keyed on the human AND the review, exactly as the pull-request draft table
+   * is. Two humans can review the same branch pair, so the review id alone does
+   * not identify a row: a read keyed on it would hand one human the other's
+   * unsubmitted review text, which is the single most private thing this store
+   * holds.
+   *
+   * Throws `StoreUnreadableError` when the row exists but its JSON cannot be
+   * parsed, so a corrupt draft is never reported as no draft and then written
+   * over.
+   */
+  getLocalDraft(humanId: string, localId: number): ReviewDraft | null
+  /**
+   * Persist one human's draft on one local review, replacing any draft that
+   * human already had on it.
+   *
+   * The stored document is an unchanged `ReviewDraft` carrying the local review
+   * id in its `prNumber` field, so nothing downstream needs a second draft type.
+   * The row is keyed by the draft's OWN `humanId`; a caller that accepts an
+   * identity from a request must overwrite it with the session's before calling,
+   * exactly as the pull-request draft path does — the store makes the keying
+   * possible and does not police who is asking.
+   */
+  putLocalDraft(draft: ReviewDraft): void
+  /**
+   * Remove one human's draft on one local review, and nothing else.
+   *
+   * Both key columns are matched. Deleting on the review id alone would take
+   * every human's draft on that review with it; deleting on the human alone
+   * would take their drafts on every other review. Drafts are irreplaceable
+   * local work, so the narrowest statement that can express the intent is the
+   * only acceptable one.
+   */
+  deleteLocalDraft(humanId: string, localId: number): void
+  /**
+   * One human's per-file viewed state on one local review. An absent row reads
+   * back as an empty record — nothing viewed yet is the ordinary state, not an
+   * error — while a present-but-unparseable row throws `StoreUnreadableError`.
+   *
+   * A separate keyspace from the pull-request viewed table, not a shared one
+   * with a wider key: a local review id and a pull request number are different
+   * kinds of number, and a review that happened to carry a colliding value must
+   * never inherit the other's checkmarks.
+   */
+  getLocalViewed(humanId: string, localId: number): FileViewedState
+  /** Replace one human's per-file viewed state on one local review. */
+  setLocalViewed(humanId: string, localId: number, state: FileViewedState): void
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -1011,6 +1061,58 @@ export function openDirectStore(
         immutable: stored.immutable,
         mutable: envelope.mutable,
       }
+    },
+
+    getLocalDraft(humanId: string, localId: number): ReviewDraft | null {
+      const row = db
+        .query('SELECT data FROM local_drafts WHERE human_id = ? AND local_id = ?')
+        .get(humanId, localId) as { data: string } | null
+      if (!row) return null
+      return parseRow<ReviewDraft>('local_drafts', `${humanId}/${localId}`, row.data)
+    },
+
+    putLocalDraft(draft: ReviewDraft): void {
+      write('local_drafts', () => {
+        // The local review's id travels in `prNumber`, so the document written
+        // here is an unchanged draft: the same shape the pull-request path
+        // stores, read by the same code, with nothing to keep in step.
+        db.run(
+          'INSERT INTO local_drafts (human_id, local_id, data) VALUES (?, ?, ?) ' +
+            'ON CONFLICT(human_id, local_id) DO UPDATE SET data = excluded.data',
+          [draft.humanId, draft.prNumber, JSON.stringify(draft)],
+        )
+      })
+    },
+
+    deleteLocalDraft(humanId: string, localId: number): void {
+      write('local_drafts', () => {
+        // BOTH key columns, and that is the whole statement's substance. Two
+        // humans reviewing one branch pair hold two rows under the same
+        // `local_id`, so a delete keyed on the id alone would discard the other
+        // human's unsubmitted review text — silently, since a delete reports
+        // nothing about what it matched. Keyed on the pair it removes exactly
+        // the row the caller addressed and cannot reach a row belonging to
+        // anyone else.
+        db.run('DELETE FROM local_drafts WHERE human_id = ? AND local_id = ?', [humanId, localId])
+      })
+    },
+
+    getLocalViewed(humanId: string, localId: number): FileViewedState {
+      const row = db
+        .query('SELECT data FROM local_viewed WHERE human_id = ? AND local_id = ?')
+        .get(humanId, localId) as { data: string } | null
+      if (!row) return {}
+      return parseRow<FileViewedState>('local_viewed', `${humanId}/${localId}`, row.data)
+    },
+
+    setLocalViewed(humanId: string, localId: number, state: FileViewedState): void {
+      write('local_viewed', () => {
+        db.run(
+          'INSERT INTO local_viewed (human_id, local_id, data) VALUES (?, ?, ?) ' +
+            'ON CONFLICT(human_id, local_id) DO UPDATE SET data = excluded.data',
+          [humanId, localId, JSON.stringify(state)],
+        )
+      })
     },
 
     putLocalSnapshot(snapshot: Snapshot): void {

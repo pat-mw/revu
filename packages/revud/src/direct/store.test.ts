@@ -232,6 +232,74 @@ describe('persist + read round-trips', () => {
     expect(store.getViewed('h2', 204)).toEqual({})
     store.close()
   })
+
+  test('local viewed state round-trips per human + local review id', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 's', at: 'now' } })
+    expect(store.getLocalViewed('h1', id)['a.ts'].viewed).toBe(true)
+    store.close()
+  })
+
+  test('a second human reads local viewed state back as empty — the answer, not an error', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 's', at: 'now' } })
+    // Empty rather than a throw, and the contrast with a draft is deliberate:
+    // "nobody has marked anything viewed" is an ordinary state with a natural
+    // empty value, whereas a draft that is absent and a draft that is unreadable
+    // are different enough that one must be `null` and the other must be loud.
+    expect(store.getLocalViewed('h2', id)).toEqual({})
+    store.close()
+  })
+
+  test('a present-but-corrupt local viewed row throws rather than reading as empty', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 's', at: 'now' } })
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_viewed SET data = '{not valid json' WHERE local_id = ?", [id])
+    raw.close()
+
+    // An empty record here would read as "nothing viewed" and the next write
+    // would flatten whatever the row really held. Absent and unreadable are
+    // different answers even where the absent one is a value rather than null.
+    const reopened = open()
+    expect(() => reopened.getLocalViewed('h1', id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('viewed state under a local review id is invisible to the pull-request table', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 's', at: 'now' } })
+
+    // Nothing was ever marked viewed on a PULL REQUEST numbered `id`, so the
+    // pull-request read must be empty. This is the only case in this block where
+    // the pull-request row is absent, which is the one shape a getter that
+    // "helpfully" falls back to the other table would slip through.
+    expect(store.getViewed('h1', id)).toEqual({})
+    store.close()
+  })
+
+  test('the two viewed keyspaces hold their own state under one number', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.setViewed('h1', id, { 'pr.ts': { viewed: true, blobSha: 'pr', at: 'now' } })
+    store.setLocalViewed('h1', id, { 'local.ts': { viewed: true, blobSha: 'local', at: 'now' } })
+
+    // A local review id and a pull request number are different kinds of number
+    // that can coincide. Sharing one table under a wider key would make the
+    // second write overwrite the first and hand each side the other's
+    // checkmarks — a file marked reviewed in one place, silently marked in the
+    // other. Both reads are pinned, so a getter aimed at the wrong table is red
+    // even when both rows exist.
+    expect(Object.keys(store.getViewed('h1', id))).toEqual(['pr.ts'])
+    expect(Object.keys(store.getLocalViewed('h1', id))).toEqual(['local.ts'])
+    store.close()
+  })
 })
 
 describe('the immutable half is a content-addressed cache keyed by compareKey', () => {

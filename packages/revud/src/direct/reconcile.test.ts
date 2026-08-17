@@ -125,6 +125,11 @@ function fakeStore(opts: {
     nextLocalEntityId: unexpected('nextLocalEntityId'),
     getLocalSnapshot: unexpected('getLocalSnapshot'),
     putLocalSnapshot: unexpected('putLocalSnapshot'),
+    getLocalDraft: unexpected('getLocalDraft'),
+    putLocalDraft: unexpected('putLocalDraft'),
+    deleteLocalDraft: unexpected('deleteLocalDraft'),
+    getLocalViewed: unexpected('getLocalViewed'),
+    setLocalViewed: unexpected('setLocalViewed'),
     close: () => {},
   }
 }
