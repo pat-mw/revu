@@ -163,3 +163,151 @@ export function authorBannerCopy(mode: ReviewMode, unresolved: number): AuthorBa
     action,
   }
 }
+
+/** A toast's two lines: the headline, and the sentence drawn under it. */
+export interface ToastCopy {
+  title: string
+  detail: string
+}
+
+/**
+ * The toast at the end of a submitted review.
+ *
+ * On a mediated pull request the whole review — the summary and every line
+ * comment — leaves in a single request, and saying so is the point of the
+ * sentence rather than trivia: it tells a reader that reviewing costs one round
+ * trip instead of one per comment, which is why the draft is batched at all.
+ *
+ * Neither half of that survives on a review of two local branches. Nothing was
+ * published anywhere, so there is nothing to have posted; and no request was
+ * made, so there is no call to have made one of. What did happen is worth
+ * saying plainly, because it is the reassurance the sentence is really for: the
+ * review was written down, and it is on the branch the reader is looking at.
+ *
+ * `comments` is the number of line comments in the draft. Zero means the review
+ * is a summary alone, which is submittable and gets its own line rather than
+ * being reported as none.
+ */
+export function submitSuccessCopy(mode: ReviewMode, comments: number): ToastCopy {
+  const counted = `${comments} ${comments === 1 ? 'comment' : 'comments'}`
+  if (mode === 'local') {
+    return {
+      title: 'Review saved',
+      detail:
+        comments === 0 ? 'Summary saved on this branch.' : `${counted} on this branch.`,
+    }
+  }
+  return {
+    title: 'Review posted',
+    detail:
+      comments === 0 ? 'Summary posted in one API call.' : `${counted} in one API call.`,
+  }
+}
+
+/**
+ * The toast at the end of a review submitted through the reconcile screen.
+ *
+ * The tally is the receipt for a decision session the reader just spent real
+ * time on — which comments survived the branch moving under them, and which
+ * they chose to let go — so it is identical on both readings. What changes is
+ * the clause after it, for the same reason the plain submit's does: on a branch
+ * pair no request was made and nothing was published.
+ */
+export function reconcileSuccessCopy(
+  mode: ReviewMode,
+  kept: number,
+  dropped: number,
+): ToastCopy {
+  const tally = `${kept} kept, ${dropped} dropped`
+  if (mode === 'local') {
+    return {
+      title: 'Review saved after reconcile',
+      detail: `${tally} — saved on this branch.`,
+    }
+  }
+  return {
+    title: 'Review posted after reconcile',
+    detail: `${tally} — one API call.`,
+  }
+}
+
+/**
+ * The line under a write that failed, where the headline is the error itself.
+ *
+ * The headline is the same on both readings and is not this module's to choose
+ * — it is whatever the failure was. This is the sentence beneath it, and its
+ * whole job is to stop a reader from retyping a review they still have.
+ */
+export interface FailureDetailCopy {
+  detail: string
+}
+
+/**
+ * What a failed submit says about the draft it did not send.
+ *
+ * Only the custodian differs. The promise is the load-bearing half and is true
+ * on both readings: a write that fails rolls back to an editable draft with
+ * every character intact, and a reader who is not told that will assume the
+ * opposite and start again.
+ */
+export function submitFailureCopy(mode: ReviewMode): FailureDetailCopy {
+  if (mode === 'local') {
+    return { detail: 'Your draft is untouched in this workspace — nothing was lost.' }
+  }
+  return { detail: 'Your draft is untouched on the broker — nothing was lost.' }
+}
+
+/**
+ * What a failed reconcile says about the draft it did not send.
+ *
+ * The same promise a failed plain submit makes, and it matters more here: the
+ * draft it is about is one the reader just re-decided comment by comment, so
+ * losing it would cost the decisions as well as the text.
+ */
+export function reconcileFailureCopy(mode: ReviewMode): FailureDetailCopy {
+  if (mode === 'local') {
+    return {
+      detail: 'Your reconciled draft is saved in this workspace — nothing was lost.',
+    }
+  }
+  return { detail: 'Your reconciled draft is saved on the broker — nothing was lost.' }
+}
+
+/** The persistence whisper beside the draft controls, and what it expands to. */
+export interface DraftSavedCopy {
+  /** The quiet line that says the draft is written down. */
+  label: string
+  /** Where it lives and what that means, on hover. */
+  tooltip: string
+}
+
+/**
+ * The whisper that says an unfinished review is safe to walk away from.
+ *
+ * Two facts, and they are why the whisper earns its space: the draft is
+ * private, and it will still be there later. Both hold on either reading, but
+ * for different reasons, and the reasons are the difference in wording.
+ *
+ * A mediated pull request's draft is held away from the machine it was typed
+ * on, by the same service that mediates the writes — which is what lets it
+ * survive the workspace being thrown away and rebuilt, and what makes "nobody
+ * else can see it" a claim about the other people sharing that service. A
+ * review of two local branches keeps its draft where the review itself lives,
+ * so the durability it can honestly promise is smaller: reloads and coming back
+ * tomorrow, not a rebuild of the very thing holding it. Claiming the larger one
+ * would invite a reader to discard exactly the work it told them was safe.
+ */
+export function draftSavedCopy(mode: ReviewMode): DraftSavedCopy {
+  if (mode === 'local') {
+    return {
+      label: 'saved · workspace',
+      tooltip:
+        'Drafts are kept beside the review in this workspace — invisible to GitHub and to anyone else. They survive reloads and tomorrow.',
+    }
+  }
+  return {
+    label: 'saved · broker',
+    tooltip:
+      'Drafts live on the broker, keyed to you — invisible to GitHub and to other contractors. They survive reloads, tomorrow, and a workspace rebuild.',
+  }
+}

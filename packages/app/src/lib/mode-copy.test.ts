@@ -12,11 +12,17 @@
  * control only looks like it bites.
  */
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import {
   authorBannerCopy,
   conversationEmptyCopy,
+  draftSavedCopy,
   notFoundCopy,
+  reconcileFailureCopy,
+  reconcileSuccessCopy,
   stateChipCopy,
+  submitFailureCopy,
+  submitSuccessCopy,
 } from './mode-copy'
 import type { ReviewMode } from './review-mode'
 
@@ -170,5 +176,227 @@ describe('the banner over the thread queue', () => {
 
   test('and does not abbreviate one either', () => {
     expect(bannerText('local', 3)).not.toMatch(/\bPR\b/)
+  })
+})
+
+/** Every line of the submitted-review toast as one string. */
+function submitSuccessText(mode: ReviewMode, comments: number): string {
+  return Object.values(submitSuccessCopy(mode, comments)).join(' ')
+}
+
+describe('the toast at the end of a submitted review', () => {
+  test('a pull request is told what left, and that it left in one go', () => {
+    // Today's literals, pinned character for character. The count line carries
+    // a singular form a sweep could quietly lose, and the "one call" claim is
+    // the point of the sentence on this path: it tells a reader that a review
+    // costs one round trip rather than one per comment.
+    expect(submitSuccessCopy('github', 3).title).toBe('Review posted')
+    expect(submitSuccessCopy('github', 3).detail).toBe('3 comments in one API call.')
+    expect(submitSuccessCopy('github', 1).detail).toBe('1 comment in one API call.')
+    expect(submitSuccessCopy('github', 0).detail).toBe('Summary posted in one API call.')
+  })
+
+  test('a branch pair is told what was written down, and where', () => {
+    // The control for the three absences below, and the sentence a reader sees
+    // at the end of every review of two local branches — pinned as a value
+    // rather than left merely un-wrong.
+    expect(submitSuccessCopy('local', 3).title).toBe('Review saved')
+    expect(submitSuccessCopy('local', 3).detail).toBe('3 comments on this branch.')
+    expect(submitSuccessCopy('local', 1).detail).toBe('1 comment on this branch.')
+    expect(submitSuccessCopy('local', 0).detail).toBe('Summary saved on this branch.')
+  })
+
+  test('and its two lines read as one sentence', () => {
+    // The toast draws its headline above its detail; read together they are
+    // the wording this sentence was settled as, which neither line pins alone.
+    const copy = submitSuccessCopy('local', 3)
+    expect(`${copy.title} — ${copy.detail}`).toBe('Review saved — 3 comments on this branch.')
+  })
+
+  // One absence per test: a runner stops at the first failure in a body, so a
+  // pair of them would leave the second never independently falsifiable.
+  test('and claims no call was made, because none was', () => {
+    expect(submitSuccessText('local', 3)).not.toMatch(/API call/i)
+  })
+
+  test('and claims nothing was posted, because nothing was', () => {
+    expect(submitSuccessText('local', 3)).not.toMatch(/posted/i)
+  })
+
+  test('and names no github, which was not involved', () => {
+    expect(submitSuccessText('local', 3)).not.toMatch(/github/i)
+  })
+})
+
+/** Every line of the reconciled-review toast as one string. */
+function reconcileSuccessText(mode: ReviewMode, kept: number, dropped: number): string {
+  return Object.values(reconcileSuccessCopy(mode, kept, dropped)).join(' ')
+}
+
+describe('the toast at the end of a reconciled review', () => {
+  test('a pull request makes the same claim the plain submit makes', () => {
+    expect(reconcileSuccessCopy('github', 5, 2).title).toBe('Review posted after reconcile')
+    expect(reconcileSuccessCopy('github', 5, 2).detail).toBe(
+      '5 kept, 2 dropped — one API call.',
+    )
+  })
+
+  test('a branch pair keeps the tally and drops the claim', () => {
+    // The tally is the whole value of this toast — it is the receipt for a
+    // decision session the reader just spent minutes on — so it survives the
+    // reword unchanged while the sentence around it stops asserting a write.
+    expect(reconcileSuccessCopy('local', 5, 2).title).toBe('Review saved after reconcile')
+    expect(reconcileSuccessCopy('local', 5, 2).detail).toBe(
+      '5 kept, 2 dropped — saved on this branch.',
+    )
+  })
+
+  test('and claims no call was made on this path either', () => {
+    expect(reconcileSuccessText('local', 5, 2)).not.toMatch(/API call/i)
+  })
+
+  test('and claims nothing was posted on this path either', () => {
+    expect(reconcileSuccessText('local', 5, 2)).not.toMatch(/posted/i)
+  })
+})
+
+/** Every line of the failed-submit detail as one string. */
+function submitFailureText(mode: ReviewMode): string {
+  return Object.values(submitFailureCopy(mode)).join(' ')
+}
+
+describe('the line under a submit that failed', () => {
+  test('a pull request is told where its draft still is', () => {
+    expect(submitFailureCopy('github').detail).toBe(
+      'Your draft is untouched on the broker — nothing was lost.',
+    )
+  })
+
+  test('a branch pair is told the same thing about a different custodian', () => {
+    expect(submitFailureCopy('local').detail).toBe(
+      'Your draft is untouched in this workspace — nothing was lost.',
+    )
+  })
+
+  test('and both keep the guarantee, which is the half true on either', () => {
+    // Only the custodian changes. That the text a reader typed survived the
+    // failure is a hard rule of every write here, and a reword that dropped it
+    // would leave someone retyping a review they still have.
+    expect(submitFailureCopy('github').detail).toMatch(/nothing was lost/)
+    expect(submitFailureCopy('local').detail).toMatch(/nothing was lost/)
+  })
+
+  test('and a branch pair names no broker, since none is holding it', () => {
+    expect(submitFailureText('local')).not.toMatch(/\bbroker\b/i)
+  })
+})
+
+/** Every line of the failed-reconcile detail as one string. */
+function reconcileFailureText(mode: ReviewMode): string {
+  return Object.values(reconcileFailureCopy(mode)).join(' ')
+}
+
+describe('the line under a reconcile that failed', () => {
+  test('a pull request is told its reconciled draft is safe', () => {
+    expect(reconcileFailureCopy('github').detail).toBe(
+      'Your reconciled draft is saved on the broker — nothing was lost.',
+    )
+  })
+
+  test('a branch pair is told the same about a different custodian', () => {
+    expect(reconcileFailureCopy('local').detail).toBe(
+      'Your reconciled draft is saved in this workspace — nothing was lost.',
+    )
+  })
+
+  test('and both keep the guarantee here too', () => {
+    // This one matters more than the plain submit's: the draft it promises is
+    // safe is one the reader just re-decided comment by comment.
+    expect(reconcileFailureCopy('github').detail).toMatch(/nothing was lost/)
+    expect(reconcileFailureCopy('local').detail).toMatch(/nothing was lost/)
+  })
+
+  test('and a branch pair names no broker here either', () => {
+    expect(reconcileFailureText('local')).not.toMatch(/\bbroker\b/i)
+  })
+})
+
+/** Every line of the draft-saved whisper as one string. */
+function draftSavedText(mode: ReviewMode): string {
+  return Object.values(draftSavedCopy(mode)).join(' ')
+}
+
+describe('the whisper that says the draft is safe', () => {
+  test('a pull request names the broker holding it', () => {
+    // The tooltip is pinned as one line because that is how it reads: the
+    // component splits it across three source lines and the renderer joins
+    // them back with single spaces.
+    expect(draftSavedCopy('github').label).toBe('saved · broker')
+    expect(draftSavedCopy('github').tooltip).toBe(
+      'Drafts live on the broker, keyed to you — invisible to GitHub and to other contractors. They survive reloads, tomorrow, and a workspace rebuild.',
+    )
+  })
+
+  test('a branch pair names the workspace that does', () => {
+    // Surviving a workspace rebuild is a property of a draft kept somewhere
+    // else, so the branch-pair reading does not claim it. What it keeps is the
+    // durability it actually has.
+    expect(draftSavedCopy('local').label).toBe('saved · workspace')
+    expect(draftSavedCopy('local').tooltip).toBe(
+      'Drafts are kept beside the review in this workspace — invisible to GitHub and to anyone else. They survive reloads and tomorrow.',
+    )
+  })
+
+  test('and both still promise nobody else can read it', () => {
+    // The half of the pull-request sentence that is true on a branch pair as
+    // well, and the reason to reword the custodian rather than delete the
+    // tooltip: a private draft is the thing that makes an unfinished review
+    // safe to leave open.
+    expect(draftSavedCopy('local').tooltip).toMatch(/invisible to GitHub/)
+  })
+
+  test('and a branch pair names no broker', () => {
+    expect(draftSavedText('local')).not.toMatch(/\bbroker\b/i)
+  })
+})
+
+/** One chrome file's source, read as text. */
+function chromeSource(relative: string): string {
+  return readFileSync(new URL(relative, import.meta.url), 'utf8')
+}
+
+const REVIEW_BAR_SOURCE = chromeSource('../components/review/review-bar.tsx')
+const RECONCILE_DIALOG_SOURCE = chromeSource('../components/review/reconcile-dialog.tsx')
+
+/** The names a file pulls out of this module, or none if it pulls out nothing. */
+function importedFromHere(source: string): string {
+  return /import\s*\{([^}]*)\}\s*from\s*'@\/lib\/mode-copy'/.exec(source)?.[1] ?? ''
+}
+
+describe('the chrome draws these sentences rather than its own', () => {
+  test('the reads are looking at the files they name', () => {
+    // The control for the two pins below: a path resolving to the wrong file,
+    // or to an empty one, would fail them for a reason with nothing to do with
+    // where the copy lives.
+    expect(REVIEW_BAR_SOURCE).toMatch(/export function ReviewBar\(/)
+    expect(RECONCILE_DIALOG_SOURCE).toMatch(/export function ReconcileDialog\(/)
+  })
+
+  test('the review bar takes all three of its mode-varying lines from here', () => {
+    // PRESENCE, not execution — nothing here proves a toast ever fires. What it
+    // turns red is a sentence pasted back inline, which every assertion above
+    // is blind to: they call this module, and a component that quietly stopped
+    // calling it would leave all of them green while the screen went back to
+    // claiming a write that never happened.
+    const names = importedFromHere(REVIEW_BAR_SOURCE)
+    expect(names).toContain('submitSuccessCopy')
+    expect(names).toContain('submitFailureCopy')
+    expect(names).toContain('draftSavedCopy')
+  })
+
+  test('and the reconcile dialog takes both of its own', () => {
+    const names = importedFromHere(RECONCILE_DIALOG_SOURCE)
+    expect(names).toContain('reconcileSuccessCopy')
+    expect(names).toContain('reconcileFailureCopy')
   })
 })

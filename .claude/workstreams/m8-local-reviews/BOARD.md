@@ -10,9 +10,17 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing.** No unit is dispatched, no agent is running, no worktree exists, the tree is clean and everything
-landed is committed and pushed. **The session paused deliberately at a unit boundary** — the next session
-finishes M8.7.
+**M8.7.6** — the residual sweep + the pinning test. Dispatched to an isolated worktree at `opus`. Files:
+`components/app-shell.tsx`, `pages/pr-layout.tsx`, `pages/files.tsx`, `components/ui/avatar.tsx`,
+`components/threads/comment-view.tsx`, `components/files/use-flat-rows.ts`, `lib/mode-copy.ts`,
+`lib/chrome-sweep.test.ts` (new). Nothing is committed for it yet; if this session dies now, discard the
+worktree and re-dispatch from M8.7.6 — nothing else is running.
+
+**Execution order for the rest, decided 2026-08-17 and recorded so it is not re-derived:**
+**M8.7.5 → M8.7.6 → M8.7.8 → M8.7.12 → M8.7.11 → M8.7.7.** Serial by file contention. M8.7.12 lands before
+M8.7.7 because it is the last `pr-layout.tsx` writer and M8.7.7 is the closing proof, which the ticket says
+runs after every other unit. M8.7.11 (`state/threads.ts`) is genuinely disjoint from all of them and is placed
+second-to-last only to keep M8.7.7 last.
 
 | ticket | state | where |
 | --- | --- | --- |
@@ -33,7 +41,8 @@ partial ticket parked at a session boundary.
 | M8.7.2 — tab set: omit Checks and Description | `efd260d` | 1391 pass · 1 skip · 0 fail · 79 files |
 | M8.7.9 — the two optimistic-path bugs | `38b9bd3` | 1405 pass · 1 skip · 0 fail · 80 files |
 | M8.7.4 — Conversation: threads only | `548f8e5` | 1411 pass · 1 skip · 0 fail · 81 files |
-| M8.7.3 — header identity, state chip, 404, banner stack | `4a9cd44` | **1440 pass · 1 skip · 0 fail · 81 files** |
+| M8.7.3 — header identity, state chip, 404, banner stack | `4a9cd44` | 1440 pass · 1 skip · 0 fail · 81 files |
+| M8.7.5 — review-bar: no lock, no API claim, no broker | `pending` | **1472 pass · 1 skip · 0 fail · 81 files** |
 
 **NOT landed — the next session's work, in this order** (serial by file contention, not by dependency; the
 reasoning is in the ticket's own `## Wave plan as actually run`):

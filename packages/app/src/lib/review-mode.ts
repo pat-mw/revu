@@ -176,3 +176,33 @@ export function prPaletteCommands(mode: ReviewMode): PrPaletteCommand[] {
   commands.push('resync', 'walk-threads')
   return commands
 }
+
+/** What the verdict picker knows when it decides whether to lock. */
+export interface SelfReviewLockInput {
+  mode: ReviewMode
+  /** Whether the review's list entry says this identity may approve it. */
+  canApprove: boolean
+}
+
+/**
+ * Whether the verdict picker locks its approving segments and offers the
+ * explanation behind them.
+ *
+ * The lock exists for one situation: a pull request opened by the single shared
+ * identity every contractor here writes through cannot be approved by that same
+ * identity, so two of the three segments would silently do nothing. The
+ * explanation behind the lock says who can approve it instead, and where. None
+ * of that has a counterpart on a review of two local branches — nothing was
+ * opened anywhere, there is no shared identity in the way, and there is no site
+ * to send anyone to — so the segments are simply live.
+ *
+ * The approval flag alone is not a safe gate, and the reason is a DEFAULT
+ * rather than a value: it is read off the review's list entry and falls back to
+ * "may not approve" whenever that entry is missing, which is every review's
+ * state on first paint and any review's state for good after a list error. A
+ * lock gated on the flag alone therefore shows the mediated-pull-request
+ * explanation on a branch pair no matter what the entry eventually says.
+ */
+export function showSelfReviewLock({ mode, canApprove }: SelfReviewLockInput): boolean {
+  return mode === 'github' && !canApprove
+}

@@ -48,6 +48,7 @@ import {
   redirectTargetFor,
   reviewMode,
   reviewTabs,
+  showSelfReviewLock,
   useRouteReviewMode,
 } from './review-mode'
 
@@ -182,12 +183,78 @@ describe('a tab reached by bookmark that the strip no longer offers', () => {
   })
 })
 
+describe('whether the verdict picker locks its approving segments', () => {
+  test('a branch pair does not, not even before its list entry has arrived', () => {
+    // The case this gate exists for. The approval flag is read off the review's
+    // list entry and falls back to false while that list is still loading — a
+    // state EVERY review passes through on first paint, and one any list error
+    // leaves it in for good. Gated on the flag alone, a review of two local
+    // branches therefore shows the mediated-pull-request explanation, which
+    // names a person and a website that have nothing to do with it, for as long
+    // as the list takes to arrive.
+    expect(showSelfReviewLock({ mode: 'local', canApprove: false })).toBe(false)
+  })
+
+  test('and does not once that entry says it may approve either', () => {
+    expect(showSelfReviewLock({ mode: 'local', canApprove: true })).toBe(false)
+  })
+
+  test('a pull request this identity may not approve does', () => {
+    // The control for the two above: a gate that answered false everywhere
+    // would satisfy both and silently remove the only explanation of why two
+    // of the three segments refuse to select on a mediated pull request.
+    expect(showSelfReviewLock({ mode: 'github', canApprove: false })).toBe(true)
+  })
+
+  test('and one it may approve does not', () => {
+    expect(showSelfReviewLock({ mode: 'github', canApprove: true })).toBe(false)
+  })
+})
+
 /**
  * The router's source. Read as text because the claim below is about WIRING
  * that only a renderer could execute — the predicate above can be correct and
  * still be consulted by nobody.
  */
 const APP_SOURCE = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8')
+
+/** The review bar's source, read for the same reason the router's is. */
+const REVIEW_BAR_SOURCE = readFileSync(
+  new URL('../components/review/review-bar.tsx', import.meta.url),
+  'utf8',
+)
+
+describe('the verdict picker consults the lock decision', () => {
+  test('the read is looking at the bar it names', () => {
+    // The control for the two pins below: a path resolving to the wrong file,
+    // or to an empty one, would satisfy neither for a reason that has nothing
+    // to do with wiring.
+    expect(/export function ReviewBar\(/.test(REVIEW_BAR_SOURCE)).toBe(true)
+  })
+
+  test('the bar imports the lock decision by name', () => {
+    // PRESENCE, not execution. The assertions above prove only that the
+    // decision is right; nothing here proves the picker renders on its answer.
+    // What it does turn red is the change it exists to catch — the gate tidied
+    // away and the approval flag read straight into the picker again, which
+    // every other test in this file would stay green through.
+    //
+    // Anchored to the import STATEMENT and the module it comes from, so a
+    // mention of the name in a comment or a leftover local does not satisfy it.
+    const imported =
+      /import\s*\{[^}]*\bshowSelfReviewLock\b[^}]*\}\s*from\s*'@\/lib\/review-mode'/
+    expect(imported.test(REVIEW_BAR_SOURCE)).toBe(true)
+  })
+
+  test('and the approval flag is read exactly once in it', () => {
+    // The flag defaults to "may not approve" while the review's list entry
+    // loads, which is why it is not a safe gate on its own. One read is the
+    // read that feeds the gate; a second one is an ungated branch that restores
+    // the behaviour the gate replaced, sitting beside a gate that stays green.
+    const reads = REVIEW_BAR_SOURCE.match(/broker\.canApprove/g) ?? []
+    expect(reads.length).toBe(1)
+  })
+})
 
 describe('the route table consults the redirect decision', () => {
   test('the read is looking at the router it names', () => {
