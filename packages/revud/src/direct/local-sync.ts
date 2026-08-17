@@ -1,6 +1,7 @@
 /**
  * The git-only read path for a review of two local branches: resolving the pair
- * to the commit range the review covers, and the key that range is cached under.
+ * to the commit range the review covers, the key that range is cached under, and
+ * the change set that range contains.
  *
  * Every command runs through the hardened seam beside this module, which is the
  * only place argv arrays are built — nothing here assembles one, so a ref name
@@ -36,7 +37,39 @@
  *     only by asking `rev-parse --is-shallow-repository`, which is why the probe
  *     runs before the no-common-ancestor outcome is reported;
  *   - `merge-base` handed a commit the repository does not have exits **128**.
+ *
+ * ## The change set is read as records, never as text
+ *
+ * `git diff --raw -z` reports one record per changed path, carrying both sides'
+ * file modes, both sides' object names and a status letter — everything the file
+ * list and the blob index need, from a single read, with no cap on how many
+ * records it will emit. `-z` makes each field NUL-terminated, so a path can hold
+ * a space, a newline or a quote and still be read back byte for byte.
+ *
+ * Reading it correctly turns on three details, each with a consequence:
+ *
+ *   - **`--no-abbrev` is mandatory.** Plain `--raw` truncates object names to
+ *     seven characters. Content is stored and looked up under full-length names,
+ *     so a truncated one matches nothing: every blob lookup would miss, line
+ *     resolution would come back empty, and pending comments would be classified
+ *     as lost en masse — with no visible cause, because a short name looks like a
+ *     name. The parser here refuses anything that is not a full-length object
+ *     name, so the mistake fails loudly rather than silently, but the flag is
+ *     what stops it happening at all.
+ *   - **An all-zero object name means "absent on this side"** and becomes null,
+ *     the same value the API-shaped producer of this structure uses; a zero-
+ *     spelled name in the index would be looked up as though it were content.
+ *   - **Gitlinks and symlinks are left out of the blob index, decided by file
+ *     mode.** A gitlink's oid is a commit in another repository that this one
+ *     usually does not hold at all, so asking for its bytes fails permanently
+ *     and the path would sit in the review as a blob nothing can ever supply.
+ *     A symlink's object is a path string rather than file content. Both stay in
+ *     the file list, with the reason they carry no index entry recorded beside
+ *     it, so the change set stays honest about what changed. The decision is made
+ *     on the mode and never on the shape of the oid: a real gitlink names an
+ *     ordinary-looking oid, and "it looks like zeros" would skip the wrong ones.
  */
+import type { PullFile, SnapshotImmutable } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import { runGit } from './local-git'
 
@@ -211,4 +244,285 @@ export async function resolveLocalRange(
       compareKey: `${mergeBaseSha}...${head.sha}`,
     },
   }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// The change set the range contains.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** How git spells "no object on this side" in a `--raw` record. */
+const ABSENT_OBJECT_NAME = '0'.repeat(40)
+
+/** How git spells "nothing on this side" in a `--raw` record's file-mode field. */
+const ABSENT_FILE_MODE = '000000'
+
+/**
+ * The status letters a diff between two commits can report. `U` (unmerged) and
+ * `X` (unknown) describe an index mid-conflict, which a commit-to-commit range
+ * cannot produce; a record carrying one is not a case to map but evidence that
+ * the output being read is not what it was asked for.
+ */
+export type RawDiffStatus = 'A' | 'C' | 'D' | 'M' | 'R' | 'T'
+
+const RAW_DIFF_STATUSES: readonly string[] = ['A', 'C', 'D', 'M', 'R', 'T']
+
+/**
+ * One `--raw -z` record, held as git spelled it. Deliberately unopinionated: the
+ * object names are the literal fields, including the all-zero spelling, and the
+ * status keeps its letter with any similarity score alongside rather than folded
+ * in. Interpretation happens one step later, so the two steps can be read — and
+ * tested — apart.
+ */
+export interface RawDiffRecord {
+  /** File mode on the base side, `000000` when the path is absent there. */
+  readonly srcMode: string
+  /** File mode on the head side, `000000` when the path is absent there. */
+  readonly dstMode: string
+  readonly srcSha: string
+  readonly dstSha: string
+  readonly status: RawDiffStatus
+  /** The similarity score git printed beside a rename or a copy, when it printed one. */
+  readonly score?: number
+  /** The head-side path. For a rename or a copy, the post-image path. */
+  readonly path: string
+  /** The pre-image path, present only for a rename or a copy. */
+  readonly previousPath?: string
+}
+
+/** Why a changed path carries no blob index entry. */
+export type BlobIndexSkipReason = 'gitlink' | 'symlink'
+
+/**
+ * The fields of a change-set file that a `--raw` read determines on its own:
+ * which object the head side names, the path it lives under, how it changed, and
+ * where a rename came from. Line counts and patch text come from separate reads
+ * over the same range and are layered on by whatever runs them.
+ *
+ * Deliberately a subset of the wire shape rather than the whole of it with zeros
+ * in the gaps: a file that silently claims no lines changed is indistinguishable
+ * from one that genuinely did not, whereas a missing later step is a type error.
+ */
+export type DiffFileEntry = Pick<PullFile, 'sha' | 'filename' | 'status' | 'previous_filename'>
+
+/** A change set: what changed, and which objects hold each side of it. */
+export interface LocalDiffFiles {
+  /** One entry per record, in the order git emitted them. */
+  readonly files: readonly DiffFileEntry[]
+  /** Keyed by head-side path. A path whose object cannot be read is absent. */
+  readonly blobIndex: SnapshotImmutable['blobIndex']
+  /**
+   * Head-side path → why that path has no blob index entry. Carried beside the
+   * index rather than inside the file entry, so a reader can say *why* a file
+   * shows no content without the reason having to fit a wire shape that has no
+   * field for it.
+   */
+  readonly skippedBlobPaths: Readonly<Record<string, BlobIndexSkipReason>>
+}
+
+/** git produced output, but not output in the format that was asked for. */
+export interface MalformedDiff {
+  readonly ok: false
+  readonly reason: 'malformed_diff'
+  readonly detail: string
+}
+
+/** The diff command itself failed. Carries the exit code that was observed. */
+export interface DiffFailed {
+  readonly ok: false
+  readonly reason: 'diff_failed'
+  readonly code: number
+}
+
+export type RawDiffParse =
+  | { readonly ok: true; readonly records: readonly RawDiffRecord[] }
+  | MalformedDiff
+
+export type LocalDiffFilesResult =
+  | { readonly ok: true; readonly diff: LocalDiffFiles }
+  | MalformedDiff
+  | DiffFailed
+
+/**
+ * A `--raw` metadata field. The object names are pinned at full length: without
+ * `--no-abbrev` git prints seven characters here, and a truncated name that was
+ * accepted would poison the blob index silently, where one that is refused says
+ * exactly what went wrong.
+ */
+const RAW_META = /^:(\d{6}) (\d{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([A-Z])(\d*)$/
+
+function malformed(detail: string): MalformedDiff {
+  return { ok: false, reason: 'malformed_diff', detail }
+}
+
+/**
+ * Reads `git diff --raw -z` output into records.
+ *
+ * The stream is a flat sequence of NUL-terminated fields: one metadata field,
+ * then the one path it concerns — or, for a rename or a copy, the two paths it
+ * pairs. How many path fields follow is therefore a function of the status letter
+ * that was just read, which is why this walks the fields rather than splitting on
+ * a record separator: there is no record separator to split on.
+ *
+ * Anything that is not that format is reported as a typed failure rather than
+ * skipped. A record this cannot read is a file the review would silently omit,
+ * and a review that quietly drops a changed file is worse than one that says it
+ * could not be built.
+ */
+export function parseRawZ(stdout: string): RawDiffParse {
+  const fields = stdout.split('\0')
+  // Every field is NUL-terminated, so splitting leaves one trailing empty string.
+  if (fields[fields.length - 1] === '') fields.pop()
+
+  const records: RawDiffRecord[] = []
+  let index = 0
+  while (index < fields.length) {
+    const meta = RAW_META.exec(fields[index])
+    if (meta === null) {
+      return malformed(`${JSON.stringify(fields[index])} is not a --raw -z metadata field`)
+    }
+    const [, srcMode, dstMode, srcSha, dstSha, letter, score] = meta
+    if (!RAW_DIFF_STATUSES.includes(letter)) {
+      return malformed(`status ${JSON.stringify(letter)} cannot arise between two commits`)
+    }
+    const status = letter as RawDiffStatus
+    const pathCount = status === 'R' || status === 'C' ? 2 : 1
+    const paths = fields.slice(index + 1, index + 1 + pathCount)
+    if (paths.length < pathCount || paths.some((path) => path.length === 0)) {
+      return malformed(`status ${status} needs ${pathCount} path field(s), got ${paths.length}`)
+    }
+    index += 1 + pathCount
+    records.push({
+      srcMode,
+      dstMode,
+      srcSha,
+      dstSha,
+      status,
+      ...(score.length > 0 ? { score: Number(score) } : {}),
+      ...(pathCount === 2 ? { previousPath: paths[0], path: paths[1] } : { path: paths[0] }),
+    })
+  }
+  return { ok: true, records }
+}
+
+/**
+ * Status letters onto the four the wire shape declares. Two of them have no
+ * member of their own and are mapped to the closest true statement about the head
+ * side: a copy is a file that is new where it now sits, and a type change is a
+ * path that exists on both sides with different content.
+ */
+const STATUS: Readonly<Record<RawDiffStatus, PullFile['status']>> = {
+  A: 'added',
+  C: 'added',
+  D: 'removed',
+  M: 'modified',
+  R: 'renamed',
+  T: 'modified',
+}
+
+/** File modes whose object is not readable file content, and what to call each. */
+const UNREADABLE_MODES = new Map<string, BlobIndexSkipReason>([
+  ['160000', 'gitlink'],
+  ['120000', 'symlink'],
+])
+
+/**
+ * Whether a record's object is something this repository can read as content,
+ * decided on the file modes of the sides that exist. A skip on either side takes
+ * the whole path out of the index: an entry whose base or head names something
+ * that is not file content would anchor a comment against something that is not
+ * the file.
+ */
+function skipReason(record: RawDiffRecord): BlobIndexSkipReason | null {
+  for (const mode of [record.srcMode, record.dstMode]) {
+    if (mode === ABSENT_FILE_MODE) continue
+    const reason = UNREADABLE_MODES.get(mode)
+    if (reason !== undefined) return reason
+  }
+  return null
+}
+
+/** An object name, or null where git spelled the side as absent. */
+function objectNameOrNull(sha: string): string | null {
+  return sha === ABSENT_OBJECT_NAME ? null : sha
+}
+
+/**
+ * Turns records into the file list and the blob index a review is read through.
+ *
+ * The index is keyed by the **head-side** path, which is what makes a rename work:
+ * its entry lives under the new path and holds the old path's object on the base
+ * side, so a comment written against the pre-image resolves through the one entry
+ * that knows both sides. A removed file keeps a null head side, and an added file
+ * a null base side, whichever way git happened to spell the missing object.
+ */
+export function buildLocalDiffFiles(records: readonly RawDiffRecord[]): LocalDiffFiles {
+  const files: DiffFileEntry[] = []
+  const blobIndex: SnapshotImmutable['blobIndex'] = {}
+  const skippedBlobPaths: Record<string, BlobIndexSkipReason> = {}
+
+  for (const record of records) {
+    const status = STATUS[record.status]
+    const base = objectNameOrNull(record.srcSha)
+    const head = objectNameOrNull(record.dstSha)
+
+    files.push({
+      // The head-side object when there is one, and the pre-image object
+      // otherwise: a removed file has no head side, and its pre-image name is the
+      // only thing that identifies it — the same value the API-shaped producer
+      // carries in this field for a removal.
+      sha: head ?? base ?? '',
+      filename: record.path,
+      // Only a rename carries its pre-image path. A copy is reported as added,
+      // and an added file has no earlier name, so saying it does would describe a
+      // relationship the status it was given does not have.
+      ...(record.status === 'R' && record.previousPath !== undefined
+        ? { previous_filename: record.previousPath }
+        : {}),
+      status,
+    })
+
+    const skip = skipReason(record)
+    if (skip !== null) {
+      skippedBlobPaths[record.path] = skip
+      continue
+    }
+    blobIndex[record.path] = {
+      base: status === 'added' ? null : base,
+      head: status === 'removed' ? null : head,
+    }
+  }
+
+  return { files, blobIndex, skippedBlobPaths }
+}
+
+/** The two commits a change set is read between. */
+export type LocalDiffRange = Pick<LocalRange, 'mergeBaseSha' | 'headSha'>
+
+/**
+ * Reads the change set between two commits.
+ *
+ * There is no upper bound on how many files come back. The API-shaped producer
+ * caps itself because it pages through a list and a very large pull would page
+ * forever; one `git diff` emits every record in a single reply, so a cap here
+ * would be an artifact copied from a constraint that does not exist on this path,
+ * and it would silently truncate a large review.
+ *
+ * `core.quotePath=false` is passed explicitly even though `-z` already emits
+ * paths verbatim: the guarantee then rests on the setting rather than on a
+ * behaviour of the output format, and a path outside ASCII arrives as its own
+ * bytes either way.
+ */
+export async function readLocalDiffFiles(
+  runner: CommandRunner,
+  cwd: string,
+  range: LocalDiffRange,
+): Promise<LocalDiffFilesResult> {
+  const result = await runGit(runner, cwd, {
+    args: ['-c', 'core.quotePath=false', 'diff', '--raw', '--no-abbrev', '-M', '-z'],
+    revs: [range.mergeBaseSha, range.headSha],
+  })
+  if (!result.ok) return { ok: false, reason: 'diff_failed', code: result.code }
+  const parsed = parseRawZ(result.stdout)
+  if (!parsed.ok) return parsed
+  return { ok: true, diff: buildLocalDiffFiles(parsed.records) }
 }

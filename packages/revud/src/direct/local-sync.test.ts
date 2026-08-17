@@ -24,9 +24,16 @@
  * predicate rather than restated here, and the sweep covers every captured call
  * with an independently pinned count — a resolver that quietly stopped spawning
  * something shrinks that count.
+ *
+ * The second half of the file covers the change set that range produces: git's
+ * `--raw -z` records parsed into a file list and a blob index. Three of its
+ * assertions are assertions of an *absence* — no object name spelled as absent
+ * reaches the index, and neither a gitlink's nor a symlink's path does — so each
+ * is paired with a permanent control that puts the forbidden thing there, and
+ * each control is shown to fail on its own rather than only as part of a bundle.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandResult, CommandRunner } from './command-runner'
@@ -35,12 +42,21 @@ import type { FixtureRepo } from './local-fixture-repo'
 import {
   FIXTURE_AUTHOR_EMAIL,
   FIXTURE_AUTHOR_NAME,
+  FIXTURE_GITLINK_SHA,
   createFixtureRepo,
 } from './local-fixture-repo'
 import { isHardenedArgv } from './local-git-argv'
 import { GIT_ARGV_BLOCKED, normalizeRef } from './local-git'
-import type { LocalRange, LocalRangeFailure, LocalRangeResult } from './local-sync'
-import { resolveLocalRange } from './local-sync'
+import type {
+  BlobIndexSkipReason,
+  DiffFileEntry,
+  LocalDiffFiles,
+  LocalRange,
+  LocalRangeFailure,
+  LocalRangeResult,
+  RawDiffRecord,
+} from './local-sync'
+import { buildLocalDiffFiles, parseRawZ, readLocalDiffFiles, resolveLocalRange } from './local-sync'
 import * as localSyncModule from './local-sync'
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -543,8 +559,13 @@ describe('every command the resolver runs is hardened, and none is classified by
   })
 
   test('the module exports exactly the surface this suite drives', () => {
-    // A new export must join the sweep by hand; this pin is what forces that.
-    expect(Object.keys(localSyncModule).sort()).toEqual(['resolveLocalRange'])
+    // A new export must join a sweep by hand; this pin is what forces that.
+    expect(Object.keys(localSyncModule).sort()).toEqual([
+      'buildLocalDiffFiles',
+      'parseRawZ',
+      'readLocalDiffFiles',
+      'resolveLocalRange',
+    ])
   })
 })
 
@@ -770,5 +791,845 @@ describe('a shallow clone is reported as itself, not as unrelated histories', ()
       baseRef: qualified(fixture.baseBranch),
       headRef: qualified(fixture.headBranch),
     })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The change set: `git diff --raw -z` records, a file list, and a blob index.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** How git spells "there is no object on this side". */
+const ABSENT_OID = '0'.repeat(40)
+
+/** How git spells "there is nothing on this side" in a file-mode position. */
+const ABSENT_MODE = '000000'
+
+/**
+ * A distinct full-length object name per seed. Every one is deliberately free of
+ * any run of zeros, so the only object names in this table that could trip a scan
+ * for an absent-spelled oid are the ones that are *meant* to be caught.
+ */
+function oid(seed: string): string {
+  return seed.repeat(20)
+}
+
+/** One `--raw -z` record: a metadata field, then its path fields, each NUL-terminated. */
+function rawRecord(meta: string, ...paths: readonly string[]): string {
+  return [meta, ...paths].map((field) => `${field}\0`).join('')
+}
+
+const ADDED_OID = oid('1a')
+const REMOVED_OID = oid('2b')
+const PLAIN_BASE_OID = oid('3c')
+const PLAIN_HEAD_OID = oid('4d')
+const RENAME_BASE_OID = oid('5e')
+const RENAME_HEAD_OID = oid('6f')
+const COPY_SOURCE_OID = oid('7a')
+const COPY_HEAD_OID = oid('8b')
+const TYPECHANGE_BASE_OID = oid('9c')
+const TYPECHANGE_HEAD_OID = oid('ab')
+const SYMLINK_OID = oid('bc')
+
+const SYMLINK_PATH = 'src/link'
+const GITLINK_PATH = 'vendor/sub'
+const TYPECHANGE_PATH = 'src/becomes-link'
+const COPY_PATH = 'src/copied.txt'
+
+/** The blob index entry a row must produce, or the reason it must produce none. */
+type ExpectedIndexing =
+  | { readonly base: string | null; readonly head: string | null }
+  | { readonly skipped: BlobIndexSkipReason }
+
+interface ParseRow {
+  readonly label: string
+  /** The record exactly as `diff --raw --no-abbrev -M -z` emits it. */
+  readonly record: string
+  /** The whole of the `files[]` entry this record must produce. */
+  readonly file: DiffFileEntry
+  readonly indexed: ExpectedIndexing
+}
+
+/**
+ * One row per shape `git diff --raw` can report over a commit-to-commit range.
+ * The rows drive the parser and the builder directly, with no runner anywhere: a
+ * fake runner could only prove which argv was asked for, and the semantics under
+ * test here are entirely a function of the bytes git replied with.
+ */
+const PARSE_ROWS: readonly ParseRow[] = [
+  {
+    label: 'an added file',
+    record: rawRecord(`:${ABSENT_MODE} 100644 ${ABSENT_OID} ${ADDED_OID} A`, 'src/added.txt'),
+    file: { sha: ADDED_OID, filename: 'src/added.txt', status: 'added' },
+    indexed: { base: null, head: ADDED_OID },
+  },
+  {
+    label: 'a deleted file',
+    record: rawRecord(`:100644 ${ABSENT_MODE} ${REMOVED_OID} ${ABSENT_OID} D`, 'src/removed.txt'),
+    // The pre-image object name is the only one a delete has, and it is what the
+    // API-shaped producer carries in the same field.
+    file: { sha: REMOVED_OID, filename: 'src/removed.txt', status: 'removed' },
+    indexed: { base: REMOVED_OID, head: null },
+  },
+  {
+    label: 'a modified file',
+    record: rawRecord(`:100644 100644 ${PLAIN_BASE_OID} ${PLAIN_HEAD_OID} M`, 'src/plain.txt'),
+    file: { sha: PLAIN_HEAD_OID, filename: 'src/plain.txt', status: 'modified' },
+    indexed: { base: PLAIN_BASE_OID, head: PLAIN_HEAD_OID },
+  },
+  {
+    label: 'a rename detected by similarity',
+    record: rawRecord(
+      `:100644 100644 ${RENAME_BASE_OID} ${RENAME_HEAD_OID} R096`,
+      'src/renamed-from.txt',
+      'src/renamed-to.txt',
+    ),
+    file: {
+      sha: RENAME_HEAD_OID,
+      filename: 'src/renamed-to.txt',
+      previous_filename: 'src/renamed-from.txt',
+      status: 'renamed',
+    },
+    // Keyed by the post-image path, with the pre-image path's blob on the base
+    // side — the same keying the API-shaped producer uses, and the entry a
+    // comment anchored to the old path is looked up through.
+    indexed: { base: RENAME_BASE_OID, head: RENAME_HEAD_OID },
+  },
+  {
+    label: 'a copy',
+    record: rawRecord(
+      `:100644 100644 ${COPY_SOURCE_OID} ${COPY_HEAD_OID} C078`,
+      'src/copy-source.txt',
+      COPY_PATH,
+    ),
+    // The contract's status vocabulary has no member for a copy, and the closest
+    // true statement about the head side is that the file is new there. Saying so
+    // means saying it completely: an added file has no base side and no pre-image
+    // path, so a copy reported as added carries neither either.
+    file: { sha: COPY_HEAD_OID, filename: COPY_PATH, status: 'added' },
+    indexed: { base: null, head: COPY_HEAD_OID },
+  },
+  {
+    label: 'a file that became a symlink',
+    record: rawRecord(
+      `:100644 120000 ${TYPECHANGE_BASE_OID} ${TYPECHANGE_HEAD_OID} T`,
+      TYPECHANGE_PATH,
+    ),
+    // A type change has no status of its own in the contract, and the file did
+    // exist on both sides, so it is reported as modified.
+    file: { sha: TYPECHANGE_HEAD_OID, filename: TYPECHANGE_PATH, status: 'modified' },
+    indexed: { skipped: 'symlink' },
+  },
+  {
+    label: 'a symlink',
+    record: rawRecord(`:${ABSENT_MODE} 120000 ${ABSENT_OID} ${SYMLINK_OID} A`, SYMLINK_PATH),
+    file: { sha: SYMLINK_OID, filename: SYMLINK_PATH, status: 'added' },
+    indexed: { skipped: 'symlink' },
+  },
+  {
+    label: 'a submodule',
+    record: rawRecord(`:${ABSENT_MODE} 160000 ${ABSENT_OID} ${FIXTURE_GITLINK_SHA} A`, GITLINK_PATH),
+    file: { sha: FIXTURE_GITLINK_SHA, filename: GITLINK_PATH, status: 'added' },
+    indexed: { skipped: 'gitlink' },
+  },
+]
+
+/** The whole table as one stream of records, in the order git would emit them. */
+const TABLE_STDOUT = PARSE_ROWS.map((row) => row.record).join('')
+
+function parseRecords(stdout: string): readonly RawDiffRecord[] {
+  const parsed = parseRawZ(stdout)
+  if (!parsed.ok) throw new Error(`this stream must parse, got ${parsed.detail}`)
+  return parsed.records
+}
+
+function build(stdout: string): LocalDiffFiles {
+  return buildLocalDiffFiles(parseRecords(stdout))
+}
+
+describe('every shape git can report becomes the file entry it means', () => {
+  for (const row of PARSE_ROWS) {
+    test(`${row.label} produces exactly its file entry`, () => {
+      expect(build(row.record).files).toEqual([row.file])
+    })
+
+    const indexed = row.indexed
+    if ('skipped' in indexed) {
+      test(`${row.label} is left out of the blob index`, () => {
+        expect(Object.hasOwn(build(row.record).blobIndex, row.file.filename)).toBe(false)
+      })
+
+      test(`${row.label} carries ${indexed.skipped} as its skip reason`, () => {
+        expect(build(row.record).skippedBlobPaths).toEqual({
+          [row.file.filename]: indexed.skipped,
+        })
+      })
+    } else {
+      test(`${row.label} produces exactly its blob index entry`, () => {
+        expect(build(row.record).blobIndex).toEqual({ [row.file.filename]: indexed })
+      })
+
+      test(`${row.label} is not recorded as skipped`, () => {
+        expect(build(row.record).skippedBlobPaths).toEqual({})
+      })
+    }
+  }
+})
+
+describe('the whole table at once', () => {
+  let table: LocalDiffFiles
+
+  beforeAll(() => {
+    table = build(TABLE_STDOUT)
+  })
+
+  test('every record becomes one file entry, in the order git emitted them', () => {
+    expect(table.files).toEqual(PARSE_ROWS.map((row) => row.file))
+  })
+
+  test('the blob index holds exactly the paths that were not skipped', () => {
+    expect(Object.keys(table.blobIndex).sort()).toEqual(
+      PARSE_ROWS.filter((row) => !('skipped' in row.indexed))
+        .map((row) => row.file.filename)
+        .sort(),
+    )
+  })
+
+  test('both unreadable object kinds are recorded with their reason', () => {
+    expect(table.skippedBlobPaths).toEqual({
+      [TYPECHANGE_PATH]: 'symlink',
+      [SYMLINK_PATH]: 'symlink',
+      [GITLINK_PATH]: 'gitlink',
+    })
+  })
+
+  test('no object name spelled as absent reaches the index, from any status', () => {
+    // Asserted over the whole table rather than per row: one oid leaking from
+    // any single status is enough to make this red, where a per-row form would
+    // let a status nobody thought to check leak one quietly.
+    expect(JSON.stringify(table.blobIndex)).not.toContain('0000000')
+  })
+
+  test('the table really does carry object names git spells as absent', () => {
+    expect(TABLE_STDOUT).toContain(ABSENT_OID)
+  })
+
+  test('the gitlink oid in the table is not itself all-zero', () => {
+    // A builder that decided what to skip by looking for an all-zero oid rather
+    // than at the file mode would pass every assertion above if the gitlink's
+    // oid were all zeros. It is not, deliberately.
+    expect(FIXTURE_GITLINK_SHA).not.toBe(ABSENT_OID)
+  })
+
+  test('yet that gitlink oid would still trip the scan above if it were indexed', () => {
+    // Which is what ties the mode skip and the scan together: the submodule case
+    // is guarded twice, by its own absence assertion and by the table-wide one.
+    expect(FIXTURE_GITLINK_SHA).toContain('0000000')
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The controls for the three absences, and the proof each fails on its own.
+// ————————————————————————————————————————————————————————————————————————————
+
+type BlobIndexEntry = { base: string | null; head: string | null }
+type BlobIndex = Record<string, BlobIndexEntry>
+
+/** The rules the real builder applies unconditionally, made switchable one by one. */
+interface IndexRules {
+  /**
+   * Whether a side git spelled as absent — an all-zero oid, or the missing side
+   * of an addition or a deletion — becomes null.
+   */
+  readonly nullAbsentSides: boolean
+  /** File modes whose path is left out of the index entirely. */
+  readonly skipModes: readonly string[]
+}
+
+const EVERY_RULE: IndexRules = { nullAbsentSides: true, skipModes: ['160000', '120000'] }
+const NO_RULE: IndexRules = { nullAbsentSides: false, skipModes: [] }
+
+/**
+ * A blob index built from the same records the real builder reads, with each of
+ * its rules switchable. It exists so the three absence assertions above are each
+ * paired with something that puts the forbidden thing into an index: an absence
+ * that has never been observed failing proves nothing, and none of these three
+ * has a natural failing case, because the real builder is correct.
+ *
+ * Its faithfulness is asserted rather than assumed — with every rule applied it
+ * must reproduce the real index exactly, which is what makes its behaviour with a
+ * rule switched off evidence about that rule rather than about some unrelated
+ * function that happens to live in a test file.
+ */
+function indexWithRules(records: readonly RawDiffRecord[], rules: IndexRules): BlobIndex {
+  const index: BlobIndex = {}
+  for (const record of records) {
+    const presentModes = [record.srcMode, record.dstMode].filter((mode) => mode !== ABSENT_MODE)
+    if (presentModes.some((mode) => rules.skipModes.includes(mode))) continue
+    const baseAbsent = record.srcSha === ABSENT_OID || record.status === 'A' || record.status === 'C'
+    const headAbsent = record.dstSha === ABSENT_OID || record.status === 'D'
+    index[record.path] = {
+      base: rules.nullAbsentSides && baseAbsent ? null : record.srcSha,
+      head: rules.nullAbsentSides && headAbsent ? null : record.dstSha,
+    }
+  }
+  return index
+}
+
+/**
+ * The three claims the real index must falsify, each stated as a predicate so the
+ * restorations below can ask which of them a given set of rules leaves standing.
+ */
+const FORBIDDEN_CLAIMS: Readonly<Record<string, (index: BlobIndex) => boolean>> = {
+  'an object name spelled as absent is a value in the index': (index) =>
+    Object.values(index).some((entry) => entry.base === ABSENT_OID || entry.head === ABSENT_OID),
+  'the gitlink path is a key of the index': (index) => Object.hasOwn(index, GITLINK_PATH),
+  'the symlink path is a key of the index': (index) => Object.hasOwn(index, SYMLINK_PATH),
+}
+
+function claimsFalsifiedBy(index: BlobIndex): string[] {
+  return Object.entries(FORBIDDEN_CLAIMS)
+    .filter(([, holds]) => !holds(index))
+    .map(([claim]) => claim)
+}
+
+interface Restoration {
+  readonly label: string
+  readonly rules: IndexRules
+  /** The one claim this rule, and only this rule, takes away. */
+  readonly falsifies: string
+}
+
+const RESTORATIONS: readonly Restoration[] = [
+  {
+    label: 'the absent-side mapping',
+    rules: { ...NO_RULE, nullAbsentSides: true },
+    falsifies: 'an object name spelled as absent is a value in the index',
+  },
+  {
+    label: 'the gitlink mode skip',
+    rules: { ...NO_RULE, skipModes: ['160000'] },
+    falsifies: 'the gitlink path is a key of the index',
+  },
+  {
+    label: 'the symlink mode skip',
+    rules: { ...NO_RULE, skipModes: ['120000'] },
+    falsifies: 'the symlink path is a key of the index',
+  },
+]
+
+describe('the three absences are each proved able to fail, and each on its own', () => {
+  let records: readonly RawDiffRecord[]
+  let real: LocalDiffFiles
+
+  beforeAll(() => {
+    records = parseRecords(TABLE_STDOUT)
+    real = build(TABLE_STDOUT)
+  })
+
+  test('with every rule applied the control reproduces the real index exactly', () => {
+    expect(indexWithRules(records, EVERY_RULE)).toEqual(real.blobIndex)
+  })
+
+  test('with no rule applied the index does contain an absent-spelled object name', () => {
+    expect(JSON.stringify(indexWithRules(records, NO_RULE))).toContain('0000000')
+  })
+
+  test('with no rule applied the gitlink path is a key of the index', () => {
+    expect(Object.hasOwn(indexWithRules(records, NO_RULE), GITLINK_PATH)).toBe(true)
+  })
+
+  test('with no rule applied the symlink path is a key of the index', () => {
+    expect(Object.hasOwn(indexWithRules(records, NO_RULE), SYMLINK_PATH)).toBe(true)
+  })
+
+  test('with no rule applied every forbidden claim holds', () => {
+    expect(claimsFalsifiedBy(indexWithRules(records, NO_RULE))).toEqual([])
+  })
+
+  test('against the real index every forbidden claim is false', () => {
+    expect(claimsFalsifiedBy(real.blobIndex).sort()).toEqual(Object.keys(FORBIDDEN_CLAIMS).sort())
+  })
+
+  for (const restoration of RESTORATIONS) {
+    test(`restoring ${restoration.label} takes away that rule's claim and no other`, () => {
+      // The reason the restorations run one at a time: three controls that only
+      // fire as a bundle prove that *something* in the bundle is load-bearing,
+      // never which. One rule at a time names which.
+      expect(claimsFalsifiedBy(indexWithRules(records, restoration.rules))).toEqual([
+        restoration.falsifies,
+      ])
+    })
+  }
+
+  test('there are exactly three forbidden claims and a restoration for each', () => {
+    // Independent literals: a claim added without a restoration to falsify it,
+    // or a restoration quietly dropped, is red here even though every assertion
+    // above still passes.
+    expect(Object.keys(FORBIDDEN_CLAIMS)).toHaveLength(3)
+    expect(RESTORATIONS).toHaveLength(3)
+    expect(RESTORATIONS.map((restoration) => restoration.falsifies).sort()).toEqual(
+      Object.keys(FORBIDDEN_CLAIMS).sort(),
+    )
+  })
+})
+
+/**
+ * A blob index that reads "this side is absent" from one spelling only: either the
+ * all-zero object name git prints, or the status letter that implies it. The real
+ * builder reads both, and the table below is what says which of the two is doing
+ * work — a pair of rules read as a pair of defenses is how a redundant one quietly
+ * stops being true.
+ */
+function indexBySpelling(
+  records: readonly RawDiffRecord[],
+  spelling: 'the all-zero object name' | 'the status letter',
+): BlobIndex {
+  const index: BlobIndex = {}
+  for (const record of records) {
+    const presentModes = [record.srcMode, record.dstMode].filter((mode) => mode !== ABSENT_MODE)
+    if (presentModes.some((mode) => EVERY_RULE.skipModes.includes(mode))) continue
+    const byOid = spelling === 'the all-zero object name'
+    const baseAbsent = byOid
+      ? record.srcSha === ABSENT_OID
+      : record.status === 'A' || record.status === 'C'
+    const headAbsent = byOid ? record.dstSha === ABSENT_OID : record.status === 'D'
+    index[record.path] = {
+      base: baseAbsent ? null : record.srcSha,
+      head: headAbsent ? null : record.dstSha,
+    }
+  }
+  return index
+}
+
+describe('the two spellings of an absent side are not two defenses over the index', () => {
+  let records: readonly RawDiffRecord[]
+  let real: LocalDiffFiles
+
+  beforeAll(() => {
+    records = parseRecords(TABLE_STDOUT)
+    real = build(TABLE_STDOUT)
+  })
+
+  test('reading the status letter alone already produces the real index', () => {
+    // Measured, and recorded because the pair reads like two guards: a src oid of
+    // all zeros only ever accompanies an addition, and a dst oid of all zeros only
+    // ever accompanies a deletion, so over the blob index the all-zero reading is
+    // never the unique cause of anything. It is kept as a second net under a
+    // record shape nobody anticipated — but it must not be counted as a defense
+    // the index depends on.
+    expect(indexBySpelling(records, 'the status letter')).toEqual(real.blobIndex)
+  })
+
+  test('reading the all-zero object name alone does not', () => {
+    expect(indexBySpelling(records, 'the all-zero object name')).not.toEqual(real.blobIndex)
+  })
+
+  test('and the copy is the whole of the difference between them', () => {
+    // Which is the other half of the same finding: the status reading is the
+    // unique cause of a copy having no base side, because a copy's source object
+    // is a real one and the oid reading has nothing to notice.
+    const byOid = indexBySpelling(records, 'the all-zero object name')
+    const differing = Object.keys(real.blobIndex).filter(
+      (path) => JSON.stringify(byOid[path]) !== JSON.stringify(real.blobIndex[path]),
+    )
+    expect(differing).toEqual([COPY_PATH])
+  })
+
+  test('where the all-zero reading is the unique cause is the object name of a delete', () => {
+    // `sha` is the head-side object when there is one and the pre-image object
+    // otherwise. Without the all-zero reading the "otherwise" never fires, and a
+    // deleted file is named by a string of zeros instead of by the object that
+    // holds the content the review is about.
+    expect(real.files.find((file) => file.status === 'removed')?.sha).toBe(REMOVED_OID)
+  })
+})
+
+describe('what is skipped is decided by the file mode, never by the oid', () => {
+  // The strongest form of the same control, because it runs the real builder: the
+  // identical oid under an ordinary file mode is indexed, so the skip cannot be
+  // keyed on the shape of the object name.
+  const addedUnderMode = (mode: string, path: string, headOid: string): LocalDiffFiles =>
+    build(rawRecord(`:${ABSENT_MODE} ${mode} ${ABSENT_OID} ${headOid} A`, path))
+
+  test('the gitlink oid under mode 160000 is left out of the index', () => {
+    const built = addedUnderMode('160000', GITLINK_PATH, FIXTURE_GITLINK_SHA)
+    expect(Object.hasOwn(built.blobIndex, GITLINK_PATH)).toBe(false)
+  })
+
+  test('the same oid under mode 100644 is indexed', () => {
+    expect(addedUnderMode('100644', GITLINK_PATH, FIXTURE_GITLINK_SHA).blobIndex).toEqual({
+      [GITLINK_PATH]: { base: null, head: FIXTURE_GITLINK_SHA },
+    })
+  })
+
+  test('and the real builder then does produce an index the scan objects to', () => {
+    expect(
+      JSON.stringify(addedUnderMode('100644', GITLINK_PATH, FIXTURE_GITLINK_SHA).blobIndex),
+    ).toContain('0000000')
+  })
+
+  test('the symlink oid under mode 120000 is left out of the index', () => {
+    const built = addedUnderMode('120000', SYMLINK_PATH, SYMLINK_OID)
+    expect(Object.hasOwn(built.blobIndex, SYMLINK_PATH)).toBe(false)
+  })
+
+  test('the same symlink oid under mode 100644 is indexed', () => {
+    expect(addedUnderMode('100644', SYMLINK_PATH, SYMLINK_OID).blobIndex).toEqual({
+      [SYMLINK_PATH]: { base: null, head: SYMLINK_OID },
+    })
+  })
+
+  test('a mode 160000 entry on the base side alone is skipped too', () => {
+    // A deleted submodule names its commit oid on the src side, where the same
+    // reasoning applies: it is not an object this repository can read.
+    const built = build(
+      rawRecord(`:160000 ${ABSENT_MODE} ${FIXTURE_GITLINK_SHA} ${ABSENT_OID} D`, GITLINK_PATH),
+    )
+    expect(built.skippedBlobPaths).toEqual({ [GITLINK_PATH]: 'gitlink' })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The argv: the only place the abbreviation landmine can be guarded.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** A runner that replies with one canned diff stream and records the argv it saw. */
+function diffGit(stdout: string, sink?: string[][], code = 0): CommandRunner {
+  return {
+    async run(args): Promise<CommandResult> {
+      sink?.push(args)
+      return { ok: code === 0, code, stdout, stderr: '' }
+    },
+  }
+}
+
+const DIFF_RANGE = { mergeBaseSha: MERGE_BASE_SHA, headSha: HEAD_SHA }
+
+describe('the change-set read asks git for full-length object names', () => {
+  const sink: string[][] = []
+
+  beforeAll(async () => {
+    await readLocalDiffFiles(diffGit(TABLE_STDOUT, sink), '/repo', DIFF_RANGE)
+  })
+
+  test('it spawns exactly one command', () => {
+    expect(sink).toHaveLength(1)
+  })
+
+  test('the argv carries --no-abbrev', () => {
+    // Object names are abbreviated to seven characters without it, and a short
+    // name matches nothing in a store keyed by the full one: every blob lookup
+    // misses, line resolution comes back empty, and pending comments are
+    // classified as lost en masse. Nothing downstream of the parse can tell a
+    // truncated object name from a full one, so the argv is the only place this
+    // can be guarded at all.
+    expect(sink[0]).toContain('--no-abbrev')
+  })
+
+  test('the argv carries -z, so paths are never quoted or split on whitespace', () => {
+    expect(sink[0]).toContain('-z')
+  })
+
+  test('the argv carries -M, so a rename is one record rather than two', () => {
+    expect(sink[0]).toContain('-M')
+  })
+
+  test('the argv turns path quoting off explicitly rather than relying on -z', () => {
+    const flag = sink[0].indexOf('-c')
+    expect([sink[0][flag], sink[0][flag + 1]]).toEqual(['-c', 'core.quotePath=false'])
+  })
+
+  test('the whole argv is the one this read is specified to run', () => {
+    expect(sink[0]).toEqual([
+      'git',
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--raw',
+      '--no-abbrev',
+      '-M',
+      '-z',
+      '--end-of-options',
+      MERGE_BASE_SHA,
+      HEAD_SHA,
+    ])
+  })
+
+  test('the argv is in the hardened form', () => {
+    expect(isHardenedArgv(sink[0])).toEqual({ ok: true })
+  })
+})
+
+describe('every command the change-set read runs is hardened', () => {
+  const sink: string[][] = []
+
+  beforeAll(async () => {
+    await readLocalDiffFiles(diffGit(TABLE_STDOUT, sink), '/repo', DIFF_RANGE)
+    await readLocalDiffFiles(diffGit('', sink, 128), '/repo', DIFF_RANGE)
+    await readLocalDiffFiles(diffGit('not a record\0', sink), '/repo', DIFF_RANGE)
+  })
+
+  test('the drive spawned every command the read has', () => {
+    // An independent literal: one command per drive, and a read that quietly
+    // grew a second git invocation — or stopped making one — moves this.
+    expect(sink).toHaveLength(3)
+  })
+
+  test('every captured argv satisfies the hardened form — no sampling', () => {
+    for (const args of sink) {
+      expect(isHardenedArgv(args)).toEqual({ ok: true })
+    }
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// No file cap: the page limit on the API path is an artifact of pagination.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** Larger than the API path's page cap, so a cap copied "for symmetry" is red. */
+const GENERATED_RECORD_COUNT = 3001
+
+function generatedRecords(count: number): string {
+  let stream = ''
+  for (let i = 0; i < count; i++) {
+    const base = i.toString(16).padStart(40, 'f')
+    const head = i.toString(16).padStart(40, 'e')
+    stream += rawRecord(`:100644 100644 ${base} ${head} M`, `src/generated-${i}.txt`)
+  }
+  return stream
+}
+
+const LOCAL_SYNC_SOURCE = readFileSync(new URL('./local-sync.ts', import.meta.url), 'utf8')
+
+describe('a change set larger than the API path could paginate is kept whole', () => {
+  let generated: LocalDiffFiles
+
+  beforeAll(() => {
+    generated = build(generatedRecords(GENERATED_RECORD_COUNT))
+  })
+
+  test('the generated change set is larger than the cap it must ignore', () => {
+    // An independent literal rather than the imported constant: importing it here
+    // would tie this file to the very module whose vocabulary the assertion below
+    // forbids.
+    expect(GENERATED_RECORD_COUNT).toBeGreaterThan(3000)
+  })
+
+  test('every record becomes a file', () => {
+    expect(generated.files).toHaveLength(GENERATED_RECORD_COUNT)
+  })
+
+  test('every one of those paths reached the blob index', () => {
+    expect(Object.keys(generated.blobIndex)).toHaveLength(GENERATED_RECORD_COUNT)
+  })
+
+  test('the last file of the change set is the last record git emitted', () => {
+    expect(generated.files.at(-1)?.filename).toBe(`src/generated-${GENERATED_RECORD_COUNT - 1}.txt`)
+  })
+
+  test('the builder never names the page cap', () => {
+    expect(LOCAL_SYNC_SOURCE).not.toMatch(/MAX_FILES/)
+  })
+
+  test('that pattern does fire against the module the cap belongs to', () => {
+    // Without this, the assertion above would also pass for a pattern that
+    // matches nothing anywhere.
+    expect(readFileSync(new URL('./sync.ts', import.meta.url), 'utf8')).toMatch(/MAX_FILES/)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// What the parser reads, and what it refuses.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('the parser reads git format, and refuses anything else', () => {
+  test('an empty change set is an empty record list, not a failure', () => {
+    expect(parseRawZ('')).toEqual({ ok: true, records: [] })
+  })
+
+  test('an abbreviated object name is refused rather than carried into the index', () => {
+    // A second, independent net under the argv assertion: were --no-abbrev ever
+    // dropped, this turns the seven-character oids into a loud typed failure
+    // instead of a blob index full of names nothing can match.
+    const abbreviated = rawRecord(':100644 100644 1a2b3c4 4d5e6f7 M', 'src/plain.txt')
+    expect(parseRawZ(abbreviated).ok).toBe(false)
+  })
+
+  test('the same record with full-length object names parses', () => {
+    expect(parseRawZ(PARSE_ROWS[2].record).ok).toBe(true)
+  })
+
+  test('a rename missing its second path field is refused', () => {
+    const truncated = rawRecord(
+      `:100644 100644 ${RENAME_BASE_OID} ${RENAME_HEAD_OID} R096`,
+      'src/renamed-from.txt',
+    )
+    expect(parseRawZ(truncated).ok).toBe(false)
+  })
+
+  test('a status letter git cannot produce over a commit range is refused', () => {
+    const unmerged = rawRecord(
+      `:100644 100644 ${PLAIN_BASE_OID} ${PLAIN_HEAD_OID} U`,
+      'src/plain.txt',
+    )
+    expect(parseRawZ(unmerged).ok).toBe(false)
+  })
+
+  test('a refusal is a typed failure naming what could not be read', () => {
+    const parsed = parseRawZ('not a record\0')
+    if (parsed.ok) throw new Error('this stream must not parse')
+    expect(parsed.reason).toBe('malformed_diff')
+    expect(parsed.detail).toContain('not a record')
+  })
+
+  test('a similarity score is kept apart from the status it decorates', () => {
+    const [record] = parseRecords(PARSE_ROWS[3].record)
+    expect(record).toEqual({
+      srcMode: '100644',
+      dstMode: '100644',
+      srcSha: RENAME_BASE_OID,
+      dstSha: RENAME_HEAD_OID,
+      status: 'R',
+      score: 96,
+      path: 'src/renamed-to.txt',
+      previousPath: 'src/renamed-from.txt',
+    })
+  })
+})
+
+describe('a change set git would not produce is a typed failure, never a throw', () => {
+  test('a non-zero exit carries its exit code', async () => {
+    expect(await readLocalDiffFiles(diffGit('', undefined, 128), '/repo', DIFF_RANGE)).toEqual({
+      ok: false,
+      reason: 'diff_failed',
+      code: 128,
+    })
+  })
+
+  test('output the parser cannot read resolves rather than rejecting', async () => {
+    await expect(
+      readLocalDiffFiles(diffGit('not a record\0'), '/repo', DIFF_RANGE),
+    ).resolves.toMatchObject({ ok: false, reason: 'malformed_diff' })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// Against real git: the seeded repository's seven cases, classified.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('against a real repository, every seeded case lands where it belongs', () => {
+  let fixture: FixtureRepo
+  let diff: LocalDiffFiles
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    const result = await readLocalDiffFiles(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: fixture.headSha,
+    })
+    if (!result.ok) throw new Error(`the fixture range must read, got ${result.reason}`)
+    diff = result.diff
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('every seeded path is classified as git reported it', () => {
+    const statusByPath = Object.fromEntries(diff.files.map((file) => [file.filename, file.status]))
+    expect(statusByPath).toEqual({
+      [fixture.paths.modified]: 'modified',
+      [fixture.paths.added]: 'added',
+      [fixture.paths.removed]: 'removed',
+      [fixture.paths.renamedTo]: 'renamed',
+      [fixture.paths.binary]: 'added',
+      [fixture.paths.symlink]: 'added',
+      [fixture.paths.gitlink]: 'added',
+    })
+  })
+
+  test('the base branch commit made after the fork is not in the range', () => {
+    // Proof the read is against the merge base rather than the base tip: the two
+    // are different commits in this repository, and only one of them leaves this
+    // path out of the change set.
+    expect(diff.files.map((file) => file.filename)).not.toContain(fixture.paths.baseOnly)
+  })
+
+  test('the rename carries the pre-image path git paired it with', () => {
+    const renamed = diff.files.find((file) => file.filename === fixture.paths.renamedTo)
+    expect(renamed?.previous_filename).toBe(fixture.paths.renamedFrom)
+  })
+
+  test("the rename's base side is the blob the pre-image path held", async () => {
+    const preImage = await git(fixture.dir, [
+      'rev-parse',
+      `${fixture.mergeBaseSha}:${fixture.paths.renamedFrom}`,
+    ])
+    expect(diff.blobIndex[fixture.paths.renamedTo].base).toBe(preImage)
+  })
+
+  test("the modified file's head side is the blob the head commit holds", async () => {
+    const headBlob = await git(fixture.dir, [
+      'rev-parse',
+      `${fixture.headSha}:${fixture.paths.modified}`,
+    ])
+    expect(diff.blobIndex[fixture.paths.modified].head).toBe(headBlob)
+  })
+
+  test('the deleted file keeps no head side', () => {
+    expect(diff.blobIndex[fixture.paths.removed].head).toBeNull()
+  })
+
+  test('the added file keeps no base side', () => {
+    expect(diff.blobIndex[fixture.paths.added].base).toBeNull()
+  })
+
+  test('the gitlink path is absent from the blob index', () => {
+    expect(Object.hasOwn(diff.blobIndex, fixture.paths.gitlink)).toBe(false)
+  })
+
+  test('the symlink path is absent from the blob index', () => {
+    expect(Object.hasOwn(diff.blobIndex, fixture.paths.symlink)).toBe(false)
+  })
+
+  test('both are still in the file list, with their skip reason recorded', () => {
+    expect(diff.skippedBlobPaths).toEqual({
+      [fixture.paths.gitlink]: 'gitlink',
+      [fixture.paths.symlink]: 'symlink',
+    })
+  })
+
+  test('no object name spelled as absent reached the index', () => {
+    expect(JSON.stringify(diff.blobIndex)).not.toContain('0000000')
+  })
+
+  test('every object name in the index is full length', () => {
+    const names = Object.values(diff.blobIndex).flatMap((entry) =>
+      [entry.base, entry.head].filter((name): name is string => name !== null),
+    )
+    expect(names.filter((name) => !/^[0-9a-f]{40}$/.test(name))).toEqual([])
+  })
+
+  test('the index really did hold object names to check', () => {
+    // Without this the assertion above would also pass over an empty index.
+    const names = Object.values(diff.blobIndex).flatMap((entry) =>
+      [entry.base, entry.head].filter((name): name is string => name !== null),
+    )
+    expect(names.length).toBeGreaterThan(0)
+  })
+
+  test('git really does report the gitlink as mode 160000 in this range', async () => {
+    // The skip is proved against git's own output, not only against the table: a
+    // fixture that failed to seed the case would make the two absence assertions
+    // above pass over a change set that never carried it.
+    const raw = await git(fixture.dir, [
+      'diff',
+      '--raw',
+      '--no-abbrev',
+      '-M',
+      fixture.mergeBaseSha,
+      fixture.headSha,
+    ])
+    expect(raw).toContain(`160000 ${ABSENT_OID} ${FIXTURE_GITLINK_SHA} A`)
   })
 })
