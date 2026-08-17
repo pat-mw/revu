@@ -10,25 +10,42 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing.** No unit is dispatched, no agent is running, no worktree is in use, the tree is clean and
-everything landed is committed and pushed. **M8.7 is `In Review` on PR [#72](https://github.com/pat-mw/revu/pull/72)**
-(base `m8.6`): all thirteen units landed, `Verify` green, the fable-tier adversarial review of the full diff
-run and its findings closed.
+**The daemon track is dispatched as three concurrent lanes.** M8.2, M8.3 and M8.4 are `In Progress`. Each
+lane has its own branch and its own serial unit chain; the lanes never share a file, so three workers run
+against each other while integration and gating stay serial in the main tree.
 
-**The next work is the daemon track**, which is untouched and unblocked: **M8.2, M8.3 and M8.4 are mutually
-independent**, own genuinely disjoint file sets, and each needs only M8.1. That is the first three-lane
-parallel wave in this workstream. ⚠️ **The roadmap's S3 wave table cannot be dispatched as written** — see
-`HANDOVER.md`'s top entry, which carries the corrected widths and names the four collisions.
+| lane | branch | chain (execution order, not numbering) | status |
+| --- | --- | --- | --- |
+| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — **fully serial**: .1–.6 all write `direct/store.ts`, and .7 shares `store.test.ts` | dispatching `.7` |
+| **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | dispatching `.8` |
+| **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | dispatching `.6` |
+
+**Two guard rails land first in their lanes and are deliberately RED at their landing commit** — the protocol
+requires a guard rail to land before the code it constrains, and both assert their target modules *exist*:
+
+- **M8.3.8** (`local-no-github.test.ts`) is red until M8.3.1 and M8.3.2 create `local-git.ts` / `local-sync.ts`.
+- **M8.4.6** (`local-write-isolation.test.ts`) is red until all four scanned files exist — green at M8.4.2.
+- **M8.2.7** is the exception: it arms tripwires on *today's* store, so it lands **green** and armed.
+
+Every other commit on every lane is gated green in the main tree. A red gate on one of the two files above,
+at one of those commits, is the intended state and is recorded per commit in the ticket Log — it is not a
+broken gate.
+
+**The wave widths came from `HANDOVER.md`'s top entry, not from `ROADMAP.md`'s S3 table**, which plans
+`3 → 4 → 6 → 6 → 4 → 2 → 1 → 1` on the assumption that the orchestrator can merge two workers' versions of
+one file. It cannot — integration is by copying whole files out of isolated worktrees — so the honest widths
+are `3 → 4 → 3 → 4 → 2 → 1 → 1 → 1` and the four collisions are named there. Do not re-derive them.
 
 **The stack, bottom-up — four PRs open, none merged.** `main` → `m8/local-reviews-design`
 ([#69](https://github.com/pat-mw/revu/pull/69)) → `m8.1` ([#70](https://github.com/pat-mw/revu/pull/70)) →
 `m8.6` ([#71](https://github.com/pat-mw/revu/pull/71)) → `m8.7` ([#72](https://github.com/pat-mw/revu/pull/72)).
 #69 has no ticket row below because it is the design/board PR, not a ticket — but it gates the merge order.
+The three new lanes extend it: `m8.2` on `m8.7`, then `m8.3` on `m8.2`, `m8.4` on `m8.3`. All three branches
+**start** at `d0cc1d0` because they run concurrently; each is rebased onto its true base before its PR opens,
+per `SESSION_PROTOCOL.md` §6 ("parallel results get rebased into the chain before their PRs open").
 
-⚠️ **One ref is not pushed:** local `m8.6/app-creation-flow` is **ahead of its remote by one commit**
-(`0c17be9`, a board-docs commit). Its *content* is safe — it is an ancestor of `m8.7`'s tip and therefore on
-the remote — but PR #71's diff does not contain it and it rides in #72's range instead. Push `m8.6` and it
-moves to where it belongs.
+✅ **Every ref is pushed.** `m8.6/app-creation-flow` was one commit ahead of its remote (`0c17be9`, board
+docs); it is pushed, so that commit now sits in #71's range instead of riding in #72's.
 
 | ticket | state | where |
 | --- | --- | --- |
@@ -85,9 +102,9 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
-| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | Todo | 7 | revud | M8.1 | `m8.2/store-v4` | — |
-| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
-| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
+| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | **In Progress** | 7 | revud | M8.1 | `m8.2/store-v4` | — |
+| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Progress** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
+| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Progress** | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
