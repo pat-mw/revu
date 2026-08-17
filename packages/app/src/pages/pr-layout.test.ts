@@ -26,13 +26,21 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { createElement } from 'react'
-import type { CheckRun, CommentIdentity, PullDetail, PullSummary } from '@revu/shared'
+import type {
+  CheckRun,
+  CommentIdentity,
+  PullDetail,
+  PullSummary,
+  Snapshot,
+  StalenessInfo,
+} from '@revu/shared'
 import { identityName, parseCommentIdentity } from '@revu/shared'
 import { fixtureDB } from '@/fixtures'
 import { countChecks } from '@/lib/checks-rollup'
 import { renderStatic } from '@/lib/render-test'
+import { SHORTCUT_CATALOG } from '@/lib/shortcuts'
 import { authorBannerVisible } from '@/components/author/author-banner'
-import { PrIdentityRow, PrMetaRow, PrTabs } from './pr-layout'
+import { PrIdentityRow, PrMetaRow, PrTabs, SnapshotSeal } from './pr-layout'
 
 /** The strip as HTML, with counts that make both count slots render. */
 function strip(mode: 'github' | 'local'): string {
@@ -123,6 +131,30 @@ describe('the tabs that survive the omission', () => {
     )
     expect(quiet).toContain('Conversation')
     expect(quiet).not.toContain('>0<')
+  })
+})
+
+/** Every catalogued chord whose id or label mentions one of these words. */
+function chordsNaming(pattern: RegExp): string[] {
+  return SHORTCUT_CATALOG.filter((s) => pattern.test(s.id + s.label)).map((s) => s.id)
+}
+
+describe('the chords the help sheet documents still lead somewhere', () => {
+  test('the catalog does name the sections a review keeps', () => {
+    // The control for the absence below: this search finds a chord when there
+    // is one to find, so an empty result there is the omission rather than a
+    // predicate that matches nothing at all.
+    expect(chordsNaming(/files|conversation/i)).toContain('go-files')
+    expect(chordsNaming(/files|conversation/i)).toContain('go-conversation')
+  })
+
+  test('and none of them targets a section a branch pair does not offer', () => {
+    // Two sections are omitted from a review of two local branches, and a
+    // documented chord that jumped to either would be a key the help sheet
+    // promises and the strip cannot honour. Asserted as the whole list of
+    // offenders so every one is named at once, and asserted here rather than
+    // read once by eye so it stays true after the next chord is added.
+    expect(chordsNaming(/checks|description/i)).toEqual([])
   })
 })
 
@@ -446,5 +478,125 @@ describe('who the thread-queue banner is for', () => {
         unresolved: 2,
       }),
     ).toBe(false)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The snapshot seal
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The seal reports that time moved underneath a stored snapshot, in four
+ * readings: nothing has been read yet, commits landed, the base advanced under
+ * an unmoved head, or the head was rewritten in place.
+ *
+ * All four are drawn from what a repository did to a branch, and a branch pair
+ * on this machine does every one of those things — so the wording is the same
+ * for both kinds of review and is meant to stay that way. That makes it exactly
+ * the vocabulary a well-meaning sweep for GitHub-sounding words would take out,
+ * which is why it is rendered and read here on every run rather than compared
+ * against an older copy of the tree once.
+ */
+
+/** The seeded snapshot for one review, whole, or a failure naming it. */
+function seededSnapshot(n: number): Snapshot {
+  const found = fixtureDB.seededSnapshots.find((s) => s.prNumber === n)
+  if (found === undefined) throw new Error(`the fixture set holds no snapshot for ${n}`)
+  return found
+}
+
+const SYNCED = seededSnapshot(347)
+
+/**
+ * One staleness report, filled out around whichever of its two fields the
+ * branch under test turns on.
+ */
+function stalenessOf(over: Partial<StalenessInfo>): StalenessInfo {
+  return {
+    stale: false,
+    newCommits: 0,
+    baseMoved: false,
+    snapshotHeadSha: SYNCED.immutable.headSha,
+    currentHeadSha: SYNCED.immutable.headSha,
+    syncedAt: SYNCED.syncedAt,
+    ...over,
+  }
+}
+
+/**
+ * The seal's markup with runs of whitespace flattened to single spaces.
+ *
+ * These sentences are written across several source lines, and a line break in
+ * the source reaches the markup as one — so a sentence a reader sees as one
+ * line arrives here broken, and an unflattened search for it fails on
+ * formatting rather than on wording.
+ */
+function seal(
+  mode: 'github' | 'local',
+  snapshot: Snapshot | null,
+  staleness: StalenessInfo | null,
+): string {
+  return renderStatic(
+    createElement(SnapshotSeal, {
+      mode,
+      snapshot,
+      loading: false,
+      staleness,
+      syncing: false,
+      onSync: () => {},
+    }),
+  ).replace(/\s+/g, ' ')
+}
+
+const NEVER_SYNCED = stalenessOf({})
+const COMMITS_LANDED = stalenessOf({ stale: true, newCommits: 3 })
+const BASE_ADVANCED = stalenessOf({ stale: true, baseMoved: true })
+const HEAD_REWRITTEN = stalenessOf({ stale: true })
+
+describe('what the seal says about a snapshot time moved underneath', () => {
+  test('a review whose content has never been read says so', () => {
+    expect(seal('github', null, NEVER_SYNCED)).toContain('never synced')
+  })
+
+  test('commits that landed since the read are counted', () => {
+    expect(seal('github', SYNCED, COMMITS_LANDED)).toContain('3 new commits since sync')
+  })
+
+  test('a base that advanced under an unmoved head is named as such', () => {
+    expect(seal('github', SYNCED, BASE_ADVANCED)).toContain('base advanced — diff changed')
+  })
+
+  test('and a head rewritten in place is named as that', () => {
+    // Stale with no commit delta and the base where it was: the only thing
+    // left is the head being replaced rather than added to.
+    expect(seal('github', SYNCED, HEAD_REWRITTEN)).toContain('head moved since sync')
+  })
+})
+
+describe('and it says the same thing on either kind of review', () => {
+  // Byte equality rather than a second search for the same words: it fails on
+  // any divergence at all, including one introduced through a class, an
+  // attribute or an element the wording assertions above would not see.
+  //
+  // The never-synced reading is left out on a stated ground rather than by
+  // omission — its one difference is the sync's cost, which it says in a
+  // tooltip body, and a tooltip body is rendered through a portal and reaches
+  // no static markup. An equality there would be pinning that limit rather
+  // than the vocabulary.
+  test('commits landed', () => {
+    expect(seal('local', SYNCED, COMMITS_LANDED)).toBe(seal('github', SYNCED, COMMITS_LANDED))
+  })
+
+  test('the base advanced', () => {
+    expect(seal('local', SYNCED, BASE_ADVANCED)).toBe(seal('github', SYNCED, BASE_ADVANCED))
+  })
+
+  test('the head was rewritten', () => {
+    expect(seal('local', SYNCED, HEAD_REWRITTEN)).toBe(seal('github', SYNCED, HEAD_REWRITTEN))
+  })
+
+  test('and both are told a review with nothing read yet has nothing read yet', () => {
+    // The presence half for the reading the equality above leaves out.
+    expect(seal('local', null, NEVER_SYNCED)).toContain('never synced')
   })
 })

@@ -128,7 +128,23 @@ export function SyncEmptyState({
 // The snapshot seal
 // ————————————————————————————————————————————————————————————————
 
-function SnapshotSeal({
+/**
+ * What the header says about the snapshot the review is being read from: that
+ * nothing has been read yet, that a read is running, that one died partway, or
+ * that time moved underneath what was read.
+ *
+ * Props-only and exported for the reason the three header rows are: the layout
+ * around it needs a query client, a session and a loaded pull list before it
+ * renders a single element, while the seal needs only a snapshot and a
+ * staleness report — so what each of its readings says is assertable against
+ * real markup.
+ *
+ * Only the sync's cost differs by the kind of review. Everything the seal says
+ * about time having moved is a fact about what a repository did to a branch,
+ * which is as true of two local branches as of a mediated pull request, so
+ * those readings are deliberately identical and are asserted to stay so.
+ */
+export function SnapshotSeal({
   mode,
   snapshot,
   loading,

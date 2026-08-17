@@ -13,6 +13,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import * as modeCopy from './mode-copy'
 import {
   authorBannerCopy,
   conversationEmptyCopy,
@@ -67,6 +68,21 @@ describe('the conversation tab with nothing on it yet', () => {
     expect(conversationEmptyCopy('local').title).toBe('No comments on this branch yet')
     expect(conversationEmptyCopy('github').title).toBe('No discussion yet')
   })
+
+  test('and both are sent to the same place, in the same words', () => {
+    // The two lines that do NOT vary, pinned on the pull-request reading as
+    // well as the branch-pair one. A line a mode branch leaves alone is still a
+    // line a reword can change, and the pull-request reading of it is what a
+    // reader of an ordinary review sees.
+    expect(conversationEmptyCopy('github').hint).toBe(
+      'Open Files and leave the first comment (c on any line).',
+    )
+    expect(conversationEmptyCopy('github').action).toBe('Open files')
+    expect(conversationEmptyCopy('local').hint).toBe(
+      'Open Files and leave the first comment (c on any line).',
+    )
+    expect(conversationEmptyCopy('local').action).toBe('Open files')
+  })
 })
 
 /** A review key from the reserved band, spelled out so a search can find it whole. */
@@ -86,6 +102,11 @@ describe('the screen a review that is not in the list lands on', () => {
     expect(notFoundCopy('github', 415).hint).toBe(
       'The broker only sees pull requests in repos this GitHub App is installed on.',
     )
+    // The way out is the same on both readings and is pinned on both, because
+    // an empty state with no next action is a dead end whichever kind of review
+    // led to it.
+    expect(notFoundCopy('github', 415).action).toBe('Back to inbox')
+    expect(notFoundCopy('local', LOCAL_KEY).action).toBe('Back to inbox')
   })
 
   test('a branch pair gets its own two sentences', () => {
@@ -602,5 +623,131 @@ describe('the chrome draws these sentences rather than its own', () => {
     const names = importedFromHere(RECONCILE_DIALOG_SOURCE)
     expect(names).toContain('reconcileSuccessCopy')
     expect(names).toContain('reconcileFailureCopy')
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// Coverage — every sentence is pinned on both readings, and every sentence
+// really has two
+// ————————————————————————————————————————————————————————————————
+
+/** One copy function's two answers, for the checks that span the whole module. */
+interface BothReadings {
+  /** The exported name, matched against the module's own export list. */
+  name: string
+  /** What it says about a mediated pull request. */
+  github: unknown
+  /** What it says about a review of two local branches. */
+  local: unknown
+}
+
+/**
+ * Every export of this module, asked both ways.
+ *
+ * Arguments are chosen to reach the wordiest branch of each function, and the
+ * whole returned value is kept rather than one line of it, so a line added to
+ * one of these records later is compared without touching this list.
+ */
+const BOTH_READINGS: BothReadings[] = [
+  {
+    name: 'conversationEmptyCopy',
+    github: conversationEmptyCopy('github'),
+    local: conversationEmptyCopy('local'),
+  },
+  {
+    name: 'notFoundCopy',
+    github: notFoundCopy('github', 415),
+    local: notFoundCopy('local', LOCAL_KEY),
+  },
+  {
+    name: 'stateChipCopy',
+    github: stateChipCopy('github', 'open'),
+    local: stateChipCopy('local', 'open'),
+  },
+  {
+    name: 'authorBannerCopy',
+    github: authorBannerCopy('github', 3),
+    local: authorBannerCopy('local', 3),
+  },
+  {
+    name: 'submitSuccessCopy',
+    github: submitSuccessCopy('github', 3),
+    local: submitSuccessCopy('local', 3),
+  },
+  {
+    name: 'reconcileSuccessCopy',
+    github: reconcileSuccessCopy('github', 5, 2),
+    local: reconcileSuccessCopy('local', 5, 2),
+  },
+  {
+    name: 'submitFailureCopy',
+    github: submitFailureCopy('github'),
+    local: submitFailureCopy('local'),
+  },
+  {
+    name: 'reconcileFailureCopy',
+    github: reconcileFailureCopy('github'),
+    local: reconcileFailureCopy('local'),
+  },
+  { name: 'draftSavedCopy', github: draftSavedCopy('github'), local: draftSavedCopy('local') },
+  { name: 'syncCostCopy', github: syncCostCopy('github'), local: syncCostCopy('local') },
+  {
+    name: 'neverSyncedCopy',
+    github: neverSyncedCopy('github', 25),
+    local: neverSyncedCopy('local', 25),
+  },
+  { name: 'syncErrorCopy', github: syncErrorCopy('github'), local: syncErrorCopy('local') },
+  {
+    name: 'dirtyWorktreeCopy',
+    github: dirtyWorktreeCopy('github'),
+    local: dirtyWorktreeCopy('local'),
+  },
+  {
+    name: 'tooLargeDiffCopy',
+    github: tooLargeDiffCopy('github'),
+    local: tooLargeDiffCopy('local'),
+  },
+  { name: 'orgMemberTitle', github: orgMemberTitle('github'), local: orgMemberTitle('local') },
+  { name: 'orgMemberChip', github: orgMemberChip('github'), local: orgMemberChip('local') },
+]
+
+/** Two answers compared as whole values, records and nulls included. */
+function same(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+describe('every sentence in the module is accounted for on both readings', () => {
+  test('every export is asked both ways here', () => {
+    // The guard that stops the pins above decaying into a record of whatever
+    // the module happened to export the day they were written. A copy function
+    // added later and never pinned on the pull-request reading would leave that
+    // reading — the one an ordinary review shows — checked by nothing at all.
+    // Each entry named here has its literal pinned in its own block above; this
+    // is what says no export is missing a block.
+    const exported = Object.entries(modeCopy as Record<string, unknown>)
+      .filter(([, value]) => typeof value === 'function')
+      .map(([name]) => name)
+    const covered = new Set(BOTH_READINGS.map((c) => c.name))
+    expect(exported.filter((name) => !covered.has(name))).toEqual([])
+  })
+
+  test('and there really are functions here to ask', () => {
+    // The positive half of the guard above: an empty export list satisfies it
+    // for free, and would satisfy the check below as well.
+    expect(BOTH_READINGS.length).toBeGreaterThan(10)
+    expect(BOTH_READINGS.every((c) => c.name !== '')).toBe(true)
+  })
+
+  test('and no sentence gives the same answer whichever review asked it', () => {
+    // The check that needs no wording to be useful, and the one that would have
+    // caught the failure this whole module family was reorganised around: a
+    // copy function that ignores its argument satisfies every absence written
+    // about it, because an absence is satisfied by any wording that happens not
+    // to contain the banned word — including the wording it was supposed to
+    // replace. Two identical answers mean the mode reached the function and
+    // changed nothing, which is the shape of that bug and of no correct
+    // function here.
+    const blind = BOTH_READINGS.filter((c) => same(c.github, c.local)).map((c) => c.name)
+    expect(blind).toEqual([])
   })
 })

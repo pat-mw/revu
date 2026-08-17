@@ -105,6 +105,7 @@ const SCANNED: ScannedFile[] = [
   { path: 'components/review/reconcile-dialog.tsx', marker: /export function ReconcileDialog\(/ },
   { path: 'components/author/author-banner.tsx', marker: /export function AuthorBanner\(/ },
   { path: 'components/review/dirty-banner.tsx', marker: /export function DirtyWorktreeBanner\(/ },
+  { path: 'components/review/head-moved-dialog.tsx', marker: /export function HeadMovedDialog\(/ },
 ]
 
 /**
@@ -238,6 +239,90 @@ describe('the one exemption is anchored to the sentence it was granted for', () 
       "Submit comments here — an org member (e.g. dkozlov) approves on github.com.",
     )
   })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The mirror of the ban: sentences that must still be there
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * A sentence that must still be in the source of the one file that draws it.
+ *
+ * These are the opposite risk to the banned ones. A review of two local
+ * branches has a merge base, a head that can be rewritten, a base that can
+ * advance underneath it and blobs addressed by their contents — so the
+ * vocabulary describing all of that is exactly as true there as on a mediated
+ * pull request, and is the strongest thing the two kinds of review share. It
+ * also reads, to a fresh eye sweeping for GitHub-sounding words, like the next
+ * thing to remove. Nothing else in the suite would notice if it went: every
+ * one of these sentences lives in a tooltip body or a dialog body, which are
+ * rendered through a portal and reach no static markup at all.
+ *
+ * Anchored to ONE path each rather than searched across the tree. A sentence
+ * that survives somewhere else — in a comment, in a sibling component, in a
+ * test's own fixture — is not the sentence a reader sees, and a scan that
+ * accepts either cannot tell the two apart.
+ *
+ * Matched as a pattern rather than as plain text for the same reason: the
+ * sync-stats sentence is also DESCRIBED, in nearly the same words, by the
+ * docstring of the function that composes it, so a plain search for its
+ * opening fragment is satisfied by the prose after the sentence itself is
+ * gone. The pattern for that fragment requires the interpolated count that
+ * follows it, which prose does not have and code cannot lose without losing
+ * the sentence.
+ */
+interface RequiredSentence {
+  /** Path relative to the app's source root — one file, not the tree. */
+  path: string
+  /** What the assertion is called, and therefore what its failure reports. */
+  name: string
+  /** What must still be in that file's source, whitespace flattened. */
+  pattern: RegExp
+}
+
+const REQUIRED: RequiredSentence[] = [
+  {
+    path: 'pages/pr-layout.tsx',
+    name: 'the seal still explains a diff that changed without the head moving',
+    pattern:
+      /The base branch moved, so the three-dot compare changed even though head/,
+  },
+  {
+    path: 'pages/pr-layout.tsx',
+    name: 'a finished sync still reports what it fetched',
+    pattern: /blobs fetched, \$\{[^}]+\}/,
+  },
+  {
+    path: 'pages/pr-layout.tsx',
+    name: 'and what it reused instead of fetching',
+    pattern: /reused \(content-addressed\)/,
+  },
+  {
+    path: 'components/review/head-moved-dialog.tsx',
+    name: 'a branch that moved mid-review can still be left where it was',
+    pattern: /Keep reviewing on the old snapshot/,
+  },
+]
+
+describe('the sentences both kinds of review share are still in the source', () => {
+  test('and every one of them names a file this sweep already checks is there', () => {
+    // What ties a required sentence to a file something else already vouches
+    // for: every scanned path is checked to exist and to still export what it
+    // is scanned for, so a required sentence naming a path outside that set
+    // would be read from a file nobody had established is the right one.
+    const unchecked = REQUIRED.map((r) => r.path).filter(
+      (path) => !SCANNED.some((s) => s.path === path),
+    )
+    expect(unchecked).toEqual([])
+  })
+
+  for (const { path, name, pattern } of REQUIRED) {
+    test(name, () => {
+      // The path travels into the assertion so a failure says which file was
+      // read as well as what was missing from it.
+      expect([path, pattern.test(source(path))]).toEqual([path, true])
+    })
+  }
 })
 
 // ————————————————————————————————————————————————————————————————
