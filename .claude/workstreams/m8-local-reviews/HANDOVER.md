@@ -79,6 +79,13 @@ value. Fixed by moving the guards into the statement's `WHERE` clause, because t
    would have passed unread. Check with `file(1)` or a byte scan.
 4. **`gh pr create` uses a GraphQL mutation that 503'd repeatedly** while queries worked. `gh api repos/<o>/<r>/pulls
    -X POST` over REST worked first time. Use it if `pr create` fails.
+5. **A host-machine sleep kills every in-flight worker at once**, mid-response. It happened here to both lanes
+   simultaneously. **That is a harness stall, not a failed Check — re-dispatch at the SAME tier, do not
+   escalate**, and prefer **resuming** the worker (its transcript, and therefore its already-recorded red
+   observations, survive) over restarting it from scratch. A resumed worker must first re-establish footing:
+   `git status --porcelain` and `git diff --numstat` in its worktree, confirm HEAD is still the lane tip, and
+   re-run `bun install` — **a stall can leave a worktree mid-edit, and `node_modules` may be gone.** Ask it
+   explicitly to re-derive any observation it can no longer evidence rather than restate it from memory.
 
 ### Findings that belong to other tickets — none absorbed silently
 
