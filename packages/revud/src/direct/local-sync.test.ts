@@ -60,11 +60,13 @@ import type {
   LocalReviewIdentity,
   NumstatRecord,
   RawDiffRecord,
+  WorktreeState,
 } from './local-sync'
 import {
   buildLocalChangeSet,
   buildLocalDiffFiles,
   buildLocalSnapshotImmutable,
+  detectDirtyWorktree,
   parseCommitLogZ,
   parseNumstatZ,
   parseRawZ,
@@ -586,6 +588,7 @@ describe('every command the resolver runs is hardened, and none is classified by
       'buildLocalChangeSet',
       'buildLocalDiffFiles',
       'buildLocalSnapshotImmutable',
+      'detectDirtyWorktree',
       'parseCommitLogZ',
       'parseNumstatZ',
       'parseRawZ',
@@ -3479,5 +3482,230 @@ describe('assembling a snapshot asks git for exactly four things', () => {
         LOCAL_RANGE,
       ),
     ).resolves.toEqual({ ok: false, reason: 'commit_log_failed', code: 128 })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// What the worktree holds that the reviewed range does not.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('an uncommitted change is what makes a worktree dirty, and an untracked file is not one', () => {
+  let fixture: FixtureRepo
+  const runner = createBunCommandRunner()
+  let onCleanTree: WorktreeState
+  let withAnUntrackedFile: WorktreeState
+  let untrackedSeenWithoutTheFlag: string
+  let withAModifiedTrackedFile: WorktreeState
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    // Three readings of one worktree, taken in sequence as it changes, so no
+    // test here depends on the order the runner happens to pick.
+    onCleanTree = await detectDirtyWorktree(runner, fixture.dir)
+
+    writeFileSync(join(fixture.dir, 'scratch-notes.txt'), 'a note nobody committed\n')
+    withAnUntrackedFile = await detectDirtyWorktree(runner, fixture.dir)
+    // The control that gives the reading above its meaning. Asking git the same
+    // question with untracked files INCLUDED must show the file — otherwise the
+    // clean reading would be explained by the file being ignored rather than by
+    // the flag that excludes it, and the case would prove nothing about either.
+    untrackedSeenWithoutTheFlag = await gitRaw(fixture.dir, [
+      'status',
+      '--porcelain=v1',
+      '-uall',
+    ])
+
+    writeFileSync(join(fixture.dir, fixture.paths.modified), 'edited in the worktree\n')
+    withAModifiedTrackedFile = await detectDirtyWorktree(runner, fixture.dir)
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('a worktree holding no uncommitted change reads clean', () => {
+    expect(onCleanTree).toBe('clean')
+  })
+
+  test('a file git has never been told about leaves the worktree clean', () => {
+    // The claim the reading backs is that the review covers committed content
+    // and the worktree holds changes it does not. A scratch file is not content
+    // the review is missing — it is content nobody has offered — so counting it
+    // would raise the warning on nearly every working repository and teach the
+    // reader to ignore the one case that matters.
+    expect(withAnUntrackedFile).toBe('clean')
+  })
+
+  test('that untracked file was genuinely visible to git, so the reading above discriminates', () => {
+    expect(untrackedSeenWithoutTheFlag).toContain('scratch-notes.txt')
+  })
+
+  test('editing a file git already tracks makes the worktree dirty', () => {
+    expect(withAModifiedTrackedFile).toBe('dirty')
+  })
+})
+
+describe('the worktree read states its untracked-file handling rather than inheriting it', () => {
+  const sink: string[][] = []
+
+  beforeAll(async () => {
+    await detectDirtyWorktree(
+      {
+        async run(args): Promise<CommandResult> {
+          sink.push(args)
+          return { ok: true, code: 0, stdout: '', stderr: '' }
+        },
+      },
+      '/repo',
+    )
+  })
+
+  test('it spawns exactly one command', () => {
+    // An independent literal: a read that grew a second invocation moves this.
+    expect(sink).toHaveLength(1)
+  })
+
+  test('the argv is the one this read is specified to run', () => {
+    // Pinned as the whole array rather than a membership check, so a silently
+    // dropped flag is red here even while every behavioural case still passes
+    // on a machine whose configuration happens to agree with it.
+    expect(sink[0]).toEqual(['git', 'status', '--porcelain=v1', '-uno'])
+  })
+
+  test('the captured argv satisfies the hardened form', () => {
+    expect(isHardenedArgv(sink[0])).toEqual({ ok: true })
+  })
+})
+
+describe('what counts as a record is a path, never whitespace', () => {
+  test('a reply carrying nothing but a line break is clean', async () => {
+    // git prints nothing at all for a worktree with nothing outstanding, so
+    // this shape is not one it emits today. The decision is pinned anyway,
+    // because the direction of the error matters: read as dirty, a stray byte
+    // would raise the warning permanently on a spotless repository, which is
+    // the same "always on, therefore never read" failure that excluding
+    // untracked files exists to avoid.
+    await expect(
+      detectDirtyWorktree(
+        {
+          async run(): Promise<CommandResult> {
+            return { ok: true, code: 0, stdout: '\n', stderr: '' }
+          },
+        },
+        '/repo',
+      ),
+    ).resolves.toBe('clean')
+  })
+
+  test('a reply carrying a record is dirty even without a trailing break', async () => {
+    // The control for the row above: whitespace is discarded, content is not.
+    await expect(
+      detectDirtyWorktree(
+        {
+          async run(): Promise<CommandResult> {
+            return { ok: true, code: 0, stdout: ' M src/plain.txt', stderr: '' }
+          },
+        },
+        '/repo',
+      ),
+    ).resolves.toBe('dirty')
+  })
+})
+
+describe('the untracked-file handling beats configuration set by the repository', () => {
+  let fixture: FixtureRepo
+  let configuredToShowThem: string
+  let state: WorktreeState
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    // A repository can ask for untracked files to be listed, and that setting
+    // reaches every command that does not say otherwise. This is where stating
+    // the flag stops being an argv assertion and becomes something git can
+    // disagree with.
+    await git(fixture.dir, ['config', 'status.showUntrackedFiles', 'all'])
+    writeFileSync(join(fixture.dir, 'scratch-notes.txt'), 'a note nobody committed\n')
+    // The control: with the flag left off, this configuration does list it.
+    configuredToShowThem = await gitRaw(fixture.dir, ['status', '--porcelain=v1'])
+    state = await detectDirtyWorktree(createBunCommandRunner(), fixture.dir)
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('the configuration really does list the file when nothing overrides it', () => {
+    expect(configuredToShowThem).toContain('scratch-notes.txt')
+  })
+
+  test('the read is unmoved by it', () => {
+    expect(state).toBe('clean')
+  })
+})
+
+describe('a worktree that cannot be read is unknown, and unknown is never a throw', () => {
+  /** One reading of the worktree, from a git that replies exactly this. */
+  function reading(reply: CommandResult): Promise<WorktreeState> {
+    return detectDirtyWorktree(
+      {
+        async run(): Promise<CommandResult> {
+          return reply
+        },
+      },
+      '/repo',
+    )
+  }
+
+  const threeAnswers: WorktreeState[] = []
+
+  beforeAll(async () => {
+    threeAnswers.push(
+      await reading({ ok: true, code: 0, stdout: '', stderr: '' }),
+      await reading({ ok: true, code: 0, stdout: ' M src/plain.txt\n', stderr: '' }),
+      await reading({ ok: false, code: 128, stdout: '', stderr: '' }),
+    )
+  })
+
+  test('a non-zero exit resolves as unknown', async () => {
+    // A bare repository has no worktree and a locked index cannot be compared
+    // against one. Neither is an answer to the question, and neither may take
+    // down a read of committed content that succeeded perfectly well.
+    await expect(
+      detectDirtyWorktree(
+        {
+          async run(): Promise<CommandResult> {
+            return { ok: false, code: 128, stdout: '', stderr: '' }
+          },
+        },
+        '/repo',
+      ),
+    ).resolves.toBe('unknown')
+  })
+
+  test('a runner that rejects outright resolves as unknown', async () => {
+    // The resolve form on purpose: written as a rejection assertion, a thrown
+    // error would satisfy the test rather than failing it.
+    await expect(
+      detectDirtyWorktree(
+        {
+          async run(): Promise<CommandResult> {
+            throw new Error('spawn git: no such file or directory')
+          },
+        },
+        '/repo',
+      ),
+    ).resolves.toBe('unknown')
+  })
+
+  test('unreadable is its own answer, distinct from both readable ones', () => {
+    // Folding it into either would be a silent claim: reported clean, the
+    // warning stops firing for a reader who has no idea it went quiet;
+    // reported dirty, the warning fires forever on a repository that may be
+    // spotless. Which of the three a caller stores, and how, is the caller's
+    // decision — this read's job is to have a third thing to say. Driven
+    // through the function rather than restated as a list of literals, which
+    // would only assert that three different strings are three different
+    // strings.
+    expect(new Set(threeAnswers).size).toBe(3)
   })
 })

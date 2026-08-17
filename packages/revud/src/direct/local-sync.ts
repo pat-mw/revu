@@ -1324,3 +1324,65 @@ export async function readLocalSnapshotImmutable(
     },
   }
 }
+
+/**
+ * What a worktree holds relative to the commits a review covers.
+ *
+ * Three states rather than a flag, because "the question could not be answered"
+ * is a genuinely different answer from "answered, nothing outstanding". A
+ * repository with no worktree at all, or one whose index is held by another
+ * process, produces no reading — and collapsing that into `clean` at the point
+ * of measurement is how a warning stops appearing without anyone deciding it
+ * should. The third state travels; what a caller does with it, including how it
+ * is stored somewhere that only has room for a flag, is the caller's decision to
+ * make in the open.
+ */
+export type WorktreeState = 'clean' | 'dirty' | 'unknown'
+
+/**
+ * Reads whether the worktree holds changes the reviewed range does not contain.
+ *
+ * The range is built from commits, so anything uncommitted is by definition
+ * outside it. This read is what lets a reader be told so, and it is deliberately
+ * only a read: the worktree is observed, never taken into the review.
+ *
+ * ## A file git has never been told about is not an uncommitted change
+ *
+ * `-uno` is stated explicitly, and the choice it encodes is the whole value of
+ * the reading. The claim being made is "there is work here the review does not
+ * cover"; a scratch file, a stray build artifact or a directory of dependencies
+ * that the ignore rules do not quite cover is not work the review is missing —
+ * it is content nobody has offered for review at all. Counting those would raise
+ * the warning in nearly every working repository, and a warning that is always
+ * on is a warning nobody reads, which costs exactly the case it exists for: an
+ * edit sitting in a tracked file that the reader believes they are reviewing.
+ *
+ * The flag is written out rather than left to git, because the untracked-file
+ * mode is configurable and its default is to include them. Left ambient, one
+ * clone's configuration would decide what another clone's reader is told.
+ *
+ * ## An unreadable worktree degrades, it never fails the read
+ *
+ * Every failure — a non-zero exit, an unspawnable git, a runner that rejects
+ * outright — becomes `unknown`. The commits half of a review is already read and
+ * complete by the time this runs, and losing all of it because a supplementary
+ * observation could not be made would trade a large certainty for a small one.
+ * Outcomes are decided by the exit code, never by matching the message text.
+ */
+export async function detectDirtyWorktree(
+  runner: CommandRunner,
+  cwd: string,
+): Promise<WorktreeState> {
+  let result
+  try {
+    result = await runGit(runner, cwd, { args: ['status', '--porcelain=v1', '-uno'] })
+  } catch {
+    // The runner's contract allows a rejection when git cannot be spawned at
+    // all. That is one more way of not knowing, not a different kind of event.
+    return 'unknown'
+  }
+  if (!result.ok) return 'unknown'
+  // The porcelain format prints one record per outstanding path and nothing at
+  // all when there are none, so the presence of any content is the answer.
+  return result.stdout.trim().length > 0 ? 'dirty' : 'clean'
+}
