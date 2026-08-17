@@ -256,6 +256,104 @@ describe('parseHunks (via parsePatch)', () => {
 })
 
 // ————————————————————————————————————————————————————————————————
+// Why a patch must contain only its own file's hunks
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The parser ignores everything before the first `@@` but nothing after it.
+ * Once a hunk is open, the lines a unified diff uses to introduce the *next*
+ * file are read as ordinary hunk content: `diff --git …` has no diff marker so
+ * it becomes a context line, `--- a/…` starts with `-` so it becomes a deleted
+ * line, and `+++ b/…` starts with `+` so it becomes an added line. Each one
+ * advances the line cursors, so every row after them is numbered past the end
+ * of the hunk its header declares — and a comment anchored to one of those rows
+ * points at a line of the file that holds entirely different content.
+ *
+ * These tests exist so that mechanism is a named, permanent assertion rather
+ * than a remark, and so the producers that must hand this parser one file's
+ * hunks at a time are guarding something demonstrated rather than assumed. If
+ * the parser ever learns to stop at a file boundary, these go red — and the
+ * producer-side guards that keep patches split can then be relaxed
+ * deliberately instead of by accident.
+ */
+describe('a patch carrying a following file bleeds into the previous hunk', () => {
+  /** The three lines a unified diff uses to introduce the file after this one. */
+  const BLEED = ['diff --git a/n b/n', '--- a/n', '+++ b/n']
+
+  /** One file's own hunk: three new-side lines numbered 1 to 3. */
+  const OWN_HUNK = ['@@ -1,3 +1,3 @@', ' a', '-b', '+B', ' c']
+
+  /** A second file's hunk, far away in the file, as git would emit it next. */
+  const NEXT_HUNK = ['@@ -100,2 +100,2 @@', ' x', '+y']
+
+  const clean = parsePatch(makeFile({ patch: patch(...OWN_HUNK) }))
+  const bled = parsePatch(
+    makeFile({ patch: patch(...OWN_HUNK, ...BLEED, ...NEXT_HUNK) }),
+  )
+
+  it('reads the three introducing lines as context, del and add content', () => {
+    expect(bled.hunks[0].lines.slice(-3)).toEqual([
+      // No diff marker at all, so the whole raw line becomes the text.
+      { kind: 'context', oldLine: 4, newLine: 4, text: 'diff --git a/n b/n' },
+      // The leading `-` is consumed as the deletion marker.
+      { kind: 'del', oldLine: 5, newLine: null, text: '-- a/n' },
+      // The leading `+` is consumed as the addition marker.
+      { kind: 'add', oldLine: null, newLine: 5, text: '++ b/n' },
+    ])
+  })
+
+  it('leaves the clean patch with none of them', () => {
+    // The control: the same hunk without the bleed ends at its own last line,
+    // so the three rows above are caused by the bleed and by nothing else.
+    expect(clean.hunks[0].lines).toHaveLength(4)
+    expect(clean.hunks[0].lines.at(-1)).toEqual({
+      kind: 'context',
+      oldLine: 3,
+      newLine: 3,
+      text: 'c',
+    })
+  })
+
+  it('numbers rows past the end of the range its own header declares', () => {
+    const hunk = bled.hunks[0]
+    // The header says three lines on the new side starting at 1 — so 1 to 3.
+    expect([hunk.newStart, hunk.newLines]).toEqual([1, 3])
+    // The parsed rows run to 5, and lines 4 and 5 of the file are real lines
+    // this patch never showed. That is the drift: two rows now carry line
+    // numbers belonging to content they do not hold.
+    expect(
+      hunk.lines.filter((l) => l.newLine !== null).map((l) => l.newLine),
+    ).toEqual([1, 2, 3, 4, 5])
+  })
+
+  it('attaches the following file hunk to this file model', () => {
+    expect(clean.hunks).toHaveLength(1)
+    expect(bled.hunks).toHaveLength(2)
+    expect(bled.hunks[1].header).toBe('@@ -100,2 +100,2 @@')
+  })
+
+  it('makes row ids ambiguous, so a row no longer names one line', () => {
+    // Row ids are documented as unique within a mode: a new-file line number
+    // names exactly one row. Expanding the gap that follows the first hunk
+    // synthesizes rows for lines 4 and 5 from the head blob — the same ids the
+    // two drifted rows already took, so `L4` names two different lines at once
+    // and anything addressing a row by id resolves to whichever comes first.
+    const rowIds = (model: FileDiffModel): string[] =>
+      buildRows(model, {
+        mode: 'unified',
+        expanded: [{ fromNew: 4, toNew: 6 }],
+        headBlobContent: headBlob(6),
+        baseBlobContent: null,
+      })
+        .filter((row) => row.type === 'line')
+        .map((row) => row.id)
+
+    expect(rowIds(clean).filter((id) => id === 'L4')).toHaveLength(1)
+    expect(rowIds(bled).filter((id) => id === 'L4')).toHaveLength(2)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
 // intralineDiff
 // ————————————————————————————————————————————————————————————————
 

@@ -68,6 +68,43 @@
  *     it, so the change set stays honest about what changed. The decision is made
  *     on the mode and never on the shape of the oid: a real gitlink names an
  *     ordinary-looking oid, and "it looks like zeros" would skip the wrong ones.
+ *
+ * ## Counts and patch text come from two more reads over the same range
+ *
+ * `--raw` says what changed; it does not say how many lines moved or what they
+ * were. `--numstat -z` answers the first and `--unified=3` the second, both over
+ * the same two commits, and all three emit files in git's one diff-queue order —
+ * which is what lets the three streams be joined by position. The join is by
+ * position and not by path on purpose: a patch's paths live inside a
+ * `diff --git a/… b/…` header, where a path holding a quote or a newline arrives
+ * C-quoted, so parsing one back out would be a second, weaker path parser beside
+ * the exact one `-z` already gives. Position is only safe if a disagreement is
+ * loud, so a length mismatch between the three reads is a typed failure rather
+ * than an off-by-one nobody notices.
+ *
+ * ## Each file's patch starts at that file's own first hunk header
+ *
+ * Everything a unified diff prints before a file's first `@@` introduces the
+ * file — `diff --git`, `index`, `similarity index`, `rename from`/`rename to`,
+ * `--- a/…`, `+++ b/…` — and none of it may travel with the hunks. The reader on
+ * the other side ignores whatever precedes the first hunk header but nothing
+ * after it: once a hunk is open, a following file's `--- a/x` is consumed as a
+ * deleted line, its `+++ b/x` as an added line and its `diff --git` line as
+ * context. Each of those advances the line cursors, so every row after them is
+ * numbered past the end of the range the hunk's own header declares, and a
+ * comment anchored to one of those rows names a line holding entirely different
+ * content. Splitting the stream on `diff --git ` and then dropping everything
+ * before the first `@@` is what keeps that from happening at all.
+ *
+ * ## An absent patch is a statement, not a gap
+ *
+ * `patch` is set only when the file has at least one hunk. A binary file
+ * (`Binary files … differ`), a pure rename and a mode-only change all produce a
+ * section with no hunk, and all three leave the field **absent** rather than
+ * empty — the same convention the API-shaped producer carries, where absence
+ * means "there is no text diff to show" and an empty string would mean "the diff
+ * is empty", two different claims. Binary files additionally report `-` for both
+ * line counts, which become zero.
  */
 import type { PullFile, SnapshotImmutable } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
@@ -525,4 +562,323 @@ export async function readLocalDiffFiles(
   const parsed = parseRawZ(result.stdout)
   if (!parsed.ok) return parsed
   return { ok: true, diff: buildLocalDiffFiles(parsed.records) }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// How many lines moved.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * One `--numstat -z` record. `additions` and `deletions` are already numbers:
+ * git spells a binary file's counts as `-`, which carry no line information at
+ * all, and those become zero with `binary` recording why — the same pair of
+ * values the API-shaped producer reports for a binary file, so a consumer never
+ * has to know which producer it came from.
+ */
+export interface NumstatRecord {
+  readonly additions: number
+  readonly deletions: number
+  /** True when git spelled both counts as `-`, its notation for a binary file. */
+  readonly binary: boolean
+  /** The head-side path. For a rename, the post-image path. */
+  readonly path: string
+  /** The pre-image path, present only for a rename. */
+  readonly previousPath?: string
+}
+
+export type NumstatParse =
+  | { readonly ok: true; readonly records: readonly NumstatRecord[] }
+  | MalformedDiff
+
+/**
+ * A `--numstat -z` field: two counts and then either the path or, for a rename,
+ * nothing. The path is matched with an any-character class rather than `.`,
+ * because `-z` exists precisely so a path may hold a newline.
+ */
+const NUMSTAT_FIELD = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/
+
+/**
+ * Reads `git diff --numstat -z` output into records.
+ *
+ * A record is one NUL-terminated field holding both counts and the path — except
+ * for a rename, whose path position is **empty** and whose two paths follow as
+ * their own fields. So how many fields a record spans is decided by whether the
+ * path position was empty, which is why this walks the fields rather than
+ * splitting on a record separator; there is none.
+ *
+ * Anything that is not that format is a typed failure rather than a skipped
+ * record: a count this cannot read would leave a file claiming that nothing
+ * changed in it, which is indistinguishable from a file where nothing did.
+ */
+export function parseNumstatZ(stdout: string): NumstatParse {
+  const fields = stdout.split('\0')
+  // Every field is NUL-terminated, so splitting leaves one trailing empty string.
+  if (fields[fields.length - 1] === '') fields.pop()
+
+  const records: NumstatRecord[] = []
+  let index = 0
+  while (index < fields.length) {
+    const field = NUMSTAT_FIELD.exec(fields[index])
+    if (field === null) {
+      return malformed(`${JSON.stringify(fields[index])} is not a --numstat -z field`)
+    }
+    const [, added, deleted, path] = field
+    const binary = added === '-' && deleted === '-'
+    if (!binary && (added === '-' || deleted === '-')) {
+      // git spells a binary file as `-` on BOTH sides. One `-` beside a number
+      // is a shape git does not emit, and guessing which half to believe would
+      // put a fabricated count on a file.
+      return malformed(`counts ${JSON.stringify(`${added}\t${deleted}`)} are not a pair git emits`)
+    }
+    const counts = {
+      additions: binary ? 0 : Number(added),
+      deletions: binary ? 0 : Number(deleted),
+      binary,
+    }
+    if (path.length > 0) {
+      records.push({ ...counts, path })
+      index += 1
+      continue
+    }
+    const paths = fields.slice(index + 1, index + 3)
+    if (paths.length < 2 || paths.some((candidate) => candidate.length === 0)) {
+      return malformed(`an empty path field must be followed by two paths, got ${paths.length}`)
+    }
+    records.push({ ...counts, previousPath: paths[0], path: paths[1] })
+    index += 3
+  }
+  return { ok: true, records }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// The patch text, split per file and trimmed to that file's own hunks.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** How git opens each file's section in patch output. */
+const PATCH_SECTION_START = 'diff --git '
+
+/**
+ * A hunk header at the start of a line. Nothing inside a hunk can be mistaken
+ * for one: every body line carries a `+`, `-` or space marker in the first
+ * column, so a line beginning with `@@` is always the header it looks like.
+ */
+const HUNK_HEADER_START = '@@ -'
+
+/** Every line of `text`, as `[start, end)` offsets, with the terminators excluded. */
+function* lineRanges(text: string): Generator<readonly [number, number]> {
+  let cursor = 0
+  for (;;) {
+    const terminator = text.indexOf('\n', cursor)
+    if (terminator === -1) {
+      if (cursor < text.length) yield [cursor, text.length]
+      return
+    }
+    yield [cursor, terminator]
+    cursor = terminator + 1
+  }
+}
+
+/**
+ * Splits patch output into one section per file, each beginning at its own
+ * `diff --git ` line and running to the start of the next.
+ *
+ * The boundary is a line that begins with `diff --git ` in the first column,
+ * which no hunk body line can: a context line holding that text arrives with a
+ * leading space, an added one with a `+` and a deleted one with a `-`. So the
+ * split cannot be fooled by a repository whose own content is a patch.
+ */
+export function splitPatchSections(stdout: string): string[] {
+  const sections: string[] = []
+  let start = -1
+  for (const [from] of lineRanges(stdout)) {
+    if (!stdout.startsWith(PATCH_SECTION_START, from)) continue
+    if (start !== -1) sections.push(stdout.slice(start, from))
+    start = from
+  }
+  if (start !== -1) sections.push(stdout.slice(start))
+  return sections
+}
+
+/**
+ * One file's hunks, from its first hunk header to the end of its section, or
+ * `undefined` when the section carries no hunk at all.
+ *
+ * Dropping everything before the first header is the whole point: those lines
+ * introduce the file, and a reader that has already opened a hunk consumes them
+ * as content — `--- a/x` as a deleted line, `+++ b/x` as an added one — which
+ * shifts every line number after them. `undefined` rather than an empty string
+ * for a section with no hunk, because absence and emptiness are different
+ * claims: a binary file, a pure rename and a mode-only change all have no text
+ * diff to show, which is not the same as showing an empty one.
+ */
+export function patchHunks(section: string): string | undefined {
+  for (const [from] of lineRanges(section)) {
+    if (!section.startsWith(HUNK_HEADER_START, from)) continue
+    const body = section.slice(from)
+    // git terminates the last line of a section; the wire shape carries a patch
+    // as lines without a terminator, the way the API-shaped producer sends it.
+    return body.endsWith('\n') ? body.slice(0, -1) : body
+  }
+  return undefined
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// The three reads, joined.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** A change set with the line counts and the patch text layered onto every file. */
+export interface LocalChangeSet {
+  /** One complete file per changed path, in the order git emitted them. */
+  readonly files: readonly PullFile[]
+  /** Keyed by head-side path. A path whose object cannot be read is absent. */
+  readonly blobIndex: SnapshotImmutable['blobIndex']
+  /** Head-side path → why that path has no blob index entry. */
+  readonly skippedBlobPaths: Readonly<Record<string, BlobIndexSkipReason>>
+  /**
+   * Head-side paths git reported as binary. Carried beside the file list
+   * because the wire shape has no field for it: there, a binary file is spelled
+   * by an absent patch, which cannot distinguish binary from a diff git declined
+   * to produce for some other reason. A reader wanting to say which is which
+   * reads this.
+   */
+  readonly binaryPaths: readonly string[]
+}
+
+export type LocalChangeSetResult =
+  | { readonly ok: true; readonly changeSet: LocalChangeSet }
+  | MalformedDiff
+  | DiffFailed
+
+/**
+ * What joining three already-read streams can produce. Narrower than the result
+ * of reading them: nothing here spawns a command, so no exit code can arise.
+ */
+export type LocalChangeSetBuild =
+  | { readonly ok: true; readonly changeSet: LocalChangeSet }
+  | MalformedDiff
+
+/**
+ * Joins the three reads of one range into complete files.
+ *
+ * The join is by position, which is sound because all three commands walk git's
+ * one diff queue — and it is only sound while the three agree, so a length
+ * disagreement is refused here rather than absorbed. The counts additionally
+ * carry their own path, verbatim under `-z`, and it is checked against the
+ * `--raw` path at the same position: a silent shift by one would otherwise put
+ * one file's line counts and another file's patch onto a third file's name.
+ * The patch sections carry paths too, but only inside a header where a path
+ * holding a quote or a newline arrives C-quoted, so they are matched by position
+ * alone rather than through a second, weaker path parser.
+ */
+export function buildLocalChangeSet(
+  diff: LocalDiffFiles,
+  counts: readonly NumstatRecord[],
+  sections: readonly string[],
+): LocalChangeSetBuild {
+  if (counts.length !== diff.files.length) {
+    return malformed(
+      `${diff.files.length} changed file(s) but ${counts.length} line-count record(s)`,
+    )
+  }
+  if (sections.length !== diff.files.length) {
+    return malformed(`${diff.files.length} changed file(s) but ${sections.length} patch section(s)`)
+  }
+
+  const files: PullFile[] = []
+  const binaryPaths: string[] = []
+  for (const [index, entry] of diff.files.entries()) {
+    const count = counts[index]
+    if (count.path !== entry.filename) {
+      return malformed(
+        `line counts at position ${index} name ${JSON.stringify(count.path)}, the change set names ${JSON.stringify(entry.filename)}`,
+      )
+    }
+    const file: PullFile = {
+      ...entry,
+      additions: count.additions,
+      deletions: count.deletions,
+      changes: count.additions + count.deletions,
+    }
+    const patch = patchHunks(sections[index])
+    // Assigned only when there is one, so a file with no text diff carries no
+    // `patch` key at all rather than a key holding undefined — the difference
+    // survives serialization, where an undefined value does not.
+    if (patch !== undefined) file.patch = patch
+    files.push(file)
+    if (count.binary) binaryPaths.push(entry.filename)
+  }
+
+  return {
+    ok: true,
+    changeSet: {
+      files,
+      blobIndex: diff.blobIndex,
+      skippedBlobPaths: diff.skippedBlobPaths,
+      binaryPaths,
+    },
+  }
+}
+
+/**
+ * Reads the line counts for a range. `-M` matches the change-set read, so a
+ * rename is one record there and one record here rather than a deletion and an
+ * addition on one side and a rename on the other.
+ */
+export async function readLocalNumstat(
+  runner: CommandRunner,
+  cwd: string,
+  range: LocalDiffRange,
+): Promise<NumstatParse | DiffFailed> {
+  const result = await runGit(runner, cwd, {
+    args: ['-c', 'core.quotePath=false', 'diff', '--numstat', '-M', '-z'],
+    revs: [range.mergeBaseSha, range.headSha],
+  })
+  if (!result.ok) return { ok: false, reason: 'diff_failed', code: result.code }
+  return parseNumstatZ(result.stdout)
+}
+
+/**
+ * Reads the patch text for a range, split into one section per file.
+ *
+ * The context width is stated explicitly rather than left to git's default: the
+ * default is configurable per repository, and a patch's context width decides
+ * which lines a comment can be anchored to, so leaving it ambient would let one
+ * contractor's configuration change what another contractor can review.
+ */
+export async function readLocalPatchSections(
+  runner: CommandRunner,
+  cwd: string,
+  range: LocalDiffRange,
+): Promise<{ readonly ok: true; readonly sections: string[] } | DiffFailed> {
+  const result = await runGit(runner, cwd, {
+    args: ['-c', 'core.quotePath=false', 'diff', '-M', '--unified=3'],
+    revs: [range.mergeBaseSha, range.headSha],
+  })
+  if (!result.ok) return { ok: false, reason: 'diff_failed', code: result.code }
+  return { ok: true, sections: splitPatchSections(result.stdout) }
+}
+
+/**
+ * Reads a range's complete change set: what changed, which objects hold each
+ * side, how many lines moved, and each file's own hunks.
+ *
+ * Three commands rather than one combined invocation, deliberately. git will
+ * emit `--raw`, `--numstat` and `--patch` together, but the boundary between the
+ * NUL-delimited sections and the plain-text patch section is then the fragile
+ * part of the parse, and getting it wrong misreads every file rather than
+ * failing. Three reads of one immutable pair of commits cost three subprocesses
+ * and are each parsed by a function that does one thing.
+ */
+export async function readLocalChangeSet(
+  runner: CommandRunner,
+  cwd: string,
+  range: LocalDiffRange,
+): Promise<LocalChangeSetResult> {
+  const diff = await readLocalDiffFiles(runner, cwd, range)
+  if (!diff.ok) return diff
+  const counts = await readLocalNumstat(runner, cwd, range)
+  if (!counts.ok) return counts
+  const patches = await readLocalPatchSections(runner, cwd, range)
+  if (!patches.ok) return patches
+  return buildLocalChangeSet(diff.diff, counts.records, patches.sections)
 }

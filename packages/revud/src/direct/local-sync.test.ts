@@ -33,6 +33,7 @@
  * each control is shown to fail on its own rather than only as part of a bundle.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import type { PullFile } from '@revu/shared'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -47,16 +48,29 @@ import {
 } from './local-fixture-repo'
 import { isHardenedArgv } from './local-git-argv'
 import { GIT_ARGV_BLOCKED, normalizeRef } from './local-git'
+import { BINARY_SNIFF_BYTES, isBinaryContent } from './blobs'
 import type {
   BlobIndexSkipReason,
   DiffFileEntry,
+  LocalChangeSet,
   LocalDiffFiles,
   LocalRange,
   LocalRangeFailure,
   LocalRangeResult,
+  NumstatRecord,
   RawDiffRecord,
 } from './local-sync'
-import { buildLocalDiffFiles, parseRawZ, readLocalDiffFiles, resolveLocalRange } from './local-sync'
+import {
+  buildLocalChangeSet,
+  buildLocalDiffFiles,
+  parseNumstatZ,
+  parseRawZ,
+  patchHunks,
+  readLocalChangeSet,
+  readLocalDiffFiles,
+  resolveLocalRange,
+  splitPatchSections,
+} from './local-sync'
 import * as localSyncModule from './local-sync'
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -561,11 +575,28 @@ describe('every command the resolver runs is hardened, and none is classified by
   test('the module exports exactly the surface this suite drives', () => {
     // A new export must join a sweep by hand; this pin is what forces that.
     expect(Object.keys(localSyncModule).sort()).toEqual([
+      'buildLocalChangeSet',
       'buildLocalDiffFiles',
+      'parseNumstatZ',
       'parseRawZ',
+      'patchHunks',
+      'readLocalChangeSet',
       'readLocalDiffFiles',
+      'readLocalNumstat',
+      'readLocalPatchSections',
       'resolveLocalRange',
+      'splitPatchSections',
     ])
+  })
+
+  test('every one of those exports is a function', () => {
+    // A `const` string export would be swept by nothing above: the argv sweep
+    // drives functions, and a value export would sit in the surface pin looking
+    // covered while no assertion ever reads it.
+    const notFunctions = Object.entries(localSyncModule)
+      .filter(([, value]) => typeof value !== 'function')
+      .map(([name]) => name)
+    expect(notFunctions).toEqual([])
   })
 })
 
@@ -596,6 +627,32 @@ async function git(dir: string, args: readonly string[]): Promise<string> {
     throw new Error(`\`git ${args.join(' ')}\` exited ${result.code}: ${result.stderr.trim()}`)
   }
   return result.stdout.trim()
+}
+
+/**
+ * The same read, untrimmed. Patch output is asserted byte for byte in places,
+ * and trimming would quietly remove the terminator git puts on a section's last
+ * line — the one byte the patch trimmer is specified to drop.
+ */
+async function gitRaw(dir: string, args: readonly string[]): Promise<string> {
+  const result = await createBunCommandRunner().run(['git', ...args], { cwd: dir })
+  if (!result.ok) {
+    throw new Error(`\`git ${args.join(' ')}\` exited ${result.code}: ${result.stderr.trim()}`)
+  }
+  return result.stdout
+}
+
+/**
+ * One git read as raw bytes. The shared command runner decodes stdout as UTF-8,
+ * which is lossy for a binary object and would destroy the very byte the sniff
+ * looks for, so this spawns directly.
+ */
+async function gitBytes(dir: string, args: readonly string[]): Promise<Uint8Array> {
+  const spawned = Bun.spawn(['git', ...args], { cwd: dir, stdout: 'pipe', stderr: 'pipe' })
+  const bytes = new Uint8Array(await new Response(spawned.stdout).arrayBuffer())
+  const code = await spawned.exited
+  if (code !== 0) throw new Error(`\`git ${args.join(' ')}\` exited ${code}`)
+  return bytes
 }
 
 function qualified(shortName: string): string {
@@ -1631,5 +1688,846 @@ describe('against a real repository, every seeded case lands where it belongs', 
       fixture.headSha,
     ])
     expect(raw).toContain(`160000 ${ABSENT_OID} ${FIXTURE_GITLINK_SHA} A`)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The line counts, and the rename record with the empty field in the middle.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * One `--numstat -z` record. A single path rides inside the count field; a
+ * rename leaves that position **empty** and follows with its two paths as their
+ * own fields, which is the shape this parser has to walk rather than split.
+ */
+function numstatRecord(
+  additions: string,
+  deletions: string,
+  ...paths: readonly string[]
+): string {
+  if (paths.length === 1) return `${additions}\t${deletions}\t${paths[0]}\0`
+  return [`${additions}\t${deletions}\t`, ...paths].map((field) => `${field}\0`).join('')
+}
+
+interface NumstatRow {
+  readonly label: string
+  readonly record: string
+  readonly parsed: NumstatRecord
+}
+
+const NUMSTAT_ROWS: readonly NumstatRow[] = [
+  {
+    label: 'a modification',
+    record: numstatRecord('1', '1', 'src/plain.txt'),
+    parsed: { additions: 1, deletions: 1, binary: false, path: 'src/plain.txt' },
+  },
+  {
+    label: 'an addition',
+    record: numstatRecord('2', '0', 'src/added.txt'),
+    parsed: { additions: 2, deletions: 0, binary: false, path: 'src/added.txt' },
+  },
+  {
+    label: 'a deletion',
+    record: numstatRecord('0', '2', 'src/removed.txt'),
+    parsed: { additions: 0, deletions: 2, binary: false, path: 'src/removed.txt' },
+  },
+  {
+    label: 'a rename that also changed content',
+    record: numstatRecord('1', '0', 'src/renamed-from.txt', 'src/renamed-to.txt'),
+    parsed: {
+      additions: 1,
+      deletions: 0,
+      binary: false,
+      previousPath: 'src/renamed-from.txt',
+      path: 'src/renamed-to.txt',
+    },
+  },
+  {
+    label: 'a rename with no content change',
+    record: numstatRecord('0', '0', 'src/pure-from.txt', 'src/pure-to.txt'),
+    parsed: {
+      additions: 0,
+      deletions: 0,
+      binary: false,
+      previousPath: 'src/pure-from.txt',
+      path: 'src/pure-to.txt',
+    },
+  },
+  {
+    label: 'a mode change with no content change',
+    record: numstatRecord('0', '0', 'src/mode.sh'),
+    parsed: { additions: 0, deletions: 0, binary: false, path: 'src/mode.sh' },
+  },
+  {
+    label: 'a binary file',
+    // git spells both counts as `-`: a binary file has no lines to count. Zero
+    // is the honest translation, and the flag is what keeps zero from reading
+    // as "nothing changed here".
+    record: numstatRecord('-', '-', 'assets/binary.bin'),
+    parsed: { additions: 0, deletions: 0, binary: true, path: 'assets/binary.bin' },
+  },
+]
+
+const NUMSTAT_STDOUT = NUMSTAT_ROWS.map((row) => row.record).join('')
+
+function parseCounts(stdout: string): readonly NumstatRecord[] {
+  const parsed = parseNumstatZ(stdout)
+  if (!parsed.ok) throw new Error(`this stream must parse, got ${parsed.detail}`)
+  return parsed.records
+}
+
+describe('every shape --numstat can report becomes the counts it means', () => {
+  for (const row of NUMSTAT_ROWS) {
+    test(`${row.label} parses to exactly its record`, () => {
+      expect(parseCounts(row.record)).toEqual([row.parsed])
+    })
+  }
+
+  test('the whole table parses in the order git emitted it', () => {
+    expect(parseCounts(NUMSTAT_STDOUT)).toEqual(NUMSTAT_ROWS.map((row) => row.parsed))
+  })
+
+  test('a rename record really does carry an empty field between the two paths', () => {
+    // The one detail this parser exists for: the path position of a rename is
+    // empty, so the record spans three fields rather than one. Without this the
+    // table above could be satisfied by a parser that split on something else.
+    const record = NUMSTAT_ROWS[3].record
+    expect(record.split('\0').slice(0, 3)).toEqual([
+      '1\t0\t',
+      'src/renamed-from.txt',
+      'src/renamed-to.txt',
+    ])
+  })
+
+  test('an empty change set is an empty record list, not a failure', () => {
+    expect(parseNumstatZ('')).toEqual({ ok: true, records: [] })
+  })
+})
+
+describe('the counts parser refuses what git does not emit', () => {
+  test('a field that is not two counts and a path is refused', () => {
+    expect(parseNumstatZ('not a record\0').ok).toBe(false)
+  })
+
+  test('a rename missing its second path field is refused', () => {
+    const truncated = `1\t0\t\0src/renamed-from.txt\0`
+    expect(parseNumstatZ(truncated).ok).toBe(false)
+  })
+
+  test('a dash on one side beside a number on the other is refused', () => {
+    // git spells a binary file as `-` on both sides. Half of that pair is a
+    // shape git does not emit, and choosing which half to believe would put a
+    // fabricated count on a real file.
+    expect(parseNumstatZ(numstatRecord('-', '3', 'src/plain.txt')).ok).toBe(false)
+    expect(parseNumstatZ(numstatRecord('3', '-', 'src/plain.txt')).ok).toBe(false)
+  })
+
+  test('a refusal is a typed failure naming what could not be read', () => {
+    const parsed = parseNumstatZ('not a record\0')
+    if (parsed.ok) throw new Error('this stream must not parse')
+    expect(parsed.reason).toBe('malformed_diff')
+    expect(parsed.detail).toContain('not a record')
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The patch text: each file's own hunks, and nothing that belongs to another.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * The lines a unified diff uses to introduce a file. None of them may appear in
+ * an emitted patch: everything before a file's own first hunk header introduces
+ * that file, and everything introducing a *later* file belongs to that file, so
+ * a patch carrying either has bled across a boundary.
+ */
+const FILE_HEADER_LINE =
+  /^(diff --git |index [0-9a-f]{7,}|--- |\+\+\+ |similarity index |rename (from|to) |new file mode |deleted file mode )/
+
+/**
+ * Two section shapes git emits that the seeded repository's range does not
+ * contain, transcribed from git's own output at the version this suite is
+ * measured against. Both carry **no hunk at all**, and between them they are
+ * the only shapes whose introduction has no `index` line — which is what makes
+ * them the cases that decide whether the pattern above is one net or several.
+ */
+const MODE_ONLY_SECTION =
+  'diff --git a/src/mode.sh b/src/mode.sh\nold mode 100644\nnew mode 100755\n'
+const PURE_RENAME_SECTION =
+  'diff --git a/src/pure.txt b/src/pure-renamed.txt\n' +
+  'similarity index 100%\n' +
+  'rename from src/pure.txt\n' +
+  'rename to src/pure-renamed.txt\n'
+
+describe('patch output is split on the line that opens each file', () => {
+  test('an empty patch stream is no sections at all', () => {
+    expect(splitPatchSections('')).toEqual([])
+  })
+
+  test('a single file is a single section carrying the whole of it', () => {
+    expect(splitPatchSections(MODE_ONLY_SECTION)).toEqual([MODE_ONLY_SECTION])
+  })
+
+  test('two files are two sections, each opening at its own header line', () => {
+    expect(splitPatchSections(MODE_ONLY_SECTION + PURE_RENAME_SECTION)).toEqual([
+      MODE_ONLY_SECTION,
+      PURE_RENAME_SECTION,
+    ])
+  })
+
+  test('a hunk line whose content is itself a header does not open a section', () => {
+    // A repository whose own files hold patches is not a special case: inside a
+    // hunk every line carries a marker in the first column, so a header line in
+    // the content is indented by that marker and cannot be mistaken for one.
+    const withPatchContent =
+      'diff --git a/doc/example.md b/doc/example.md\n' +
+      'index aaaaaaa..bbbbbbb 100644\n' +
+      '--- a/doc/example.md\n' +
+      '+++ b/doc/example.md\n' +
+      '@@ -1,3 +1,3 @@\n' +
+      ' diff --git a/x b/x\n' +
+      '-diff --git a/y b/y\n' +
+      '+diff --git a/z b/z\n'
+    expect(splitPatchSections(withPatchContent)).toEqual([withPatchContent])
+  })
+
+  test('output that opens with anything else yields no section at all', () => {
+    // The stream either begins with a file introduction or it is not patch
+    // output; leading bytes are never salvaged into a section of their own,
+    // because a section with no introduction has no file to belong to.
+    expect(splitPatchSections('@@ -1 +1 @@\n-a\n+b\n')).toEqual([])
+  })
+})
+
+describe('a section is trimmed to the hunks that belong to it', () => {
+  const withHunks =
+    'diff --git a/src/plain.txt b/src/plain.txt\n' +
+    'index 8b05eae..f2de380 100644\n' +
+    '--- a/src/plain.txt\n' +
+    '+++ b/src/plain.txt\n' +
+    '@@ -1,3 +1,3 @@\n' +
+    ' alpha\n' +
+    '-bravo\n' +
+    '+BRAVO-CHANGED\n' +
+    ' charlie\n'
+
+  test('the introduction is dropped and the hunks are kept whole', () => {
+    expect(patchHunks(withHunks)).toBe(
+      '@@ -1,3 +1,3 @@\n alpha\n-bravo\n+BRAVO-CHANGED\n charlie',
+    )
+  })
+
+  test("git's terminating newline is not carried into the patch", () => {
+    expect(patchHunks(withHunks)?.endsWith('\n')).toBe(false)
+  })
+
+  test('a section with no hunk has no patch at all, rather than an empty one', () => {
+    // Absence and emptiness are different claims: "there is no text diff to
+    // show" is not "the diff is empty", and the consumer reads absence as the
+    // former.
+    expect(patchHunks(MODE_ONLY_SECTION)).toBeUndefined()
+    expect(patchHunks(PURE_RENAME_SECTION)).toBeUndefined()
+  })
+
+  test('a binary section has no patch either', () => {
+    const binary =
+      'diff --git a/assets/binary.bin b/assets/binary.bin\n' +
+      'new file mode 100644\n' +
+      'index 0000000..0fbf126\n' +
+      'Binary files /dev/null and b/assets/binary.bin differ\n'
+    expect(patchHunks(binary)).toBeUndefined()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// How much of the header-bleed guard is one net, and how much is several.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** The eight shapes the guard pattern above matches, one at a time. */
+const HEADER_LINE_ALTERNATIVES: Readonly<Record<string, RegExp>> = {
+  'diff --git': /^diff --git /,
+  index: /^index [0-9a-f]{7,}/,
+  'three dashes': /^--- /,
+  'three plusses': /^\+\+\+ /,
+  'similarity index': /^similarity index /,
+  'rename from or to': /^rename (from|to) /,
+  'new file mode': /^new file mode /,
+  'deleted file mode': /^deleted file mode /,
+}
+
+/** Which alternatives match at least one line of a patch. */
+function alternativesFiring(patch: string): string[] {
+  const lines = patch.split('\n')
+  return Object.entries(HEADER_LINE_ALTERNATIVES)
+    .filter(([, pattern]) => lines.some((line) => pattern.test(line)))
+    .map(([label]) => label)
+}
+
+/** A patch text a defective producer could emit, and what to call it. */
+interface Emission {
+  readonly label: string
+  readonly patch: string
+}
+
+/**
+ * The patches producers with each plausible defect would emit: one that split
+ * the stream into sections but stripped nothing, one that dropped only each
+ * section's opening line, and — over the whole stream — one that stripped to
+ * the first hunk but never split at all, which is the header-bleed shape itself.
+ */
+function defectiveEmissions(
+  stdout: string,
+  sections: readonly Emission[],
+): Emission[] {
+  const emissions: Emission[] = [{ label: 'neither split nor stripped', patch: stdout }]
+  const firstHunk = stdout.indexOf('\n@@ -')
+  if (firstHunk !== -1) {
+    emissions.push({
+      label: 'stripped to the first hunk but never split',
+      patch: stdout.slice(firstHunk + 1),
+    })
+  }
+  for (const section of sections) {
+    emissions.push({ label: `${section.label}, split but not stripped`, patch: section.patch })
+    emissions.push({
+      label: `${section.label}, missing only its opening line`,
+      patch: section.patch.slice(section.patch.indexOf('\n') + 1),
+    })
+  }
+  return emissions
+}
+
+describe('the header-bleed guard, measured against real git output', () => {
+  let fixture: FixtureRepo
+  let emissions: Emission[]
+  let fixtureStdout: string
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    fixtureStdout = await gitRaw(fixture.dir, [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '-M',
+      '--unified=3',
+      fixture.mergeBaseSha,
+      fixture.headSha,
+    ])
+    const sections: Emission[] = [
+      ...splitPatchSections(fixtureStdout).map((patch, index) => ({
+        label: `the seeded section ${index}`,
+        patch,
+      })),
+      { label: 'a mode-only change', patch: MODE_ONLY_SECTION },
+      { label: 'a rename with no content change', patch: PURE_RENAME_SECTION },
+    ]
+    emissions = defectiveEmissions(
+      fixtureStdout + MODE_ONLY_SECTION + PURE_RENAME_SECTION,
+      sections,
+    )
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('the measurement runs over patches real git produced', () => {
+    // The whole finding below is about git's own output; measured against
+    // hand-written strings it would be a statement about the strings.
+    expect(fixtureStdout).toContain('diff --git ')
+    expect(emissions.length).toBeGreaterThan(8)
+  })
+
+  test('every one of the eight alternatives fires on something', () => {
+    const witnessed = new Set(emissions.flatMap((emission) => alternativesFiring(emission.patch)))
+    expect([...witnessed].sort()).toEqual(Object.keys(HEADER_LINE_ALTERNATIVES).sort())
+  })
+
+  test('only the opening line is ever the sole reason a patch is rejected', () => {
+    // Measured, and recorded because eight alternatives read as eight defenses.
+    // Seven of them only ever fire alongside another, so removing any one of
+    // the seven changes no verdict here; the exception is a mode-only change,
+    // whose introduction carries no `index`, no `---` and no `+++` line,
+    // leaving the opening line as the only thing that names it.
+    const soleReasons = new Set(
+      emissions
+        .map((emission) => alternativesFiring(emission.patch))
+        .filter((firing) => firing.length === 1)
+        .map((firing) => firing[0]),
+    )
+    expect([...soleReasons]).toEqual(['diff --git'])
+  })
+
+  test('and a mode-only change is what makes the opening line load-bearing', () => {
+    expect(alternativesFiring(MODE_ONLY_SECTION)).toEqual(['diff --git'])
+  })
+
+  test('every alternative also fires alongside another, so none is dead', () => {
+    // The other half of the same finding, stated so it cannot rot: each of the
+    // eight does fire, so none is a corpse — seven are second nets.
+    const accompanied = new Set(
+      emissions
+        .map((emission) => alternativesFiring(emission.patch))
+        .filter((firing) => firing.length > 1)
+        .flat(),
+    )
+    expect([...accompanied].sort()).toEqual(Object.keys(HEADER_LINE_ALTERNATIVES).sort())
+  })
+
+  test('a patch the line scan catches and the opening check does not', () => {
+    // The header-bleed shape exactly: the patch starts at a hunk header, so it
+    // passes the opening check, and carries the next file's introduction after
+    // it. Nothing but the line scan sees that.
+    const caught = emissions.filter(
+      (emission) => emission.patch.startsWith('@@') && alternativesFiring(emission.patch).length > 0,
+    )
+    expect(caught.map((emission) => emission.label)).toEqual([
+      'stripped to the first hunk but never split',
+    ])
+  })
+
+  test('a patch the opening check catches and the line scan does not', () => {
+    // The mirror: a mode-only change with its opening line already dropped is
+    // two `mode` lines the pattern does not name at all, so only "it must start
+    // at a hunk header" rejects it. So the two halves are one guard each, not
+    // one guard and a restatement of it.
+    const caught = emissions.filter(
+      (emission) =>
+        !emission.patch.startsWith('@@') && alternativesFiring(emission.patch).length === 0,
+    )
+    expect(caught.map((emission) => emission.label)).toEqual([
+      'a mode-only change, missing only its opening line',
+    ])
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// Against real git: complete files, with counts and each file's own hunks.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('against a real repository, every file is completed', () => {
+  let fixture: FixtureRepo
+  let changeSet: LocalChangeSet
+  let byPath: Readonly<Record<string, PullFile>>
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    const range = { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headSha }
+    const result = await readLocalChangeSet(createBunCommandRunner(), fixture.dir, range)
+    if (!result.ok) throw new Error(`the fixture range must read, got ${result.reason}`)
+    changeSet = result.changeSet
+    byPath = Object.fromEntries(changeSet.files.map((file) => [file.filename, file]))
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('every seeded path carries the line counts git reported', () => {
+    const counts = Object.fromEntries(
+      changeSet.files.map((file) => [file.filename, [file.additions, file.deletions]]),
+    )
+    expect(counts).toEqual({
+      [fixture.paths.modified]: [1, 1],
+      [fixture.paths.added]: [2, 0],
+      [fixture.paths.removed]: [0, 2],
+      [fixture.paths.renamedTo]: [1, 0],
+      // A binary file has no lines to count, so git spells both counts as `-`.
+      [fixture.paths.binary]: [0, 0],
+      [fixture.paths.symlink]: [1, 0],
+      [fixture.paths.gitlink]: [1, 0],
+    })
+  })
+
+  test('changes is the sum of the two counts on every file', () => {
+    const disagreeing = changeSet.files.filter(
+      (file) => file.changes !== file.additions + file.deletions,
+    )
+    expect(disagreeing).toEqual([])
+  })
+
+  test('the rename binds to the counts record at its own position', () => {
+    // The counts and the change set are joined by position; this is the file
+    // where a shift by one would be visible, because it is the only record in
+    // either stream that spans more than one field.
+    const renamed = byPath[fixture.paths.renamedTo]
+    expect([renamed.previous_filename, renamed.additions, renamed.deletions]).toEqual([
+      fixture.paths.renamedFrom,
+      1,
+      0,
+    ])
+  })
+
+  test('the binary file carries no patch key at all', () => {
+    // Asserted on the key rather than on the value: a key holding undefined
+    // reads the same as an absent one until the shape is serialized, and by
+    // then the file has been persisted claiming a diff it never had.
+    expect('patch' in byPath[fixture.paths.binary]).toBe(false)
+  })
+
+  test('and every other file in this range does carry one', () => {
+    // Without this the assertion above would also pass on a producer that set
+    // no patch on anything.
+    const withoutPatch = changeSet.files.filter((file) => !('patch' in file))
+    expect(withoutPatch.map((file) => file.filename)).toEqual([fixture.paths.binary])
+  })
+
+  test('git and the shared binary heuristic agree about that file', () => {
+    expect(changeSet.binaryPaths).toEqual([fixture.paths.binary])
+  })
+
+  test('the file git called binary has a NUL inside the shared sniff window', async () => {
+    // The convention is reproduced rather than restated: the window comes from
+    // the constant the rest of the pipeline reads, and the verdict comes from
+    // the same function, so a change to either moves both together.
+    const bytes = await gitBytes(fixture.dir, ['show', `${fixture.headSha}:${fixture.paths.binary}`])
+    expect(isBinaryContent(bytes.slice(0, BINARY_SNIFF_BYTES))).toBe(true)
+  })
+
+  test('and the file it called text does not', () => {
+    const bytes = new TextEncoder().encode('alpha\nBRAVO-CHANGED\ncharlie\n')
+    expect(isBinaryContent(bytes.slice(0, BINARY_SNIFF_BYTES))).toBe(false)
+  })
+
+  test('the change set still carries the blob index the raw read produced', () => {
+    // Completing the files must not disturb what the change-set read decided:
+    // the two paths with no readable object stay out of the index and keep
+    // their reason.
+    expect(changeSet.skippedBlobPaths).toEqual({
+      [fixture.paths.gitlink]: 'gitlink',
+      [fixture.paths.symlink]: 'symlink',
+    })
+    expect(Object.hasOwn(changeSet.blobIndex, fixture.paths.modified)).toBe(true)
+  })
+
+  test('the range really did produce patches to check', () => {
+    // Without this the two assertions below hold vacuously over an empty list —
+    // the shape that turns a guard into a recorded green that proves nothing.
+    expect(changeSet.files.filter((file) => file.patch !== undefined).length).toBeGreaterThan(0)
+  })
+
+  test('every emitted patch starts at that file own first hunk header', () => {
+    // Stated per file rather than over a joined blob, so a fourth file added to
+    // the fixture extends the guard with no assertion to edit.
+    for (const file of changeSet.files) {
+      if (file.patch === undefined) continue
+      expect([file.filename, file.patch.slice(0, 2)]).toEqual([file.filename, '@@'])
+    }
+  })
+
+  test('no emitted patch carries a line that introduces a file', () => {
+    for (const file of changeSet.files) {
+      if (file.patch === undefined) continue
+      const bled = file.patch.split('\n').filter((line) => FILE_HEADER_LINE.test(line))
+      expect([file.filename, bled]).toEqual([file.filename, []])
+    }
+  })
+
+  test('the patch of the modified file is the hunk git printed for it', () => {
+    expect(byPath[fixture.paths.modified].patch).toBe(
+      '@@ -1,3 +1,3 @@\n alpha\n-bravo\n+BRAVO-CHANGED\n charlie',
+    )
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The three reads are joined by position, so a disagreement has to be loud.
+// ————————————————————————————————————————————————————————————————————————————
+
+const ZIP_PLAIN_PATH = 'src/plain.txt'
+const ZIP_BINARY_PATH = 'assets/binary.bin'
+const ZIP_BINARY_OID = oid('cd')
+
+/** Two files, spelled the way each of the three commands spells them. */
+const ZIP_RAW =
+  rawRecord(`:${ABSENT_MODE} 100644 ${ABSENT_OID} ${ZIP_BINARY_OID} A`, ZIP_BINARY_PATH) +
+  rawRecord(`:100644 100644 ${PLAIN_BASE_OID} ${PLAIN_HEAD_OID} M`, ZIP_PLAIN_PATH)
+
+const ZIP_COUNTS =
+  numstatRecord('-', '-', ZIP_BINARY_PATH) + numstatRecord('1', '1', ZIP_PLAIN_PATH)
+
+const ZIP_PATCH =
+  'diff --git a/assets/binary.bin b/assets/binary.bin\n' +
+  'new file mode 100644\n' +
+  'index 0000000..0fbf126\n' +
+  'Binary files /dev/null and b/assets/binary.bin differ\n' +
+  'diff --git a/src/plain.txt b/src/plain.txt\n' +
+  'index 8b05eae..f2de380 100644\n' +
+  '--- a/src/plain.txt\n' +
+  '+++ b/src/plain.txt\n' +
+  '@@ -1,3 +1,3 @@\n' +
+  ' alpha\n' +
+  '-bravo\n' +
+  '+BRAVO-CHANGED\n' +
+  ' charlie\n'
+
+function zipWith(
+  raw = ZIP_RAW,
+  counts = ZIP_COUNTS,
+  patch = ZIP_PATCH,
+): ReturnType<typeof buildLocalChangeSet> {
+  return buildLocalChangeSet(build(raw), parseCounts(counts), splitPatchSections(patch))
+}
+
+describe('the three reads agree, or the change set is refused', () => {
+  test('three agreeing reads produce one complete file per change', () => {
+    // The positive control the rows below need: without it a builder that
+    // refused everything would satisfy all of them.
+    const built = zipWith()
+    if (!built.ok) throw new Error(`the agreeing trio must build, got ${built.detail}`)
+    expect(built.changeSet.files).toEqual([
+      {
+        sha: ZIP_BINARY_OID,
+        filename: ZIP_BINARY_PATH,
+        status: 'added',
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+      {
+        sha: PLAIN_HEAD_OID,
+        filename: ZIP_PLAIN_PATH,
+        status: 'modified',
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: '@@ -1,3 +1,3 @@\n alpha\n-bravo\n+BRAVO-CHANGED\n charlie',
+      },
+    ])
+  })
+
+  test('one count record too few is a typed failure, not an off-by-one', () => {
+    // Joining by position is only sound while the streams are the same length.
+    // A short stream silently shifts every file after the gap onto the wrong
+    // counts, which no later assertion could distinguish from real counts.
+    const short = zipWith(ZIP_RAW, numstatRecord('1', '1', ZIP_PLAIN_PATH))
+    expect(short.ok).toBe(false)
+    if (short.ok) return
+    expect(short.reason).toBe('malformed_diff')
+    expect(short.detail).toContain('2 changed file(s) but 1 line-count record(s)')
+  })
+
+  test('one count record too many is refused as well', () => {
+    const long = zipWith(ZIP_RAW, ZIP_COUNTS + numstatRecord('4', '0', 'src/extra.txt'))
+    expect(long.ok).toBe(false)
+  })
+
+  test('one patch section too few is a typed failure', () => {
+    const sections = splitPatchSections(ZIP_PATCH)
+    const short = buildLocalChangeSet(build(ZIP_RAW), parseCounts(ZIP_COUNTS), sections.slice(1))
+    expect(short.ok).toBe(false)
+    if (short.ok) return
+    expect(short.detail).toContain('2 changed file(s) but 1 patch section(s)')
+  })
+
+  test('one patch section too many is refused as well', () => {
+    const sections = [...splitPatchSections(ZIP_PATCH), MODE_ONLY_SECTION]
+    expect(buildLocalChangeSet(build(ZIP_RAW), parseCounts(ZIP_COUNTS), sections).ok).toBe(false)
+  })
+
+  test('counts of the right length naming the wrong file are refused', () => {
+    // Equal lengths are not agreement: two streams can be the same length and
+    // still be one file apart. The counts carry their own path verbatim, so the
+    // shift is visible, and refusing it is what keeps a silent mis-zip from
+    // putting one file's counts under another file's name.
+    const swapped =
+      numstatRecord('1', '1', ZIP_PLAIN_PATH) + numstatRecord('-', '-', ZIP_BINARY_PATH)
+    const built = zipWith(ZIP_RAW, swapped)
+    expect(built.ok).toBe(false)
+    if (built.ok) return
+    expect(built.detail).toContain(ZIP_PLAIN_PATH)
+    expect(built.detail).toContain(ZIP_BINARY_PATH)
+  })
+
+  test('an empty range agrees with itself and produces nothing', () => {
+    const built = buildLocalChangeSet(build(''), parseCounts(''), splitPatchSections(''))
+    expect(built).toEqual({
+      ok: true,
+      changeSet: { files: [], blobIndex: {}, skippedBlobPaths: {}, binaryPaths: [] },
+    })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The argv of the two reads that complete a file.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** A runner that answers each of the three reads with its own canned stream. */
+function changeSetGit(
+  streams: { raw?: string; numstat?: string; patch?: string },
+  sink?: string[][],
+  failing?: 'raw' | 'numstat' | 'patch',
+): CommandRunner {
+  return {
+    async run(args): Promise<CommandResult> {
+      sink?.push(args)
+      const which = args.includes('--raw') ? 'raw' : args.includes('--numstat') ? 'numstat' : 'patch'
+      if (which === failing) return { ok: false, code: 128, stdout: '', stderr: '' }
+      return { ok: true, code: 0, stdout: streams[which] ?? '', stderr: '' }
+    },
+  }
+}
+
+const ZIP_STREAMS = { raw: ZIP_RAW, numstat: ZIP_COUNTS, patch: ZIP_PATCH }
+
+describe('completing a change set asks git for exactly three things', () => {
+  const sink: string[][] = []
+
+  beforeAll(async () => {
+    await readLocalChangeSet(changeSetGit(ZIP_STREAMS, sink), '/repo', DIFF_RANGE)
+  })
+
+  test('it spawns exactly three commands', () => {
+    // An independent literal: a read that quietly grew a fourth invocation, or
+    // stopped making one, moves this.
+    expect(sink).toHaveLength(3)
+  })
+
+  test('the counts argv is the one this read is specified to run', () => {
+    expect(sink[1]).toEqual([
+      'git',
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--numstat',
+      '-M',
+      '-z',
+      '--end-of-options',
+      MERGE_BASE_SHA,
+      HEAD_SHA,
+    ])
+  })
+
+  test('the patch argv states its context width rather than inheriting one', () => {
+    // The default context width is configurable per repository, and the width
+    // decides which lines a comment can be anchored to — so leaving it ambient
+    // would let one clone's configuration change what another can review.
+    expect(sink[2]).toEqual([
+      'git',
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '-M',
+      '--unified=3',
+      '--end-of-options',
+      MERGE_BASE_SHA,
+      HEAD_SHA,
+    ])
+  })
+
+  test('the counts read carries -M, so a rename is one record and not two', () => {
+    // Without it the counts stream reports a deletion and an addition where the
+    // change set reports one rename, and the two streams stop being the same
+    // length — which the join would then refuse on every renaming branch.
+    expect(sink[1]).toContain('-M')
+  })
+
+  test('every captured argv satisfies the hardened form — no sampling', () => {
+    for (const args of sink) {
+      expect(isHardenedArgv(args)).toEqual({ ok: true })
+    }
+  })
+})
+
+describe('any of the three reads failing fails the change set, never throws', () => {
+  for (const failing of ['raw', 'numstat', 'patch'] as const) {
+    test(`a non-zero exit from the ${failing} read carries its exit code`, async () => {
+      await expect(
+        readLocalChangeSet(changeSetGit(ZIP_STREAMS, undefined, failing), '/repo', DIFF_RANGE),
+      ).resolves.toEqual({ ok: false, reason: 'diff_failed', code: 128 })
+    })
+  }
+
+  test('output the counts parser cannot read resolves as a typed failure', async () => {
+    await expect(
+      readLocalChangeSet(
+        changeSetGit({ ...ZIP_STREAMS, numstat: 'not a record\0' }, undefined),
+        '/repo',
+        DIFF_RANGE,
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: 'malformed_diff' })
+  })
+})
+
+describe('rename detection is asked for, never inherited from the repository', () => {
+  let fixture: FixtureRepo
+  let result: Awaited<ReturnType<typeof readLocalChangeSet>>
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    // A repository may turn rename detection off in its own configuration, and
+    // that configuration reaches every command that does not override it. The
+    // three reads must agree about what a rename is, so each states the flag —
+    // and this is where "each states it" stops being an argv assertion and
+    // becomes something git can disagree with.
+    await git(fixture.dir, ['config', 'diff.renames', 'false'])
+    // The same reasoning for the context width: it decides which lines a
+    // comment can be anchored to, so one clone's configuration must not change
+    // what another reviewer sees.
+    await git(fixture.dir, ['config', 'diff.context', '1'])
+    result = await readLocalChangeSet(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: fixture.headSha,
+    })
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('the repository really carries both hostile settings', async () => {
+    // Without this the assertions below would also pass over a repository where
+    // the settings never took, which is the whole point of the leg.
+    await expect(git(fixture.dir, ['config', '--get', 'diff.renames'])).resolves.toBe('false')
+    await expect(git(fixture.dir, ['config', '--get', 'diff.context'])).resolves.toBe('1')
+  })
+
+  test('the patch still carries three lines of context, not the configured one', () => {
+    if (!result.ok) throw new Error(`the fixture range must read, got ${result.reason}`)
+    const renamed = result.changeSet.files.find(
+      (file) => file.filename === fixture.paths.renamedTo,
+    )
+    // Three context lines precede the single added line, which is what a width
+    // of three produces; the repository asked for one.
+    expect(renamed?.patch?.split('\n').slice(0, 5)).toEqual([
+      '@@ -10,3 +10,4 @@ rename-line-8',
+      ' rename-line-9',
+      ' rename-line-10',
+      ' rename-line-11',
+      '+rename-line-appended',
+    ])
+  })
+
+  test('the rename is still one file with its pre-image path', () => {
+    if (!result.ok) throw new Error(`the fixture range must read, got ${result.reason}`)
+    const renamed = result.changeSet.files.find(
+      (file) => file.filename === fixture.paths.renamedTo,
+    )
+    expect([renamed?.status, renamed?.previous_filename, renamed?.additions]).toEqual([
+      'renamed',
+      fixture.paths.renamedFrom,
+      1,
+    ])
+  })
+
+  test('and the pre-image path is not also a file of its own', () => {
+    // The shape a read that lost rename detection produces: the pre-image as a
+    // deletion beside the post-image as an addition, which is one more file
+    // than the change-set read found and would make the three streams disagree.
+    if (!result.ok) throw new Error(`the fixture range must read, got ${result.reason}`)
+    expect(result.changeSet.files.map((file) => file.filename)).not.toContain(
+      fixture.paths.renamedFrom,
+    )
+  })
+})
+
+describe('the binary sniff window is imported, never restated', () => {
+  test('the builder never writes the window down', () => {
+    expect(LOCAL_SYNC_SOURCE).not.toMatch(/\b8000\b/)
+  })
+
+  test('that pattern does fire against the module the window belongs to', () => {
+    // Without this, the assertion above would also pass for a pattern that
+    // matches nothing anywhere.
+    expect(readFileSync(new URL('./blobs.ts', import.meta.url), 'utf8')).toMatch(/\b8000\b/)
   })
 })

@@ -36,8 +36,13 @@ import type { DirectStore } from './store'
  * binary bytes.
  */
 
-/** Git's binary sniff window: a NUL in the first this-many bytes marks a blob binary. */
-const BINARY_SNIFF_BYTES = 8000
+/**
+ * Git's binary sniff window: a NUL in the first this-many bytes marks a blob
+ * binary. Exported so anything that has to reproduce the same convention states
+ * the window once, here, rather than restating the number where a later change
+ * would move one copy and leave the other.
+ */
+export const BINARY_SNIFF_BYTES = 8000
 
 /**
  * The GraphQL `object()` batch size. GitHub's node-count limits and query size

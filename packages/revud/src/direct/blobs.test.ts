@@ -25,7 +25,7 @@ import type {
 import type { RepoRef } from './repo'
 import { unusedWriteMethods } from './github-write-stubs'
 import { openDirectStore, type DirectStore } from './store'
-import { isBinaryContent, provisionBlobs } from './blobs'
+import { BINARY_SNIFF_BYTES, isBinaryContent, provisionBlobs } from './blobs'
 
 const REPO: RepoRef = { owner: 'o', repo: 'r' }
 
@@ -173,6 +173,26 @@ describe('isBinaryContent — git NUL-in-first-8000-bytes heuristic', () => {
   })
   test('an empty blob is not binary', () => {
     expect(isBinaryContent(new Uint8Array(0))).toBe(false)
+  })
+
+  test('the window is 8000 bytes, stated once here', () => {
+    // The one place the number is written down as an assertion. Every other
+    // producer that has to reproduce this convention imports the constant
+    // instead of restating it, so this is the single pin the whole convention
+    // rests on — and the boundary cases above are what give it teeth.
+    expect(BINARY_SNIFF_BYTES).toBe(8000)
+  })
+
+  test('the exported constant is the window the heuristic actually applies', () => {
+    // Without this the pin above would hold over a constant nothing reads: a
+    // NUL at the last byte inside the exported window is binary, and the first
+    // byte outside it is not, both derived from the constant rather than typed.
+    const lastInside = new Uint8Array(BINARY_SNIFF_BYTES + 1).fill(0x41)
+    lastInside[BINARY_SNIFF_BYTES - 1] = 0
+    expect(isBinaryContent(lastInside)).toBe(true)
+    const firstOutside = new Uint8Array(BINARY_SNIFF_BYTES + 1).fill(0x41)
+    firstOutside[BINARY_SNIFF_BYTES] = 0
+    expect(isBinaryContent(firstOutside)).toBe(false)
   })
 })
 
