@@ -1,24 +1,24 @@
 /**
- * The two identity derivations behind the optimistic thread mutations: what
- * body an optimistic reply carries, and who an optimistic resolve is
- * attributed to. Both are pure functions of the session and the review's mode,
- * so both are asserted directly — the hooks that call them need a renderer and
- * a query client and add nothing to the decision under test.
+ * The three identity derivations behind the optimistic thread mutations: what
+ * body an optimistic reply carries, who authors it, and who an optimistic
+ * resolve is attributed to. All three are pure functions of the session and the
+ * review's mode, so all three are asserted directly — the hooks that call them
+ * need a renderer and a query client and add nothing to the decision under test.
  *
- * Both derivations exist because an optimistic value that disagrees with the
- * stored one is not merely wrong for a moment: the success paths copy the body
- * and `resolvedBy` straight out of the response, so a disagreement shows up as
- * a visible swap under the reader's eyes.
+ * They exist because an optimistic value that disagrees with the stored one is
+ * not merely wrong for a moment: the success paths copy the comment and
+ * `resolvedBy` straight out of the response, so a disagreement shows up as a
+ * visible swap under the reader's eyes.
  *
  * The mode is the second input for a reason that is easy to lose: a local
  * review's writes never pass through a shared account, whatever identity the
- * session happens to carry, so both answers change on a local review even
+ * session happens to carry, so every answer changes on a local review even
  * though the session did not.
  */
 import { describe, expect, test } from 'bun:test'
-import type { Human, Session } from '@revu/shared'
+import type { GhUser, Human, Session } from '@revu/shared'
 import { parsePrefixedBody } from '@revu/shared'
-import { optimisticBody, optimisticResolvedBy } from './threads'
+import { optimisticAuthor, optimisticBody, optimisticResolvedBy } from './threads'
 
 const HUMAN: Human = {
   id: 'alice@example.com',
@@ -131,6 +131,75 @@ describe('optimisticResolvedBy', () => {
     test(`${label} never attributes a resolve to an empty login`, () => {
       expect(optimisticResolvedBy(session, 'github').login).not.toBe('')
       expect(optimisticResolvedBy(session, 'local').login).not.toBe('')
+    })
+  }
+})
+
+describe('optimisticAuthor', () => {
+  /**
+   * The exact author a local write records: the reviewer's display name in the
+   * only name-shaped field a GitHub user has, an id outside every real band
+   * (GitHub ids are positive and nothing local mints them), `type: 'Bot'`
+   * marking it as not a genuine account, and no URLs because there is nothing
+   * on github.com to link to.
+   *
+   * Spelled out here rather than imported from the write path, so a change to
+   * the stored shape has to be mirrored into the optimistic one deliberately
+   * instead of the two tracking each other into agreement on a wrong value.
+   */
+  const LOCAL_SENTINEL: GhUser = {
+    login: HUMAN.name,
+    id: 0,
+    node_id: 'local:user',
+    avatar_url: '',
+    html_url: '',
+    type: 'Bot',
+  }
+
+  /**
+   * `onGithub` is the author the pull request write path records for this
+   * session: the shared bot where one fronts many humans, and the
+   * authenticated viewer where the session writes as a real GitHub user.
+   * A session with no write identity at all cannot post — its answer only has
+   * to be total and nameable, so it falls back to the display name and is
+   * marked as the non-account it is.
+   */
+  const shapes: { label: string; session: Session; onGithub: Pick<GhUser, 'login' | 'type'> }[] = [
+    { label: 'direct mode', session: DIRECT, onGithub: { login: 'alice-ng', type: 'User' } },
+    {
+      label: 'broker with a bot',
+      session: BROKER,
+      onGithub: { login: 'acme-revu[bot]', type: 'Bot' },
+    },
+    { label: 'broker with no bot', session: NO_LOGIN, onGithub: { login: HUMAN.name, type: 'Bot' } },
+  ]
+
+  for (const { label, session, onGithub } of shapes) {
+    test(`${label} authors a pull request reply as the identity that posts it`, () => {
+      const author = optimisticAuthor(session, 'github')
+      expect(author.login).toBe(onGithub.login)
+      expect(author.type).toBe(onGithub.type)
+    })
+
+    test(`${label} authors a local reply as the local sentinel reviewer`, () => {
+      // A local write is never mediated by an account, under any session — the
+      // local branch of the write path is taken above the account it would
+      // otherwise write through. So the stored author is the sentinel below,
+      // field for field, whatever identity the session carries.
+      expect(optimisticAuthor(session, 'local')).toEqual(LOCAL_SENTINEL)
+    })
+
+    test(`${label} never authors an optimistic reply with an empty login`, () => {
+      expect(optimisticAuthor(session, 'github').login).not.toBe('')
+      expect(optimisticAuthor(session, 'local').login).not.toBe('')
+    })
+
+    test(`${label} never puts the reviewer's email in the rendered author`, () => {
+      // The email is a storage key, never a body: no field of a rendered user
+      // may carry it, and `login` is the field that gets drawn.
+      for (const mode of ['github', 'local'] as const) {
+        expect(Object.values(optimisticAuthor(session, mode))).not.toContain(HUMAN.email)
+      }
     })
   }
 })

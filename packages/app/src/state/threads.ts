@@ -125,20 +125,48 @@ function nextSyntheticId(): number {
   return syntheticSeq--
 }
 
-function brokerUser(login: string): GhUser {
-  return { login, id: 0, node_id: '', avatar_url: '', html_url: '', type: 'Bot' }
+/**
+ * An author on the github.com side, as much of one as an optimistic comment can
+ * know. The login is certain — it is the account the write authenticates as —
+ * while the numeric id, node id and URLs are minted by github.com and arrive
+ * with the stored comment. They are left empty rather than guessed: an empty
+ * avatar already means "no avatar" to every renderer, and nothing downstream
+ * reads a comment author's ids.
+ */
+function pendingGithubUser(login: string, type: GhUser['type']): GhUser {
+  return { login, id: 0, node_id: '', avatar_url: '', html_url: '', type }
 }
 
 /**
- * Whether writes from this session go out as a shared bot, and therefore carry
- * the human's smuggled `**Name** (role)` prefix.
+ * The sentinel author a local write records. The display name rides in `login`,
+ * the only name-shaped field a GitHub user has; `id: 0` sits outside every real
+ * band (GitHub ids are positive and nothing local mints them); `type: 'Bot'`
+ * marks it as not a genuine GitHub account; the URLs are empty because there is
+ * nothing on github.com to link to. The email never appears — it is a storage
+ * key, not something to render.
+ */
+function localReviewer(name: string): GhUser {
+  return {
+    login: name,
+    id: 0,
+    node_id: 'local:user',
+    avatar_url: '',
+    html_url: '',
+    type: 'Bot',
+  }
+}
+
+/**
+ * Whether writes from this session go out as one shared bot — which decides
+ * both who authors a mediated comment and whether its body carries the human's
+ * smuggled `**Name** (role)` prefix.
  *
  * `brokerLogin` is the fact: it is the empty "no bot" sentinel when the session
  * writes as a real GitHub user or has no write identity at all, and the bot's
  * login when one shared account fronts many humans. That is the same fact the
- * write path branches on when it decides whether to stamp a body, so reading it
- * here keeps the optimistic body and the stored body derived from one condition
- * instead of two that can drift apart.
+ * write path branches on, so reading it here keeps the optimistic comment and
+ * the stored one derived from one condition instead of two that can drift
+ * apart.
  */
 function stampsWrites(session: Session): boolean {
   return session.brokerLogin !== ''
@@ -187,10 +215,44 @@ export function optimisticResolvedBy(session: Session, mode: ReviewMode): { logi
 }
 
 /**
+ * Who an optimistic reply is authored by: the identity the write path records,
+ * which is a different identity on a local review, under a shared bot, and
+ * under a session that reaches GitHub as itself.
+ *
+ * The optimistic comment is replaced by the stored one on success, so an author
+ * that disagrees is a visible change of face under the reader — and the widest
+ * disagreement available is an author with no login at all, which is what a
+ * session carrying no shared account holds.
+ *
+ * A local reply is authored by the sentinel local reviewer under EVERY session,
+ * because a local write is never mediated by an account: the local branch of
+ * the write path is taken above the account it would otherwise write through,
+ * so a bot the session happens to carry never reaches the stored comment. On a
+ * pull request the shared bot is the author wherever one exists, since every
+ * mediated write really is posted by that one account; without one the session
+ * writes to GitHub as the authenticated viewer, and that login is what lands.
+ *
+ * The last branch is a session with no write identity at all — a shape whose
+ * writes are refused before they reach GitHub. It converges on nothing because
+ * nothing is ever stored; it only has to be total and nameable, and a display
+ * name is the one name such a session holds. It is kept separate from the local
+ * branch whose login it coincides with: the two carry the same name for
+ * unrelated reasons, and folding them together would read as a rule.
+ */
+export function optimisticAuthor(session: Session, mode: ReviewMode): GhUser {
+  if (mode === 'local') return localReviewer(session.human.name)
+  if (stampsWrites(session)) return pendingGithubUser(session.brokerLogin, 'Bot')
+  if (session.viewerLogin !== undefined && session.viewerLogin !== '') {
+    return pendingGithubUser(session.viewerLogin, 'User')
+  }
+  return pendingGithubUser(session.human.name, 'Bot')
+}
+
+/**
  * Builds the reply exactly as the write path would return it: authored by the
- * broker bot, and stamped only where that write path stamps — so the render
- * pipeline (identity parsing included) treats the optimistic comment
- * identically to the real one that replaces it.
+ * identity that write records, and stamped only where that write path stamps —
+ * so the render pipeline (identity parsing included) treats the optimistic
+ * comment identically to the real one that replaces it.
  */
 function syntheticReply(
   thread: ReviewThread,
@@ -217,7 +279,7 @@ function syntheticReply(
     side: thread.diffSide,
     start_side: null,
     subject_type: thread.subjectType === 'FILE' ? 'file' : 'line',
-    user: brokerUser(session.brokerLogin),
+    user: optimisticAuthor(session, mode),
     body: optimisticBody(session, mode, body),
     created_at: at,
     updated_at: at,

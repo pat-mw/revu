@@ -10,9 +10,11 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.7.11** — the optimistic reply's author is an empty-login bot. Dispatched to an isolated worktree at
-`opus`. Files: `state/threads.ts`, `state/threads.test.ts`. Nothing is committed for it yet; if this session
-dies now, discard the worktree and re-dispatch from M8.7.11 — nothing else is running.
+**M8.7.7** — the closing proof that the GitHub path is unchanged. Dispatched to an isolated worktree at
+`opus`. Files: `lib/mode-copy.test.ts`, `pages/pr-layout.test.ts`, `pages/pr-layout.tsx` (one export),
+`lib/chrome-sweep.test.ts`. Nothing is committed for it yet; if this session dies now, discard the worktree and
+re-dispatch from M8.7.7 — nothing else is running. **It is the last unit**; after it come M8.7's `Verify`, a
+fable-tier review of the full diff, and the PR on base `m8.6`.
 
 **Execution order for the rest, decided 2026-08-17 and recorded so it is not re-derived:**
 **M8.7.5 → M8.7.6 → M8.7.8 → M8.7.12 → M8.7.11 → M8.7.7.** Serial by file contention. M8.7.12 lands before
@@ -24,7 +26,7 @@ second-to-last only to keep M8.7.7 last.
 | --- | --- | --- |
 | M8.1 | `In Review` — 9 units | PR [#70](https://github.com/pat-mw/revu/pull/70), base `m8/local-reviews-design` |
 | M8.6 | `In Review` — 7 units, Verify green incl. the browser walk | PR [#71](https://github.com/pat-mw/revu/pull/71), base `m8.1` |
-| **M8.7** | `In Progress` — **6 of 12 units landed** | branch `m8.7/app-local-chrome`, **pushed, no PR** |
+| **M8.7** | `In Progress` — **11 of 12 units landed** | branch `m8.7/app-local-chrome`, **pushed, no PR** |
 
 **M8.7 has no PR on purpose:** a ticket's PR opens the moment its `Verify` runs green, and M8.7's has not run.
 The branch is pushed so nothing lives only on one machine. This is the same shape the roadmap sanctions for a
@@ -43,13 +45,11 @@ partial ticket parked at a session boundary.
 | M8.7.5 — review-bar: no lock, no API claim, no broker | `27453da` | 1472 pass · 1 skip · 0 fail · 81 files |
 | M8.7.6 — residual sweep, rate chip, org-member title | `71c71e0` | 1534 pass · 1 skip · 0 fail · 82 files |
 | M8.7.8 — the dirty-worktree banner | `6dc373b` | 1551 pass · 1 skip · 0 fail · 83 files |
-| M8.7.12 — the header draws the branch pair once | `pending` | **1558 pass · 1 skip · 0 fail · 83 files** |
+| M8.7.12 — the header draws the branch pair once | `c50787b` | 1558 pass · 1 skip · 0 fail · 83 files |
+| M8.7.11 — the optimistic reply's author | `pending` | **1570 pass · 1 skip · 0 fail · 83 files** |
 
-**NOT landed — the next session's work, in this order** (serial by file contention, not by dependency; the
-reasoning is in the ticket's own `## Wave plan as actually run`):
-**M8.7.5** → **M8.7.6** → **M8.7.8** → **M8.7.7**, plus the two appended units **M8.7.11** (the optimistic
-reply's author) and **M8.7.12** (the header draws the branch pair twice). Then M8.7's `Verify`, a fable review
-of the full diff, and the PR on base `m8.6`.
+**NOT landed — what remains:** **M8.7.7**, the closing proof that the GitHub path is unchanged. Then M8.7's
+`Verify`, a fable-tier adversarial review of the full diff, and the PR on base `m8.6`.
 
 ### M8.6 and M8.1 — landed and pushed
 
