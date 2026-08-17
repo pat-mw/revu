@@ -14,27 +14,89 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 lane has its own branch and its own serial unit chain; the lanes never share a file, so three workers run
 against each other while integration and gating stay serial in the main tree.
 
-| lane | branch | chain (execution order, not numbering) | status |
+| lane | branch | chain (execution order, not numbering) | landed | in flight | lane tip |
+| --- | --- | --- | --- | --- | --- |
+| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — **fully serial**: .1–.6 all write `direct/store.ts`, and .7 shares `store.test.ts` | **`.7`** | **`.1`** (opus) | `4d7eb60` |
+| **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | **`.8`** | **`.1`** (fable — the argv/injection seam) | `d1c697e` |
+| **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | **`.6`** | **`.1`** (opus) | `4504876` |
+
+**The `lane tip` column is the STEP ZERO fast-forward target** for the next dispatch in that lane, and it
+advances as each unit lands. A worker whose worktree is still at the repo base commit has neither the lane's
+landed modules nor `node_modules`, and any result it produces before fast-forwarding is void.
+
+### ⚠️ This file is authoritative on `m8.2/store-v4` only — a consequence of three concurrent branches
+
+Three lanes means three branches, and `BOARD.md` is one file. Maintaining it on all three would guarantee a
+conflict at every rebase, so:
+
+- **`BOARD.md` is written only on `m8.2/store-v4`, the chain base.** The copies on `m8.3` and `m8.4` are stale
+  until those branches are rebased onto their true bases, which happens before their PRs open. **A cold session
+  must `git checkout m8.2/store-v4` before trusting this file** — that is step 1 of the handover.
+- **Each ticket's `## Log` rides its own lane's branch**, because those are three different files and never
+  conflict. So M8.3's and M8.4's unit records live on their branches, not here.
+- This is a **deliberate deviation** from the "ticket State, Log and BOARD.md change in the same edit" rule,
+  forced by concurrency: the two writes happen in the same *integration step* but land on two branches. Recorded
+  rather than silently done. Ticket **State** rows and the table below stay here, so this file remains the one
+  place that claims what is `In Progress`.
+
+**All three guard rails have landed. Two are deliberately RED and that is the protocol, not a fault** — §4
+requires a guard rail to land before the code it constrains, and both assert their target modules *exist*,
+which is exactly what stops them passing vacuously on a tree with nothing to scan:
+
+| guard | commit | state now | goes green at |
 | --- | --- | --- | --- |
-| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — **fully serial**: .1–.6 all write `direct/store.ts`, and .7 shares `store.test.ts` | **`.7` landed** (1617 pass); `.1` dispatched |
-| **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | `.8` dispatched |
-| **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | `.6` dispatched |
+| **M8.2.7** — nine PR-keyed tripwires | `4d7eb60` | **green and armed** — it constrains *today's* store, so there was nothing to wait for | already green |
+| **M8.3.8** — D7 source scan + real-git fixture | `d1c697e` | **24 fail**, all in `local-no-github.test.ts`; the fixture self-test is green | M8.3.2 (M8.3.1 drops it to 6) |
+| **M8.4.6** — no-GitHub-client scan | `4504876` | **11 fail**, all in `local-write-isolation.test.ts`; 28 assertions already pass | M8.4.2 |
 
-**All three lane branches are at `ef6b851`** — that is the STEP ZERO fast-forward target for the next dispatch
-in every lane, and it advances as each lane's units land. A worker whose worktree is still at the repo base
-commit has neither the lane's landed modules nor `node_modules`, and any result it produces before
-fast-forwarding is void.
+**Anyone who greens one of these by making its existence assertion conditional, skipping when a file is
+missing, or deriving the expected file set from whichever files happen to exist, has destroyed the guard while
+leaving it green.** The last variant is the "two quantities that move together" shape. Both were verified to
+*be able* to go green (placeholders created, scan run clean, placeholders deleted) — without that, a designed
+red is indistinguishable from a guard that can never pass.
 
-**Two guard rails land first in their lanes and are deliberately RED at their landing commit** — the protocol
-requires a guard rail to land before the code it constrains, and both assert their target modules *exist*:
+Every commit is otherwise gated green in the main tree, and each ticket `## Log` records the exact failure count
+and its location at that commit.
 
-- **M8.3.8** (`local-no-github.test.ts`) is red until M8.3.1 and M8.3.2 create `local-git.ts` / `local-sync.ts`.
-- **M8.4.6** (`local-write-isolation.test.ts`) is red until all four scanned files exist — green at M8.4.2.
-- **M8.2.7** is the exception: it arms tripwires on *today's* store, so it lands **green** and armed.
+### What the three guard rails measured — all three ban lists, and two dead members found
 
-Every other commit on every lane is gated green in the main tree. A red gate on one of the two files above,
-at one of those commits, is the intended state and is recorded per commit in the ticket Log — it is not a
-broken gate.
+Directive: every absence assertion gets a control that proves it can fail, and no ban list is trusted because
+it is written down. Running total across this workstream: **eight of ten measured lists contained a dead
+member.** This session's three:
+
+- **M8.2.7 — nine tripwires, all nine proved to fire by name.** The control caught a vacuous assertion *inside
+  the unit*: a `COUNT(*) type='trigger' === 9` pin that **nine wrong triggers satisfy**. Replaced with a
+  behavioral abort. Two SQLite facts verified rather than assumed, each of which would have produced a
+  never-firing trigger: `BEFORE INSERT` fires on an upsert even when it takes the `DO UPDATE` branch, and a
+  `BEFORE UPDATE`/`DELETE` row trigger fires only per **matched** row (so each guarded table is seeded before
+  arming — without that, six of nine would have read as installed while never firing once).
+- **M8.3.8 — six banned tokens, all six fire, and the suspected redundancy was overturned.** `getBlob` and
+  `getBlobObjects` are **disjoint, not subsumed**, because of the trailing `\b`: `/\bgetBlob\b/` does not match
+  `getBlobObjects(…)`. Written unbounded, `getBlob` would have made `getBlobObjects` dead weight. Five of six
+  are additionally witnessed against the *real* source of the modules that legitimately carry the vocabulary,
+  and the unwitnessed remainder is pinned as a literal.
+- **M8.4.6 — one genuinely dead discriminator, kept but pinned.** `./github-client` is **fully subsumed** by the
+  "basename contains github" rule and can never be the unique cause of a failure; it is kept with the
+  subsumption asserted by a test, so it cannot rot into a false sense of independent coverage. The *other*
+  suspected redundancy is not one: `https://` is not implied by `api.github.com` — each trips on a string the
+  other does not.
+
+### The daemon track — exactly what has landed, and the gate at that commit
+
+Every gate below was re-run **by the orchestrator in the main tree**, never trusted from a worker's isolated
+worktree. Counts differ per lane because the three branches carry disjoint work and have not been rebased into
+the chain yet.
+
+| unit | commit | lane | gate in the main tree at that commit |
+| --- | --- | --- | --- |
+| board — three-lane dispatch | `96b63de` | A (shared ancestor) | docs only |
+| board — rulings propagated into unit text | `ef6b851` | A (shared ancestor) | docs only |
+| **M8.2.7** — nine PR-keyed tripwires, armed | `4d7eb60` | A | **1617 pass · 1 skip · 0 fail · 83 files** |
+| **M8.3.8** — D7 scan + seeded real-git fixture | `d1c697e` | B | 1647 pass · 1 skip · **24 fail** · 85 files — all 24 the designed red |
+| **M8.4.6** — no-GitHub-client structural scan | `4504876` | C | 1639 pass · 1 skip · **11 fail** · 84 files — all 11 the designed red |
+
+`bunx tsc -b` and `bunx oxlint` are clean at every commit above, including the two carrying a red test leg —
+the deliberate reds are assertion failures, never compile failures.
 
 **The wave widths came from `HANDOVER.md`'s top entry, not from `ROADMAP.md`'s S3 table**, which plans
 `3 → 4 → 6 → 6 → 4 → 2 → 1 → 1` on the assumption that the orchestrator can merge two workers' versions of
