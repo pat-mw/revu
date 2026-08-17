@@ -365,25 +365,51 @@ describe('how often the whole header names the branch pair', () => {
   })
 })
 
-/** Every accessible name the markup offers, in the order it offers them. */
-function ariaLabels(markup: string): string[] {
-  return [...markup.matchAll(/\saria-label="([^"]*)"/g)].map((m) => m[1])
+/**
+ * Every name the markup offers a reader who is not looking at it, in the order
+ * it offers them.
+ *
+ * BOTH naming attributes, and the second one is the point. A `title` is a name
+ * channel as well as a hover: an element carrying no other accessible name is
+ * announced by its title, and every sighted reader gets it by resting a pointer
+ * on the element. It is also invisible to the text extraction above, which
+ * strips whole tags and takes every attribute with them — so a branch pair that
+ * reached a screen through a title would be seen by nothing in this file.
+ *
+ * That channel is not hypothetical here. The one identity claim this header had
+ * to lose was carried by a title attribute, and it is precisely why it went
+ * unnoticed through several readings of these screens.
+ */
+function accessibleNames(markup: string): string[] {
+  return [...markup.matchAll(/\s(?:aria-label|title)="([^"]*)"/g)].map((m) => m[1])
 }
 
 /** The accessible names that name both of a review's branches. */
 function labelsNamingBothBranches(markup: string, pull: PullSummary): string[] {
-  return ariaLabels(markup).filter(
+  return accessibleNames(markup).filter(
     (label) => label.includes(pull.base.ref) && label.includes(pull.head.ref),
   )
 }
 
 describe('what the header says to a reader who cannot see the arrow', () => {
+  test('the read does find the names a header carries', () => {
+    // The control for the two lists below: both are exact values and both would
+    // be satisfied by an extraction that found no names at all — one because
+    // the sentence it expects would then be missing, which fails loudly, and
+    // the other because an empty list is precisely what it expects. This says
+    // the reader can see names in the header it is reading, so the pull
+    // request's empty list is an absence of qualifying names rather than an
+    // absence of names.
+    expect(accessibleNames(GITHUB_HEADER).length).toBeGreaterThan(0)
+  })
+
   test('a branch pair is spoken once, as a sentence', () => {
     // An element with an accessible name is announced by that name instead of
     // by its contents, so the local pair's spoken form is this sentence and not
     // the arrow between two refs. Asserted as the whole list of qualifying
-    // names rather than as a search: a second row growing a label of its own
-    // would report as an extra member here instead of hiding behind a match.
+    // names rather than as a search: a second row growing a label — or a
+    // title — of its own would report as an extra member here instead of hiding
+    // behind a match.
     expect(labelsNamingBothBranches(LOCAL_HEADER, LOCAL_PULL)).toEqual([
       `Local review of ${LOCAL_PULL.head.ref} against ${LOCAL_PULL.base.ref}`,
     ])

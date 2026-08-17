@@ -8,10 +8,12 @@
  * or it does not, and which sections a review offers is a table. The
  * interesting half is structural, and reads SOURCE rather than behaviour,
  * because the rules it holds are ABSENCES: a second copy of the path matcher, a
- * second reader of the band predicate, and a route guard someone tidied away
- * all compile, pass every other test in the suite, and ship. Nothing but a scan
- * over the tree can hold them, so the scan lives here beside the derivation it
- * protects.
+ * second reader of the band predicate, a threshold written out where the
+ * predicate would have been asked, a route guard someone tidied away, and a
+ * component handed a kind of review chosen at the call site rather than read
+ * off the review. Every one of them compiles, passes every other test in the
+ * suite, and ships. Nothing but a scan over the tree can hold them, so the
+ * scans live here beside the derivation they protect.
  *
  * ## Why the predicate scan stops at the transport seam
  *
@@ -297,6 +299,24 @@ describe('the verdict picker consults the lock decision', () => {
   })
 })
 
+/** The router's source with runs of whitespace flattened to single spaces. */
+const APP_FLAT = APP_SOURCE.replace(/\s+/g, ' ')
+
+/**
+ * What the router mounts DIRECTLY at one review tab's path, by name — or a
+ * sentence saying it mounts nothing there.
+ *
+ * Anchored to the path, so an answer about one tab is never an answer about
+ * whichever route the table happens to list first. The component's name is
+ * returned rather than a boolean because the failure is then the name of the
+ * thing that replaced the guard, which says what happened as well as that
+ * something did.
+ */
+function elementAt(tab: string): string {
+  const match = new RegExp(`<Route path="${tab}" element=\\{ ?<(\\w+)`).exec(APP_FLAT)
+  return match === null ? `no route mounts a ${tab} tab` : match[1]
+}
+
 describe('the route table consults the redirect decision', () => {
   test('the read is looking at the router it names', () => {
     // The control for the pin below: a path resolving to the wrong file, or to
@@ -318,6 +338,32 @@ describe('the route table consults the redirect decision', () => {
     const imported =
       /import\s*\{[^}]*\bredirectTargetFor\b[^}]*\}\s*from\s*'@\/lib\/review-mode'/
     expect(imported.test(APP_SOURCE)).toBe(true)
+  })
+
+  test('the read finds the route it names, and no route it was not asked for', () => {
+    // The control for the two pins below. Without it they are equally satisfied
+    // by a pattern that matched whichever route came first whatever path was
+    // asked for — under which unwrapping exactly one screen leaves both green,
+    // which is the single-route regression they exist for.
+    expect(elementAt('commits')).toBe('ReviewSection')
+    expect(elementAt('settings')).toBe('no route mounts a settings tab')
+  })
+
+  // One tab per test. Both are guarded by the same component today, so a pair
+  // in one body would let the second tab's exposure hide behind the first.
+  test('the checks route is answered by the guard, not by the screen', () => {
+    // The import pin above says the guard exists somewhere in this table; it
+    // cannot say which routes are inside it. Wrapping four of the five leaves
+    // that pin satisfied, `tsc` clean and every test in the package green,
+    // while a bookmarked branch-pair path renders a screen whose whole content
+    // is where to find logs for a build that never ran.
+    expect(elementAt('checks')).toBe('ReviewSection')
+  })
+
+  test('and so is the description route', () => {
+    // The other screen with nothing true to render on a branch pair: a body
+    // nobody typed into a form, described as having been opened empty.
+    expect(elementAt('description')).toBe('ReviewSection')
   })
 })
 
@@ -358,6 +404,21 @@ function readingSideFiles(): string[] {
  */
 const PREDICATE_TAIL = 'Id'
 const BAND_PREDICATE = `isLocalReview${PREDICATE_TAIL}`
+
+/**
+ * Every way the band's first id can be written into a comparison.
+ *
+ * Three numeric spellings and the shared constant they all come from. The
+ * numeric ones are bounded so a longer number that merely starts or ends the
+ * same way is not mistaken for the threshold — a scan that cannot tell those
+ * apart turns red on arithmetic that has nothing to do with review identity.
+ */
+const BAND_BASE_SPELLINGS: RegExp[] = [
+  /1_000_000_000(?!\d|_)/,
+  /(?<![\d_])1000000000(?!\d)/,
+  /(?<![\w.])1e9\b/i,
+  /LOCAL_REVIEW_ID_BASE/,
+]
 
 describe('the scan itself', () => {
   test('reads real files, and the seam it stops at is where the calls are', () => {
@@ -400,5 +461,72 @@ describe('one definition, one reader', () => {
     // rather than re-deriving the band membership itself.
     const callers = readingSideFiles().filter((p) => read(p).includes(BAND_PREDICATE))
     expect(callers).toEqual(['lib/local-reviews.ts'])
+  })
+
+  test('and nothing up here compares a review number to the band base itself', () => {
+    // The other half of the same rule, and the half a scan for the predicate's
+    // NAME cannot hold: a second reader does not have to call the predicate to
+    // become a second opinion. Written out as a threshold — or as the shared
+    // constant it is defined from — it is the same decision restated, and the
+    // failure it produces is identical: a review that is local to one surface
+    // and remote to another, silent on every screen but the one that renders a
+    // key nobody was meant to see.
+    //
+    // Every spelling of the same number is looked for, because which one a
+    // second reader reaches for is a matter of taste. The scan carries the same
+    // categorical exclusions as the one above: the transport MINTS ids in the
+    // band and legitimately names where it starts, and a suite asserting that a
+    // minted id landed in the band is checking the transport rather than
+    // teaching the interface a second definition of local. Suites are excluded
+    // for that reason and, incidentally, are why this file cannot count itself.
+    const offenders = readingSideFiles().filter((p) =>
+      BAND_BASE_SPELLINGS.some((spelling) => spelling.test(read(p))),
+    )
+    expect(offenders).toEqual([])
+  })
+})
+
+/** Every `<IdentityAvatar …>` element in one file, as its attribute text. */
+function avatarElements(relative: string): string[] {
+  const flat = read(relative).replace(/\s+/g, ' ')
+  return [...flat.matchAll(/<IdentityAvatar\b([^>]*)>/g)].map((m) => m[1])
+}
+
+/** Whether an element's `mode` is a constant written at the call site. */
+function handedAConstantMode(attributes: string): boolean {
+  return /\bmode=(?:"[^"]*"|\{ ?'[^']*' ?\})/.test(attributes)
+}
+
+describe('the identity treatment is decided by the review, not by the call site', () => {
+  // The ring and the hover title saying where a person reviews are drawn for
+  // every author whose login is not the shared write identity's — which is EVERY
+  // author of a review of two local branches, because the one recorded on it is
+  // synthesized here and carries no shared login. The component takes the kind
+  // of review as a REQUIRED prop so a call site that never considered the
+  // question cannot compile; what nothing but a scan can say is that a call site
+  // which did consider it answered from the review rather than from a guess.
+  //
+  // Scoped to the reading side for the reason every scan here is: a suite
+  // renders the component with a chosen mode precisely to assert both
+  // treatments, and the transport draws nothing.
+  test('the scan finds the call sites it is scanning', () => {
+    // The control. Every assertion below holds an absence, and an absence over
+    // a walk that matched no elements at all is satisfied for free — by a
+    // renamed component, a reformatted call site, or a regex that stopped
+    // matching JSX.
+    const drawn = readingSideFiles().filter((p) => avatarElements(p).length > 0)
+    expect(drawn.length).toBeGreaterThan(3)
+  })
+
+  test('and no call site hands it a kind of review chosen by hand', () => {
+    // A missing prop is a compile error and a WRONG one is nothing at all, so
+    // this is the only thing standing between a screen and the treatment it was
+    // taken off. Reported as the whole list of offending files rather than the
+    // first, and derived from a walk rather than from a list of today's call
+    // sites — a new surface drawing an avatar is covered without editing this.
+    const offenders = readingSideFiles().filter((p) =>
+      avatarElements(p).some(handedAConstantMode),
+    )
+    expect(offenders).toEqual([])
   })
 })

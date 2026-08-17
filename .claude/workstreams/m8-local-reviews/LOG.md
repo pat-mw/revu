@@ -264,3 +264,46 @@ exhaustiveness guard is red-first.
 **Next**
 - Finish M8.7: **M8.7.5 → .6 → .8 → .7**, plus appended **M8.7.11** and **M8.7.12**. Then Verify, a fable
   review of the full diff, and the PR on base `m8.6`. R14/R15 bind every one of those units.
+
+---
+
+**update — 2026-08-17**
+
+**Done**
+- **M8.7 is COMPLETE and `In Review` on PR #72** (base `m8.6`). Seven units landed this session in one serial
+  chain — **M8.7.5 → .6 → .8 → .12 → .11 → .7**, then the review fixes and the appended **M8.7.13** — each
+  dispatched to an isolated worktree, integrated by copying whole files back, and **gated in the main tree**
+  rather than trusted from the worker's.
+- **Gate green after every single unit, never batched: 1440 → 1611 pass · 1 skip · 0 fail · 83 files** (+171
+  tests, +2 files).
+- **M8.7's `Verify` ran green**: the unit-check set at 232 pass · 0 fail across 8 files, the six-control ledger
+  complete, and the `?mock=1` walk driven from the orchestrator's tree — tab set, header identity, redirects,
+  verdict picker, submit toast, the inbox rows, the whole pull-request path, and all four seal states.
+- **A fable-tier adversarial review of the full diff found NO blockers** and verified all fifteen rulings as
+  implemented rather than taking them on trust. Its four `should-fix` findings are closed.
+- **The two live defects M8.7 owned are dead and controlled**: the local rows now carry zero `title`
+  attributes while a genuine org member still carries `org member · reviews on github.com`; and the rate chip
+  omits on an unavailable workspace instead of shimmering forever.
+
+**Decisions**
+- **Execution order was decided once and recorded rather than re-derived**: serial by file contention, with
+  M8.7.12 before M8.7.7 because the closing proof must run after the last `pr-layout.tsx` writer, and M8.7.11
+  placed second-to-last purely to keep M8.7.7 last (it is genuinely disjoint from everything).
+- **M8.7.13 was appended, not absorbed** — the palette's "This PR" heading is a live false claim in no copy
+  inventory, and folding it into an existing unit is how a ticket's scope stops meaning anything.
+- **The palette placeholder takes no mode**, deliberately: the palette opens with no review at all, so there is
+  no mode to scope it and inventing one would state a fact the surface does not have.
+
+**Blockers**
+- **M8.12 OQ1 is unchanged and still live** — the frozen route set gives `DELETE /api/local-reviews/:n` no body
+  and no query parameter, so a server-authoritative delete force has nowhere to live. **Settle with M8.10
+  before either ticket dispatches.**
+- **Two findings handed to M8.1 (the mock is the spec), neither absorbed:** the mock emits a session shape the
+  daemon never produces (`viewerLogin` omitted while `brokerLogin` is set); and **`dirty: true` is
+  unrepresentable** — no fixture or dev control sets it, so the container half of the dirty banner has never
+  executed against a `true` anywhere, and M8.7's own Verify text asks for a leg that is not runnable.
+
+**Next**
+- The app track is finished through M8.7. The daemon track is untouched and unblocked: **M8.2, M8.3, M8.4 are
+  mutually independent** and all three need only M8.1. M8.5 needs all four.
+- Nothing merges until the whole workstream lands; `main` stays at `177068a`.

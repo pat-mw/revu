@@ -5,6 +5,111 @@ act from it alone.
 
 ---
 
+## 2026-08-17 — Session 3 (the app, finished) — **M8.7 COMPLETE and in review on #72**
+
+> **Read this section and the _Standing rulings_ in the 2026-08-14 entry below; both are live.** Nothing is in
+> flight, no worktree is in use, the tree is clean, and everything landed is committed and pushed. **The app
+> track is finished through M8.7.** No §5 stop condition was hit.
+
+### Start here
+
+1. `git checkout m8.7/app-local-chrome` (pushed; `main` is untouched at `177068a`).
+2. Run `bun run check` — expect **1611 pass · 1 skip · 0 fail · 83 files**. The 1 skip is pre-existing.
+3. **The next work is the daemon track, which is untouched and unblocked.** `BOARD.md`'s dependency graph is
+   authoritative: **M8.2, M8.3 and M8.4 are mutually independent** and each needs only M8.1. They are
+   `packages/revud` and genuinely disjoint from everything landed so far — the first real opportunity in this
+   workstream to run a wide parallel wave rather than a serial chain.
+
+### The stack, bottom-up — three PRs open, none merged
+
+`main` → `m8/local-reviews-design` ([#69](https://github.com/pat-mw/revu/pull/69)) →
+`m8.1/contract-and-mock` ([#70](https://github.com/pat-mw/revu/pull/70)) →
+`m8.6/app-creation-flow` ([#71](https://github.com/pat-mw/revu/pull/71)) →
+`m8.7/app-local-chrome` ([#72](https://github.com/pat-mw/revu/pull/72)).
+
+**Nothing merges until the whole workstream lands.** Never merge, never commit to `main`, never retarget.
+
+### What this session did
+
+Seven units in one serial chain — **M8.7.5 → .6 → .8 → .12 → .11 → .7**, then review fixes and the appended
+**M8.7.13**. Each went to an isolated worktree, was integrated by copying whole files back, and **was gated in
+the main tree**, never trusted from the worker's. **Gate green after every unit: 1440 → 1611 pass · 1 skip ·
+0 fail · 83 files.** M8.7's `Verify` ran green, then a fable-tier adversarial review of the full diff, then #72.
+
+**The two live defects M8.7 owned are dead, each with the positive control that makes the absence mean
+something:** local inbox rows carry **zero** `title` attributes while `#355` still carries
+`org member · reviews on github.com`; and the rate chip **omits** on an unavailable workspace instead of
+shimmering forever, via a three-valued gate (`null` loading · `false` unavailable · `true` available) that
+takes no `mode` at all.
+
+### ⚠️ The one finding worth carrying into every future ticket
+
+**A required prop turns a MISSING prop into a compile error and a WRONG prop into nothing.** The pre-merge
+reviewer hard-coded `mode="github"` at the inbox row — the *exact site where the org-member defect was
+originally reproduced in a browser* — and `tsc -b` was clean with **all 1589 tests passing**. The landed
+assertion rendered the component with an explicit mode, so it proved the component honours its prop and never
+that the reproduction site passes the right one.
+
+**This is a fifth shape of guard-that-asserts-nothing**, and it is invisible to every technique this ticket had
+been using, because it is neither a string nor an absence. It is closed two ways: per-path pins reading back the
+exact expression at each site, **and** a categorical guard that no site above the transport seam may hand the
+component a literal mode — added after the fixer attacked its own fix and found the same hole at three *other*
+call sites. Both were kept: the per-path pins assert the specific expression, which "not a literal" does not.
+
+**R15(b) fired three more times this session** — a prescribed absence that stays green under mode-blindness —
+including once on a copy function written *during the fix for it*. Running total: **six of seven measured
+ban/pin lists in this ticket contained a dead member.** One was on the *required* side: a pinned sentence also
+appeared in a docstring three lines above the code, so the pin stayed green with the sentence deleted.
+**Never trust a ban list because it is written down; run the mode-blind control and see which members fire.**
+
+### Decisions not to relitigate
+
+- **Execution order was serial by file contention**, decided once and recorded in `BOARD.md`. M8.7.12 ran
+  before M8.7.7 because the closing proof must follow the last `pr-layout.tsx` writer; M8.7.11 is genuinely
+  disjoint and sat second-to-last only to keep M8.7.7 last.
+- **M8.7.13 was appended rather than absorbed.** Absorbing a discovered defect into an existing unit is how a
+  ticket's scope stops meaning anything — the same call M8.7.11 and M8.7.12 got.
+- **The palette placeholder takes no mode.** The palette opens with no review at all, so there is no mode to
+  scope it; a mode branch there would state a fact the surface does not have.
+- **`dirtyWorktreeCopy('github')` returns `null`** rather than a fabricated GitHub literal, on the
+  `orgMemberTitle` precedent.
+
+### Two findings handed to M8.1 — the mock is the specification, so neither is cosmetic
+
+1. **`dirty: true` is unrepresentable.** No fixture or dev control sets it, so the *container* half of the
+   dirty banner — the annotations lookup — has **never executed against a `true`** in a test or a walk. M8.7's
+   own Verify text asks for a leg that is not runnable. **One seeded dirty fixture closes both.**
+2. **The mock emits a session shape the daemon never produces** — `viewerLogin` omitted while `brokerLogin` is
+   set. The contract's own docstring says `viewerLogin` is absent only when the broker has no configured bot.
+   Inert today, but the one app-side reader of `viewerLogin` therefore exercises a path under `?mock=1` that a
+   real broker never takes.
+
+### Still blocking, unchanged
+
+⚠️ **M8.12 OQ1** — the frozen route set gives `DELETE /api/local-reviews/:n` no body and no query parameter, so
+a *server-authoritative* delete force has nowhere to live. Either the confirmation is client-side only (weaker)
+or it is a frozen-contract change and a §5.2 stop. **Must be settled with M8.10 before either ticket
+dispatches.**
+
+### Hazards for the next session
+
+1. **An isolated agent worktree is created at the repo's BASE commit and has no `node_modules`.** Every
+   dispatch brief must open with a mandatory STEP ZERO (`git log` → `git merge --ff-only <tip>` →
+   `bun install`) and state that any result produced before it is void. Seven briefs did this and none lost time.
+2. **The `?mock=1` walk must be driven from the orchestrator's tree.** The preview server serves the parent
+   checkout, so a worker's screenshot is evidence of different source. Every worker correctly declined to run one.
+3. **Synthetic key injection does not reach the app's global handlers**, so keyboard legs cannot be driven and
+   must be recorded as NOT RUN. Four Verify legs this session are recorded that way, each with the in-gate
+   assertion that covers it.
+4. **Anything importing `app-shell.tsx` is still unimportable from a `bun test` file** — the preload's
+   `document` stub has no `documentElement`. Source-read it with `readFileSync` instead.
+5. **Three gaps named and deliberately left open**, all outside M8.7: the route pins catch an unwrap and a
+   deletion but not a route re-parented elsewhere; the header's accessible-name list reads `aria-label` and
+   `title` but not `alt` or a tooltip's `data-*`; and the band-literal scan stops at the app, so a second
+   reader added in `packages/shared` is invisible to it.
+
+---
+
 ## 2026-08-14 — Session 2 (the app) — **PAUSED at a unit boundary; M8.6 done, M8.7 half done**
 
 > **Read this section and _Standing rulings_ below; both are live.** The session paused for context, not for a

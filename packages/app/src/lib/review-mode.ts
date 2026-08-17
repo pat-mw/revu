@@ -16,11 +16,27 @@
  * second opinion that will be missed when the first one moves, and the failure
  * it produces is a review that is local to one surface and remote to another.
  *
- * Inside the review subtree the mode is threaded as a REQUIRED PROP, derived
- * once by the layout and passed down, so no descendant can disagree with its
- * siblings. `useRouteReviewMode` exists for the two consumers that render ABOVE
- * the router — the app shell and the command palette — which have no layout to
- * hand them a prop and can only read the path.
+ * ## Three ways to reach the answer, chosen by what the caller already holds
+ *
+ * Most callers hold the review's number already — a route param, a listed row,
+ * a query key — and simply call `reviewMode` with it. That is deliberately not
+ * routed through a prop: a number a module is already holding is a smaller seam
+ * than a prop every component between the layout and that module would have to
+ * thread, and every one of those calls resolves through the same single reading
+ * of the band, so they cannot disagree.
+ *
+ * A component that draws chrome for a review whose number it was never handed
+ * takes the mode as a REQUIRED PROP instead. Required rather than defaulted,
+ * because the alternative is a call site that never thought about the question
+ * answering it by accident: a missing prop is then a compile error, though a
+ * WRONG one is not, which is why the call sites that pass it are pinned to the
+ * expression they derive it from.
+ *
+ * `useRouteReviewMode` is the third way and the narrowest. It reads the mode
+ * off the current path, for a screen rendered under the router that is handed
+ * neither the number nor the mode. Nothing above the router uses it: the chrome
+ * that renders there holds the path itself and matches the number out of it
+ * with `matchPrNumber`, which is the same derivation one step earlier.
  */
 import { useLocation } from 'react-router'
 import { isLocal } from './local-reviews'
@@ -51,8 +67,13 @@ export function matchPrNumber(pathname: string): number | null {
 
 /**
  * The mode of the review the current path has open, or null when the path
- * opens no review at all — for chrome that renders above the router and so
- * cannot be handed the mode as a prop.
+ * opens no review at all — for a screen that is handed neither the review's
+ * number nor its mode and can only ask where it is.
+ *
+ * The null is a real answer and not a degenerate one: a caller that renders
+ * whether or not a review is open needs "none is" back rather than a guess, and
+ * folding it into either mode would have a screen off the review routes
+ * claiming to know which kind of review it is showing.
  */
 export function useRouteReviewMode(): ReviewMode | null {
   const { pathname } = useLocation()

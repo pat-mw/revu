@@ -23,6 +23,7 @@ import {
   notFoundCopy,
   orgMemberChip,
   orgMemberTitle,
+  paletteReviewHeading,
   reconcileFailureCopy,
   reconcileSuccessCopy,
   stateChipCopy,
@@ -164,6 +165,30 @@ describe('what the state chip says a review is', () => {
     // function rather than growing a second one beside it.
     expect(stateChipCopy('local', 'closed')).toBe('archived')
     expect(stateChipCopy('local', 'merged')).toBe('archived')
+  })
+})
+
+describe('what the launcher calls the group acting on the open review', () => {
+  test('a pull request is named as one', () => {
+    // Today's literal, copied character for character out of the launcher. It
+    // is drawn inside a dialog and reaches no static markup, so this is the
+    // only place either wording can be pinned.
+    expect(paletteReviewHeading('github')).toBe('This PR')
+  })
+
+  test('a branch pair is named as the review it is', () => {
+    // The control for the pin above and the fix for the claim it replaces: the
+    // launcher is one chord away from every screen, so a heading calling a
+    // branch pair a pull request is the most reachable false claim in the app.
+    expect(paletteReviewHeading('local')).toBe('This review')
+  })
+
+  test('and a branch pair is not told it has a pull request', () => {
+    expect(paletteReviewHeading('local')).not.toMatch(/pull request/i)
+  })
+
+  test('nor an abbreviated one', () => {
+    expect(paletteReviewHeading('local')).not.toMatch(/\bPR\b/)
   })
 })
 
@@ -709,6 +734,11 @@ const BOTH_READINGS: BothReadings[] = [
   },
   { name: 'orgMemberTitle', github: orgMemberTitle('github'), local: orgMemberTitle('local') },
   { name: 'orgMemberChip', github: orgMemberChip('github'), local: orgMemberChip('local') },
+  {
+    name: 'paletteReviewHeading',
+    github: paletteReviewHeading('github'),
+    local: paletteReviewHeading('local'),
+  },
 ]
 
 /** Two answers compared as whole values, records and nulls included. */
@@ -736,6 +766,20 @@ describe('every sentence in the module is accounted for on both readings', () =>
     // for free, and would satisfy the check below as well.
     expect(BOTH_READINGS.length).toBeGreaterThan(10)
     expect(BOTH_READINGS.every((c) => c.name !== '')).toBe(true)
+  })
+
+  test('and nothing here escapes being asked by not being a function', () => {
+    // The hole in the guard above rather than in the list it checks. It reads
+    // this module's exports and KEEPS ONLY THE FUNCTIONS, so a sentence
+    // exported as a bare constant is dropped by the filter instead of reported
+    // by it: never pinned on either reading, and never asked which review is
+    // asking. Every sentence here varies by that, which is the whole reason the
+    // module exists — a constant is a sentence that has stopped varying and
+    // said so to nobody.
+    const notFunctions = Object.entries(modeCopy as Record<string, unknown>)
+      .filter(([, value]) => typeof value !== 'function')
+      .map(([name]) => name)
+    expect(notFunctions).toEqual([])
   })
 
   test('and no sentence gives the same answer whichever review asked it', () => {

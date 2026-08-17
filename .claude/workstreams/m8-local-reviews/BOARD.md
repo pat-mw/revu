@@ -10,9 +10,10 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.7's `Verify`** — run by the orchestrator in the main tree. No agent is dispatched, no worktree is in use.
-All twelve units are landed and committed. What remains after Verify: a fable-tier adversarial review of the
-full diff, then the PR on base `m8.6`.
+**Nothing.** No unit is dispatched, no agent is running, no worktree is in use, the tree is clean and
+everything landed is committed and pushed. **M8.7 is `In Review` on PR [#72](https://github.com/pat-mw/revu/pull/72)**
+(base `m8.6`): all thirteen units landed, `Verify` green, the fable-tier adversarial review of the full diff
+run and its findings closed.
 
 **Execution order for the rest, decided 2026-08-17 and recorded so it is not re-derived:**
 **M8.7.5 → M8.7.6 → M8.7.8 → M8.7.12 → M8.7.11 → M8.7.7.** Serial by file contention. M8.7.12 lands before
@@ -24,11 +25,10 @@ second-to-last only to keep M8.7.7 last.
 | --- | --- | --- |
 | M8.1 | `In Review` — 9 units | PR [#70](https://github.com/pat-mw/revu/pull/70), base `m8/local-reviews-design` |
 | M8.6 | `In Review` — 7 units, Verify green incl. the browser walk | PR [#71](https://github.com/pat-mw/revu/pull/71), base `m8.1` |
-| **M8.7** | `In Progress` — **all 12 units landed; `Verify` running** | branch `m8.7/app-local-chrome`, **pushed, no PR** |
+| **M8.7** | `In Review` — 13 units, `Verify` green, fable review run | PR [#72](https://github.com/pat-mw/revu/pull/72), base `m8.6` |
 
-**M8.7 has no PR on purpose:** a ticket's PR opens the moment its `Verify` runs green, and M8.7's has not run.
-The branch is pushed so nothing lives only on one machine. This is the same shape the roadmap sanctions for a
-partial ticket parked at a session boundary.
+**M8.7's PR opened the moment its `Verify` went green**, mid-session, and the fable-tier review ran against
+the full diff before it. `main` is still untouched at `177068a`; nothing has merged.
 
 ### M8.7 — exactly what has landed, and what has not
 
@@ -45,11 +45,13 @@ partial ticket parked at a session boundary.
 | M8.7.8 — the dirty-worktree banner | `6dc373b` | 1551 pass · 1 skip · 0 fail · 83 files |
 | M8.7.12 — the header draws the branch pair once | `c50787b` | 1558 pass · 1 skip · 0 fail · 83 files |
 | M8.7.11 — the optimistic reply's author | `dd1931c` | 1570 pass · 1 skip · 0 fail · 83 files |
-| M8.7.7 — the closing proof: GitHub path unchanged | `03d48f6` | **1589 pass · 1 skip · 0 fail · 83 files** |
+| M8.7.7 — the closing proof: GitHub path unchanged | `82c9d55` | 1589 pass · 1 skip · 0 fail · 83 files |
+| M8.7 `Verify` — unit set, control ledger, mock walk | `3e7bfa6` | 232 pass · 0 fail in the unit-check set |
+| M8.7.13 + review fixes — palette, and 7 guards made real | `see #72 tip` | **1611 pass · 1 skip · 0 fail · 83 files** |
 
-**All twelve units are landed.** What remains: M8.7's `Verify` (the unit-check set, the negative-control
-ledger, and the `?mock=1` walk driven from the orchestrator's tree), a fable-tier adversarial review of the
-full diff, and the PR on base `m8.6`.
+**All thirteen units are landed and M8.7 is complete.** The unit count grew by one when the pre-merge review
+found the command palette still framing a local review as a pull request — appended as **M8.7.13** rather than
+absorbed, the same handling M8.7.11 and M8.7.12 got.
 
 ### M8.6 and M8.1 — landed and pushed
 
@@ -64,7 +66,7 @@ one. `main` is untouched at **`177068a`**; nothing merged.
 
 ## Tickets
 
-**93 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**94 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
 count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
 from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14).
@@ -77,7 +79,7 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
-| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Progress | 12 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
+| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |

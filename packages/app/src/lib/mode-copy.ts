@@ -114,6 +114,24 @@ export function stateChipCopy(mode: ReviewMode, state: ReviewState): string {
   return state
 }
 
+/**
+ * The heading over the launcher group that acts on the review already open.
+ *
+ * The group holds that review's sections, a re-sync and the trip into its
+ * thread queue — actions that exist on either kind of review — so the entries
+ * are shared and only the name over them varies. On a branch pair there is no
+ * pull request for the heading to point at, and the launcher is one chord away
+ * from every screen, which makes this the most reachable false claim a review
+ * with no pull request behind it could carry.
+ *
+ * The heading is drawn inside a dialog, which renders through a portal and
+ * reaches no static markup, so this is the only place either wording can be
+ * pinned at all.
+ */
+export function paletteReviewHeading(mode: ReviewMode): string {
+  return mode === 'local' ? 'This review' : 'This PR'
+}
+
 /** The lines of the banner that leads into the thread queue. */
 export interface AuthorBannerCopy {
   /**

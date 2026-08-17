@@ -62,6 +62,7 @@ import {
   notFoundCopy,
   orgMemberChip,
   orgMemberTitle,
+  paletteReviewHeading,
   reconcileFailureCopy,
   reconcileSuccessCopy,
   stateChipCopy,
@@ -95,6 +96,8 @@ interface ScannedFile {
 
 const SCANNED: ScannedFile[] = [
   { path: 'components/app-shell.tsx', marker: /export function AppShell\(/ },
+  { path: 'components/palette.tsx', marker: /export function CommandPalette\(/ },
+  { path: 'pages/inbox.tsx', marker: /export function InboxPage\(/ },
   { path: 'pages/pr-layout.tsx', marker: /export function PrLayout\(/ },
   { path: 'pages/files.tsx', marker: /export function FilesPage\(/ },
   { path: 'pages/conversation.tsx', marker: /export function ConversationPage\(/ },
@@ -149,19 +152,73 @@ describe('the sweep is looking at real files', () => {
 })
 
 /**
+ * The one sentence in the scanned chrome that names an org member and
+ * github.com and is CORRECT where it sits.
+ *
+ * It explains who can approve a pull request the single shared identity opened,
+ * which is true, is the only useful thing to say there, and has no path to a
+ * screen on a branch pair — the whole popover is unrendered when the lock is
+ * off. It lives in a popover body, which renders through a portal and reaches
+ * no static markup, so source is the only place it can be pinned at all.
+ */
+const LOCK_EXPLANATION =
+  'Submit comments here — an org member (e.g. dkozlov) approves on github.com.'
+
+/**
+ * The one sentence subtracted from each file that has one, by path.
+ *
+ * Subtracted from the TEXT rather than expressed as a per-file exemption from a
+ * pattern, and the difference is the whole point: exempting a file from a
+ * pattern exempts every OTHER occurrence of it in that file as well, so a
+ * second, wrong sentence naming the same thing lands in the file most likely to
+ * regress into one and the sweep stays green over it. Removing the sentence
+ * leaves every pattern live over everything else the file says.
+ */
+const EXEMPT_SENTENCE: Record<string, string> = {
+  'components/review/review-bar.tsx': LOCK_EXPLANATION,
+}
+
+/**
+ * One scanned file's text as the banned-literal pass reads it: its source with
+ * its one exempt sentence taken out, ONCE.
+ *
+ * Once rather than globally, so a second verbatim paste of the sentence is
+ * still an offender. A reword makes the removal a no-op, which the required pin
+ * below reports by name rather than leaving as a silent widening.
+ */
+function scanned(relative: string): string {
+  const sentence = EXEMPT_SENTENCE[relative]
+  const text = source(relative)
+  return sentence === undefined ? text : text.replace(sentence, ' ')
+}
+
+/**
+ * How much of each file granted a subtraction the banned pass is not allowed to
+ * read, by path.
+ *
+ * Derived from the map rather than from a path written out here, so a second
+ * exemption is measured by the same bounds without editing anything — a check
+ * over a hand-named file stops covering the newest exemption the moment one is
+ * added, which is the shape of the hole it exists to close.
+ */
+function charactersExempted(): [string, number][] {
+  return Object.keys(EXEMPT_SENTENCE).map((path) => [
+    path,
+    source(path).length - scanned(path).length,
+  ])
+}
+
+/**
  * A sentence the copy module owns, which must therefore not also be written
  * inline in the chrome that renders it.
  *
- * `exempt` names the files where a match is CORRECT rather than a regression,
- * and every entry states why. An exemption is per file and per pattern — never
- * a file dropped from the scan, which would take every other pattern's coverage
- * of that file with it.
+ * Every pattern applies to every scanned file. What a file can be granted is
+ * the removal of one exact sentence from the text this pass reads, which is
+ * narrower than a per-pattern exemption by exactly the rest of the file.
  */
 interface BannedLiteral {
   /** What the sweep looks for. */
   pattern: RegExp
-  /** Scanned paths where this pattern is correct copy. */
-  exempt?: string[]
 }
 
 const BANNED: BannedLiteral[] = [
@@ -169,15 +226,8 @@ const BANNED: BannedLiteral[] = [
   // local review resolves to a GitHub-shaped user whose login is not the shared
   // one. It is a hover title and a chip, not body text, which is why it
   // survived every earlier reading of these screens.
-  //
-  // The verdict picker's lock is exempt from both identity patterns: its
-  // explanation names the person who CAN approve a pull request the shared
-  // identity opened, which is true, is the only useful thing to say there, and
-  // has no path to a screen on a branch pair because the whole popover is
-  // unrendered when the lock is off. The exemption is anchored by the pin
-  // below, so it covers that one sentence rather than the whole file.
-  { pattern: /org member/i, exempt: ['components/review/review-bar.tsx'] },
-  { pattern: /github\.com/i, exempt: ['components/review/review-bar.tsx'] },
+  { pattern: /org member/i },
+  { pattern: /github\.com/i },
   // A claim that a write left in a single request, made where nothing was
   // written and no request happened.
   { pattern: /\bAPI call\b/i },
@@ -215,14 +265,14 @@ const BANNED: BannedLiteral[] = [
 ]
 
 describe('no sentence the copy module owns is also written inline', () => {
-  for (const { pattern, exempt = [] } of BANNED) {
+  for (const { pattern } of BANNED) {
     test(`nothing in the chrome still says ${String(pattern)}`, () => {
       // Every offender at once rather than the first: a list equality names all
       // of them, where a loop of assertions would stop at whichever file the
       // scan happened to reach first.
-      const offenders = SCANNED.filter(
-        ({ path }) => !exempt.includes(path) && pattern.test(source(path)),
-      ).map(({ path }) => path)
+      const offenders = SCANNED.filter(({ path }) => pattern.test(scanned(path))).map(
+        ({ path }) => path,
+      )
       expect(offenders).toEqual([])
     })
   }
@@ -230,14 +280,47 @@ describe('no sentence the copy module owns is also written inline', () => {
 
 describe('the one exemption is anchored to the sentence it was granted for', () => {
   test('the verdict lock still explains who can approve a mediated pull request', () => {
-    // A required literal, and the reason the exemption above is narrow rather
-    // than a hole: if this sentence is ever swept away, the exemption stops
-    // describing anything and must go with it. It lives in a popover body,
-    // which renders through a portal and reaches no static markup, so source is
-    // the only place it can be pinned at all.
-    expect(source('components/review/review-bar.tsx')).toContain(
-      "Submit comments here — an org member (e.g. dkozlov) approves on github.com.",
-    )
+    // A required literal, and the reason the subtraction above is narrow rather
+    // than a hole: if this sentence is ever swept away or reworded, the removal
+    // stops describing anything and must go with it.
+    expect(source('components/review/review-bar.tsx')).toContain(LOCK_EXPLANATION)
+  })
+
+  test('and every subtraction really takes something out of its file', () => {
+    // A reworded sentence makes the removal a silent no-op, and an exemption
+    // that describes nothing is a hole nobody notices. The pin above reports
+    // the reword by name; this reports the consequence, for every file granted
+    // a subtraction rather than for the one that has one today.
+    expect(charactersExempted().filter(([, removed]) => removed === 0)).toEqual([])
+  })
+
+  test('and stays one sentence wide rather than one file wide', () => {
+    // The ceiling is a literal chosen independently of the sentences it bounds
+    // rather than derived from their lengths. A bound computed from the thing
+    // being measured moves with it, so widening a sentence to a paragraph — or
+    // to the whole file — would satisfy a check written against its own new
+    // size, which is a guard that asserts nothing. Every scanned file here is
+    // tens of times longer than this bound.
+    expect(charactersExempted().filter(([, removed]) => removed >= 120)).toEqual([])
+  })
+
+  test('and no sentence is granted one that no pattern would have caught', () => {
+    // The positive control for the subtraction itself. Without it every
+    // identity pattern above is satisfied by removing text that was never going
+    // to match anything, which proves nothing about whether the removal is
+    // doing any work — and quietly licenses removing whatever one likes.
+    const pointless = Object.entries(EXEMPT_SENTENCE)
+      .filter(([, sentence]) => !BANNED.some(({ pattern }) => pattern.test(sentence)))
+      .map(([path]) => path)
+    expect(pointless).toEqual([])
+  })
+
+  test('and the one granted here is caught by BOTH identity patterns', () => {
+    // The file-wide exemption this subtraction replaced covered two patterns at
+    // once, so both are named: an exemption that only ever needed to cover one
+    // of them would be narrower still.
+    expect(/org member/i.test(LOCK_EXPLANATION)).toBe(true)
+    expect(/github\.com/i.test(LOCK_EXPLANATION)).toBe(true)
   })
 })
 
@@ -383,6 +466,69 @@ describe('every swept surface asks the copy module for its sentence', () => {
   })
 })
 
+/**
+ * The attributes of every `<IdentityAvatar …>` element written in one file.
+ *
+ * Anchored to the element, so the read cannot be satisfied by the component's
+ * name appearing in an import, a comment or a docstring.
+ */
+function avatarElements(relative: string): string[] {
+  return [...scanned(relative).matchAll(/<IdentityAvatar\b([^>]*)>/g)].map((m) => m[1])
+}
+
+/**
+ * The expression each of a file's avatars is handed for its mode, in source
+ * order — or a sentence naming the omission, so a missing prop reports as
+ * itself rather than as an empty list.
+ */
+function avatarModeExpressions(relative: string): string[] {
+  return avatarElements(relative).map(
+    (attributes) =>
+      /\bmode=(\{[^}]*\}|"[^"]*")/.exec(attributes)?.[1] ?? 'this avatar is handed no mode',
+  )
+}
+
+/**
+ * What a file binds its own `mode` local to, or a sentence saying it binds
+ * none. Read as the expression rather than as a whole-file search, so a failure
+ * names what the binding became instead of reprinting the file.
+ */
+function modeBinding(relative: string): string {
+  return /\bconst mode\b[^=]*= (\S+)/.exec(scanned(relative))?.[1] ?? 'this file binds no mode'
+}
+
+describe('the avatar is told which kind of review it is drawing inside', () => {
+  // The treatment this decides — a ring and a title saying where a person
+  // reviews — is drawn for every author whose login is not the shared write
+  // identity's, which is EVERY author of a review of two local branches. The
+  // component honours whatever mode it is handed, and its own render assertions
+  // prove that; what they cannot see is a call site handing it the wrong one.
+  //
+  // A required prop turns a MISSING mode into a compile error and a WRONG one
+  // into nothing at all, so the two surfaces where the treatment was reproduced
+  // on a screen are pinned to the expression they derive it from. Each is read
+  // out of its own file: a pattern satisfied by any file in the tree would stay
+  // green through exactly the edit these exist to catch.
+  test('the inbox row asks the review that row is for', () => {
+    // An exact list rather than a search, so it is unsatisfiable in both
+    // directions: a row that stopped drawing the avatar reports `[]`, and one
+    // that hard-codes a kind reports the constant it hard-coded.
+    expect(avatarModeExpressions('pages/inbox.tsx')).toEqual(['{reviewMode(pull.number)}'])
+  })
+
+  test('and the comment header asks the review the comment is on', () => {
+    expect(avatarModeExpressions('components/threads/comment-view.tsx')).toEqual(['{mode}'])
+  })
+
+  test('and that binding is the review number, not a constant chosen once', () => {
+    // The second link of the chain above. The comment card derives the mode one
+    // line up because it also hands it to the descriptor beside the name, so
+    // the call site names a binding — which is only as good as what the binding
+    // is bound to.
+    expect(modeBinding('components/threads/comment-view.tsx')).toBe('reviewMode(prNumber)')
+  })
+})
+
 describe('the review header mounts the banners hung under it', () => {
   test('the header still mounts the dirty-worktree banner', () => {
     // The one regression in this sweep that adds no sentence and removes none:
@@ -397,6 +543,33 @@ describe('the review header mounts the banners hung under it', () => {
     expect(
       importsFrom('pages/pr-layout.tsx', '@/components/review/dirty-banner', 'ReviewDirtyBanner'),
     ).toBe(true)
+  })
+})
+
+describe('the launcher names the open review rather than assuming one', () => {
+  // Every entry the launcher draws lives inside a dialog, which renders through
+  // a portal and reaches no static markup at all — so nothing about this
+  // surface is assertable from a render, and the wording is pinned where it is
+  // decided while the source says the surface still asks for it.
+  test('the group over the open review asks what to call it', () => {
+    // PRESENCE, not execution. Anchored to the import STATEMENT and the module
+    // it names, so a mention in a comment or a leftover local does not satisfy
+    // it — the group's own heading is one chord from every screen, and a
+    // heading pasted back inline leaves every pin on the wording green.
+    expect(importsFrom('components/palette.tsx', '@/lib/mode-copy', 'paletteReviewHeading')).toBe(
+      true,
+    )
+  })
+
+  test('and the search line offers to reach a review, not a pull request', () => {
+    // Deliberately NOT a mode-varying sentence, so it is pinned here rather
+    // than in the copy module: the launcher opens with no review at all and its
+    // jump list holds both kinds at once, so there is no mode to branch on and
+    // inventing one would state a fact this surface does not have. What it must
+    // stay is true of everything the list can reach.
+    expect(scanned('components/palette.tsx')).toContain(
+      'placeholder="Jump to a review or run a command…"',
+    )
   })
 })
 
@@ -466,6 +639,7 @@ const SWEPT: SweptCopy[] = [
   { name: 'orgMemberChip', text: flatten(orgMemberChip('local')) },
   { name: 'orgMemberTitle', text: flatten(orgMemberTitle('local')) },
   { name: 'dirtyWorktreeCopy', text: flatten(dirtyWorktreeCopy('local')) },
+  { name: 'paletteReviewHeading', text: flatten(paletteReviewHeading('local')) },
 ]
 
 describe('the copy sweep covers the module it is sweeping', () => {
@@ -486,6 +660,20 @@ describe('the copy sweep covers the module it is sweeping', () => {
     // satisfy it for free, and would satisfy every absence below as well.
     expect(SWEPT.length).toBeGreaterThan(10)
     expect(SWEPT.every((c) => c.name !== '')).toBe(true)
+  })
+
+  test('and nothing the module exports escapes that guard by not being one', () => {
+    // The hole in the guard above rather than in the list it checks. It reads
+    // the module's exports and KEEPS ONLY THE FUNCTIONS, so a sentence exported
+    // as a bare constant is dropped by the filter instead of reported by it —
+    // swept by nothing here, pinned by nothing anywhere, and free to say
+    // whatever it likes on whichever screen renders it. Every sentence in this
+    // module is a function of the kind of review asking, and a constant is a
+    // sentence that has stopped being one.
+    const notFunctions = Object.entries(modeCopy as Record<string, unknown>)
+      .filter(([, value]) => typeof value !== 'function')
+      .map(([name]) => name)
+    expect(notFunctions).toEqual([])
   })
 })
 

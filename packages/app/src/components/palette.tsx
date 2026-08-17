@@ -36,6 +36,7 @@ import { ApiError } from '@revu/shared'
 import type { PullListItem } from '@revu/shared'
 import { partitionInbox, rowIdentity } from '@/lib/local-reviews'
 import type { RowIdentity } from '@/lib/local-reviews'
+import { paletteReviewHeading } from '@/lib/mode-copy'
 import { matchPrNumber, prPaletteCommands, reviewMode } from '@/lib/review-mode'
 
 /** Look up a chord's formatted chips by catalog id, for CommandShortcut hints. */
@@ -174,8 +175,10 @@ PaletteReviewLabel.displayName = 'PaletteReviewLabel'
  *   matcher).
  * - "Local reviews": the open reviews with no pull request behind them, drawn
  *   and searched by their branch pair. Present only when there is one.
- * - "This PR": the sections the open review actually has, a re-sync, and the
- *   author-queue walk — present only while a review is open.
+ * - The open review's own group: the sections it actually has, a re-sync, and
+ *   the author-queue walk — present only while a review is open, and named for
+ *   the kind of review it is, since a branch pair has no pull request to point
+ *   a heading at.
  * - "Identity": switch which human drives the shared bot.
  * - "Help": open the keyboard sheet.
  *
@@ -250,7 +253,12 @@ export function CommandPalette({
 
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange}>
-      <CommandInput placeholder="Jump to a PR or run a command…" />
+      {/* Not varied by the kind of review, because this line belongs to no
+          review: the launcher opens from the inbox with nothing open, and its
+          jump list holds both kinds at once. So the honest wording is the one
+          that is true whatever is open, rather than a branch on a mode this
+          surface does not have. */}
+      <CommandInput placeholder="Jump to a review or run a command…" />
       <CommandList>
         <CommandEmpty>No matches.</CommandEmpty>
 
@@ -307,7 +315,7 @@ export function CommandPalette({
         {prNumber !== null && (
           <>
             <CommandSeparator />
-            <CommandGroup heading="This PR">
+            <CommandGroup heading={paletteReviewHeading(reviewMode(prNumber))}>
               <CommandItem
                 value="files diff this pr"
                 onSelect={() => run(() => navigate(`/pr/${prNumber}/files`))}
