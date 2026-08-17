@@ -16,7 +16,7 @@ against each other while integration and gating stay serial in the main tree.
 
 | lane | branch | chain (execution order, not numbering) | landed | in flight | lane tip |
 | --- | --- | --- | --- | --- | --- |
-| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — **fully serial**: .1–.6 all write `direct/store.ts`, and .7 shares `store.test.ts` | **`.7 .1 .2 .3 .4`** — 5/7 | **`.5`** | `a133991` |
+| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` | **ALL 7 — `Verify` green, fable review run, fixes landed** | **none — `In Review` on [#73](https://github.com/pat-mw/revu/pull/73)** | `70dd63d` |
 | **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | **`.8 .1 .2 .3 .7`** — 5/9 | **`.4`** | `c0b14f2` |
 | **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | **`.6 .1 .8 .2`** — 4/9 | **`.3`** | `769dba2` |
 
@@ -257,7 +257,7 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
-| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | **In Progress** | 7 | revud | M8.1 | `m8.2/store-v4` | — |
+| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | **In Review** | 7 | revud | M8.1 | `m8.2/store-v4` | [#73](https://github.com/pat-mw/revu/pull/73) |
 | [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Progress** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
 | [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Progress** | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
