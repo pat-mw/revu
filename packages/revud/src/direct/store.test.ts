@@ -32,6 +32,8 @@ import {
   STORE_VERSION,
   type AuditEntry,
   type DirectStore,
+  type LocalReviewSyncState,
+  type NewLocalReview,
 } from './store'
 
 let dir: string
@@ -111,6 +113,61 @@ function draft(humanId: string, prNumber: number, body: string): ReviewDraft {
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   }
+}
+
+/**
+ * A new local review's caller-supplied half. The repository identity and both
+ * refs are spelled out rather than defaulted, because every uniqueness claim in
+ * this block turns on which of the three differs between two calls.
+ */
+function newLocalReview(over: Partial<NewLocalReview>): NewLocalReview {
+  return {
+    repo: 'acme/widgets',
+    baseRef: 'refs/heads/main',
+    headRef: 'refs/heads/feature/x',
+    title: 'feature/x',
+    ...over,
+  }
+}
+
+/** A sync observation with every field populated, for patch assertions. */
+function syncState(over: Partial<LocalReviewSyncState> = {}): LocalReviewSyncState {
+  return {
+    baseSha: 'base-sha',
+    mergeBaseSha: 'merge-base-sha',
+    headSha: 'head-sha',
+    dirty: false,
+    lastSyncedAt: '2026-01-01T00:00:00.000Z',
+    ...over,
+  }
+}
+
+/** How many local reviews the store file holds, read through a raw handle. */
+function localReviewCount(): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM local_reviews').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+/**
+ * Arm a single aborting trigger on `local_reviews` INSERT and return a freshly
+ * opened store, so a create fails at exactly the statement that writes the row
+ * while everything before it in the same call has already run.
+ *
+ * A deliberately induced failure is the only way to observe that the mint's
+ * read-and-bump and its insert are one unit: nothing a caller can pass makes the
+ * insert fail on its own.
+ */
+function armLocalReviewInsertTripwire(store: DirectStore): DirectStore {
+  store.close()
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run(
+    'CREATE TRIGGER refuse_local_review_insert BEFORE INSERT ON local_reviews ' +
+      "BEGIN SELECT RAISE(ABORT, 'refused: INSERT on local_reviews'); END",
+  )
+  raw.close()
+  return open()
 }
 
 describe('resolveDirectDataDir', () => {
@@ -620,6 +677,420 @@ describe('the local-review keyspace arrives as a purely additive version step', 
       // merely describes the guard shape cannot satisfy the pin.
       expect(source).toContain(`if (current < ${n}) {`)
     }
+  })
+})
+
+describe('local reviews: mint, read, list', () => {
+  test('the first mint takes an id from the reserved band, never an auto-assigned rowid', () => {
+    const store = open()
+    const created = store.createLocalReview(newLocalReview({}))
+    store.close()
+
+    // `id INTEGER PRIMARY KEY` is a rowid alias, so an insert that omits the
+    // column makes SQLite assign 1 — a value squarely inside the pull-request
+    // number range this entire keyspace exists to stay out of, in the one table
+    // whose purpose is to stay out of it. The id is therefore always supplied
+    // from the high-water mark, and this is the assertion that notices if it
+    // stops being.
+    expect(created.id).toBeGreaterThanOrEqual(LOCAL_REVIEW_ID_BASE)
+    // The band's first legal value, spelled out: the mark is seeded one below it
+    // so the first read-and-bump yields the base exactly.
+    expect(created.id).toBe(LOCAL_REVIEW_ID_BASE)
+  })
+
+  test('the created review reads back field for field, defaulted where nothing has synced', () => {
+    const store = open()
+    const created = store.createLocalReview(
+      newLocalReview({ repo: 'acme/widgets', title: 'ship the widget' }),
+    )
+    const read = store.getLocalReview(created.id)
+    store.close()
+
+    expect(read).toEqual(created)
+    expect(read).toEqual({
+      id: LOCAL_REVIEW_ID_BASE,
+      repo: 'acme/widgets',
+      baseRef: 'refs/heads/main',
+      headRef: 'refs/heads/feature/x',
+      title: 'ship the widget',
+      // Null before the first sync — a real state ("never synced"), not a
+      // missing value — and `dirty` false rather than unknown.
+      baseSha: null,
+      mergeBaseSha: null,
+      headSha: null,
+      dirty: false,
+      archivedPr: null,
+      createdAt: created.createdAt,
+      updatedAt: created.updatedAt,
+      lastSyncedAt: null,
+    })
+  })
+
+  test('an id no review carries reads back as null, not an error', () => {
+    const store = open()
+    const absent = store.getLocalReview(LOCAL_REVIEW_ID_BASE + 41)
+    store.close()
+    expect(absent).toBeNull()
+  })
+
+  test('the same repo and branch pair mints once: a second create returns the first row', () => {
+    const store = open()
+    const first = store.createLocalReview(newLocalReview({ title: 'first' }))
+    const second = store.createLocalReview(newLocalReview({ title: 'second' }))
+    store.close()
+
+    expect(second.id).toBe(first.id)
+    // The existing row is returned verbatim, so the second call's title never
+    // lands: creation is idempotent, not an upsert.
+    expect(second.title).toBe('first')
+    expect(localReviewCount()).toBe(1)
+  })
+
+  test('a superseded branch pair returns the superseded review, minting no successor', () => {
+    const store = open()
+    const original = store.createLocalReview(newLocalReview({}))
+    store.close()
+
+    // Mark the review superseded by a pull request through a raw handle: nothing
+    // in the store surface writes this column yet, and the one-way-door rule is
+    // exactly what a later writer of it depends on. Without this the column has
+    // no behavioral assertion at all.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run('UPDATE local_reviews SET archived_pr = 4242 WHERE id = ?', [original.id])
+    raw.close()
+
+    const reopened = open()
+    const again = reopened.createLocalReview(newLocalReview({}))
+    reopened.close()
+
+    // The branch pair keeps the review it already has. A superseded pair minting
+    // a successor would give one pair two reviews and leave every caller to guess
+    // which one a branch name means.
+    expect(again.id).toBe(original.id)
+    expect(again.archivedPr).toBe(4242)
+    expect(localReviewCount()).toBe(1)
+  })
+
+  test('the same branch pair under two repositories are two distinct reviews', () => {
+    const store = open()
+    const widgets = store.createLocalReview(newLocalReview({ repo: 'acme/widgets' }))
+    const gadgets = store.createLocalReview(newLocalReview({ repo: 'acme/gadgets' }))
+
+    // Branch names collide across repositories far more readily than pull-request
+    // numbers do, which is why the repository is part of the key from the first
+    // row rather than added once someone hits the collision.
+    expect(gadgets.id).not.toBe(widgets.id)
+    expect(localReviewCount()).toBe(2)
+
+    // And the listing is scoped, so one repository's reviews never surface under
+    // another's identity.
+    expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([widgets.id])
+    expect(store.listLocalReviews('acme/gadgets').map((r) => r.id)).toEqual([gadgets.id])
+    store.close()
+  })
+
+  test('minted ids and their rows survive a close and reopen of the same data dir', () => {
+    const store = open()
+    const created = store.createLocalReview(newLocalReview({ title: 'survives a restart' }))
+    store.close()
+
+    const reopened = open()
+    expect(reopened.getLocalReview(created.id)).toEqual(created)
+    // Creating the same pair after the reopen still returns the same review: the
+    // uniqueness lives on disk, not in a process's memory.
+    expect(reopened.createLocalReview(newLocalReview({})).id).toBe(created.id)
+    // And the next id continues past it rather than restarting at the base.
+    const next = reopened.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/y' }))
+    reopened.close()
+    expect(next.id).toBeGreaterThan(created.id)
+  })
+
+  test('createLocalReview against a closed database throws StoreWriteError', () => {
+    const store = open()
+    store.close()
+    expect(() => store.createLocalReview(newLocalReview({}))).toThrow(StoreWriteError)
+  })
+
+  test('two live stores over one data dir mint one review for one branch pair', () => {
+    // Two `openDirectStore` handles, both open at once, is as close as one test
+    // process gets to two daemons sharing a data directory. What it proves is
+    // that the second handle observes the first's committed row and yields to it
+    // rather than minting a second review for the same branch pair — the unique
+    // key is the serializer, and the row that won is what both callers get back.
+    const first = open()
+    const second = open()
+
+    const a = first.createLocalReview(newLocalReview({ title: 'from the first handle' }))
+    const b = second.createLocalReview(newLocalReview({ title: 'from the second handle' }))
+
+    expect(b.id).toBe(a.id)
+    expect(b.title).toBe('from the first handle')
+    expect(localReviewCount()).toBe(1)
+
+    first.close()
+    second.close()
+  })
+
+  test('the mint is one unit: a refused insert leaves the high-water mark where it was', () => {
+    const store = open()
+    const armed = armLocalReviewInsertTripwire(store)
+
+    const before = metaValue('local_review_id_high_water')
+    expect(() => armed.createLocalReview(newLocalReview({}))).toThrow(StoreWriteError)
+    armed.close()
+
+    // The mark is read and bumped BEFORE the row is inserted, so the two steps
+    // being one transaction is the only thing that keeps a refused insert from
+    // leaving the mark ahead of every id in the table. This is the assertion that
+    // notices the transaction being dropped: without it the bump commits on its
+    // own and the mark walks forward on every failed create.
+    expect(metaValue('local_review_id_high_water')).toBe(before)
+    expect(localReviewCount()).toBe(0)
+  })
+
+  /**
+   * Delete the newest local review through a raw handle and return its id.
+   *
+   * The store has no delete for this table and must not grow one to satisfy a
+   * test. Raw is also the honest shape: what is being modelled is a row that is
+   * gone while the counter that issued it is not.
+   */
+  function deleteNewestLocalReviewRaw(id: number): void {
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run('DELETE FROM local_reviews WHERE id = ?', [id])
+    raw.close()
+  }
+
+  // The next two tests are one claim in two bodies, and the split is load-bearing
+  // rather than stylistic: the runner abandons a test at its first failing
+  // assertion, so a bookkeeping check sharing a body with the id claim would
+  // shadow it and the id claim would never be observed failing on its own.
+
+  test('a deleted id is never re-issued to a later review', () => {
+    const store = open()
+    const first = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/a' }))
+    const second = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/b' }))
+    store.close()
+    expect(second.id).toBeGreaterThan(first.id)
+
+    deleteNewestLocalReviewRaw(second.id)
+
+    const reopened = open()
+    const third = reopened.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/c' }))
+    reopened.close()
+
+    // THE assertion that separates a monotonic high-water mark from
+    // `MAX(id) + 1`, and the only behavioral one that does: every other claim
+    // about minting in this file passes identically under both. `MAX(id) + 1`
+    // hands the deleted id straight to this third review, so any per-human draft
+    // or viewed row that outlived the delete would be silently adopted by an
+    // unrelated review — same id, different branch pair, and no way for a reader
+    // to tell which review the text was written against.
+    expect(third.id).toBeGreaterThan(second.id)
+    expect(third.id).not.toBe(second.id)
+  })
+
+  test('deleting a review does not move the high-water mark backwards', () => {
+    const store = open()
+    store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/a' }))
+    const second = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/b' }))
+    store.close()
+
+    expect(metaValue('local_review_id_high_water')).toBe(String(second.id))
+
+    deleteNewestLocalReviewRaw(second.id)
+
+    // The mechanism behind the claim above, read straight off disk: the mark is a
+    // high-water mark, so removing the row it was last bumped for does not walk it
+    // back. A next-id recomputed from the table's contents would drop here.
+    expect(metaValue('local_review_id_high_water')).toBe(String(second.id))
+  })
+
+  test('the sync patch writes exactly its named fields', () => {
+    const store = open()
+    const created = store.createLocalReview(
+      newLocalReview({ repo: 'acme/widgets', title: 'identity that must not move' }),
+    )
+
+    // Age the row's `updated_at` to a fixed past instant through a raw handle.
+    // `created_at` and `updated_at` are stamped from the same clock read at
+    // creation, so within one test they are the same string — and "the patch
+    // moved `updated_at`" would then be unfalsifiable against a patch that wrote
+    // nothing. An explicit older value makes the claim deterministic without
+    // making the test depend on how long it takes to run.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_reviews SET updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?", [
+      created.id,
+    ])
+    raw.close()
+
+    const reopened = open()
+    reopened.patchLocalReviewSync(created.id, {
+      baseSha: 'b'.repeat(40),
+      mergeBaseSha: 'm'.repeat(40),
+      headSha: 'h'.repeat(40),
+      dirty: true,
+      lastSyncedAt: '2026-03-04T05:06:07.000Z',
+    })
+    const patched = reopened.getLocalReview(created.id)!
+    reopened.close()
+    store.close()
+
+    // The six named fields landed.
+    expect(patched.baseSha).toBe('b'.repeat(40))
+    expect(patched.mergeBaseSha).toBe('m'.repeat(40))
+    expect(patched.headSha).toBe('h'.repeat(40))
+    expect(patched.dirty).toBe(true)
+    expect(patched.lastSyncedAt).toBe('2026-03-04T05:06:07.000Z')
+    expect(patched.updatedAt).not.toBe('2000-01-01T00:00:00.000Z')
+
+    // And nothing else did. A sync observes the two refs; it has no business
+    // rewriting what the review IS, and a patch that rewrote the title would
+    // rename a review behind the back of whoever named it. Compared field by
+    // field against the values the create returned, so a rewrite that happens to
+    // land the same shape is still red.
+    expect(patched.repo).toBe(created.repo)
+    expect(patched.baseRef).toBe(created.baseRef)
+    expect(patched.headRef).toBe(created.headRef)
+    expect(patched.title).toBe(created.title)
+    expect(patched.createdAt).toBe(created.createdAt)
+    // `archived_pr` is not a sync field either: a review superseded by a pull
+    // request must not un-supersede itself the next time the branch is compared.
+    expect(patched.archivedPr).toBeNull()
+  })
+
+  test('the sync patch against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const created = store.createLocalReview(newLocalReview({}))
+    store.close()
+    expect(() => store.patchLocalReviewSync(created.id, syncState())).toThrow(StoreWriteError)
+  })
+
+  test('a sync patch for an id no review carries writes nothing', () => {
+    const store = open()
+    const created = store.createLocalReview(newLocalReview({}))
+    const unknown = created.id + 1000
+
+    store.patchLocalReviewSync(unknown, syncState())
+
+    // The update matched no row, so nothing was written and nothing was created:
+    // a patch is not a back door into minting a review with a chosen id.
+    expect(store.getLocalReview(unknown)).toBeNull()
+    expect(store.getLocalReview(created.id)).toEqual(created)
+    store.close()
+    expect(localReviewCount()).toBe(1)
+  })
+
+  test('listLocalReviews returns each review once, oldest first, across a reopen', () => {
+    const store = open()
+    const a = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/a' }))
+    const b = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/b' }))
+    const c = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/c' }))
+    // A repeated create must not add a second listing entry for the same review.
+    store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/b' }))
+
+    // Ascending id, which is creation order because the ids come from a mark that
+    // only moves up. The documented order is what a caller renders in.
+    //
+    // What this pins, exactly: a reversal or a re-ordering onto another column is
+    // red. Dropping the ordering clause outright is NOT — `id` is declared
+    // `INTEGER PRIMARY KEY`, which makes it the rowid alias, so a table scan
+    // already yields ascending id and no arrangement of rows can separate the two.
+    // The clause is therefore a statement of the contract rather than the thing
+    // that produces it, and the residual is recorded here rather than left for a
+    // reader to assume otherwise.
+    expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([a.id, b.id, c.id])
+    store.close()
+
+    const reopened = open()
+    expect(reopened.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([a.id, b.id, c.id])
+    // A repository with no reviews lists nothing rather than everything.
+    expect(reopened.listLocalReviews('acme/gadgets')).toEqual([])
+    reopened.close()
+  })
+})
+
+describe('the local entity id allocator', () => {
+  test('the first value is at the base of the reserved entity band', () => {
+    const store = open()
+    const first = store.nextLocalEntityId()
+    store.close()
+    expect(first).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+    expect(first).toBe(LOCAL_ENTITY_ID_BASE)
+  })
+
+  test('a thousand successive calls are strictly increasing safe integers', () => {
+    const store = open()
+    const issued: number[] = []
+    for (let i = 0; i < 1000; i += 1) issued.push(store.nextLocalEntityId())
+    store.close()
+
+    for (const id of issued) {
+      // The band sits around 9e12: comfortably inside the exactly representable
+      // integers, and this is what says so rather than assuming it.
+      expect(Number.isSafeInteger(id)).toBe(true)
+      expect(id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+    }
+    for (let i = 1; i < issued.length; i += 1) {
+      expect(issued[i]).toBeGreaterThan(issued[i - 1]!)
+    }
+    // No value repeated, stated independently of the ordering above: a generator
+    // that returned a constant satisfies neither, but a subtler one might satisfy
+    // only one.
+    expect(new Set(issued).size).toBe(1000)
+  })
+
+  test('a reopen continues above the last issued value rather than restarting at the base', () => {
+    const store = open()
+    let last = 0
+    for (let i = 0; i < 5; i += 1) last = store.nextLocalEntityId()
+    store.close()
+
+    // The mark is on disk for exactly this reason: an id re-issued after a restart
+    // would attach a new comment to whatever already referenced the old one.
+    const reopened = open()
+    const afterRestart = reopened.nextLocalEntityId()
+    reopened.close()
+    expect(afterRestart).toBeGreaterThan(last)
+    expect(afterRestart).not.toBe(LOCAL_ENTITY_ID_BASE)
+  })
+
+  test('the entity mark and the review mark are separate counters', () => {
+    const store = open()
+    const review = store.createLocalReview(newLocalReview({}))
+    const entity = store.nextLocalEntityId()
+    store.close()
+
+    // Allocating a review id must not advance the entity mark, or a review
+    // created between two comments would leave a hole in the comment ids — and
+    // one shared counter would make each band's argument depend on the other's
+    // traffic.
+    expect(entity).toBe(LOCAL_ENTITY_ID_BASE)
+    expect(review.id).toBe(LOCAL_REVIEW_ID_BASE)
+    expect(metaValue('local_entity_id_high_water')).toBe(String(LOCAL_ENTITY_ID_BASE))
+  })
+
+  test('nextLocalEntityId against a closed database throws StoreWriteError', () => {
+    const store = open()
+    store.close()
+    expect(() => store.nextLocalEntityId()).toThrow(StoreWriteError)
+  })
+
+  test('a missing high-water row refuses to allocate rather than fabricating an id', () => {
+    const store = open()
+    store.nextLocalEntityId()
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("DELETE FROM meta WHERE key = 'local_entity_id_high_water'")
+    raw.close()
+
+    // A file whose mark was removed outside this store cannot be allocated from:
+    // restarting at the base would hand back an id that has already been issued.
+    // Loud beats a fabricated value that collides months later.
+    const reopened = open()
+    expect(() => reopened.nextLocalEntityId()).toThrow(StoreWriteError)
+    reopened.close()
   })
 })
 

@@ -6,6 +6,7 @@ import type {
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  LocalReviewSummary,
   ReviewDraft,
   Snapshot,
   SnapshotImmutable,
@@ -169,6 +170,45 @@ export interface AuditEntry {
 }
 
 /**
+ * The caller-supplied half of a new local review.
+ *
+ * The store is TOLD its repository identity rather than deriving one: resolving
+ * it needs git, which is not this layer's concern, and a request must never be
+ * able to name the repository it writes into. The value is `owner/name` when the
+ * workspace has a parseable GitHub remote and the absolute path of the
+ * repository root otherwise; it is never empty.
+ *
+ * Refs arrive already validated and fully qualified, and `title` already
+ * defaulted. The store stores what it is handed and normalizes nothing, so one
+ * branch pair cannot end up as two reviews under two spellings of the same
+ * branch.
+ */
+export interface NewLocalReview {
+  repo: string
+  baseRef: string
+  headRef: string
+  title: string
+}
+
+/**
+ * The sync-derived state of a local review: the three SHAs a comparison is built
+ * from, whether the worktree held uncommitted changes (which are therefore NOT
+ * part of the review), and when the sync ran. Every field is null-or-false before
+ * the first sync.
+ *
+ * All of it is replaced together because all of it describes ONE observation of
+ * the two refs — writing a head SHA without the merge base it was compared
+ * against would record a comparison that never happened.
+ */
+export interface LocalReviewSyncState {
+  baseSha: string | null
+  mergeBaseSha: string | null
+  headSha: string | null
+  dirty: boolean
+  lastSyncedAt: string | null
+}
+
+/**
  * The durable store surface direct mode reads and writes. Every getter returns
  * a fresh value (JSON round-trips, so nothing aliases internal state) and every
  * setter that touches disk throws `StoreWriteError` on failure rather than
@@ -249,6 +289,58 @@ export interface DirectStore {
    */
   getPrAuthor(pr: number): string | null | undefined
 
+  // ——— the local-review keyspace ———
+  /**
+   * Create the local review for a branch pair, or return the one that already
+   * exists for it. Creation is idempotent per `(repo, baseRef, headRef)`: a
+   * second call with the same three values returns the first review rather than
+   * minting a second, which is what makes a retried request safe and what makes a
+   * branch pair's identity stable.
+   *
+   * That idempotence holds even once a pull request has superseded the review.
+   * The branch pair keeps the review it already has; a superseded pair is a
+   * one-way door and mints no successor.
+   *
+   * The returned id comes from a monotonic high-water mark and is at or above the
+   * reserved local band, never a value a pull request could carry. Durable: the
+   * row reaches disk before the call returns or a `StoreWriteError` surfaces.
+   */
+  createLocalReview(input: NewLocalReview): LocalReviewSummary
+  /** One local review by id, or `null` when no review carries that id. */
+  getLocalReview(id: number): LocalReviewSummary | null
+  /**
+   * Every local review recorded for one repository, ordered by **ascending id**,
+   * which is creation order — the ids come from a mark that only ever moves up,
+   * so the oldest review is always first. The order is part of the contract
+   * because a caller renders the list in the order it arrives.
+   *
+   * Scoped to one repository on purpose: two repositories sharing a data
+   * directory share these tables, and branch names collide across repositories
+   * far more readily than pull-request numbers do — `main` exists in nearly
+   * every repository.
+   */
+  listLocalReviews(repo: string): LocalReviewSummary[]
+  /**
+   * Replace the sync-derived state of one local review and stamp `updated_at`.
+   *
+   * Writes exactly those columns. The repository, both refs, the title, the
+   * generation and `created_at` are identity and history: a sync observes the two
+   * refs and has no business rewriting what the review IS. An id that matches no
+   * row writes nothing — a caller that needs to distinguish reads the review
+   * first.
+   */
+  patchLocalReviewSync(id: number, state: LocalReviewSyncState): void
+  /**
+   * Allocate the next locally minted entity id — for a comment or a submitted
+   * review summary created against a local review.
+   *
+   * Strictly increasing, at or above the reserved entity band, and durable: the
+   * mark it reads lives on disk, so a restart continues above the last value
+   * handed out instead of re-issuing one. Re-issuing would attach a new comment
+   * to whatever already referenced the old id.
+   */
+  nextLocalEntityId(): number
+
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
 }
@@ -260,6 +352,123 @@ function parseRow<T>(table: string, rowKey: string, json: string): T {
   } catch (err) {
     throw new StoreUnreadableError(table, rowKey, err)
   }
+}
+
+/**
+ * The generation every local review is created at.
+ *
+ * `generation` is the fourth column of the unique key over `(repo, base_ref,
+ * head_ref, generation)`. Nothing advances it, which is what makes a branch
+ * pair's identity a one-way door: the pair keeps the review it already has, even
+ * once a pull request has superseded it. The column exists so a later change can
+ * distinguish a superseded pair from a fresh one WITHOUT altering a primary key —
+ * SQLite cannot do that without rebuilding the table, and a rebuild is what this
+ * file's migration doctrine forbids.
+ */
+const LOCAL_REVIEW_GENERATION = 0
+
+/** One `local_reviews` row as stored, before the wire-shaped rename. */
+interface LocalReviewRow {
+  id: number
+  repo: string
+  base_ref: string
+  head_ref: string
+  title: string
+  base_sha: string | null
+  merge_base_sha: string | null
+  head_sha: string | null
+  dirty: number
+  archived_pr: number | null
+  created_at: string
+  updated_at: string
+  last_synced_at: string | null
+}
+
+/**
+ * The columns a local review reads back through, named rather than `*` so a
+ * column added later cannot silently change what a row destructures to.
+ * `generation` is deliberately absent: it discriminates rows inside the store and
+ * is not part of what a review IS to a caller.
+ */
+const LOCAL_REVIEW_COLUMNS =
+  'id, repo, base_ref, head_ref, title, base_sha, merge_base_sha, head_sha, ' +
+  'dirty, archived_pr, created_at, updated_at, last_synced_at'
+
+/**
+ * Rename one stored row onto the wire shape. A local review is stored as typed
+ * columns rather than as a JSON document, so there is no stored text that could
+ * fail to parse and no unreadable-versus-absent distinction to preserve here: an
+ * absent row is `null` and a present one always maps. `dirty` is the one
+ * conversion — SQLite has no boolean type, so it is stored as 0 or 1.
+ */
+function toLocalReviewSummary(row: LocalReviewRow): LocalReviewSummary {
+  return {
+    id: row.id,
+    repo: row.repo,
+    baseRef: row.base_ref,
+    headRef: row.head_ref,
+    title: row.title,
+    baseSha: row.base_sha,
+    mergeBaseSha: row.merge_base_sha,
+    headSha: row.head_sha,
+    dirty: row.dirty !== 0,
+    archivedPr: row.archived_pr,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastSyncedAt: row.last_synced_at,
+  }
+}
+
+/**
+ * The review recorded for one branch pair, looked up by the FULL unique key.
+ *
+ * Keying on the unique key rather than on a subset of it is what lets the mint
+ * insert with `ON CONFLICT … DO NOTHING` and then read back the row that won: a
+ * lookup on any narrower or wider predicate could miss the conflicting row and
+ * leave the mint with nothing to return.
+ */
+function selectLocalReview(db: Database, key: NewLocalReview): LocalReviewRow | null {
+  return db
+    .query(
+      `SELECT ${LOCAL_REVIEW_COLUMNS} FROM local_reviews ` +
+        'WHERE repo = ? AND base_ref = ? AND head_ref = ? AND generation = ?',
+    )
+    .get(key.repo, key.baseRef, key.headRef, LOCAL_REVIEW_GENERATION) as LocalReviewRow | null
+}
+
+/**
+ * Read and bump one monotonic id high-water mark, returning the value handed out.
+ *
+ * ONE statement, and that is the whole point. A `SELECT` followed by an `UPDATE`
+ * lets two readers observe the same value and hand out the same id — and a
+ * high-water mark makes that failure MORE likely than a `MAX(id) + 1` scan would,
+ * not less, because both readers see a row that has not moved yet. `UPDATE …
+ * RETURNING` closes the window entirely: the value returned is the value written,
+ * decided by SQLite under the row's write lock, which is what keeps the mark
+ * correct when two daemons share one data directory.
+ *
+ * The value is stored as text (the `meta` table holds strings), so the increment
+ * casts through an integer and back rather than relying on column affinity.
+ *
+ * A missing row refuses to allocate. Both marks are seeded when the keyspace is
+ * created and again on every path that upgrades a file into it, so an absent one
+ * means the file was edited outside this store — and fabricating a starting value
+ * there could hand back an id that was already issued.
+ */
+function bumpIdHighWater(db: Database, key: string): number {
+  const row = db
+    .query(
+      'UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) ' +
+        'WHERE key = ? RETURNING value',
+    )
+    .get(key) as { value: string } | null
+  if (!row) {
+    throw new Error(
+      `the id high-water mark "${key}" is missing, so no id can be allocated ` +
+        'without risking one that has already been handed out',
+    )
+  }
+  return Number(row.value)
 }
 
 /**
@@ -292,10 +501,15 @@ export function openDirectStore(
 
   migrate(db)
 
-  /** Run a write, wrapping any failure in a typed `StoreWriteError` (never swallowed). */
-  function write(table: string, fn: () => void): void {
+  /**
+   * Run a write, wrapping any failure in a typed `StoreWriteError` (never
+   * swallowed). The callback's result is forwarded, so a write that has to report
+   * what it wrote — a minted id, the row that won a conflict — reads back through
+   * the same wrapper rather than around it.
+   */
+  function write<T>(table: string, fn: () => T): T {
     try {
-      fn()
+      return fn()
     } catch (err) {
       throw new StoreWriteError(table, err)
     }
@@ -586,6 +800,106 @@ export function openDirectStore(
       // so a present row with a NULL author reads back as `null`, not `undefined`.
       if (!row) return undefined
       return row.human_id
+    },
+
+    createLocalReview(input: NewLocalReview): LocalReviewSummary {
+      return write('local_reviews', () => {
+        // Read the mark, bump it, and insert the row as ONE transaction. Two
+        // daemons can share a data directory, and the failure that a partial
+        // sequence produces is silent: a bump that commits without its row leaves
+        // the mark ahead of every id in the table, and an insert that commits
+        // without its bump hands the same id out twice.
+        const tx = db.transaction(() => {
+          // Already recorded for this branch pair: leave it alone and consume no
+          // id. Minting first and discarding the loser would burn an id on every
+          // retried request.
+          if (selectLocalReview(db, input)) return
+
+          const id = bumpIdHighWater(db, LOCAL_REVIEW_ID_META_KEY)
+          const at = new Date().toISOString()
+          // The id is supplied explicitly — never omitted and never NULL, which
+          // SQLite would answer by assigning a small rowid inside the
+          // pull-request number range.
+          //
+          // `ON CONFLICT … DO NOTHING` rather than a failure, because the unique
+          // key is the real serializer: if another writer recorded this branch
+          // pair between the lookup above and here, the insert yields to it and
+          // the read below returns the row that won. Spelled as `ON CONFLICT`
+          // and not as a blanket ignoring insert so that any OTHER constraint
+          // violation — a NULL in a NOT NULL column — still aborts loudly
+          // instead of being indistinguishable from a yielded duplicate.
+          db.run(
+            'INSERT INTO local_reviews (id, repo, base_ref, head_ref, generation, title, ' +
+              'created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ' +
+              'ON CONFLICT(repo, base_ref, head_ref, generation) DO NOTHING',
+            [
+              id,
+              input.repo,
+              input.baseRef,
+              input.headRef,
+              LOCAL_REVIEW_GENERATION,
+              input.title,
+              at,
+              at,
+            ],
+          )
+        })
+        tx()
+        // Read after the commit, so the row returned is the one that WON the
+        // branch pair — whether this call inserted it or yielded to a writer that
+        // got there first. Absent here means the row was removed from underneath
+        // the commit, which is a real failure and not a review to hand back.
+        const row = selectLocalReview(db, input)
+        if (!row) {
+          throw new Error('the local review is neither newly inserted nor already recorded')
+        }
+        return toLocalReviewSummary(row)
+      })
+    },
+
+    getLocalReview(id: number): LocalReviewSummary | null {
+      const row = db
+        .query(`SELECT ${LOCAL_REVIEW_COLUMNS} FROM local_reviews WHERE id = ?`)
+        .get(id) as LocalReviewRow | null
+      return row ? toLocalReviewSummary(row) : null
+    },
+
+    listLocalReviews(repo: string): LocalReviewSummary[] {
+      const rows = db
+        .query(
+          `SELECT ${LOCAL_REVIEW_COLUMNS} FROM local_reviews WHERE repo = ? ORDER BY id ASC`,
+        )
+        .all(repo) as LocalReviewRow[]
+      return rows.map(toLocalReviewSummary)
+    },
+
+    patchLocalReviewSync(id: number, state: LocalReviewSyncState): void {
+      write('local_reviews', () => {
+        db.run(
+          'UPDATE local_reviews SET base_sha = ?, merge_base_sha = ?, head_sha = ?, ' +
+            'dirty = ?, last_synced_at = ?, updated_at = ? WHERE id = ?',
+          [
+            state.baseSha,
+            state.mergeBaseSha,
+            state.headSha,
+            state.dirty ? 1 : 0,
+            state.lastSyncedAt,
+            new Date().toISOString(),
+            id,
+          ],
+        )
+      })
+    },
+
+    nextLocalEntityId(): number {
+      // No explicit transaction, and that is not an omission: the whole
+      // allocation is ONE `UPDATE … RETURNING`, which SQLite already runs
+      // atomically under the row's write lock. There is no second statement for a
+      // concurrent writer to interleave with, so a BEGIN/COMMIT around it would
+      // add a round trip and no guarantee. The mint of a review id is different —
+      // it bumps a mark AND inserts a row, two statements that must commit or fail
+      // together — and it wraps them accordingly.
+      return write('meta', () => bumpIdHighWater(db, LOCAL_ENTITY_ID_META_KEY))
     },
 
     close(): void {

@@ -118,6 +118,11 @@ function fakeStore(opts: {
     listAudit: unexpected('listAudit'),
     recordPrAuthor: unexpected('recordPrAuthor'),
     getPrAuthor: unexpected('getPrAuthor'),
+    createLocalReview: unexpected('createLocalReview'),
+    getLocalReview: unexpected('getLocalReview'),
+    listLocalReviews: unexpected('listLocalReviews'),
+    patchLocalReviewSync: unexpected('patchLocalReviewSync'),
+    nextLocalEntityId: unexpected('nextLocalEntityId'),
     close: () => {},
   }
 }
