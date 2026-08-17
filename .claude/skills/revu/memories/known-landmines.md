@@ -110,5 +110,27 @@ Each of these has a ticket or a doc section; listed here so no session rediscove
   2. **A loose source-scan regex matching a duplicate of its own target.** A pin on a guard clause passed with the guard deleted, because the pattern also matched an identical line in the `catch` branch. Fix: anchor **per path**, and prove it by deleting **only** the thing pinned (e.g. remove an import while leaving the call) — if it stays green the anchor is wrong.
   3. **A negative regex over copy whose current literal already satisfies the ban.** Three assertions (`/pull request/i` absent, `/github/i` absent, `/files/i` present) were **all** satisfied by a copy function that ignored its `mode` argument, because today's string happened to contain neither banned word. Fix: **always pair an absence assertion with a positive `toBe` on both branches' exact literals**, copied from the tree rather than paraphrased.
   4. **A control placed outside the scope it is meant to test.** A stray import added under `src/api/` left a scan green; the same import under `src/lib/` turned it red. Fix: a negative control must sit **inside** the scanned scope, and the scope's own membership needs its own positive control (assert the expected files ARE in the scanned set).
+  5. **A REQUIRED PROP that a call site passes WRONG.** A component gained a required `mode` prop so a missed
+     call site would be a compile error — and a reviewer then hard-coded `mode="github"` at the exact site where
+     the defect had been reproduced in a browser: `tsc -b` clean, **all 1589 tests green**, defect fully revived.
+     **Required makes a *missing* prop a compile error and a *wrong* prop nothing at all.** The assertion
+     rendered the component with an explicit mode, so it proved the component honours its prop, never that the
+     call site passes the right one — a gap that is **neither a string nor an absence**, so no copy sweep, ban
+     list or render assertion can see it. Fix: pin the **expression** each call site hands the prop (read it back
+     out of the source), **and** add a categorical guard that no site above the transport seam may pass a literal
+     — the per-path pin catches the specific expression, the categorical one catches the sixth surface nobody
+     listed. Do not rely on `noUnusedLocals` to catch it: that only fires while the file has exactly one other
+     use of the now-dead import.
+  6. **A REQUIRED-literal pin matching a duplicate of its own target.** The mirror of shape 2, on the opposite
+     sign. A pin on `blobs fetched,` stayed green with the sentence deleted from the toast, because the same
+     words sit in a docstring three lines above the code. Fix: anchor to something prose cannot satisfy (the
+     interpolation that follows it), and prove it by deleting **only** the pinned thing.
+- **Measured rates, not impressions.** Across one ticket, **six of seven** ban/pin lists that were actually
+  measured contained a member that never fires — including a list written in direct response to this failure,
+  and a list written during the fix for it. **Never treat a banned-regex list as self-evidently live.** The
+  structural fix that scales: sweep the **joined output of every export** rather than banning per function (a
+  regex dead against one function is live against another), and derive coverage guards from the module's own
+  export list so a member added later is covered without editing an assertion — including an assertion that
+  every export is a *function*, since a `const` string export is swept by nothing.
 - **Two composition rules that fall out of this.** (a) **Two `not.toContain` assertions cannot share a test body** — the runner aborts at the first, so the second is never independently falsifiable and the control only *looks* like it bit. One absence per test. (b) **A copy function should return a RECORD of named lines, not loose strings**, so a suite can sweep `Object.values(copy).join(' ')` and a field added later is covered without editing the assertions.
 - **The rule that generalises all of them: a guard is exactly as strong as the control that proves it can fail.** A "green Check" whose observed red is missing from the log is unproven, not done — and where no natural red exists (the code already behaves correctly), the honest discharge is to **break the thing, observe the named failure, revert, and record both**.

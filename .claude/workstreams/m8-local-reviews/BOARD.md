@@ -47,7 +47,7 @@ the full diff before it. `main` is still untouched at `177068a`; nothing has mer
 | M8.7.11 — the optimistic reply's author | `dd1931c` | 1570 pass · 1 skip · 0 fail · 83 files |
 | M8.7.7 — the closing proof: GitHub path unchanged | `82c9d55` | 1589 pass · 1 skip · 0 fail · 83 files |
 | M8.7 `Verify` — unit set, control ledger, mock walk | `3e7bfa6` | 232 pass · 0 fail in the unit-check set |
-| M8.7.13 + review fixes — palette, and 7 guards made real | `see #72 tip` | **1611 pass · 1 skip · 0 fail · 83 files** |
+| M8.7.13 + review fixes — palette, and 7 guards made real | `de30223` | **1611 pass · 1 skip · 0 fail · 83 files** |
 
 **All thirteen units are landed and M8.7 is complete.** The unit count grew by one when the pre-merge review
 found the command palette still framing a local review as a pull request — appended as **M8.7.13** rather than
