@@ -59,15 +59,16 @@
  * satisfy it — an in-memory one in tests, the durable one in the daemon —
  * without this module depending on either.
  *
- * THE FOUR SIGNATURES ARE FINAL; THREE OF THE FOUR BEHAVIOURS ARE WRITTEN.
- * Submit, reply and resolve are implemented below. The remaining verb's
- * docstring states the contract its signature commits to, and its body refuses
- * rather than answering until that contract can be met in full. A refusal is the only other
- * honest answer a write verb has: the caller reads a successful submit as
- * permission to discard the draft it just sent, so a verb that answered while
- * materializing nothing would destroy the reviewer's text with no error anywhere
- * to notice. That is why no body here returns a placeholder value, and why the
- * refusals are asserted by this module's tests rather than merely present.
+ * ALL FOUR BEHAVIOURS ARE WRITTEN, AND NO BODY HERE RETURNS A PLACEHOLDER. A
+ * local write verb has exactly two honest answers — a complete value, or a
+ * failure — because the caller reads a successful submit as permission to
+ * discard the draft it just sent, so a verb that answered while materializing
+ * nothing would destroy the reviewer's text with no error anywhere to notice.
+ * Every failure below is therefore an `ApiError` carrying a contract code the
+ * transport can map, rather than a bare internal throw, and that shape is
+ * asserted over the whole verb list rather than verb by verb: a verb added later
+ * whose body could not answer in full would have to fail that assertion to reach
+ * green.
  *
  * PERSIST FIRST, DELETE THE DRAFT LAST. Every write here that materializes state
  * writes that state through the store and only then, on a confirmed success,
@@ -236,38 +237,6 @@ function zeroedReactions(): ReactionRollup {
 /** The one clock every document a single write creates is stamped from. */
 function timestamp(deps: LocalWriteDeps): string {
   return deps.now?.() ?? new Date().toISOString()
-}
-
-/**
- * Refuse a verb whose behaviour has not been written, loudly, and report the two
- * facts a caller needs: what was asked, and that the review's draft is untouched.
- *
- * A local write verb has exactly two honest answers — a complete value, or a
- * failure — and until the value can be produced the failure is the only one
- * available. Answering anything else would be the worst outcome this path can
- * produce: the client treats a successful submit as permission to discard the
- * draft it just sent, so a verb that reported success while materializing
- * nothing would delete the reviewer's text and leave no trace of it anywhere.
- * Throwing keeps the draft, because a thrown verb has provably not reached the
- * one call that deletes it.
- */
-function refuseUnwritten(
-  verb: string,
-  deps: LocalWriteDeps,
-  localId: number,
-  request: Readonly<Record<string, string | number | boolean>>,
-): never {
-  const asked = Object.entries(request)
-    .map(([field, value]) => `${field}=${value}`)
-    .join(' ')
-  const draftHeld = deps.getLocalDraft(deps.session.human.id, localId) !== null
-  throw new Error(
-    `revud: the local write verb ${verb} has no behaviour written for it, so it ` +
-      `materialized nothing and deleted no draft (local review ${localId}; ${asked}; ` +
-      `draft ${draftHeld ? 'still stored' : 'absent'}). Returning a value instead ` +
-      `would tell the caller the write landed and let it discard the submitted ` +
-      `draft — the one outcome this path exists to prevent.`,
-  )
 }
 
 /**
@@ -647,18 +616,47 @@ export async function resolveLocalThread(
 }
 
 /**
- * Add a reaction to a comment of a local review and return the comment's new
+ * Add a reaction to a comment of a local review and return the comment's NEW
  * rollup.
  *
- * A local review's conversation-tab comments are always empty, so the
- * two-namespace classification the remote path needs collapses to a single
- * lookup across the review's threads, and an id found nowhere is a plain
- * not-found. A repeat of the same reaction returns the rollup unchanged, which
- * is honest rather than a stub: there is exactly one author here, the counts
- * cannot go higher, and the client reconciles an unchanged rollup silently.
+ * ONE LOOKUP IS THE WHOLE CLASSIFICATION. A review of a pull request has to
+ * decide first which of two id namespaces the comment belongs to — review
+ * comments and conversation-tab comments live behind separate endpoints and
+ * their ids are drawn from separate sequences — and it decides that against the
+ * cached snapshot's conversation-comment list. A local review's conversation
+ * comment list is empty for its whole life, so there is no second namespace for
+ * an id to be in and no classification left to get wrong: the comment is looked
+ * for across the review's threads, and an id found nowhere is a plain typed
+ * not-found rather than an id assumed to belong to the other kind.
  *
- * The contract above is what this signature commits to, not what the body does
- * today: the behaviour is unwritten and the verb refuses.
+ * A REPEAT OF THE SAME REACTION ANSWERS WITH THE ROLLUP UNCHANGED AND WRITES
+ * NOTHING, and that is the specification rather than an unfinished body. A
+ * reaction is per-account and not per-press: upstream one shared account carries
+ * every human's reactions, so a second identical one has nothing to add, and
+ * locally there is exactly one author, so the count cannot pass one either way.
+ * The verb is idempotent in the same way the forge is, and the client is built
+ * for it — it overwrites its optimistic rollup with whatever comes back, so an
+ * unchanged answer reconciles silently instead of reading as a lost write.
+ *
+ * That is a different thing from a verb which ALWAYS hands back the value it
+ * read, and the distinguishing property is that a FIRST reaction really does
+ * move a count and really is stored. Which is why the two halves are separate
+ * claims rather than one: a verb that answered with the right rollup while
+ * storing nothing, and a verb that stored the right rollup while answering with
+ * the old one, are different defects, and neither is visible to a check of the
+ * other half alone.
+ *
+ * ONLY THE LOCATED COMMENT'S ROLLUP MOVES. The comment is rebuilt with a new
+ * rollup rather than edited in place, because the snapshot it was read out of is
+ * the store's copy to hand out and a write that mutated it would change stored
+ * state with no write call to attribute it to. Every other field of that
+ * comment, every other comment of that thread and every other thread of the
+ * review are carried through unchanged, and the authorship map is not touched at
+ * all: a reaction authors no comment, and a map rewritten by a verb that created
+ * nothing would orphan comments no later write could re-attribute.
+ *
+ * The reviewer's DRAFT is not touched, on any path — a reaction says nothing
+ * about a review that has not been submitted.
  */
 export async function addLocalReaction(
   deps: LocalWriteDeps,
@@ -666,5 +664,34 @@ export async function addLocalReaction(
   commentId: number,
   reaction: ReactionKey,
 ): Promise<ReactionRollup> {
-  return refuseUnwritten('addLocalReaction', deps, localId, { commentId, reaction })
+  const snapshot = deps.getLocalSnapshot(localId)
+  const thread = snapshot?.mutable.threads.find((held) =>
+    held.comments.some((comment) => comment.id === commentId),
+  )
+  const comment = thread?.comments.find((held) => held.id === commentId)
+  if (snapshot === null || thread === undefined || comment === undefined) {
+    throw new ApiError(
+      'not_found',
+      `Comment ${commentId} was not found on local review ${localId}.`,
+    )
+  }
+
+  if (comment.reactions[reaction] > 0) return comment.reactions
+
+  // The stored counts carried forward and exactly one of them moved. Rebuilding
+  // the rollup from a zeroed one instead would answer with the same total for
+  // this reaction and silently discard every other reaction on the comment.
+  const bumped: ReactionRollup = {
+    ...comment.reactions,
+    total_count: comment.reactions.total_count + 1,
+  }
+  bumped[reaction] = comment.reactions[reaction] + 1
+
+  persistThread(deps, localId, snapshot, {
+    ...thread,
+    comments: thread.comments.map((held) =>
+      held.id === commentId ? { ...held, reactions: bumped } : held,
+    ),
+  })
+  return bumped
 }
