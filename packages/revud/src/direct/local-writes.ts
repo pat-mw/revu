@@ -59,10 +59,10 @@
  * satisfy it — an in-memory one in tests, the durable one in the daemon —
  * without this module depending on either.
  *
- * THE FOUR SIGNATURES ARE FINAL; ONE OF THE FOUR BEHAVIOURS IS WRITTEN. Submit
- * is implemented below. The remaining three verbs' docstrings state the contract
- * each signature commits to, and each of those bodies refuses rather than
- * answering until that contract can be met in full. A refusal is the only other
+ * THE FOUR SIGNATURES ARE FINAL; THREE OF THE FOUR BEHAVIOURS ARE WRITTEN.
+ * Submit, reply and resolve are implemented below. The remaining verb's
+ * docstring states the contract its signature commits to, and its body refuses
+ * rather than answering until that contract can be met in full. A refusal is the only other
  * honest answer a write verb has: the caller reads a successful submit as
  * permission to discard the draft it just sent, so a verb that answered while
  * materializing nothing would destroy the reviewer's text with no error anywhere
@@ -447,6 +447,63 @@ export async function submitLocalReview(
 }
 
 /**
+ * The stored thread with this id on this local review, together with the
+ * snapshot it was read out of — or a typed not-found.
+ *
+ * A review with NO stored snapshot answers the same way rather than with a
+ * distinct code, and that is a decision. A submit refuses such a review with
+ * "sync it, then submit", because a submit really can be retried once a
+ * snapshot exists. A thread id cannot: it is minted by the submit that
+ * materializes the thread, so an id naming nothing here names nothing anywhere,
+ * and there is no state a caller could reach that would make this particular id
+ * appear. Telling them to sync would be advice that cannot help.
+ */
+function requireStoredThread(
+  deps: LocalWriteDeps,
+  localId: number,
+  threadId: string,
+): { snapshot: Snapshot; thread: ReviewThread } {
+  const snapshot = deps.getLocalSnapshot(localId)
+  const thread = snapshot?.mutable.threads.find((held) => held.id === threadId)
+  if (snapshot === null || thread === undefined) {
+    throw new ApiError('not_found', `Thread ${threadId} was not found on local review ${localId}.`)
+  }
+  return { snapshot, thread }
+}
+
+/**
+ * Persist one changed thread: its own row first, then the whole snapshot
+ * envelope with that thread swapped in place, every other thread carried
+ * unchanged, and any new authorship entries merged onto the map.
+ *
+ * The envelope's thread list is rebuilt by MAPPING over the stored one rather
+ * than by naming the single thread that changed. A store is free to read a
+ * snapshot write as the whole truth about which threads a review has, so an
+ * envelope carrying only the touched thread would delete every other thread of
+ * the review — silently, because nothing was asked to delete anything. The
+ * authorship map is merged for the same reason: replacing it would orphan every
+ * comment written before this call, and an unattributable local comment can
+ * never be recognized as its writer's own again.
+ */
+function persistThread(
+  deps: LocalWriteDeps,
+  localId: number,
+  snapshot: Snapshot,
+  thread: ReviewThread,
+  authored: Readonly<Record<number, string>> = {},
+): void {
+  deps.putLocalThread(localId, thread)
+  deps.putLocalSnapshot({
+    ...snapshot,
+    mutable: {
+      ...snapshot.mutable,
+      threads: snapshot.mutable.threads.map((held) => (held.id === thread.id ? thread : held)),
+      commentAuthors: { ...(snapshot.mutable.commentAuthors ?? {}), ...authored },
+    },
+  })
+}
+
+/**
  * Reply to a thread of a local review, returning the created comment.
  *
  * The reply is addressed to the thread as a whole and derives its own fields
@@ -456,8 +513,30 @@ export async function submitLocalReview(
  * local band, because the client swaps its optimistic entry by id and a
  * duplicate or negative id would orphan that entry.
  *
- * The contract above is what this signature commits to, not what the body does
- * today: the behaviour is unwritten and the verb refuses.
+ * WHICH FIELD COMES FROM WHERE, AND WHY THE TWO SOURCES ARE NOT
+ * INTERCHANGEABLE. The two review-shaped links — the review the conversation
+ * belongs to, and the comment being answered — are read off the thread's FIRST
+ * comment, because a thread's identity is its root's and a reply to the fifth
+ * comment of a thread is still a reply to the thread. The LOCATION is read off
+ * the thread instead: the thread is the anchor a re-read rebuilds every
+ * comment's location from, and a thread that has gone outdated carries a null
+ * line while its root still remembers the line it was written against — so
+ * reading a location off the root would place the reply on a line the thread no
+ * longer claims. The remaining two carried fields are the root's because they
+ * describe the text the thread was opened against, which a reply does not move.
+ *
+ * A reply carries no range. A multi-line selection belongs to the comment that
+ * opened the thread; a reply is a message on that thread, not a second
+ * selection of its own.
+ *
+ * Authorship is recorded as a KEY beside the new comment. Nothing else can
+ * answer whether a local comment is the reader's own: there is no stamped name
+ * to parse and no forge login behind a synthesized author, so a reply created
+ * without an entry in the authorship map is permanently unattributable.
+ *
+ * The reviewer's DRAFT is not touched, on any path. A reply is an immediate
+ * write of text the reviewer has already committed to sending; the draft holds
+ * different text, for a review that has not been submitted yet.
  */
 export async function replyToLocalThread(
   deps: LocalWriteDeps,
@@ -465,23 +544,91 @@ export async function replyToLocalThread(
   threadId: string,
   body: string,
 ): Promise<ReviewComment> {
-  return refuseUnwritten('replyToLocalThread', deps, localId, {
-    threadId,
-    bodyLength: body.length,
-  })
+  const { snapshot, thread } = requireStoredThread(deps, localId, threadId)
+  const root = thread.comments[0]
+  if (root === undefined) {
+    throw new ApiError(
+      'not_found',
+      `Thread ${threadId} on local review ${localId} has no comment to reply to.`,
+    )
+  }
+
+  // Resolved before anything is minted, so a failure to read the branch costs
+  // no id: the allocator's high-water mark only ever moves forward.
+  const head = await deps.resolveHead()
+  const at = timestamp(deps)
+  const id = mintLocalEntityId(deps.nextEntityId)
+  const comment: ReviewComment = {
+    id,
+    node_id: `local:comment:${id}`,
+    pull_request_review_id: root.pull_request_review_id,
+    in_reply_to_id: root.id,
+    path: thread.path,
+    diff_hunk: root.diff_hunk,
+    // The branch as it stands now, which is what this comment was written
+    // against; the original commit stays the root's, because that is the state
+    // the thread was opened against and a reply does not restate it.
+    commit_id: head.sha,
+    original_commit_id: root.original_commit_id,
+    line: thread.line,
+    original_line: thread.originalLine,
+    start_line: null,
+    original_start_line: null,
+    side: thread.diffSide,
+    start_side: null,
+    subject_type: thread.subjectType === 'FILE' ? 'file' : 'line',
+    user: localAuthor(deps.session.human.name),
+    // Verbatim. See this module's header for why nothing here stamps.
+    body,
+    created_at: at,
+    updated_at: at,
+    reactions: zeroedReactions(),
+    html_url: '',
+  }
+
+  persistThread(
+    deps,
+    localId,
+    snapshot,
+    { ...thread, comments: [...thread.comments, comment] },
+    { [id]: deps.session.human.id },
+  )
+  return comment
 }
 
 /**
  * Resolve or unresolve a thread of a local review, returning the WHOLE stored
  * thread with only its resolution fields changed.
  *
- * Returning the stored thread rather than a rebuilt one is the point: the client
- * copies the resolution fields straight out of this answer, so a thread
- * reassembled from parts would quietly overwrite cached state — an outdated
- * thread flipped back to current, with no error anywhere to notice it.
+ * Returning the stored thread rather than a rebuilt one is the point, and it is
+ * the reason this verb is written as a spread of what was read. The client
+ * copies the resolution fields straight out of this answer into its cached
+ * state, so a thread reassembled from parts overwrites that cache with whatever
+ * the reassembly happened to fill in. `isOutdated` is the field that makes this
+ * dangerous: it is not derivable from anything this module holds — it says
+ * whether the diff has moved out from under the thread, which only a snapshot
+ * built against the current head can decide — so a rebuild has nothing to
+ * compute it from and would default it to false. An outdated thread would flip
+ * back to current, its hunk would stop being rendered, and there would be no
+ * error anywhere to notice. It is therefore CARRIED, never recomputed and never
+ * defaulted, and the same argument covers every other field the thread holds:
+ * a resolve knows about resolution and about nothing else.
  *
- * The contract above is what this signature commits to, not what the body does
- * today: the behaviour is unwritten and the verb refuses.
+ * WHAT `resolvedBy.login` CARRIES, AND WHY. It carries the sentinel author's
+ * own login, which is the reviewer's git-config display NAME. Two readings of
+ * the field were available — reuse the sentinel everywhere, or write the
+ * display name directly — and locally they are the SAME STRING, since the
+ * sentinel a local review synthesizes has the display name as its login. What
+ * remains is which one to derive it from, and the sentinel wins: the two
+ * cannot then drift, and a change to what a local author is called reaches this
+ * field without anybody remembering to make it twice. The field's ordinary
+ * meaning elsewhere is a forge account name, and this is not one — but no forge
+ * account resolved this thread, and inventing an account-shaped string would
+ * name something that does not exist. An address never appears here: the
+ * reviewer's key is an email, this value is rendered, and the two never meet.
+ *
+ * The reviewer's DRAFT is not touched, on any path — resolving a thread says
+ * nothing about a review that has not been submitted.
  */
 export async function resolveLocalThread(
   deps: LocalWriteDeps,
@@ -489,7 +636,14 @@ export async function resolveLocalThread(
   threadId: string,
   resolved: boolean,
 ): Promise<ReviewThread> {
-  return refuseUnwritten('resolveLocalThread', deps, localId, { threadId, resolved })
+  const { snapshot, thread } = requireStoredThread(deps, localId, threadId)
+  const updated: ReviewThread = {
+    ...thread,
+    isResolved: resolved,
+    resolvedBy: resolved ? { login: localAuthor(deps.session.human.name).login } : null,
+  }
+  persistThread(deps, localId, snapshot, updated)
+  return updated
 }
 
 /**

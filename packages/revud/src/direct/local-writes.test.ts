@@ -50,6 +50,7 @@ import type {
   ReviewComment,
   ReviewDraft,
   ReviewSummary,
+  ReviewThread,
   Session,
   Snapshot,
   SubmitReviewInput,
@@ -244,13 +245,13 @@ const VERB_CALLS: readonly (readonly [string, (deps: LocalWriteDeps) => Promise<
  * verb cannot be implemented without being moved and cannot be added without
  * being classified.
  */
-const UNWRITTEN_VERBS: readonly string[] = [
-  'addLocalReaction',
+const UNWRITTEN_VERBS: readonly string[] = ['addLocalReaction']
+
+const IMPLEMENTED_VERBS: readonly string[] = [
   'replyToLocalThread',
   'resolveLocalThread',
+  'submitLocalReview',
 ]
-
-const IMPLEMENTED_VERBS: readonly string[] = ['submitLocalReview']
 
 /** The subset of the call table whose verbs still refuse. */
 const UNWRITTEN_VERB_CALLS = VERB_CALLS.filter(([verb]) => UNWRITTEN_VERBS.includes(verb))
@@ -1071,6 +1072,679 @@ describe('submitting a local review materializes it before it touches the draft'
       expect((failure as ApiError).code).toBe('persist_failed')
       expect(store.listLocalSubmittedReviews(LOCAL_ID)).toHaveLength(1)
       expect(store.listLocalThreads(LOCAL_ID)).toHaveLength(2)
+    })
+  })
+})
+
+/**
+ * Answering one thread of a local review: appending a reply to it, and flipping
+ * its resolution.
+ *
+ * Both verbs hand back a document the client copies fields STRAIGHT OUT OF into
+ * its cached state, so both are asserted as whole values rather than field by
+ * field. The difference is not stylistic. A resolve that rebuilds its answer
+ * from parts loses whatever the rebuild does not know to fill in, and the field
+ * that loses hardest is `isOutdated`: nothing here can compute it — it says
+ * whether the diff has moved out from under the thread, which only a snapshot
+ * built against the current head can decide — so a rebuild defaults it to false,
+ * an outdated thread silently becomes current in the cache, and no error is
+ * raised anywhere. A comparison against the stored thread with only the intended
+ * fields changed catches that, and catches the same defect in every other field
+ * at the same time; three field assertions catch only the three fields somebody
+ * thought of.
+ *
+ * TWO CLAIMS HERE ARE ABOUT WHAT WAS WRITTEN, AND A READ-BACK CANNOT SEE THEM.
+ * This store keeps threads as rows keyed by id and upserts them, so a snapshot
+ * envelope written with the untouched threads DROPPED still reads back complete
+ * — the rows for the dropped threads were simply never revisited. The store is
+ * faithful to the real one in that, where the envelope write and the thread
+ * write are separate statements, so this is a property to assert around rather
+ * than a gap to close: the two cases that claim the untouched threads survive
+ * capture the envelope handed to storage instead of reading state back.
+ *
+ * The reply cases are anchored on a thread whose own anchor DISAGREES with its
+ * root comment's — a shape a real review reaches the moment a thread goes
+ * outdated. Every field of a reply is derived from one of three sources, and on
+ * a thread whose comments agree with it two of those three are indistinguishable;
+ * on this one each field has exactly one source that could have produced it.
+ */
+describe('answering a thread of a local review', () => {
+  const REPLY_PATH = 'src/retry.ts'
+  const OUTDATED_PATH = 'src/queue.ts'
+  const RANGED_PATH = 'src/backoff.ts'
+  const SIBLING_PATH = 'src/pool.ts'
+  const EMPTY_PATH = 'src/pump.ts'
+  const THREAD_ANCHOR_PATH = 'src/thread-anchor.ts'
+  const COMMENT_ANCHOR_PATH = 'src/comment-anchor.ts'
+
+  /**
+   * Seeded ids sit far above the allocator's first answer on purpose: the
+   * counting allocator starts AT the band's base, so a seed placed there would
+   * collide with the very first id a reply mints and the cases below could not
+   * tell an appended comment from one that was already stored.
+   */
+  const ROOT_ID = LOCAL_ENTITY_ID_BASE + 500
+  const LATER_ID = LOCAL_ENTITY_ID_BASE + 501
+  const OUTDATED_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 502
+  const SIBLING_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 503
+  const DIVERGENT_ROOT_ID = LOCAL_ENTITY_ID_BASE + 504
+  const DIVERGENT_LATER_ID = LOCAL_ENTITY_ID_BASE + 505
+  const RANGED_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 507
+  const ROOT_REVIEW_ID = LOCAL_ENTITY_ID_BASE + 600
+  const LATER_REVIEW_ID = LOCAL_ENTITY_ID_BASE + 601
+  const DIVERGENT_ROOT_REVIEW_ID = LOCAL_ENTITY_ID_BASE + 602
+  const DIVERGENT_LATER_REVIEW_ID = LOCAL_ENTITY_ID_BASE + 603
+
+  const REPLY_THREAD_ID = `local:${LOCAL_ID}:${ROOT_ID}`
+  const OUTDATED_THREAD_ID = `local:${LOCAL_ID}:${OUTDATED_COMMENT_ID}`
+  const SIBLING_THREAD_ID = `local:${LOCAL_ID}:${SIBLING_COMMENT_ID}`
+  const EMPTY_THREAD_ID = `local:${LOCAL_ID}:${LOCAL_ENTITY_ID_BASE + 506}`
+  const RANGED_THREAD_ID = `local:${LOCAL_ID}:${RANGED_COMMENT_ID}`
+  const DIVERGENT_THREAD_ID = `local:${LOCAL_ID}:${DIVERGENT_ROOT_ID}`
+  const UNKNOWN_THREAD_ID = `local:${LOCAL_ID}:${LOCAL_ENTITY_ID_BASE + 900}`
+
+  /** The head the divergent thread was opened against, before the branch moved on. */
+  const OLDER_SHA = 'd'.repeat(40)
+  const DIVERGENT_HUNK = '@@ -98,2 +98,2 @@\n-was\n+is\n'
+
+  const PRIOR_AUTHOR_ID = 'wren.abbot@example.test'
+  const REPLY_BODY = 'Agreed — it should stop at the first 4xx rather than retrying it.'
+
+  /** The author every local write synthesizes, written out rather than imported. */
+  const LOCAL_AUTHOR: GhUser = {
+    login: SESSION.human.name,
+    id: 0,
+    node_id: 'local:user',
+    avatar_url: '',
+    html_url: '',
+    type: 'Bot',
+  }
+
+  const NO_REACTIONS = {
+    url: '',
+    total_count: 0,
+    '+1': 0,
+    '-1': 0,
+    laugh: 0,
+    hooray: 0,
+    confused: 0,
+    heart: 0,
+    rocket: 0,
+    eyes: 0,
+  }
+
+  /**
+   * Reactions the divergent thread's root already carries. Non-zero so a reply
+   * that handed its own rollup on from the comment it answers is a different
+   * value from one that mints a fresh empty rollup — with a zeroed seed the two
+   * are indistinguishable.
+   */
+  const ROOT_REACTIONS = { ...NO_REACTIONS, url: 'seeded-rollup', total_count: 2, '+1': 2 }
+
+  const ON = { headSha: HEAD_SHA, at: FIXED_NOW }
+
+  /**
+   * The two threads the resolution cases work on, written out field by field
+   * rather than seeded through the shorthand.
+   *
+   * The shorthand leaves a thread's range fields and its start side at their
+   * defaults, and a claim that a resolve carries a field cannot be measured on a
+   * thread whose value for it is what a rebuild would have defaulted it to
+   * anyway. Between these two every field of a thread holds a value no rebuild
+   * could guess: the first has gone outdated — no line in the current diff, a
+   * remembered original one, a selection that began on the other side, and a
+   * whole-file subject — and the second is current and carries a real
+   * multi-line range, which an outdated thread cannot.
+   */
+  const outdatedThread = (): ReviewThread => ({
+    id: OUTDATED_THREAD_ID,
+    isResolved: false,
+    isOutdated: true,
+    path: OUTDATED_PATH,
+    line: null,
+    originalLine: 44,
+    startLine: null,
+    originalStartLine: 41,
+    diffSide: 'LEFT',
+    startDiffSide: 'LEFT',
+    subjectType: 'FILE',
+    resolvedBy: null,
+    comments: localThread(
+      { id: OUTDATED_THREAD_ID, path: OUTDATED_PATH, comments: [{ id: OUTDATED_COMMENT_ID }] },
+      ON,
+    ).comments,
+  })
+
+  const rangedThread = (): ReviewThread => ({
+    id: RANGED_THREAD_ID,
+    isResolved: false,
+    isOutdated: false,
+    path: RANGED_PATH,
+    line: 12,
+    originalLine: 11,
+    startLine: 9,
+    originalStartLine: 7,
+    diffSide: 'RIGHT',
+    startDiffSide: 'RIGHT',
+    subjectType: 'LINE',
+    resolvedBy: null,
+    comments: localThread(
+      { id: RANGED_THREAD_ID, path: RANGED_PATH, comments: [{ id: RANGED_COMMENT_ID }] },
+      ON,
+    ).comments,
+  })
+
+  /**
+   * The stored state both verbs start from: one ordinary thread with two
+   * comments, two threads the resolution cases flip, one bystander nothing
+   * touches, and one thread holding no comment at all.
+   */
+  const seeded = (): Snapshot => {
+    const snapshot = localSnapshot({
+      localId: LOCAL_ID,
+      headSha: HEAD_SHA,
+      at: FIXED_NOW,
+      mergeBaseSha: BASE_SHA,
+      paths: [REPLY_PATH, OUTDATED_PATH, RANGED_PATH, SIBLING_PATH, EMPTY_PATH],
+      commentAuthors: { [ROOT_ID]: PRIOR_AUTHOR_ID },
+    })
+    snapshot.mutable.threads = [
+      localThread(
+        {
+          id: REPLY_THREAD_ID,
+          path: REPLY_PATH,
+          line: 12,
+          comments: [
+            { id: ROOT_ID, reviewId: ROOT_REVIEW_ID, body: 'This retries on a 4xx too.' },
+            { id: LATER_ID, reviewId: LATER_REVIEW_ID, body: 'And the backoff never caps.' },
+          ],
+        },
+        ON,
+      ),
+      outdatedThread(),
+      rangedThread(),
+      localThread(
+        { id: SIBLING_THREAD_ID, path: SIBLING_PATH, comments: [{ id: SIBLING_COMMENT_ID }] },
+        ON,
+      ),
+      localThread({ id: EMPTY_THREAD_ID, path: EMPTY_PATH, comments: [] }, ON),
+    ]
+    return snapshot
+  }
+
+  const seededStore = (): FakeLocalStore => makeLocalStore({ snapshots: [seeded()] })
+
+  /** One thread of a freshly built seed — the comparison target, never a read of the store. */
+  const seededThread = (threadId: string): ReviewThread => {
+    const held = seeded().mutable.threads.find((thread) => thread.id === threadId)
+    if (held === undefined) throw new Error(`the seed carries no thread ${threadId}`)
+    return held
+  }
+
+  /** One thread as the store holds it now, or a loud failure. */
+  const readThread = (store: FakeLocalStore, threadId: string): ReviewThread => {
+    const snapshot = store.getLocalSnapshot(LOCAL_ID)
+    const held = snapshot?.mutable.threads.find((thread) => thread.id === threadId)
+    if (held === undefined) throw new Error(`no thread ${threadId} is stored`)
+    return held
+  }
+
+  /**
+   * A thread whose own anchor disagrees with its root comment's in every field
+   * either could supply, opened against an earlier head and already carrying
+   * reactions. Installed as a row rather than seeded, because the seed builder
+   * derives a comment's location from its thread — which is the agreement this
+   * fixture exists to break.
+   */
+  const divergentThread = (): ReviewThread => {
+    const comment = (seed: {
+      id: number
+      reviewId: number
+      line: number
+      originalLine: number
+      body: string
+    }): ReviewComment => ({
+      id: seed.id,
+      node_id: `seeded-comment-${seed.id}`,
+      pull_request_review_id: seed.reviewId,
+      path: COMMENT_ANCHOR_PATH,
+      diff_hunk: DIVERGENT_HUNK,
+      commit_id: OLDER_SHA,
+      original_commit_id: OLDER_SHA,
+      line: seed.line,
+      original_line: seed.originalLine,
+      start_line: 95,
+      original_start_line: 94,
+      side: 'RIGHT',
+      start_side: 'RIGHT',
+      subject_type: 'line',
+      user: SEEDED_AUTHOR,
+      body: seed.body,
+      created_at: FIXED_NOW,
+      updated_at: FIXED_NOW,
+      reactions: { ...ROOT_REACTIONS },
+      html_url: '',
+    })
+    return {
+      id: DIVERGENT_THREAD_ID,
+      isResolved: false,
+      isOutdated: false,
+      path: THREAD_ANCHOR_PATH,
+      line: 21,
+      originalLine: 19,
+      startLine: 17,
+      originalStartLine: 15,
+      diffSide: 'LEFT',
+      startDiffSide: 'LEFT',
+      subjectType: 'FILE',
+      resolvedBy: null,
+      comments: [
+        comment({
+          id: DIVERGENT_ROOT_ID,
+          reviewId: DIVERGENT_ROOT_REVIEW_ID,
+          line: 99,
+          originalLine: 98,
+          body: 'The comment that opened this thread, anchored unlike the thread itself.',
+        }),
+        comment({
+          id: DIVERGENT_LATER_ID,
+          reviewId: DIVERGENT_LATER_REVIEW_ID,
+          line: 97,
+          originalLine: 96,
+          body: 'A later comment, so first-comment derivation is distinguishable from last.',
+        }),
+      ],
+    }
+  }
+
+  /**
+   * Dependencies that record every document handed to storage before passing it
+   * on, for the claims a read-back through this store cannot see.
+   */
+  const capturing = (
+    store: FakeLocalStore,
+  ): { deps: LocalWriteDeps; rows: ReviewThread[]; envelopes: Snapshot[] } => {
+    const rows: ReviewThread[] = []
+    const envelopes: Snapshot[] = []
+    const base = makeLocalDeps(store)
+    return {
+      rows,
+      envelopes,
+      deps: {
+        ...base,
+        putLocalThread: (localId, thread) => {
+          rows.push(structuredClone(thread))
+          base.putLocalThread(localId, thread)
+        },
+        putLocalSnapshot: (snapshot) => {
+          envelopes.push(structuredClone(snapshot))
+          base.putLocalSnapshot(snapshot)
+        },
+      },
+    }
+  }
+
+  const draft = (deps: LocalWriteDeps): ReviewDraft | null =>
+    deps.getLocalDraft(SESSION.human.id, LOCAL_ID)
+
+  describe('a reply lands on the thread it names and derives its fields from it', () => {
+    test('the reply is minted in the positive local band and the next read carries it last', async () => {
+      const store = seededStore()
+      const comment = await localWrites.replyToLocalThread(
+        makeLocalDeps(store),
+        LOCAL_ID,
+        REPLY_THREAD_ID,
+        REPLY_BODY,
+      )
+      expect(comment.id).toBeGreaterThan(0)
+      expect(comment.id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+      // Read back through the store, which hands out clones, so this is the
+      // persisted thread and not the object the write was built from. Order is
+      // asserted with it: a reply appended anywhere but the end reorders a
+      // conversation nothing re-sorts.
+      const stored = readThread(store, REPLY_THREAD_ID)
+      expect(stored.comments.map((held) => held.id)).toEqual([ROOT_ID, LATER_ID, comment.id])
+      expect(stored.comments[2]).toEqual(comment)
+    })
+
+    test('every field of the reply comes from the one source that could have produced it', async () => {
+      // Whole-object rather than field-sampled, over the fixture where the
+      // thread and its root disagree: the location fields are the THREAD's, the
+      // two review-shaped links and the two original-state fields are the ROOT's,
+      // the current commit is the resolved head's, and the range fields and the
+      // rollup are neither's.
+      const store = seededStore()
+      store.putLocalThread(LOCAL_ID, divergentThread())
+      const comment = await localWrites.replyToLocalThread(
+        makeLocalDeps(store),
+        LOCAL_ID,
+        DIVERGENT_THREAD_ID,
+        REPLY_BODY,
+      )
+      expect(comment).toEqual({
+        id: comment.id,
+        node_id: `local:comment:${comment.id}`,
+        pull_request_review_id: DIVERGENT_ROOT_REVIEW_ID,
+        in_reply_to_id: DIVERGENT_ROOT_ID,
+        path: THREAD_ANCHOR_PATH,
+        diff_hunk: DIVERGENT_HUNK,
+        commit_id: HEAD_SHA,
+        original_commit_id: OLDER_SHA,
+        line: 21,
+        original_line: 19,
+        // A reply is a point on the thread's anchor, never a range: the
+        // selection belongs to the comment that opened the thread, and both the
+        // thread and its root carry one here so a copied range would show.
+        start_line: null,
+        original_start_line: null,
+        side: 'LEFT',
+        start_side: null,
+        subject_type: 'file',
+        user: LOCAL_AUTHOR,
+        body: REPLY_BODY,
+        created_at: FIXED_NOW,
+        updated_at: FIXED_NOW,
+        reactions: NO_REACTIONS,
+        html_url: '',
+      })
+    })
+
+    test('the reply body is stored exactly as it was written', async () => {
+      // The categorical statement is that no local body is ever stamped, and the
+      // exact-body comparison above already implies it — an unstamped body that
+      // matched the stamp pattern would have to differ from what was written.
+      // It is kept as its own case with the real stamper as the control, so the
+      // claim is measured against the exact text the defect would produce rather
+      // than against a hand-written imitation of it.
+      const store = seededStore()
+      const stampable = 'Worth another look before this lands.'
+      const comment = await localWrites.replyToLocalThread(
+        makeLocalDeps(store),
+        LOCAL_ID,
+        REPLY_THREAD_ID,
+        stampable,
+      )
+      expect(prefixBody(SESSION.human, stampable)).toContain(SESSION.human.name)
+      expect(comment.body).toBe(stampable)
+      expect(readThread(store, REPLY_THREAD_ID).comments[2]?.body).toBe(stampable)
+    })
+
+    test('the reply is attributed by key, and the entries already there survive', async () => {
+      const store = seededStore()
+      const comment = await localWrites.replyToLocalThread(
+        makeLocalDeps(store),
+        LOCAL_ID,
+        REPLY_THREAD_ID,
+        REPLY_BODY,
+      )
+      const snapshot = store.getLocalSnapshot(LOCAL_ID)
+      // Compared whole: a map REPLACED rather than merged would carry the new
+      // entry and orphan every comment written before this reply, and an
+      // orphaned local comment can never be recognized as its writer's own
+      // again — there is no stamped name and no forge login to fall back to.
+      expect(snapshot?.mutable.commentAuthors).toEqual({
+        [ROOT_ID]: PRIOR_AUTHOR_ID,
+        [comment.id]: SESSION.human.id,
+      })
+    })
+
+    test('the envelope handed to storage still carries every thread it did not touch', async () => {
+      // Asserted on what was WRITTEN, not on what reads back. This store keeps
+      // threads as rows and upserts them, so an envelope written with the other
+      // threads dropped reads back complete — the dropped rows were simply never
+      // revisited — and on a store that treats a snapshot write as the whole
+      // truth that is silent data loss.
+      const store = seededStore()
+      const { deps, envelopes } = capturing(store)
+      const comment = await localWrites.replyToLocalThread(
+        deps,
+        LOCAL_ID,
+        REPLY_THREAD_ID,
+        REPLY_BODY,
+      )
+      expect(envelopes).toHaveLength(1)
+      const envelope = envelopes[0]
+      if (envelope === undefined) throw new Error('no snapshot was handed to storage')
+      // The whole list in one comparison, against a freshly built seed: a
+      // dropped thread, a reordered list, a bystander quietly rewritten and an
+      // append onto the wrong thread all fail here.
+      expect(envelope.mutable.threads).toEqual(
+        seeded().mutable.threads.map((thread) =>
+          thread.id === REPLY_THREAD_ID
+            ? { ...thread, comments: [...thread.comments, comment] }
+            : thread,
+        ),
+      )
+    })
+
+    test('the thread row handed to storage is the whole thread with the reply appended', async () => {
+      const store = seededStore()
+      const { deps, rows } = capturing(store)
+      const comment = await localWrites.replyToLocalThread(
+        deps,
+        LOCAL_ID,
+        REPLY_THREAD_ID,
+        REPLY_BODY,
+      )
+      expect(rows).toHaveLength(1)
+      const stored = seededThread(REPLY_THREAD_ID)
+      expect(rows[0]).toEqual({ ...stored, comments: [...stored.comments, comment] })
+    })
+
+    test('a thread id nothing has minted is a typed not-found', async () => {
+      const failure = await localWrites
+        .replyToLocalThread(makeLocalDeps(seededStore()), LOCAL_ID, UNKNOWN_THREAD_ID, REPLY_BODY)
+        .then(
+          () => null,
+          (error: unknown) => error,
+        )
+      expect(failure).toBeInstanceOf(ApiError)
+      expect((failure as ApiError).code).toBe('not_found')
+      expect((failure as ApiError).message).toContain(UNKNOWN_THREAD_ID)
+    })
+
+    test('a thread holding no comment to answer is a typed not-found', async () => {
+      // Its own case rather than a second assertion on the one above: the two
+      // fail at different points and a shared body would let the first abort
+      // before the second ran.
+      const failure = await localWrites
+        .replyToLocalThread(makeLocalDeps(seededStore()), LOCAL_ID, EMPTY_THREAD_ID, REPLY_BODY)
+        .then(
+          () => null,
+          (error: unknown) => error,
+        )
+      expect(failure).toBeInstanceOf(ApiError)
+      expect((failure as ApiError).code).toBe('not_found')
+    })
+
+    test('a reply that cannot find its thread writes nothing at all', async () => {
+      const { deps, rows, envelopes } = capturing(seededStore())
+      await expect(
+        localWrites.replyToLocalThread(deps, LOCAL_ID, UNKNOWN_THREAD_ID, REPLY_BODY),
+      ).rejects.toThrow(ApiError)
+      // One comparison over both, so neither absence can abort before the other
+      // has been given the chance to fail.
+      expect({ rows, envelopes }).toEqual({ rows: [], envelopes: [] })
+    })
+
+    test('a successful reply leaves the reviewer’s draft byte-identical', async () => {
+      // A reply is an immediate write of text the reviewer has already committed
+      // to sending. The draft holds different text, for a review not yet
+      // submitted, and no reply may touch it.
+      const deps = makeLocalDeps(seededStore())
+      const before = draft(deps)
+      expect(before).not.toBeNull()
+      await localWrites.replyToLocalThread(deps, LOCAL_ID, REPLY_THREAD_ID, REPLY_BODY)
+      expect(JSON.stringify(draft(deps))).toBe(JSON.stringify(before))
+    })
+  })
+
+  describe('a resolve changes the resolution and carries the rest of the thread', () => {
+    const RESOLVED_BY = { login: SESSION.human.name }
+
+    test('an outdated thread that is resolved still reports itself outdated', async () => {
+      const returned = await localWrites.resolveLocalThread(
+        makeLocalDeps(seededStore()),
+        LOCAL_ID,
+        OUTDATED_THREAD_ID,
+        true,
+      )
+      // The two fields the client copies out of this answer alongside
+      // `resolvedBy`. A rebuilt thread defaults the first to false and flips an
+      // outdated thread back to current in the cache, with no error anywhere.
+      //
+      // Measured as fully SUBSUMED by the whole-thread comparison below — no
+      // mutant makes this the sole red — and kept anyway as the named statement
+      // of the one field this verb exists to protect, so a later edit that
+      // narrows the comparison cannot take the claim with it silently.
+      expect(returned.isOutdated).toBe(true)
+      expect(returned.isResolved).toBe(true)
+    })
+
+    const WHOLE_THREAD_CASES: readonly (readonly [string, string])[] = [
+      ['a thread the diff has moved out from under', OUTDATED_THREAD_ID],
+      ['a current thread carrying a multi-line range', RANGED_THREAD_ID],
+    ]
+
+    for (const [shape, threadId] of WHOLE_THREAD_CASES) {
+      test(`resolving ${shape} answers with it, changed only where it had to be`, async () => {
+        // Strictly stronger than the three field assertions the client's own
+        // reads would suggest: this fails on ANY field the answer lost,
+        // defaulted or recomputed, including the ones nothing reads today. Run
+        // over both threads because a carry claim can only be measured where the
+        // stored value differs from what a rebuild would default it to, and no
+        // single thread can hold a non-default value for every field: a thread
+        // with no line in the current diff cannot also carry a current range.
+        const returned = await localWrites.resolveLocalThread(
+          makeLocalDeps(seededStore()),
+          LOCAL_ID,
+          threadId,
+          true,
+        )
+        expect(returned).toEqual({
+          ...seededThread(threadId),
+          isResolved: true,
+          resolvedBy: RESOLVED_BY,
+        })
+      })
+    }
+
+    test('unresolving clears the attribution and leaves everything else alone', async () => {
+      const store = makeLocalStore({
+        snapshots: [
+          localSnapshot({
+            localId: LOCAL_ID,
+            headSha: HEAD_SHA,
+            at: FIXED_NOW,
+            mergeBaseSha: BASE_SHA,
+            paths: [OUTDATED_PATH],
+            threads: [
+              {
+                id: OUTDATED_THREAD_ID,
+                path: OUTDATED_PATH,
+                line: null,
+                isOutdated: true,
+                isResolved: true,
+                resolvedBy: RESOLVED_BY,
+                comments: [{ id: OUTDATED_COMMENT_ID }],
+              },
+            ],
+          }),
+        ],
+      })
+      const returned = await localWrites.resolveLocalThread(
+        makeLocalDeps(store),
+        LOCAL_ID,
+        OUTDATED_THREAD_ID,
+        false,
+      )
+      expect(returned.resolvedBy).toBeNull()
+      expect(returned.isResolved).toBe(false)
+      // Unresolving is the same carry obligation in the other direction, and the
+      // thread it starts from is already outdated and already resolved.
+      expect(returned.isOutdated).toBe(true)
+    })
+
+    test('the resolver is named by display name, never by the key their drafts are stored under', async () => {
+      const returned = await localWrites.resolveLocalThread(
+        makeLocalDeps(seededStore()),
+        LOCAL_ID,
+        OUTDATED_THREAD_ID,
+        true,
+      )
+      // The sentinel author's own login, which locally IS the display name — and
+      // demonstrably not the other name this session carries. The control is the
+      // pair below it: the two really are different strings, and the one that is
+      // an address is the one that must never be rendered.
+      //
+      // Also SUBSUMED by the whole-thread comparison, and also kept: that one
+      // says the value did not change in a way it should not have, while this
+      // one says what the value IS, and only this one carries the control
+      // proving the address would have been caught.
+      expect(returned.resolvedBy).toEqual({ login: SESSION.human.name })
+      expect(SESSION.human.name).not.toBe(SESSION.human.id)
+      expect(JSON.stringify(returned.resolvedBy)).not.toContain('@')
+    })
+
+    test('the next read of the thread agrees with the answer that was returned', async () => {
+      const store = seededStore()
+      const returned = await localWrites.resolveLocalThread(
+        makeLocalDeps(store),
+        LOCAL_ID,
+        OUTDATED_THREAD_ID,
+        true,
+      )
+      expect(readThread(store, OUTDATED_THREAD_ID)).toEqual(returned)
+    })
+
+    test('the envelope handed to storage still carries every thread it did not touch', async () => {
+      // The write, not the read-back: threads dropped from an envelope leave
+      // their rows in this store untouched, so a replaced thread list is
+      // invisible to any assertion phrased as "read it back afterwards".
+      const { deps, envelopes } = capturing(seededStore())
+      await localWrites.resolveLocalThread(deps, LOCAL_ID, OUTDATED_THREAD_ID, true)
+      expect(envelopes).toHaveLength(1)
+      const envelope = envelopes[0]
+      if (envelope === undefined) throw new Error('no snapshot was handed to storage')
+      expect(envelope.mutable.threads).toEqual(
+        seeded().mutable.threads.map((thread) =>
+          thread.id === OUTDATED_THREAD_ID
+            ? { ...thread, isResolved: true, resolvedBy: RESOLVED_BY }
+            : thread,
+        ),
+      )
+      // A resolve creates no comment, so it may not touch the authorship map
+      // either — a map rewritten by a verb that authored nothing would drop
+      // entries no later write could restore.
+      expect(envelope.mutable.commentAuthors).toEqual({ [ROOT_ID]: PRIOR_AUTHOR_ID })
+    })
+
+    test('a thread id nothing has minted is a typed not-found', async () => {
+      const failure = await localWrites
+        .resolveLocalThread(makeLocalDeps(seededStore()), LOCAL_ID, UNKNOWN_THREAD_ID, true)
+        .then(
+          () => null,
+          (error: unknown) => error,
+        )
+      expect(failure).toBeInstanceOf(ApiError)
+      expect((failure as ApiError).code).toBe('not_found')
+      expect((failure as ApiError).message).toContain(UNKNOWN_THREAD_ID)
+    })
+
+    test('a resolve that cannot find its thread writes nothing at all', async () => {
+      const { deps, rows, envelopes } = capturing(seededStore())
+      await expect(
+        localWrites.resolveLocalThread(deps, LOCAL_ID, UNKNOWN_THREAD_ID, true),
+      ).rejects.toThrow(ApiError)
+      expect({ rows, envelopes }).toEqual({ rows: [], envelopes: [] })
+    })
+
+    test('a successful resolve leaves the reviewer’s draft byte-identical', async () => {
+      const deps = makeLocalDeps(seededStore())
+      const before = draft(deps)
+      expect(before).not.toBeNull()
+      await localWrites.resolveLocalThread(deps, LOCAL_ID, OUTDATED_THREAD_ID, true)
+      expect(JSON.stringify(draft(deps))).toBe(JSON.stringify(before))
     })
   })
 })
