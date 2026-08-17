@@ -280,6 +280,47 @@ describe('the immutable half is a content-addressed cache keyed by compareKey', 
     expect(second.getImmutable('base...head')?.immutable.compareKey).toBe('base...head')
     second.close()
   })
+
+  test('a snapshot write over a corrupt immutable row refuses rather than overwriting it', () => {
+    const store = open()
+    store.putImmutable(immutable('base...head'))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE immutables SET data = '{not valid json' WHERE compare_key = 'base...head'")
+    raw.close()
+
+    // Writing a snapshot has to read the immutable row's own `partial` to carry
+    // it forward, and the row it would carry forward is unreadable. Overwriting it
+    // would destroy whatever real state is in there, so the write is refused.
+    //
+    // The type is the point. A corrupt row on disk is NOT the same condition as a
+    // mutation that failed to reach disk: the second is retryable and the first is
+    // not, and reporting the first as the second would invite a caller to retry
+    // forever against a row only a human can repair. The error also names the row
+    // that is actually corrupt — the immutable half — rather than the table the
+    // caller thought it was writing.
+    const reopened = open()
+    let thrown: unknown
+    try {
+      reopened.putSnapshot(snapshot(204, 'base...head'))
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(StoreUnreadableError)
+    expect((thrown as StoreUnreadableError).table).toBe('immutables')
+    expect((thrown as StoreUnreadableError).rowKey).toBe('base...head')
+    reopened.close()
+
+    // The transaction aborted, so the corrupt bytes are still there, unmodified —
+    // a present row is real state and a failed write must not have consumed it.
+    const check = new Database(join(dir, 'direct.sqlite'))
+    const row = check
+      .query("SELECT data FROM immutables WHERE compare_key = 'base...head'")
+      .get() as { data: string }
+    check.close()
+    expect(row.data).toBe('{not valid json')
+  })
 })
 
 describe('durability: write failures surface, never swallowed', () => {
@@ -287,6 +328,18 @@ describe('durability: write failures surface, never swallowed', () => {
     const store = open()
     store.close()
     expect(() => store.putDraft(draft('h1', 204, 'x'))).toThrow(StoreWriteError)
+  })
+
+  test('putSnapshot against a closed database throws StoreWriteError, not a raw database error', () => {
+    const store = open()
+    store.close()
+    // Writing a snapshot reads the immutable row's own `partial` before it writes
+    // anything, and that read has to sit inside the durability wrapper: a store
+    // that cannot be read cannot be written either, and the caller needs the same
+    // typed persist failure it gets from every other write rather than whatever
+    // the database driver happens to raise. An unreadable ROW is the other
+    // condition and keeps its own type; an unusable HANDLE is a write failure.
+    expect(() => store.putSnapshot(snapshot(204, 'base...head'))).toThrow(StoreWriteError)
   })
 })
 
@@ -1091,6 +1144,219 @@ describe('the local entity id allocator', () => {
     const reopened = open()
     expect(() => reopened.nextLocalEntityId()).toThrow(StoreWriteError)
     reopened.close()
+  })
+})
+
+/**
+ * A snapshot-scoped incompleteness: blob bytes that never arrived. A retry can
+ * fix it, so it is NOT a property of the comparison and must never be written
+ * onto the forever-cached immutable row.
+ */
+const BLOBS_MISSING_PARTIAL = {
+  missingBlobShas: ['headblob'],
+  reason: 'blobs missing: 1 file has no content',
+}
+
+/**
+ * An incompleteness of the comparison itself. It is a property of the compareKey,
+ * outlives any one sync, and is what the immutable row legitimately carries.
+ */
+const CAPPED_PARTIAL = { missingBlobShas: [], reason: 'capped at N files' }
+
+/** Row counts across the snapshot tables and the shared immutable cache. */
+function snapshotTableCounts(): {
+  snapshots: number
+  local_snapshots: number
+  immutables: number
+} {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw
+    .query(
+      'SELECT (SELECT COUNT(*) FROM snapshots) AS snapshots, ' +
+        '(SELECT COUNT(*) FROM local_snapshots) AS local_snapshots, ' +
+        '(SELECT COUNT(*) FROM immutables) AS immutables',
+    )
+    .get() as { snapshots: number; local_snapshots: number; immutables: number }
+  raw.close()
+  return row
+}
+
+describe('local snapshots: an envelope of their own, the immutable half shared', () => {
+  test('a local snapshot round-trips with its immutable half re-attached', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // The local review's id travels in `prNumber`: what is stored is an unchanged
+    // `Snapshot`, which is why the immutable half is byte-identical to the one a
+    // pull request over the same comparison would store.
+    store.putLocalSnapshot(snapshot(id, 'base...head'))
+
+    const read = store.getLocalSnapshot(id)
+    expect(read).not.toBeNull()
+    expect(read!.prNumber).toBe(id)
+    expect(read!.immutable.compareKey).toBe('base...head')
+    expect(read!.immutable.files[0].filename).toBe('a.ts')
+    expect(read!.mutable.threads).toEqual([])
+    store.close()
+  })
+
+  test('a local snapshot survives a restart (reopen the same data dir)', () => {
+    const first = open()
+    const id = first.createLocalReview(newLocalReview({})).id
+    first.putLocalSnapshot(snapshot(id, 'base...head'))
+    first.close()
+
+    const second = open()
+    expect(second.getLocalSnapshot(id)!.immutable.compareKey).toBe('base...head')
+    second.close()
+  })
+
+  test('getLocalSnapshot is null (not an error) for a never-synced local review', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Absent, and absent is the correct empty answer: a review exists but has
+    // never been synced, which is the ordinary state right after creation.
+    expect(store.getLocalSnapshot(id)).toBeNull()
+    store.close()
+  })
+
+  test('a local snapshot referencing a missing immutable half throws (corrupt, not absent)', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'base...head'))
+    store.close()
+
+    // Delete the immutable half out from under the envelope.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("DELETE FROM immutables WHERE compare_key = 'base...head'")
+    raw.close()
+
+    // A corrupt store stays loud at this layer. Offering a graceful "the objects
+    // are gone, re-sync to rebuild" state is a job for a layer that can act on it;
+    // softening the error here would hand that layer a snapshot with a fabricated
+    // empty immutable half and no way to tell it from a real one.
+    const reopened = open()
+    expect(() => reopened.getLocalSnapshot(id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('a present-but-corrupt local snapshot row throws rather than reading as absent', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'base...head'))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_snapshots SET data = '{not valid json' WHERE local_id = ?", [id])
+    raw.close()
+
+    const reopened = open()
+    expect(() => reopened.getLocalSnapshot(id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('the immutable row keeps its OWN partial; the envelope carries the merged one', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // The cold path already recorded the immutable half's own incompleteness.
+    store.putImmutable(immutable('base...head'), CAPPED_PARTIAL)
+
+    // The snapshot's `partial` is a MERGE: the comparison's own incompleteness
+    // plus a snapshot-scoped one. Only the merged value belongs on the envelope.
+    store.putLocalSnapshot({ ...snapshot(id, 'base...head'), partial: BLOBS_MISSING_PARTIAL })
+
+    // What the caller sees is the merged value, verbatim.
+    expect(store.getLocalSnapshot(id)!.partial).toEqual(BLOBS_MISSING_PARTIAL)
+
+    // The immutable row keeps what it already held. Writing the merged value here
+    // would pin a blob-missing reason to a compareKey that is cached forever with
+    // no TTL, so the next reader of that key — long after those blobs were
+    // provisioned — would resurrect a truncation that stopped being true, and
+    // nothing downstream could tell it from a fresh one.
+    expect(store.getImmutable('base...head')!.partial).toEqual(CAPPED_PARTIAL)
+    store.close()
+  })
+
+  test('putLocalSnapshot writes local_snapshots and immutables, and no PR-keyed table', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Armed BEFORE the write, so a misrouted statement aborts at the statement
+    // rather than being counted afterwards. A `COUNT(*) === 0` on its own cannot
+    // tell a table nothing wrote from one that was written and then cleaned up,
+    // and says nothing at all about a write inside a transaction that rolled back.
+    const armed = armPrKeyedTripwires(store)
+    armed.putLocalSnapshot(snapshot(id, 'base...head'))
+    // The write completed rather than being silently skipped, which is what makes
+    // the zero below an absence and not merely an untaken code path.
+    expect(armed.getLocalSnapshot(id)!.immutable.compareKey).toBe('base...head')
+    armed.close()
+
+    // The envelope is local; the immutable half is shared and stored exactly once.
+    expect(snapshotTableCounts()).toEqual({
+      snapshots: 0,
+      local_snapshots: 1,
+      immutables: 1,
+    })
+  })
+
+  test('a local snapshot and a pull request over one comparison share the stored immutable half', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putSnapshot(snapshot(204, 'base...head'))
+    store.putLocalSnapshot(snapshot(id, 'base...head'))
+
+    // The compareKey is the whole key: neither side knows or cares whether the
+    // comparison came from a pull request, so the expensive half is stored once
+    // and both envelopes reference it.
+    expect(store.getSnapshot(204)!.immutable.compareKey).toBe('base...head')
+    expect(store.getLocalSnapshot(id)!.immutable.compareKey).toBe('base...head')
+    store.close()
+
+    expect(snapshotTableCounts()).toEqual({
+      snapshots: 1,
+      local_snapshots: 1,
+      immutables: 1,
+    })
+  })
+
+  test('putLocalSnapshot against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.close()
+    expect(() => store.putLocalSnapshot(snapshot(id, 'base...head'))).toThrow(StoreWriteError)
+  })
+
+  test('a local snapshot write over a corrupt immutable row refuses rather than overwriting it', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putImmutable(immutable('base...head'))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE immutables SET data = '{not valid json' WHERE compare_key = 'base...head'")
+    raw.close()
+
+    // The same refusal a pull request's snapshot write gets, because it is the
+    // same statement: the local path reuses the shared immutable cache, so it
+    // inherits the rule that a present-but-unreadable row is never written over,
+    // and it inherits the error type that says so rather than a retryable one.
+    const reopened = open()
+    expect(() => reopened.putLocalSnapshot(snapshot(id, 'base...head'))).toThrow(
+      StoreUnreadableError,
+    )
+    // Refused whole: the envelope did not land either, so no local snapshot points
+    // at an immutable half that was never written.
+    expect(reopened.getLocalSnapshot(id)).toBeNull()
+    reopened.close()
+
+    // The corrupt bytes are still exactly as they were. This is the claim that
+    // matters: a refused write must not have consumed the state it refused to
+    // parse, or the row a human still has to repair is gone.
+    const check = new Database(join(dir, 'direct.sqlite'))
+    const row = check
+      .query("SELECT data FROM immutables WHERE compare_key = 'base...head'")
+      .get() as { data: string }
+    check.close()
+    expect(row.data).toBe('{not valid json')
   })
 })
 

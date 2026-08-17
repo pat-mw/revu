@@ -340,6 +340,29 @@ export interface DirectStore {
    * to whatever already referenced the old id.
    */
   nextLocalEntityId(): number
+  /**
+   * The stored snapshot of one local review, with the immutable half re-attached
+   * from the shared content-addressed cache, or `null` when the review has never
+   * been synced — the correct empty answer, never an error.
+   *
+   * Throws `StoreUnreadableError` when the stored envelope references a
+   * `compareKey` that has no immutable half on disk. That is a corrupt store
+   * rather than an absent snapshot, and it stays loud here: fabricating an empty
+   * immutable half would hand back a snapshot of nothing that reads as complete.
+   */
+  getLocalSnapshot(localId: number): Snapshot | null
+  /**
+   * Persist the snapshot of one local review. The review's id travels in the
+   * snapshot's `prNumber` field, so what is stored is an unchanged `Snapshot`
+   * document and there is no parallel snapshot type to keep in step.
+   *
+   * The immutable half lands in the same content-addressed table a pull request's
+   * does, keyed by `compareKey = merge_base…head` and cached with no TTL, so a
+   * local review and a pull request over the same comparison share one stored
+   * copy of the expensive half. Durable: the immutable half and the envelope
+   * reach disk together, or a `StoreWriteError` surfaces and neither did.
+   */
+  putLocalSnapshot(snapshot: Snapshot): void
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -511,8 +534,107 @@ export function openDirectStore(
     try {
       return fn()
     } catch (err) {
+      // A present-but-unreadable row is already the correctly named failure, and
+      // it is a DIFFERENT condition from a mutation that never reached disk. A
+      // write failure is retryable — the disk was full, the file was read-only,
+      // the handle was closed — and a caller is right to try again. A corrupt row
+      // is not: retrying re-reads the same bytes forever, and only a human can
+      // repair them. Re-wrapping one as the other would erase that difference at
+      // the exact moment a caller has to choose between the two responses, so it
+      // travels out unchanged.
+      if (err instanceof StoreUnreadableError) throw err
       throw new StoreWriteError(table, err)
     }
+  }
+
+  /**
+   * Read the immutable half's OWN incompleteness back off disk, so a snapshot
+   * write can leave it exactly as it found it.
+   *
+   * A snapshot's `partial` may be a MERGE of two kinds: the immutable half's own
+   * incompleteness (a file cap, a truncated merge-base tree — a function of the
+   * comparison, so it rides with the immutable row) and a snapshot-scoped one
+   * (missing blob bytes, which a retry fixes — NOT a function of the comparison).
+   * The immutable row is content-addressed by `compareKey` and cached forever with
+   * no TTL, so writing the merged value onto it would pin a blob-missing reason to
+   * a key that outlives the missing blobs: the next reader of that key, long after
+   * those blobs were provisioned, would resurrect a truncation that stopped being
+   * true and nothing downstream could tell it from a fresh one. The row's own
+   * value was written on the cold path by `putImmutable`; this preserves it.
+   *
+   * An absent row means the cold path never ran for this key, so there is nothing
+   * to preserve and the half is recorded as complete.
+   */
+  function ownImmutablePartial(compareKey: string): Snapshot['partial'] {
+    const existing = db
+      .query('SELECT data FROM immutables WHERE compare_key = ?')
+      .get(compareKey) as { data: string } | null
+    if (!existing) return null
+    return parseRow<StoredImmutable>('immutables', compareKey, existing.data).partial ?? null
+  }
+
+  /**
+   * Persist a snapshot as two rows: the immutable half in the shared
+   * content-addressed `immutables` table under its `compareKey`, and the envelope
+   * (the mutable half plus the top-level fields) in the caller's table under the
+   * caller's key column. The envelope carries the merged `partial` verbatim — it is
+   * what a caller sees — while the immutable row keeps its own, per
+   * `ownImmutablePartial`.
+   *
+   * ONE function called from the pull-request path and the local-review path, for
+   * the same reason each table's DDL is one statement constant run from two call
+   * sites: the two paths must not drift, and the `partial` rule is subtle enough
+   * that a second copy of it is where the drift would land — silently, and months
+   * from the statement that caused it.
+   *
+   * All three statements — the preservation read and the two upserts — run inside
+   * ONE transaction, so a stored envelope never references an immutable half that
+   * is not on disk and no concurrent writer can change the immutable row between
+   * the read of its `partial` and the write that carries that value forward.
+   *
+   * The whole unit sits inside the durability wrapper, so a database that cannot
+   * be read or written surfaces as a `StoreWriteError` and the caller learns the
+   * mutation did not persist. That includes a present-but-corrupt immutable row:
+   * the transaction aborts, so the corrupt row is refused rather than overwritten,
+   * and the refusal travels in the error's message.
+   *
+   * `envelopeTable` and `keyColumn` are interpolated into the statement and are
+   * therefore module literals from the two call sites below — nothing a request
+   * can supply reaches this SQL.
+   */
+  function writeSnapshotRows(
+    envelopeTable: string,
+    keyColumn: string,
+    snapshot: Snapshot,
+  ): void {
+    const envelope: StoredSnapshotEnvelope = {
+      prNumber: snapshot.prNumber,
+      syncedAt: snapshot.syncedAt,
+      partial: snapshot.partial,
+      syncStats: snapshot.syncStats,
+      compareKey: snapshot.immutable.compareKey,
+      mutable: snapshot.mutable,
+    }
+    write(envelopeTable, () => {
+      const tx = db.transaction(() => {
+        const storedImm: StoredImmutable = {
+          compareKey: snapshot.immutable.compareKey,
+          immutable: snapshot.immutable,
+          partial: ownImmutablePartial(snapshot.immutable.compareKey),
+        }
+        db.run(
+          'INSERT INTO immutables (compare_key, data) VALUES (?, ?) ' +
+            'ON CONFLICT(compare_key) DO UPDATE SET data = excluded.data',
+          [snapshot.immutable.compareKey, JSON.stringify(storedImm)],
+        )
+        db.run(
+          `INSERT INTO ${envelopeTable} (${keyColumn}, data) VALUES (?, ?) ` +
+            `ON CONFLICT(${keyColumn}) DO UPDATE SET data = excluded.data`,
+          [snapshot.prNumber, JSON.stringify(envelope)],
+        )
+      })
+      tx()
+    })
   }
 
   return {
@@ -581,56 +703,7 @@ export function openDirectStore(
     },
 
     putSnapshot(snapshot: Snapshot): void {
-      // The snapshot's `partial` may be a MERGE of two kinds: the immutable
-      // half's own incompleteness (file cap, truncated merge-base tree — a
-      // function of the compare, so it rides with the immutable row) and a
-      // snapshot-scoped one (missing blob bytes a retry can fix — NOT a function
-      // of the compare). The envelope carries the merged `partial` verbatim (it
-      // is what the client sees); the immutable row must carry ONLY the immutable-
-      // scoped part, or a warm compareKey reuse would resurrect a stale blob-
-      // missing reason after those blobs were provisioned. The immutable row's
-      // own partial was written by `putImmutable` on the cold path, so preserve
-      // whatever it already holds rather than clobbering it with the merged one.
-      const envelope: StoredSnapshotEnvelope = {
-        prNumber: snapshot.prNumber,
-        syncedAt: snapshot.syncedAt,
-        partial: snapshot.partial,
-        syncStats: snapshot.syncStats,
-        compareKey: snapshot.immutable.compareKey,
-        mutable: snapshot.mutable,
-      }
-      const existingImm = db
-        .query('SELECT data FROM immutables WHERE compare_key = ?')
-        .get(snapshot.immutable.compareKey) as { data: string } | null
-      const immutablePartial: Snapshot['partial'] = existingImm
-        ? (parseRow<StoredImmutable>(
-            'immutables',
-            snapshot.immutable.compareKey,
-            existingImm.data,
-          ).partial ?? null)
-        : null
-      const storedImm: StoredImmutable = {
-        compareKey: snapshot.immutable.compareKey,
-        immutable: snapshot.immutable,
-        partial: immutablePartial,
-      }
-      write('snapshots', () => {
-        // The immutable half and the envelope are written in ONE transaction so a
-        // snapshot never references an immutable half that is not on disk.
-        const tx = db.transaction(() => {
-          db.run(
-            'INSERT INTO immutables (compare_key, data) VALUES (?, ?) ' +
-              'ON CONFLICT(compare_key) DO UPDATE SET data = excluded.data',
-            [snapshot.immutable.compareKey, JSON.stringify(storedImm)],
-          )
-          db.run(
-            'INSERT INTO snapshots (pr_number, data) VALUES (?, ?) ' +
-              'ON CONFLICT(pr_number) DO UPDATE SET data = excluded.data',
-            [snapshot.prNumber, JSON.stringify(envelope)],
-          )
-        })
-        tx()
-      })
+      writeSnapshotRows('snapshots', 'pr_number', snapshot)
     },
 
     hasBlob(sha: string): boolean {
@@ -900,6 +973,52 @@ export function openDirectStore(
       // it bumps a mark AND inserts a row, two statements that must commit or fail
       // together — and it wraps them accordingly.
       return write('meta', () => bumpIdHighWater(db, LOCAL_ENTITY_ID_META_KEY))
+    },
+
+    getLocalSnapshot(localId: number): Snapshot | null {
+      const row = db
+        .query('SELECT data FROM local_snapshots WHERE local_id = ?')
+        .get(localId) as { data: string } | null
+      if (!row) return null
+      const envelope = parseRow<StoredSnapshotEnvelope>(
+        'local_snapshots',
+        String(localId),
+        row.data,
+      )
+      const imm = db
+        .query('SELECT data FROM immutables WHERE compare_key = ?')
+        .get(envelope.compareKey) as { data: string } | null
+      if (!imm) {
+        // The envelope references an immutable half that is not on disk. That is
+        // a corrupt store, not an absent snapshot: surface it rather than return a
+        // snapshot with a fabricated or empty immutable half. A caller that wants
+        // to offer "the objects are gone, re-sync to rebuild" needs to be told the
+        // store is broken, which returning a plausible-looking snapshot would hide.
+        throw new StoreUnreadableError(
+          'local_snapshots',
+          String(localId),
+          new Error(
+            `snapshot references compareKey "${envelope.compareKey}" with no stored immutable half`,
+          ),
+        )
+      }
+      const stored = parseRow<StoredImmutable>('immutables', envelope.compareKey, imm.data)
+      return {
+        prNumber: envelope.prNumber,
+        syncedAt: envelope.syncedAt,
+        partial: envelope.partial,
+        syncStats: envelope.syncStats,
+        immutable: stored.immutable,
+        mutable: envelope.mutable,
+      }
+    },
+
+    putLocalSnapshot(snapshot: Snapshot): void {
+      // The local review's id is what `prNumber` carries here, so the envelope
+      // lands under `local_id` while the immutable half goes to the same shared
+      // cache a pull request's does. Nothing about the immutable half is
+      // pull-request-shaped: it is addressed by the SHAs git produced locally.
+      writeSnapshotRows('local_snapshots', 'local_id', snapshot)
     },
 
     close(): void {

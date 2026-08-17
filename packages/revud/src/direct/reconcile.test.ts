@@ -123,6 +123,8 @@ function fakeStore(opts: {
     listLocalReviews: unexpected('listLocalReviews'),
     patchLocalReviewSync: unexpected('patchLocalReviewSync'),
     nextLocalEntityId: unexpected('nextLocalEntityId'),
+    getLocalSnapshot: unexpected('getLocalSnapshot'),
+    putLocalSnapshot: unexpected('putLocalSnapshot'),
     close: () => {},
   }
 }
