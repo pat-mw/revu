@@ -7,7 +7,7 @@ import { identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
-import { notFoundCopy, stateChipCopy } from '@/lib/mode-copy'
+import { notFoundCopy, stateChipCopy, syncCostCopy } from '@/lib/mode-copy'
 import type { ReviewState } from '@/lib/mode-copy'
 import { reviewMode, reviewTabs } from '@/lib/review-mode'
 import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
@@ -120,12 +120,15 @@ export function SyncEmptyState({
 // ————————————————————————————————————————————————————————————————
 
 function SnapshotSeal({
+  mode,
   snapshot,
   loading,
   staleness,
   syncing,
   onSync,
 }: {
+  /** Which kind of review the seal is on — only the sync's cost differs by it. */
+  mode: ReviewMode
   /** `undefined` while the snapshot query loads; `null` means never synced. */
   snapshot: Snapshot | null | undefined
   loading: boolean
@@ -155,10 +158,7 @@ function SnapshotSeal({
               Sync
             </Button>
           </TooltipTrigger>
-          <TooltipContent>
-            Pulls the whole PR down in one burst (~3 + 2 requests per changed file), then
-            review is fully local.
-          </TooltipContent>
+          <TooltipContent>{syncCostCopy(mode)}</TooltipContent>
         </Tooltip>
       </span>
     )
@@ -547,7 +547,7 @@ export function PrLayout() {
         {/* Row 2 — meta: author, refs, mergeability, checks, diff size */}
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-mut">
           <span className="inline-flex min-w-0 items-center gap-1.5">
-            <IdentityAvatar identity={author.identity} size="xs" />
+            <IdentityAvatar identity={author.identity} mode={mode} size="xs" />
             <span className="truncate">{identityName(author.identity)}</span>
           </span>
           <span className="font-mono">
@@ -592,6 +592,7 @@ export function PrLayout() {
         <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
           <div className="pb-1.5">
             <SnapshotSeal
+              mode={mode}
               snapshot={snapshot}
               loading={snapshotQuery.isPending}
               staleness={staleness}

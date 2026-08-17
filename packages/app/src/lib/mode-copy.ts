@@ -311,3 +311,136 @@ export function draftSavedCopy(mode: ReviewMode): DraftSavedCopy {
       'Drafts live on the broker, keyed to you — invisible to GitHub and to other contractors. They survive reloads, tomorrow, and a workspace rebuild.',
   }
 }
+
+/**
+ * What one sync will do, on the control that starts it.
+ *
+ * The sentence exists to answer "is this expensive?" before a reader commits to
+ * it, and the honest answer is not the same on both readings. Pulling a pull
+ * request down means spending a shared read budget, roughly in proportion to
+ * how big the diff is, and quoting that is what makes the one-burst design
+ * legible rather than mysterious. A branch pair is already on the machine: the
+ * sync copies it out of the repository beside the app, spends nothing anyone
+ * else is sharing, and quoting a budget cost for it would be inventing one.
+ *
+ * What survives on both is the promise after the comma — that once this
+ * finishes, nothing else needs the network — because that is the property the
+ * whole design is for.
+ */
+export function syncCostCopy(mode: ReviewMode): string {
+  if (mode === 'local') {
+    return 'Reads the whole branch pair off this machine in one pass, then review is fully local.'
+  }
+  return 'Pulls the whole PR down in one burst (~3 + 2 requests per changed file), then review is fully local.'
+}
+
+/** The lines of the screen a review that has never been synced shows. */
+export interface NeverSyncedCopy {
+  title: string
+  /** What one sync fetches, what it costs, and what it buys. */
+  hint: string
+}
+
+/**
+ * The screen standing in for a review whose content has not been read yet.
+ *
+ * `estimatedRequests` is a coarse order of magnitude for the read budget one
+ * sync spends, and it is interpolated on the pull-request reading ONLY: a
+ * branch pair's sync reads a repository that is already on this machine, so
+ * there is no budget to quote and no number that would mean anything.
+ */
+export function neverSyncedCopy(
+  mode: ReviewMode,
+  estimatedRequests: number,
+): NeverSyncedCopy {
+  if (mode === 'local') {
+    return {
+      title: 'This branch pair was never synced',
+      hint: 'One sync reads the diff, every thread, and enough blob context to expand any hunk straight off this machine. After that, review is entirely local — it works with the network gone.',
+    }
+  }
+  return {
+    title: 'This PR was never synced',
+    hint: `One sync pulls the diff, every thread, and enough blob context to expand any hunk (~${estimatedRequests} requests from the shared 5,000/hr bucket). After that, review is entirely local — it works with the network gone.`,
+  }
+}
+
+/** The sentences a failed sync falls back on when the error names no better one. */
+export interface SyncErrorCopy {
+  /** The headline for a failure with no more specific shape. */
+  title: string
+  /** The detail for a refused read whose retry time is unknown. */
+  refused: string
+}
+
+/**
+ * What a sync that did not land says about itself.
+ *
+ * Both lines are fallbacks: the transport names its own failure whenever it
+ * can, and these are what is left when it cannot. The pull-request reading
+ * blames the shared read budget because that is overwhelmingly what a refused
+ * read means there. Nothing shares a budget with a branch pair, so its reading
+ * says only what is certainly true — the read did not happen, and what was
+ * already stored is exactly as it was.
+ */
+export function syncErrorCopy(mode: ReviewMode): SyncErrorCopy {
+  if (mode === 'local') {
+    return {
+      title: "Couldn't sync this branch pair",
+      refused: 'Nothing was read; the stored snapshot is untouched.',
+    }
+  }
+  return {
+    title: "Couldn't sync this pull request",
+    refused: 'Rate limit exhausted on the shared bucket.',
+  }
+}
+
+/**
+ * The notice standing in for a diff that was never inlined.
+ *
+ * A file can be too big for a diff to be produced for it, and the notice says
+ * so where the diff would have been. Who declined to produce it is the part
+ * that differs: on a pull request the diff arrives already assembled and the
+ * omission is upstream's; on a branch pair it is produced here from the
+ * repository, so naming an upstream service would point a reader at something
+ * that was never asked.
+ */
+export function tooLargeDiffCopy(mode: ReviewMode): string {
+  if (mode === 'local') {
+    return 'No inline diff for this file (file too large) — no text patch to render'
+  }
+  return 'GitHub did not inline this diff (file too large) — no text patch to render'
+}
+
+/**
+ * The hover title on the avatar disc of an author the identity parser resolved
+ * to a GitHub account, or null when there is nothing true to say about one.
+ *
+ * The parser calls any author whose login is not the shared write identity's a
+ * GitHub account — which is every author of a branch pair, because the author
+ * recorded on one is synthesized locally and carries no shared login. So the
+ * treatment this title belongs to fires exactly where it is least true: it
+ * tells a reader that the person who wrote the branch reviews on a site this
+ * workspace may not even reach.
+ *
+ * The ring the treatment also draws is dropped with the title rather than
+ * separately: they are one claim about where a person works, and half of it is
+ * not a smaller claim, only a quieter one.
+ */
+export function orgMemberTitle(mode: ReviewMode): string | null {
+  return mode === 'local' ? null : 'org member · reviews on github.com'
+}
+
+/**
+ * The descriptor drawn beside the name of an author resolved to a GitHub
+ * account, or null when there is nothing true to say about one.
+ *
+ * The same claim the avatar's title makes, in the one place a reader sees it
+ * without hovering. It is dropped on a branch pair for the same reason, and
+ * dropped rather than reworded: on a branch pair the author's name is the whole
+ * fact, and a descriptor that added nothing would be noise beside it.
+ */
+export function orgMemberChip(mode: ReviewMode): string | null {
+  return mode === 'local' ? null : 'org member · github.com'
+}

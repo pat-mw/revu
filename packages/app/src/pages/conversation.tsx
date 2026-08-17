@@ -9,6 +9,7 @@ import { useThreads } from '@/state/threads'
 import { useSession } from '@/state/session'
 import { conversationEmptyCopy } from '@/lib/mode-copy'
 import { conversationSections, useRouteReviewMode } from '@/lib/review-mode'
+import type { ReviewMode } from '@/lib/review-mode'
 import { relativeTime } from '@/lib/time'
 import { IdentityAvatar } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -62,10 +63,13 @@ const REVIEW_STATE_META: Record<
  * so the row names the reviewer even when the review itself says nothing.
  */
 function ReviewRow({
+  mode,
   review,
   attributedTo,
   commentCount,
 }: {
+  /** Which kind of review the row is drawn inside, for the author's avatar. */
+  mode: ReviewMode
   review: ReviewSummary
   attributedTo?: CommentIdentity
   commentCount: number
@@ -83,7 +87,7 @@ function ReviewRow({
   return (
     <article className="rounded-(--radius-sm) border border-line bg-panel px-3 py-2">
       <div className="flex min-w-0 items-center gap-2">
-        <IdentityAvatar identity={identity} size="xs" />
+        <IdentityAvatar identity={identity} mode={mode} size="xs" />
         <span className="truncate text-sm font-medium text-ink">
           {identityName(identity)}
         </span>
@@ -277,7 +281,7 @@ export function ConversationPage() {
         {sections.includes('description') && (
           <article className="rounded-(--radius-sm) border border-line bg-panel">
             <header className="hairline-b flex min-w-0 items-center gap-2 px-3 py-2">
-              <IdentityAvatar identity={description.identity} size="xs" />
+              <IdentityAvatar identity={description.identity} mode={mode} size="xs" />
               <span className="truncate text-sm font-medium text-ink">
                 {identityName(description.identity)}
               </span>
@@ -327,6 +331,7 @@ export function ConversationPage() {
                   ) : (
                     <ReviewRow
                       key={`review-${entry.review.id}`}
+                      mode={mode}
                       review={entry.review}
                       attributedTo={reviewAttribution.get(entry.review.id)?.identity}
                       commentCount={reviewAttribution.get(entry.review.id)?.count ?? 0}

@@ -2,6 +2,8 @@ import { useMemo } from 'react'
 import { buildRows, parsePatch } from '@/lib/diff'
 import type { DiffRow, ExpandedRange, FileDiffModel } from '@/lib/diff'
 import { languageForPath } from '@/lib/highlight'
+import { tooLargeDiffCopy } from '@/lib/mode-copy'
+import type { ReviewMode } from '@/lib/review-mode'
 import type { FileBlob, FileViewedState, PendingComment, PullFile, ReviewThread, Snapshot } from '@revu/shared'
 /**
  * The flat row model: every file's header, diff rows, threads, pending
@@ -229,7 +231,14 @@ export interface UseFlatRowsInput {
   snapshot: Snapshot
   models: FileDiffModel[]
   contents: Record<string, FileContents>
-  mode: DiffMode
+  /** Whether the diff draws one column or two. */
+  diffMode: DiffMode
+  /**
+   * Which kind of review the rows belong to. Only one notice differs by it, but
+   * the notice stands where a diff would have been, so it is read on the tab a
+   * review of two local branches spends nearly all of its time on.
+   */
+  reviewMode: ReviewMode
   /** Per-path user-expanded context ranges (new-file line numbers). */
   expandedByPath: Record<string, ExpandedRange[]>
   /**
@@ -251,7 +260,8 @@ export function useFlatRows(input: UseFlatRowsInput): FlatRow[] {
     snapshot,
     models,
     contents,
-    mode,
+    diffMode,
+    reviewMode,
     expandedByPath,
     collapseOverride,
     outdatedOpenByPath,
@@ -266,7 +276,8 @@ export function useFlatRows(input: UseFlatRowsInput): FlatRow[] {
         snapshot,
         models,
         contents,
-        mode,
+        diffMode,
+        reviewMode,
         expandedByPath,
         collapseOverride,
         outdatedOpenByPath,
@@ -279,7 +290,8 @@ export function useFlatRows(input: UseFlatRowsInput): FlatRow[] {
       snapshot,
       models,
       contents,
-      mode,
+      diffMode,
+      reviewMode,
       expandedByPath,
       collapseOverride,
       outdatedOpenByPath,
@@ -311,7 +323,7 @@ function classifyCollapse(args: {
 }
 
 function buildFlatRows(input: UseFlatRowsInput): FlatRow[] {
-  const { snapshot, models, contents, mode, composer } = input
+  const { snapshot, models, contents, diffMode, reviewMode, composer } = input
   const files = snapshot.immutable.files
   const missingShas = new Set(snapshot.partial?.missingBlobShas ?? [])
   const out: FlatRow[] = []
@@ -358,7 +370,7 @@ function buildFlatRows(input: UseFlatRowsInput): FlatRow[] {
           fileIdx,
           path,
           kind: 'notice',
-          text: 'GitHub did not inline this diff (file too large) — no text patch to render',
+          text: tooLargeDiffCopy(reviewMode),
           action: null,
         })
       } else if (reason === 'lockfile') {
@@ -421,7 +433,7 @@ function buildFlatRows(input: UseFlatRowsInput): FlatRow[] {
     }
 
     const diffRows = buildRows(model, {
-      mode,
+      mode: diffMode,
       expanded: input.expandedByPath[path] ?? [],
       headBlobContent: fileContents.head,
       baseBlobContent: fileContents.base,

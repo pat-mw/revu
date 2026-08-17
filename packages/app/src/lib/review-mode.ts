@@ -206,3 +206,39 @@ export interface SelfReviewLockInput {
 export function showSelfReviewLock({ mode, canApprove }: SelfReviewLockInput): boolean {
   return mode === 'github' && !canApprove
 }
+
+/** What the topbar knows about the shared read budget when it decides. */
+export interface RateChipInput {
+  /**
+   * Whether this workspace has a shared read budget at all: `true` once one has
+   * been read, `false` once the read has come back saying there is none, and
+   * `null` while it has come back with neither.
+   */
+  rateAvailable: boolean | null
+}
+
+/**
+ * Whether the topbar draws the shared-budget chip at all.
+ *
+ * The budget is a property of the WORKSPACE, not of whichever review happens to
+ * be open: it is read once, globally, with no review to scope it to, and a
+ * workspace wired to no upstream service has none to report on any screen. So
+ * the chip is not suppressed while a branch pair is open and restored when a
+ * pull request is — it is either a thing this workspace has or it is not.
+ *
+ * The answer must be OMISSION rather than a hidden or emptied chip, and that is
+ * the whole reason this is a gate instead of a style. The chip stands in for an
+ * unresolved read with a shimmer; a workspace that will never resolve one would
+ * shimmer in its topbar for as long as it stayed open, which reads as a load
+ * that never finishes rather than as a budget that does not exist.
+ *
+ * Which way the undecided answer falls is the other half, and it is why the
+ * input is three-valued rather than a boolean. A read still in flight is not
+ * evidence of absence, so it keeps the chip's place and its shimmer; only a
+ * read that has come back with nothing takes the chip away. Answering "no"
+ * while the question is open would blink the chip out of every topbar on every
+ * load and back in a moment later.
+ */
+export function showRateChip({ rateAvailable }: RateChipInput): boolean {
+  return rateAvailable !== false
+}

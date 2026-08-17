@@ -48,6 +48,7 @@ import {
   redirectTargetFor,
   reviewMode,
   reviewTabs,
+  showRateChip,
   showSelfReviewLock,
   useRouteReviewMode,
 } from './review-mode'
@@ -208,6 +209,46 @@ describe('whether the verdict picker locks its approving segments', () => {
 
   test('and one it may approve does not', () => {
     expect(showSelfReviewLock({ mode: 'github', canApprove: true })).toBe(false)
+  })
+})
+
+describe('whether the topbar draws the shared-budget chip', () => {
+  test('a workspace with a budget to report gets one', () => {
+    expect(showRateChip({ rateAvailable: true })).toBe(true)
+  })
+
+  test('a workspace with none gets no chip at all', () => {
+    // OMITTED, not hidden and not emptied. The chip stands in for an unresolved
+    // read with a shimmer, so a workspace that will never resolve one would
+    // shimmer in its topbar for as long as it stayed open — which reads as a
+    // load that never finishes rather than as a budget that does not exist.
+    expect(showRateChip({ rateAvailable: false })).toBe(false)
+  })
+
+  test('and a workspace that has not answered yet keeps its place', () => {
+    // The case the whole gate is really about, and the reason the input is
+    // three-valued: a read still in flight is not evidence of absence. Folding
+    // it in with "no budget" would blink the chip out of every topbar on every
+    // load and back in a moment later; folding it in with "has one" is what the
+    // chip did before, and is what leaves a workspace with no budget shimmering
+    // forever. It is neither, and it falls to the side that keeps today's
+    // behaviour while the question is open.
+    expect(showRateChip({ rateAvailable: null })).toBe(true)
+  })
+
+  test('and the chip is a property of the workspace, not of the open review', () => {
+    // The gate takes no mode, and that is a decision rather than an omission.
+    // The budget is read once, globally, with no review to scope it to, so
+    // suppressing the chip while a branch pair is open and restoring it on the
+    // next pull request would report a different budget per screen for one
+    // workspace. A workspace wired to an upstream service has a budget on every
+    // screen including a branch pair's; one wired to none has it on no screen.
+    //
+    // Pinned as the signature rather than as behaviour, because there is no
+    // input that could demonstrate the absence of a parameter.
+    expect(read('lib/review-mode.ts')).toContain(
+      'export function showRateChip({ rateAvailable }: RateChipInput): boolean',
+    )
   })
 })
 

@@ -30,7 +30,7 @@ import { devControls } from '@/api/dev'
 import { useHumans } from '@/state/dev-humans'
 import { useTheme } from '@/state/theme'
 import { useSequenceShortcut, useShortcut } from '@/lib/keyboard'
-import { matchPrNumber } from '@/lib/review-mode'
+import { matchPrNumber, showRateChip } from '@/lib/review-mode'
 import { minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 
@@ -50,9 +50,19 @@ function useRepoContext(): string | null {
  * workspace in the installation, so its honesty matters: the number goes gold
  * under a thousand reads left and red under two hundred, and its tooltip says
  * which activity actually spends the budget — an unchanged list poll does not.
+ *
+ * Not every workspace has such a budget. One wired to no upstream service
+ * answers the read with a failure rather than with a bucket, and that answer is
+ * the difference between "still loading" and "there is nothing here" — which is
+ * why the chip distinguishes them rather than treating both as no-data-yet. A
+ * read still in flight keeps the chip's place and its shimmer; a read that came
+ * back with nothing removes the chip entirely, because a shimmer that will
+ * never resolve is a permanent load, not an absence.
  */
 function RateChip() {
   const rate = useRateLimit()
+  const rateAvailable = rate.data !== undefined ? true : rate.isError ? false : null
+  if (!showRateChip({ rateAvailable })) return null
   if (!rate.data) {
     return <span className="skeleton h-3.5 w-16" aria-hidden />
   }

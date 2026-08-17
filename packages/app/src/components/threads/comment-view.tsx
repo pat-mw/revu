@@ -8,6 +8,9 @@ import { Markdown } from '@/components/ui/markdown'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
+import { orgMemberChip } from '@/lib/mode-copy'
+import { reviewMode } from '@/lib/review-mode'
+import type { ReviewMode } from '@/lib/review-mode'
 import { formatDate, relativeTime } from '@/lib/time'
 import { useSnapshot } from '@/state/queries'
 import { useSession } from '@/state/session'
@@ -56,13 +59,20 @@ export type RenderableComment = Pick<
   'id' | 'user' | 'body' | 'created_at' | 'reactions'
 >
 
-/** The small identity descriptor rendered beside the author name. */
-function identityChip(identity: CommentIdentity): string | null {
+/**
+ * The small identity descriptor rendered beside the author name.
+ *
+ * Only the GitHub-account case varies by the kind of review: a role and the
+ * shared app identity mean the same thing wherever they appear, while "resolved
+ * to a GitHub account" is what every author of a review of two local branches
+ * resolves to and is a claim about a site that review never touched.
+ */
+function identityChip(mode: ReviewMode, identity: CommentIdentity): string | null {
   switch (identity.kind) {
     case 'human':
       return identity.role ? `(${identity.role})` : null
     case 'github':
-      return 'org member · github.com'
+      return orgMemberChip(mode)
     case 'bot':
       return 'app'
   }
@@ -84,6 +94,10 @@ export function CommentView({
   const session = useSession()
   const addReaction = useAddReaction(prNumber)
   const [pickerOpen, setPickerOpen] = useState(false)
+  // Read from the review this comment belongs to rather than taken as a prop:
+  // the card is rendered from four places, and a number every one of them
+  // already holds is a smaller seam than a prop every one of them must thread.
+  const mode = reviewMode(prNumber)
 
   const parsed = useMemo(
     () => parseCommentIdentity(comment, session.brokerLogin),
@@ -104,13 +118,13 @@ export function CommentView({
     [comment, commentAuthors, session.human, session.brokerLogin, session.viewerLogin],
   )
 
-  const chip = identityChip(parsed.identity)
+  const chip = identityChip(mode, parsed.identity)
   const active = REACTION_KEYS.filter((k) => comment.reactions[k] > 0)
 
   return (
     <article className="group/comment min-w-0">
       <div className="flex min-w-0 items-center gap-2">
-        <IdentityAvatar identity={parsed.identity} size="sm" />
+        <IdentityAvatar identity={parsed.identity} mode={mode} size="sm" />
         <span className="truncate text-sm font-semibold text-ink">
           {identityName(parsed.identity)}
         </span>

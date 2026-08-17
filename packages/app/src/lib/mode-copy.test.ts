@@ -17,12 +17,18 @@ import {
   authorBannerCopy,
   conversationEmptyCopy,
   draftSavedCopy,
+  neverSyncedCopy,
   notFoundCopy,
+  orgMemberChip,
+  orgMemberTitle,
   reconcileFailureCopy,
   reconcileSuccessCopy,
   stateChipCopy,
   submitFailureCopy,
   submitSuccessCopy,
+  syncCostCopy,
+  syncErrorCopy,
+  tooLargeDiffCopy,
 } from './mode-copy'
 import type { ReviewMode } from './review-mode'
 
@@ -357,6 +363,139 @@ describe('the whisper that says the draft is safe', () => {
 
   test('and a branch pair names no broker', () => {
     expect(draftSavedText('local')).not.toMatch(/\bbroker\b/i)
+  })
+})
+
+describe('what one sync will do, on the control that starts it', () => {
+  test('a pull request is quoted a budget cost, roughly', () => {
+    // Today's literal, pinned character for character. The estimate is the
+    // point of the sentence on this path: it answers "is this expensive?"
+    // before a reader commits to the burst.
+    expect(syncCostCopy('github')).toBe(
+      'Pulls the whole PR down in one burst (~3 + 2 requests per changed file), then review is fully local.',
+    )
+  })
+
+  test('a branch pair is told where it reads from instead', () => {
+    // The control for the absence below. A branch pair's sync spends nothing
+    // anyone is sharing, so there is no cost to quote — but the promise after
+    // the comma is the same on both, and dropping it would lose the reason the
+    // sync is one burst at all.
+    expect(syncCostCopy('local')).toBe(
+      'Reads the whole branch pair off this machine in one pass, then review is fully local.',
+    )
+  })
+
+  test('and is quoted no budget it does not spend', () => {
+    expect(syncCostCopy('local')).not.toMatch(/\brequests\b/i)
+  })
+})
+
+/** Every line of the never-synced screen as one string. */
+function neverSyncedText(mode: ReviewMode, estimate: number): string {
+  return Object.values(neverSyncedCopy(mode, estimate)).join(' ')
+}
+
+describe('the screen a review whose content was never read shows', () => {
+  test('a pull request is told the burst size it is about to spend', () => {
+    expect(neverSyncedCopy('github', 25).title).toBe('This PR was never synced')
+    expect(neverSyncedCopy('github', 25).hint).toBe(
+      'One sync pulls the diff, every thread, and enough blob context to expand any hunk (~25 requests from the shared 5,000/hr bucket). After that, review is entirely local — it works with the network gone.',
+    )
+  })
+
+  test('a branch pair is told what one sync reads and what it buys', () => {
+    // The control for the two absences below, and the half that must survive:
+    // "after this, the network is not needed" is the property the whole design
+    // exists for and is true on both readings.
+    expect(neverSyncedCopy('local', 25).title).toBe('This branch pair was never synced')
+    expect(neverSyncedCopy('local', 25).hint).toBe(
+      'One sync reads the diff, every thread, and enough blob context to expand any hunk straight off this machine. After that, review is entirely local — it works with the network gone.',
+    )
+  })
+
+  test('and is quoted no shared budget', () => {
+    expect(neverSyncedText('local', 25)).not.toMatch(/\bbucket\b/i)
+  })
+
+  test('and no request count either', () => {
+    expect(neverSyncedText('local', 25)).not.toMatch(/\brequests\b/i)
+  })
+
+  test('and the estimate reaches the sentence that quotes one', () => {
+    // The estimate is interpolated on one path only, so this is what says the
+    // argument is used rather than accepted and dropped.
+    expect(neverSyncedCopy('github', 41).hint).toContain('~41 requests')
+  })
+})
+
+/** Every line of the failed-sync fallback as one string. */
+function syncErrorText(mode: ReviewMode): string {
+  return Object.values(syncErrorCopy(mode)).join(' ')
+}
+
+describe('what a sync that did not land falls back on saying', () => {
+  test('a pull request blames the budget it shares, which is usually right', () => {
+    expect(syncErrorCopy('github').title).toBe("Couldn't sync this pull request")
+    expect(syncErrorCopy('github').refused).toBe('Rate limit exhausted on the shared bucket.')
+  })
+
+  test('a branch pair says only what is certainly true', () => {
+    // The control for the two absences below. Nothing shares a budget with a
+    // branch pair, so the fallback keeps the one guarantee that survives every
+    // cause: whatever failed, the stored snapshot is as it was.
+    expect(syncErrorCopy('local').title).toBe("Couldn't sync this branch pair")
+    expect(syncErrorCopy('local').refused).toBe(
+      'Nothing was read; the stored snapshot is untouched.',
+    )
+  })
+
+  test('and blames no limit nothing is enforcing', () => {
+    expect(syncErrorText('local')).not.toMatch(/rate limit/i)
+  })
+
+  test('and claims no pull request', () => {
+    expect(syncErrorText('local')).not.toMatch(/pull request/i)
+  })
+})
+
+describe('the notice standing in for a diff that was never inlined', () => {
+  test('a pull request names who declined to produce it', () => {
+    expect(tooLargeDiffCopy('github')).toBe(
+      'GitHub did not inline this diff (file too large) — no text patch to render',
+    )
+  })
+
+  test('a branch pair states the fact without an author', () => {
+    // The control for the absence below, and the half that must survive on
+    // both: WHY there is nothing to read, which is what stops the blank area
+    // reading as a failure to load.
+    expect(tooLargeDiffCopy('local')).toBe(
+      'No inline diff for this file (file too large) — no text patch to render',
+    )
+  })
+
+  test('and blames nobody who was never asked', () => {
+    expect(tooLargeDiffCopy('local')).not.toMatch(/github/i)
+  })
+})
+
+describe('the descriptor on an author resolved to a GitHub account', () => {
+  test('a pull request says where that person reviews', () => {
+    // Today's two literals. They are a hover title and a chip rather than
+    // paragraphs, which is exactly why they went unnoticed for so long — and
+    // why they are pinned here as values rather than looked for in prose.
+    expect(orgMemberTitle('github')).toBe('org member · reviews on github.com')
+    expect(orgMemberChip('github')).toBe('org member · github.com')
+  })
+
+  test('a branch pair says nothing, because there is nothing true to say', () => {
+    // The author of a review of two local branches resolves to this same case:
+    // their login is simply not the shared write identity's. So the treatment
+    // fires exactly where it is least true, and the honest answer is silence —
+    // the person's name is already the whole fact.
+    expect(orgMemberTitle('local')).toBeNull()
+    expect(orgMemberChip('local')).toBeNull()
   })
 })
 

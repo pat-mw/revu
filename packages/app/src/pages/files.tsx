@@ -8,6 +8,9 @@ import type { ApiError, FileBlob, FileViewedState, PendingComment, ReviewThread,
 import { blobLines, mergeExpanded } from '@/lib/diff'
 import type { ExpandedRange } from '@/lib/diff'
 import { formatKeys, useShortcut } from '@/lib/keyboard'
+import { neverSyncedCopy, syncErrorCopy } from '@/lib/mode-copy'
+import { reviewMode } from '@/lib/review-mode'
+import type { ReviewMode } from '@/lib/review-mode'
 import { minutesUntil } from '@/lib/time'
 import { qk, usePullItem, useSnapshot, useSyncPull } from '@/state/queries'
 import { makePendingComment, useDraft, useDraftActions } from '@/state/drafts'
@@ -58,6 +61,9 @@ export function FilesPage() {
   const params = useParams()
   const prNumber = Number(params.n)
   const snapshotQ = useSnapshot(prNumber)
+  // Derived here and threaded down, so nothing below this line has to work out
+  // for itself which kind of review it is drawing.
+  const mode = reviewMode(prNumber)
 
   if (snapshotQ.isPending) return <FilesSkeleton />
   if (snapshotQ.isError) {
@@ -72,8 +78,8 @@ export function FilesPage() {
       </div>
     )
   }
-  if (snapshotQ.data === null) return <NeverSynced prNumber={prNumber} />
-  return <FilesWorkbench prNumber={prNumber} snapshot={snapshotQ.data} />
+  if (snapshotQ.data === null) return <NeverSynced prNumber={prNumber} mode={mode} />
+  return <FilesWorkbench prNumber={prNumber} snapshot={snapshotQ.data} mode={mode} />
 }
 
 // ————————————————————————————————————————————————————————————————
@@ -125,35 +131,34 @@ function estimateSyncRequests(commitCount: number | undefined): number {
   return 3 + Math.max(8, commitCount * 3)
 }
 
-function syncErrorCopy(error: ApiError): { title: string; detail: string } {
+function syncErrorState(mode: ReviewMode, error: ApiError): { title: string; detail: string } {
+  const copy = syncErrorCopy(mode)
   if (error.code === 'rate_limited') {
     const minutes = error.resetAt !== undefined ? minutesUntil(error.resetAt) : null
     return {
       title: 'Sync failed',
       detail:
-        minutes !== null
-          ? `Rate limit exhausted. Resets in ${minutes} minutes.`
-          : 'Rate limit exhausted on the shared bucket.',
+        minutes !== null ? `Rate limit exhausted. Resets in ${minutes} minutes.` : copy.refused,
     }
   }
   if (error.code === 'network') {
     // The transport's message names what was kept (e.g. a partial snapshot).
     return { title: 'Sync interrupted', detail: error.message }
   }
-  return { title: "Couldn't sync this pull request", detail: error.message }
+  return { title: copy.title, detail: error.message }
 }
 
-function NeverSynced({ prNumber }: { prNumber: number }) {
+function NeverSynced({ prNumber, mode }: { prNumber: number; mode: ReviewMode }) {
   const item = usePullItem(prNumber)
   const sync = useSyncPull(prNumber)
-  const est = estimateSyncRequests(item?.broker.commitCount)
+  const copy = neverSyncedCopy(mode, estimateSyncRequests(item?.broker.commitCount))
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 overflow-y-auto p-6">
       <EmptyState
         icon={<CloudDownload size={20} strokeWidth={1.5} />}
-        title="This PR was never synced"
-        hint={`One sync pulls the diff, every thread, and enough blob context to expand any hunk (~${est} requests from the shared 5,000/hr bucket). After that, review is entirely local — it works with the network gone.`}
+        title={copy.title}
+        hint={copy.hint}
         action={
           <Button variant="primary" disabled={sync.isPending} onClick={() => sync.mutate()}>
             {sync.isPending ? (
@@ -170,7 +175,7 @@ function NeverSynced({ prNumber }: { prNumber: number }) {
       {sync.isError && (
         <ErrorState
           className="w-full max-w-md"
-          {...syncErrorCopy(sync.error)}
+          {...syncErrorState(mode, sync.error)}
           retry={() => sync.mutate()}
           retryLabel="Retry sync"
         />
@@ -248,7 +253,16 @@ function anchorKey(a: ComposerAnchor): string {
 // The workbench — tree | virtualized diff | (author queue dock)
 // ————————————————————————————————————————————————————————————————
 
-function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Snapshot }) {
+function FilesWorkbench({
+  prNumber,
+  snapshot,
+  mode,
+}: {
+  prNumber: number
+  snapshot: Snapshot
+  /** Which kind of review this is — distinct from the diff LAYOUT below. */
+  mode: ReviewMode
+}) {
   const location = useLocation()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -258,14 +272,14 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
   // reads as the default; a toggle writes through the store optimistically.
   const setPreferences = useSetPreferences()
   const setPreferencesMutate = setPreferences.mutate
-  const mode: DiffMode = usePreferences().data?.diffMode ?? 'unified'
+  const diffMode: DiffMode = usePreferences().data?.diffMode ?? 'unified'
   const setMode = useCallback(
     (m: DiffMode) => {
-      if (m !== mode) setPreferencesMutate({ diffMode: m })
+      if (m !== diffMode) setPreferencesMutate({ diffMode: m })
     },
     // `mutate` is stable across renders; depending on it (not the whole mutation
     // object, which churns with mutation state) keeps this memo from recreating.
-    [mode, setPreferencesMutate],
+    [diffMode, setPreferencesMutate],
   )
 
   const [treeOpen, setTreeOpen] = useState<boolean>(
@@ -323,7 +337,8 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
     snapshot,
     models,
     contents,
-    mode,
+    diffMode,
+    reviewMode: mode,
     expandedByPath,
     collapseOverride,
     outdatedOpenByPath,
@@ -666,14 +681,14 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
     () => ({
       jumpTo,
       focusedPath,
-      mode,
+      mode: diffMode,
       setMode,
       openComposerAt: (t) =>
         openComposer({ path: t.path, line: t.line, side: t.side, startLine: t.startLine ?? null }),
       queueOpen,
       setQueueOpen,
     }),
-    [jumpTo, focusedPath, mode, setMode, openComposer, queueOpen],
+    [jumpTo, focusedPath, diffMode, setMode, openComposer, queueOpen],
   )
 
   // ——— keyboard (all yield to the author queue while it is open) ———
@@ -753,7 +768,7 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
     },
     { enabled: kb },
   )
-  useShortcut('u', () => setMode(mode === 'unified' ? 'split' : 'unified'), { enabled: kb })
+  useShortcut('u', () => setMode(diffMode === 'unified' ? 'split' : 'unified'), { enabled: kb })
   useShortcut(
     'e',
     () => {
@@ -849,8 +864,8 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
               <Button
                 variant="ghost"
                 size="sm"
-                className={cn('h-5 px-1.5 text-2xs', mode === 'unified' && 'bg-raised text-ink')}
-                aria-pressed={mode === 'unified'}
+                className={cn('h-5 px-1.5 text-2xs', diffMode === 'unified' && 'bg-raised text-ink')}
+                aria-pressed={diffMode === 'unified'}
                 title="Unified layout (u toggles)"
                 onClick={() => setMode('unified')}
               >
@@ -859,8 +874,8 @@ function FilesWorkbench({ prNumber, snapshot }: { prNumber: number; snapshot: Sn
               <Button
                 variant="ghost"
                 size="sm"
-                className={cn('h-5 px-1.5 text-2xs', mode === 'split' && 'bg-raised text-ink')}
-                aria-pressed={mode === 'split'}
+                className={cn('h-5 px-1.5 text-2xs', diffMode === 'split' && 'bg-raised text-ink')}
+                aria-pressed={diffMode === 'split'}
                 title="Split layout (u toggles)"
                 onClick={() => setMode('split')}
               >

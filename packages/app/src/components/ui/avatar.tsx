@@ -1,6 +1,8 @@
 import { Bot } from 'lucide-react'
 import type { CommentIdentity } from '@revu/shared'
 import { avatarStyle, identityName } from '@revu/shared'
+import { orgMemberTitle } from '@/lib/mode-copy'
+import type { ReviewMode } from '@/lib/review-mode'
 import { cn } from '@/lib/cn'
 
 /** Disc diameter and glyph size per named size. */
@@ -86,16 +88,27 @@ function BotDisc({
 
 /**
  * Avatar for a resolved comment identity. Humans and real GitHub users get a
- * colored-initials disc; GitHub org members additionally carry a subtle ring and
- * a title explaining they review directly on github.com. The unparsed broker bot
- * renders as a neutral bot disc.
+ * colored-initials disc; on a mediated pull request an identity resolved to a
+ * GitHub account additionally carries a subtle ring and a title naming where
+ * that person reviews. The unparsed broker bot renders as a neutral bot disc.
+ *
+ * `mode` is required rather than defaulted, and the reason is that the identity
+ * alone cannot answer this. The parser calls every author of a review of two
+ * local branches a GitHub account — their login is simply not the shared write
+ * identity's — so the ringed treatment fires there by default and says
+ * something false about a person who never touched that site. A required prop
+ * makes a call site that has not thought about it a compile error instead of a
+ * quiet wrong answer on a screen.
  */
 export function IdentityAvatar({
   identity,
+  mode,
   size = 'sm',
   className,
 }: {
   identity: CommentIdentity
+  /** Which kind of review this identity is being drawn inside. */
+  mode: ReviewMode
   size?: AvatarSize
   className?: string
 }) {
@@ -103,15 +116,10 @@ export function IdentityAvatar({
   if (identity.kind === 'bot') {
     return <BotDisc size={size} className={className} title={name} label={name} />
   }
-  if (identity.kind === 'github') {
+  const orgTitle = identity.kind === 'github' ? orgMemberTitle(mode) : null
+  if (orgTitle !== null) {
     return (
-      <InitialsDisc
-        name={name}
-        size={size}
-        className={className}
-        ring
-        title="org member · reviews on github.com"
-      />
+      <InitialsDisc name={name} size={size} className={className} ring title={orgTitle} />
     )
   }
   return <InitialsDisc name={name} size={size} className={className} />
