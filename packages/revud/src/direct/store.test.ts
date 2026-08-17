@@ -13,7 +13,7 @@
  * reach `snapshots` would fail loudly.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -23,6 +23,7 @@ import type {
   Snapshot,
   SnapshotImmutable,
 } from '@revu/shared'
+import { LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
 import {
   openDirectStore,
   resolveDirectDataDir,
@@ -343,6 +344,282 @@ describe('STORE_VERSION migrates in place, preserving drafts', () => {
     }
     expect(after.value).toBe('999')
     check.close()
+  })
+})
+
+/**
+ * The six tables the local-review keyspace adds, and the eight the versions
+ * before it own. Both lists are written out rather than derived from the store
+ * module: a list computed from the module under test agrees with that module
+ * however wrong it becomes, so a table quietly dropped from the schema would
+ * quietly drop out of the list too and every assertion over it would stay green.
+ * Alphabetical, so a `sqlite_master` read ordered by name compares directly.
+ */
+const LOCAL_TABLES = [
+  'local_drafts',
+  'local_reviews',
+  'local_reviews_submitted',
+  'local_snapshots',
+  'local_threads',
+  'local_viewed',
+] as const
+
+const PRE_LOCAL_TABLES = [
+  'audit_log',
+  'blobs',
+  'drafts',
+  'immutables',
+  'pr_author',
+  'prefs',
+  'snapshots',
+  'viewed',
+] as const
+
+/**
+ * Reduce the current data dir's store file to a genuine file from the build that
+ * predates the local keyspace: the six local tables dropped, both local id
+ * high-water rows removed, and the recorded version rolled back to the one
+ * before them. Reopening the store is then a real in-place upgrade rather than a
+ * no-op over a file that already has the shape.
+ */
+function reduceToPreLocalFile(): void {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  for (const table of LOCAL_TABLES) raw.run(`DROP TABLE ${table}`)
+  raw.run("DELETE FROM meta WHERE key = 'local_review_id_high_water'")
+  raw.run("DELETE FROM meta WHERE key = 'local_entity_id_high_water'")
+  raw.run("UPDATE meta SET value = '3' WHERE key = 'store_version'")
+  raw.close()
+}
+
+/** One `meta` value read through a raw handle, or `null` when the row is absent. */
+function metaValue(key: string): string | null {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT value FROM meta WHERE key = ?').get(key) as
+    | { value: string }
+    | null
+  raw.close()
+  return row ? row.value : null
+}
+
+/** Every table name in the store file, alphabetical. */
+function tableNames(): string[] {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const rows = raw
+    .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .all() as { name: string }[]
+  raw.close()
+  return rows.map((r) => r.name)
+}
+
+/**
+ * One table's declared columns, in declaration order, with the four facts a
+ * later edit could silently change: the declared type, whether NULL is refused,
+ * the default, and the column's position in the primary key.
+ */
+function columnShape(
+  table: string,
+): { name: string; type: string; notnull: number; dflt: unknown; pk: number }[] {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const rows = raw.query(`PRAGMA table_info(${table})`).all() as {
+    name: string
+    type: string
+    notnull: number
+    dflt_value: unknown
+    pk: number
+  }[]
+  raw.close()
+  return rows.map((r) => ({
+    name: r.name,
+    type: r.type,
+    notnull: r.notnull,
+    dflt: r.dflt_value,
+    pk: r.pk,
+  }))
+}
+
+/** The stored DDL of every table the pre-local versions own, keyed by name. */
+function preLocalDdl(): { name: string; sql: string }[] {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const rows = raw
+    .query(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN " +
+        "('immutables','snapshots','blobs','drafts','viewed','prefs','audit_log','pr_author') " +
+        'ORDER BY name',
+    )
+    .all() as { name: string; sql: string }[]
+  raw.close()
+  return rows
+}
+
+describe('the local-review keyspace arrives as a purely additive version step', () => {
+  test('an older file gains the six local tables and both id high-water rows in place', () => {
+    const store = open()
+    store.putDraft(draft('h1', 204, 'work that must survive the local keyspace arriving'))
+    store.setViewed('h1', 204, { 'a.ts': { viewed: true, blobSha: 's', at: 'now' } })
+    store.appendAudit(auditEntry({ githubId: 77, pr: 204 }))
+    store.recordPrAuthor(204, 'h-priya')
+    store.close()
+
+    // A freshly created file already carries both marks: the fresh-file path
+    // seeds them, and asserting it here is what keeps that path guarded too.
+    expect(metaValue('local_review_id_high_water')).toBe('999999999')
+    expect(metaValue('local_entity_id_high_water')).toBe('8999999999999')
+
+    reduceToPreLocalFile()
+
+    // The rows really are gone before the reopen. Without this the "seeded again"
+    // assertions below would also be satisfied by a DELETE that never landed.
+    expect(metaValue('local_review_id_high_water')).toBeNull()
+    expect(metaValue('local_entity_id_high_water')).toBeNull()
+
+    // Reopening runs the guarded step that introduces the local keyspace: the
+    // tables are added and the marks re-seeded, and nothing else is read or
+    // rewritten, so every earlier table's rows come back byte-identical.
+    const reopened = open()
+    expect(reopened.getDraft('h1', 204)!.body).toBe(
+      'work that must survive the local keyspace arriving',
+    )
+    expect(reopened.getViewed('h1', 204)['a.ts'].viewed).toBe(true)
+    expect(reopened.listAudit()).toHaveLength(1)
+    expect(reopened.getPrAuthor(204)).toBe('h-priya')
+    reopened.close()
+
+    expect(Number(metaValue('store_version'))).toBe(STORE_VERSION)
+    const names = tableNames()
+    for (const table of LOCAL_TABLES) expect(names).toContain(table)
+
+    // Each mark is asserted on its OWN line, and that is not stylistic: one
+    // assertion covering "the high-water rows are present" stays green with
+    // either row missing, and the two rows are read by different callers — one
+    // mints review ids, the other the entity ids that live inside stored
+    // documents. Either one absent leaves its minter with nothing to bump, and
+    // only in upgraded workspaces, so a freshly created one would look fine.
+    expect(metaValue('local_review_id_high_water')).toBe('999999999')
+    expect(metaValue('local_entity_id_high_water')).toBe('8999999999999')
+    // The literals above are one below each band's first legal value, spelled
+    // out so a drift in either the seed or the band itself is loud. These two
+    // lines record which relation the literals stand for.
+    expect(metaValue('local_review_id_high_water')).toBe(String(LOCAL_REVIEW_ID_BASE - 1))
+    expect(metaValue('local_entity_id_high_water')).toBe(String(LOCAL_ENTITY_ID_BASE - 1))
+  })
+
+  test('the six local tables carry exactly the expected columns, in declaration order', () => {
+    const store = open()
+    store.close()
+
+    // `PRAGMA table_info` returns columns in DECLARATION order, so comparing the
+    // mapped rows as an array pins the order and not merely the membership: a
+    // reordering changes what `SELECT *` yields and what a positional INSERT
+    // means, and it lands here as a red rather than as a wrong column later.
+    //
+    // Four facts in this table are load-bearing beyond the names:
+    //   - `id` reports `notnull: 0` because `INTEGER PRIMARY KEY` is the rowid
+    //     alias. It cannot actually hold NULL — but omitting it on insert makes
+    //     SQLite assign 1, a value squarely inside the pull-request number range
+    //     this whole keyspace exists to stay out of, so the id is always supplied.
+    //   - `generation` must be present and refuse NULL: it is the fourth column
+    //     of the unique key and the only escape hatch from an otherwise
+    //     one-way branch-pair identity, and nothing in the current behaviour
+    //     touches it, so this is the only assertion that can notice it vanish.
+    //   - `dirty` refuses NULL and defaults to 0, so a review created before
+    //     anything computes worktree state reads as clean rather than unknown.
+    //   - `archived_pr` stays nullable with no default: absent means "no pull
+    //     request has superseded this review", which is a real state and not a
+    //     missing value.
+    expect(columnShape('local_reviews')).toEqual([
+      { name: 'id', type: 'INTEGER', notnull: 0, dflt: null, pk: 1 },
+      { name: 'repo', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+      { name: 'base_ref', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+      { name: 'head_ref', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+      { name: 'generation', type: 'INTEGER', notnull: 1, dflt: '0', pk: 0 },
+      { name: 'title', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+      { name: 'base_sha', type: 'TEXT', notnull: 0, dflt: null, pk: 0 },
+      { name: 'merge_base_sha', type: 'TEXT', notnull: 0, dflt: null, pk: 0 },
+      { name: 'head_sha', type: 'TEXT', notnull: 0, dflt: null, pk: 0 },
+      { name: 'dirty', type: 'INTEGER', notnull: 1, dflt: '0', pk: 0 },
+      { name: 'archived_pr', type: 'INTEGER', notnull: 0, dflt: null, pk: 0 },
+      { name: 'created_at', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+      { name: 'updated_at', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+      { name: 'last_synced_at', type: 'TEXT', notnull: 0, dflt: null, pk: 0 },
+    ])
+
+    expect(columnShape('local_snapshots')).toEqual([
+      { name: 'local_id', type: 'INTEGER', notnull: 0, dflt: null, pk: 1 },
+      { name: 'data', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+    ])
+
+    expect(columnShape('local_threads')).toEqual([
+      { name: 'local_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 1 },
+      { name: 'thread_id', type: 'TEXT', notnull: 1, dflt: null, pk: 2 },
+      { name: 'data', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+    ])
+
+    // `review_id` is declared INTEGER, never REAL: the ids stored here come from
+    // a band around 9e12, and a float column round-trips such a value without
+    // complaint while losing its low bits — a corruption no value-equality
+    // assertion on a smaller id would ever surface.
+    expect(columnShape('local_reviews_submitted')).toEqual([
+      { name: 'local_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 1 },
+      { name: 'review_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 2 },
+      { name: 'data', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+    ])
+
+    // Both per-human tables index `human_id` FIRST, mirroring the pull-request
+    // keyed pair they copy. That is what makes a read for one human cheap and a
+    // sweep of everything belonging to one review a scan.
+    expect(columnShape('local_drafts')).toEqual([
+      { name: 'human_id', type: 'TEXT', notnull: 1, dflt: null, pk: 1 },
+      { name: 'local_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 2 },
+      { name: 'data', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+    ])
+
+    expect(columnShape('local_viewed')).toEqual([
+      { name: 'human_id', type: 'TEXT', notnull: 1, dflt: null, pk: 1 },
+      { name: 'local_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 2 },
+      { name: 'data', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
+    ])
+  })
+
+  test('the step rebuilds no table the earlier versions own', () => {
+    const store = open()
+    store.putDraft(draft('h1', 204, 'work in a table that must not be rebuilt'))
+    store.close()
+    reduceToPreLocalFile()
+
+    const before = preLocalDdl()
+    // The scanned set needs its own positive control: a capture that silently
+    // matched nothing would compare equal to another empty capture and prove
+    // exactly nothing about the tables it was supposed to watch.
+    expect(before.map((r) => r.name)).toEqual([...PRE_LOCAL_TABLES])
+
+    const reopened = open()
+    reopened.close()
+
+    // Byte-identical stored DDL, table for table: no primary key altered and no
+    // table rebuilt. A rebuild is how a migration wipes drafts, and SQLite offers
+    // no way to widen a primary key without one — which is why the local keyspace
+    // is a parallel set of tables instead of a wider key on the existing ones.
+    expect(preLocalDdl()).toEqual(before)
+  })
+
+  test('the migration ladder carries a guarded step for every version it claims to reach', () => {
+    const source = readFileSync(new URL('./store.ts', import.meta.url), 'utf8')
+
+    // Structural rather than behavioral, and weaker on purpose: it proves the
+    // step is WRITTEN, not that it RUNS. The create-when-absent shape at the top
+    // of `migrate` runs on every open and the version stamp moves forward
+    // regardless, so a version bump with no matching guarded step behaves
+    // identically to one with it — no runtime assertion can tell them apart.
+    // What the step buys is the next migration: without it there is no record
+    // that the shape changed, and a later reordering of `migrate` has nothing to
+    // preserve. Expressed as a loop up to the current version so the next bump
+    // inherits the pin instead of needing this test rewritten.
+    expect(STORE_VERSION).toBeGreaterThanOrEqual(2)
+    for (let n = 2; n <= STORE_VERSION; n += 1) {
+      // Anchored on the statement, opening brace included, so a docstring that
+      // merely describes the guard shape cannot satisfy the pin.
+      expect(source).toContain(`if (current < ${n}) {`)
+    }
   })
 })
 

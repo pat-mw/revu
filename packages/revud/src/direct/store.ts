@@ -10,7 +10,11 @@ import type {
   Snapshot,
   SnapshotImmutable,
 } from '@revu/shared'
-import { DEFAULT_PREFERENCES } from '@revu/shared'
+import {
+  DEFAULT_PREFERENCES,
+  LOCAL_ENTITY_ID_BASE,
+  LOCAL_REVIEW_ID_BASE,
+} from '@revu/shared'
 
 /**
  * The durable, disk-backed store for direct mode.
@@ -51,7 +55,8 @@ import { DEFAULT_PREFERENCES } from '@revu/shared'
  *     during normal operation — the host-side collector correlates the workspace
  *     that opened each PR to its driving human and writes this row. The store
  *     surface is the durable seam the poll loop reads through.
- *   - `meta` — the single `store_version` row that drives migrate-in-place.
+ *   - `meta` — the `store_version` row that drives migrate-in-place, plus the
+ *     monotonic id high-water marks the local keyspace allocates from.
  *
  * Absent vs unreadable: a genuinely missing row reads back as `null` (never
  * synced / no draft yet — the correct empty answer). A row that EXISTS but whose
@@ -62,7 +67,7 @@ import { DEFAULT_PREFERENCES } from '@revu/shared'
  */
 
 /** The on-disk schema version. Bump this and add a migration step when the shape changes. */
-export const STORE_VERSION = 3
+export const STORE_VERSION = 4
 
 /** A stored row could not be read back: the row EXISTS but its JSON is corrupt. */
 export class StoreUnreadableError extends Error {
@@ -614,6 +619,138 @@ const CREATE_PR_AUTHOR =
   'human_id TEXT, recorded_at TEXT NOT NULL)'
 
 /**
+ * The local-review keyspace: reviews of a branch pair that has no pull request.
+ *
+ * A parallel set of tables rather than a wider key on the existing ones, and
+ * that is forced rather than chosen. The pull-request-keyed tables are keyed by
+ * a real GitHub pull-request number, read as such by the host-side collector and
+ * the broker's poll loop; a synthetic identifier written into one of those
+ * columns is not a wrong row that surfaces later but a row those readers cannot
+ * tell from a real one. Widening their keys instead would mean altering a primary
+ * key, which SQLite cannot do without rebuilding the table — and rebuilding a
+ * table is exactly what this file's migration doctrine forbids, because that is
+ * how a migration wipes drafts.
+ *
+ * `immutables` and `blobs` are reused untouched: both are content-addressed by
+ * SHAs git produces locally, so neither knows or cares whether a comparison came
+ * from a pull request. Nothing here writes `audit_log` or `pr_author`, and that
+ * invisibility to the audit journal is deliberate — the journal records writes
+ * that reached a client's repository under a shared identity, and a local review
+ * reaches no repository at all.
+ *
+ * `repo` is part of the key from the first row. The pull-request-keyed tables are
+ * repo-blind, which only collides when the same pull-request number exists in two
+ * repositories sharing one data directory; branch names collide far more readily,
+ * since `main` and `feature/x` exist in nearly every repository.
+ */
+const CREATE_LOCAL_REVIEWS =
+  'CREATE TABLE IF NOT EXISTS local_reviews (id INTEGER PRIMARY KEY, ' +
+  'repo TEXT NOT NULL, base_ref TEXT NOT NULL, head_ref TEXT NOT NULL, ' +
+  'generation INTEGER NOT NULL DEFAULT 0, title TEXT NOT NULL, ' +
+  'base_sha TEXT, merge_base_sha TEXT, head_sha TEXT, ' +
+  'dirty INTEGER NOT NULL DEFAULT 0, archived_pr INTEGER, ' +
+  'created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_synced_at TEXT, ' +
+  'UNIQUE(repo, base_ref, head_ref, generation))'
+
+/**
+ * The envelope half of a local review's snapshot, keyed by the local id. The
+ * immutable half lands in `immutables` under its own compareKey, exactly as a
+ * pull request's does, so a local review and a pull request over the same
+ * comparison share one cached copy of the expensive half.
+ */
+const CREATE_LOCAL_SNAPSHOTS =
+  'CREATE TABLE IF NOT EXISTS local_snapshots (local_id INTEGER PRIMARY KEY, data TEXT NOT NULL)'
+
+/** Review threads on a local review, keyed by the local id and the thread id. */
+const CREATE_LOCAL_THREADS =
+  'CREATE TABLE IF NOT EXISTS local_threads (local_id INTEGER NOT NULL, ' +
+  'thread_id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (local_id, thread_id))'
+
+/**
+ * Submitted review summaries on a local review. `review_id` is declared INTEGER
+ * and must stay INTEGER: the ids stored here come from a band around 9e12, and a
+ * REAL column round-trips such a value without complaint while losing its low
+ * bits.
+ */
+const CREATE_LOCAL_REVIEWS_SUBMITTED =
+  'CREATE TABLE IF NOT EXISTS local_reviews_submitted (local_id INTEGER NOT NULL, ' +
+  'review_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (local_id, review_id))'
+
+/**
+ * Per-human review drafts and per-human per-file viewed state on a local review,
+ * keyed exactly as their pull-request-keyed counterparts are: `human_id` first,
+ * supplied by the session and overwritten on write, so one human can never write
+ * another's row. The key order indexes `human_id` first, which makes a read for
+ * one human cheap and makes removing everything belonging to one local review a
+ * scan — small at these row counts, and noted rather than indexed against a need
+ * nobody has measured.
+ */
+const CREATE_LOCAL_DRAFTS =
+  'CREATE TABLE IF NOT EXISTS local_drafts (human_id TEXT NOT NULL, ' +
+  'local_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (human_id, local_id))'
+
+const CREATE_LOCAL_VIEWED =
+  'CREATE TABLE IF NOT EXISTS local_viewed (human_id TEXT NOT NULL, ' +
+  'local_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (human_id, local_id))'
+
+/**
+ * The `meta` key holding the highest review id ever handed out for a local
+ * review, and the one holding the highest locally minted entity id.
+ *
+ * A HIGH-WATER MARK, not a row count and not `MAX(id) + 1`. The difference only
+ * shows up after a delete: `MAX(id) + 1` re-issues the id of the review that was
+ * just removed, so any dependent row the delete happened to miss is silently
+ * adopted by an unrelated new review. A mark that only ever moves up makes that
+ * impossible however thorough the delete turns out to be.
+ *
+ * The entity mark lives in `meta` rather than being scanned out of a column
+ * because locally minted comment ids live INSIDE the stored review-thread
+ * documents; recovering the maximum would mean parsing every thread row. Both
+ * marks are durable for the same reason: an id must never be re-issued across a
+ * restart, and only the disk survives one.
+ *
+ * Exported so every reader spells the key the same way. These strings are an
+ * on-disk contract: renaming one orphans the row in every file already written,
+ * and the next allocator to look for it finds nothing to bump.
+ */
+export const LOCAL_REVIEW_ID_META_KEY = 'local_review_id_high_water'
+export const LOCAL_ENTITY_ID_META_KEY = 'local_entity_id_high_water'
+
+/**
+ * Seed both marks one below the first legal value of their band, so the first
+ * read-and-bump yields the base itself.
+ *
+ * `DO NOTHING` on conflict, because a high-water mark is STATE rather than shape:
+ * re-asserting the seed over a file that has already handed out ids would hand
+ * the next caller an id it has already issued. Written as `ON CONFLICT` rather
+ * than as a blanket ignoring insert so a constraint violation still aborts
+ * loudly instead of being indistinguishable from a skipped duplicate.
+ */
+const SEED_ID_HIGH_WATER =
+  'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING'
+
+function seedLocalIdHighWaterMarks(db: Database): void {
+  db.run(SEED_ID_HIGH_WATER, [LOCAL_REVIEW_ID_META_KEY, String(LOCAL_REVIEW_ID_BASE - 1)])
+  db.run(SEED_ID_HIGH_WATER, [LOCAL_ENTITY_ID_META_KEY, String(LOCAL_ENTITY_ID_BASE - 1)])
+}
+
+/**
+ * Create the local keyspace's six tables when absent. One function called from
+ * the create-when-absent shape at the top of `migrate` and again from the guarded
+ * step that introduces the keyspace, so the fresh-file shape and the in-place
+ * upgrade cannot drift: each statement exists once, and the list of statements to
+ * run exists once.
+ */
+function createLocalTables(db: Database): void {
+  db.run(CREATE_LOCAL_REVIEWS)
+  db.run(CREATE_LOCAL_SNAPSHOTS)
+  db.run(CREATE_LOCAL_THREADS)
+  db.run(CREATE_LOCAL_REVIEWS_SUBMITTED)
+  db.run(CREATE_LOCAL_DRAFTS)
+  db.run(CREATE_LOCAL_VIEWED)
+}
+
+/**
  * Create tables if absent and migrate an older store IN PLACE. Migration never
  * drops or reseeds a table — that would wipe drafts — it only creates missing
  * tables and adds columns/defaults, then stamps the current `store_version`.
@@ -662,13 +799,23 @@ function migrate(db: Database): void {
   // statement for an existing version-1 or version-2 file.
   db.run(CREATE_PR_AUTHOR)
 
+  // Version 4 shape: the local-review keyspace. Created-when-absent like every
+  // table above; the guarded ladder below runs the same statements for a file
+  // stamped at any earlier version.
+  createLocalTables(db)
+
   const row = db.query("SELECT value FROM meta WHERE key = 'store_version'").get() as
     | { value: string }
     | null
   const current = row ? Number(row.value) : null
 
   if (current === null) {
-    // Fresh file: stamp the current version. (No data to migrate.)
+    // Fresh file: seed the local id high-water marks and stamp the current
+    // version. (No data to migrate.) The marks are seeded on the two paths where
+    // a starting value is legitimate — a brand-new file, and a file crossing into
+    // the version that introduces them — and never re-asserted over a file that
+    // already carries them, so a mark that has moved is never walked back.
+    seedLocalIdHighWaterMarks(db)
     db.run(
       "INSERT INTO meta (key, value) VALUES ('store_version', ?) " +
         'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
@@ -701,6 +848,22 @@ function migrate(db: Database): void {
     // step; no existing row is read or rewritten, so drafts, viewed state, and
     // the audit journal survive untouched.
     db.run(CREATE_PR_AUTHOR)
+  }
+
+  if (current < 4) {
+    // v3 → v4: add the local-review keyspace and the two id high-water marks its
+    // minters read and bump. Purely additive — the idempotent CREATEs (already
+    // run above for the current shape) plus two `meta` rows; no existing row is
+    // read or rewritten, so drafts, viewed state, the audit journal and the
+    // attribution table all survive untouched.
+    //
+    // The marks are seeded HERE as well as on the fresh-file path because a file
+    // written before this shape existed carries neither, and a minter with no row
+    // to bump cannot allocate an id at all. Seeding only the fresh-file path
+    // would open that hole exclusively for upgraded workspaces while every newly
+    // created one kept working — a failure the common case cannot surface.
+    createLocalTables(db)
+    seedLocalIdHighWaterMarks(db)
   }
 
   if (current < STORE_VERSION) {
