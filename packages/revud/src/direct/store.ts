@@ -58,8 +58,57 @@ import {
  *     during normal operation — the host-side collector correlates the workspace
  *     that opened each PR to its driving human and writes this row. The store
  *     surface is the durable seam the poll loop reads through.
+ *   - `local_reviews` — one review of a branch pair that has no pull request,
+ *     per `(repo, base_ref, head_ref, generation)`. Its id is minted from a
+ *     monotonic high-water mark rather than left to the row id, so an id is
+ *     never re-issued after a review is removed and a dependent row that
+ *     outlived its review can never be adopted by an unrelated one.
+ *   - `local_snapshots` — the envelope half of a local review's snapshot. The
+ *     immutable half lands in the shared `immutables` table under the same
+ *     `compareKey`, so a local review and a pull request over the same
+ *     comparison share one stored copy of the expensive half.
+ *   - `local_drafts` / `local_viewed` — the per-human, per-local-review twins of
+ *     `drafts` and `viewed`. Their composite key names the human first, so
+ *     removing everything belonging to one review scans rather than seeks;
+ *     recorded here rather than answered with an index nobody has measured a
+ *     need for.
+ *   - `local_threads` — review threads created against a local review, keyed by
+ *     `(local_id, thread_id)` and rewritten in place, so resolving a thread
+ *     leaves one row rather than two copies in two states.
+ *   - `local_reviews_submitted` — the review summaries submitted against a local
+ *     review, keyed by `(local_id, review_id)`.
  *   - `meta` — the `store_version` row that drives migrate-in-place, plus the
  *     monotonic id high-water marks the local keyspace allocates from.
+ *
+ * The local tables carry a repository identity and the pull-request tables do
+ * not, which looks inconsistent until the keys are compared. Two repositories
+ * sharing one data directory collide on a pull-request number only when the same
+ * number happens to exist in both; they collide on branch names constantly,
+ * because `main` and `feature/x` exist in nearly every repository. So the
+ * repository is part of the local key from the first row rather than a widening
+ * a later migration would have to perform. The store is TOLD that identity — it
+ * is `owner/name` for a workspace with a parseable GitHub remote and the
+ * repository root's absolute path otherwise — because resolving it needs git,
+ * which is not this layer's concern.
+ *
+ * The local path writes NONE of the three tables whose integer key is a real
+ * GitHub pull-request number: `snapshots`, `audit_log` and `pr_author`. The
+ * reserved band a local id is minted from keeps it out of the range a pull
+ * request could occupy, but that is a convenience for the layers above and never
+ * a licence to store a synthetic id in a column that means "pull request N".
+ * Three readers interpret those columns as pull requests that exist on GitHub:
+ * the comment-author assembly on the sync path, the poll loop's per-pull
+ * annotation lookup, and the out-of-band-write detector — whose meaning, "writes
+ * that reached the client repository", a local row would falsify outright. Those
+ * columns accept an integer of any provenance without complaint, so nothing in
+ * the schema refuses the mistake and the damage would surface far from the
+ * statement that caused it.
+ *
+ * A local review is therefore invisible to the write journal, and that is
+ * deliberate rather than a gap. The journal attests writes that reached the
+ * client repository under a shared identity; a local review never reaches it, so
+ * there is nothing to attest, and a row claiming otherwise would make the
+ * journal wrong rather than more complete.
  *
  * Absent vs unreadable: a genuinely missing row reads back as `null` (never
  * synced / no draft yet — the correct empty answer). A row that EXISTS but whose

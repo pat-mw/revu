@@ -2118,6 +2118,82 @@ function writeErrorFrom(fn: () => void): StoreWriteError {
   throw new Error('expected a StoreWriteError; the statement completed instead')
 }
 
+/**
+ * The substring every method of the local keyspace carries in its name. One
+ * literal serves two filters — the type below narrows the interface with it, and
+ * the sweep narrows its record of driven calls with it — so the two cannot drift
+ * into agreeing with each other however wrong either becomes. A marker that
+ * stopped matching would empty the type, and the total map below would then
+ * refuse its own entries at compile time.
+ */
+const LOCAL_METHOD_MARKER = 'Local'
+
+/** Every `DirectStore` method that belongs to the local-review keyspace. */
+type LocalStoreMethod = Extract<
+  keyof DirectStore,
+  `${string}${typeof LOCAL_METHOD_MARKER}${string}`
+>
+
+/**
+ * The local surface the sweep must exercise, written as a TOTAL map over the
+ * interface's own local methods rather than as a list kept in step by hand.
+ *
+ * This is what makes the coverage derived instead of restated. A local method
+ * added to `DirectStore` later turns this literal into a missing-property
+ * compile error, and a name here the interface does not declare turns it into an
+ * excess-property one — so the set cannot silently fall behind the surface it
+ * claims to cover. The sweep then compares the methods it ACTUALLY called
+ * against these keys, which closes the other half: the type knows what exists
+ * but not what ran, and the call record knows what ran but not what exists.
+ */
+const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
+  createLocalReview: true,
+  getLocalReview: true,
+  listLocalReviews: true,
+  patchLocalReviewSync: true,
+  nextLocalEntityId: true,
+  getLocalSnapshot: true,
+  putLocalSnapshot: true,
+  getLocalDraft: true,
+  putLocalDraft: true,
+  deleteLocalDraft: true,
+  getLocalViewed: true,
+  setLocalViewed: true,
+  listLocalThreads: true,
+  getLocalThread: true,
+  putLocalThread: true,
+  listLocalSubmittedReviews: true,
+  putLocalSubmittedReview: true,
+}
+
+/** The local method names, sorted, as the interface declares them. */
+function declaredLocalMethods(): string[] {
+  return Object.keys(LOCAL_STORE_METHODS).sort()
+}
+
+/**
+ * Wrap a store so that every method call is recorded by name, and hand back both
+ * the wrapper and the record.
+ *
+ * The record is taken from the calls themselves rather than written down beside
+ * them: a sweep that stops driving a method loses it from this set, where a
+ * hand-kept note of what the sweep "covers" would go on claiming it forever.
+ */
+function recordingStore(store: DirectStore): { store: DirectStore; driven: Set<string> } {
+  const driven = new Set<string>()
+  const proxy = new Proxy(store, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop)
+      if (typeof prop !== 'string' || typeof value !== 'function') return value
+      return (...args: unknown[]): unknown => {
+        driven.add(prop)
+        return (value as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    },
+  })
+  return { store: proxy, driven }
+}
+
 describe('local writes never touch a PR-keyed table', () => {
   test('the harness arms nine tripwires and nothing else', () => {
     const armed = armPrKeyedTripwires(open())
@@ -2312,5 +2388,85 @@ describe('local writes never touch a PR-keyed table', () => {
     }
     check.close()
     expect(Number(after.value)).toBe(STORE_VERSION)
+  })
+
+  /**
+   * The containment proof. Every method of the local keyspace runs end to end
+   * against a store whose three PR-keyed tables are armed, and the claim is that
+   * not one statement any of them issues reaches one of those tables.
+   *
+   * A fired tripwire aborts the statement and surfaces as a `StoreWriteError`
+   * naming the trigger, so the sweep completing IS the assertion — there is no
+   * separate "and nothing was written" check to weaken. Deliberately no
+   * `COUNT(*) = 0` beside it: a count cannot tell a table nothing wrote from one
+   * that was written and then cleaned up, nor see a write inside a transaction
+   * that later rolled back, which is precisely the gap the triggers close.
+   *
+   * It sits in this block on purpose. The armed assertions above prove the
+   * tripwires still fire; an absence proved by a harness that quietly stopped
+   * arming reads exactly like an absence proved by a working one, so the proof
+   * and its control fail in the same run or neither is worth anything.
+   */
+  test('every local method runs end to end without firing one tripwire', () => {
+    const armed = armPrKeyedTripwires(open())
+    const { store, driven } = recordingStore(armed)
+
+    const review = store.createLocalReview(newLocalReview({}))
+    const id = review.id
+    expect(id).toBeGreaterThanOrEqual(LOCAL_REVIEW_ID_BASE)
+    expect(store.getLocalReview(id)!.headRef).toBe('refs/heads/feature/x')
+    expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([id])
+
+    const entityId = store.nextLocalEntityId()
+    expect(entityId).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+
+    store.putLocalSnapshot(snapshot(id, 'base...head'))
+    expect(store.getLocalSnapshot(id)!.immutable.compareKey).toBe('base...head')
+
+    store.putLocalDraft(draft('h1', id, 'unsubmitted text on a local review'))
+    expect(store.getLocalDraft('h1', id)!.body).toBe('unsubmitted text on a local review')
+
+    store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+    expect(store.getLocalViewed('h1', id)['a.ts']!.viewed).toBe(true)
+
+    store.putLocalThread(id, localThread('t-a'))
+    expect(store.getLocalThread(id, 't-a')!.id).toBe('t-a')
+    expect(store.listLocalThreads(id).map((t) => t.id)).toEqual(['t-a'])
+
+    store.putLocalSubmittedReview(id, submittedReview(entityId))
+    expect(store.listLocalSubmittedReviews(id).map((r) => r.id)).toEqual([entityId])
+
+    store.patchLocalReviewSync(id, syncState())
+    expect(store.getLocalReview(id)!.headSha).toBe('head-sha')
+
+    store.deleteLocalDraft('h1', id)
+    expect(store.getLocalDraft('h1', id)).toBeNull()
+
+    armed.close()
+
+    // Read back out of the calls that actually happened and compared against the
+    // interface's own local surface, so a method added to `DirectStore` and left
+    // out of the drive above turns this red instead of quietly going unswept.
+    expect([...driven].filter((name) => name.includes(LOCAL_METHOD_MARKER)).sort()).toEqual(
+      declaredLocalMethods(),
+    )
+  })
+
+  test('the swept surface is the store\'s own local surface, not a list beside it', () => {
+    const store = open()
+    const onTheStore = Object.keys(store)
+      .filter((name) => name.includes(LOCAL_METHOD_MARKER))
+      .sort()
+    store.close()
+    expect(onTheStore).toEqual(declaredLocalMethods())
+  })
+
+  test('the local surface is seventeen methods', () => {
+    // An independent literal, not another expression over the same map. Every
+    // other coverage check here compares two derived sets, and derived sets stay
+    // in agreement through a method deleted from the interface, the map and the
+    // sweep together — a hardcoded count is the only one of these that notices
+    // the swept surface silently shrinking. Changing it is a deliberate act.
+    expect(declaredLocalMethods()).toHaveLength(17)
   })
 })
