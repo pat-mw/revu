@@ -5,6 +5,112 @@ act from it alone.
 
 ---
 
+## 2026-08-17 — Session 4 (the daemon) — **IN FLIGHT: M8.2 ∥ M8.3 ∥ M8.4, three concurrent lanes**
+
+> **This entry is live and was written at dispatch time, not at session end** — so it is accurate about what
+> is running and *deliberately* silent about outcomes. `BOARD.md`'s **In flight right now** is the
+> minute-to-minute truth; this entry is the why. No §5 stop condition has been hit.
+
+### Start here
+
+1. `git checkout m8.2/store-v4` — it is pushed and is the base of the three new lanes.
+2. `bun run check` — the baseline at `d0cc1d0` was **1611 pass · 1 skip · 0 fail · 83 files**, re-verified this
+   session. The 1 skip is pre-existing. **Two guard files are deliberately red mid-lane** — see below — so a
+   red count on exactly `local-no-github.test.ts` or `local-write-isolation.test.ts` is the intended state,
+   not a broken gate.
+3. Read `BOARD.md`'s **In flight right now**: it carries the three lane branches and each lane's serial unit
+   chain. Resume by re-dispatching whichever unit that table says is in flight.
+
+### The three lanes, and why the width is where it is
+
+**M8.2, M8.3 and M8.4 are mutually independent, each needs only M8.1, and they own genuinely disjoint file
+sets** — `direct/store.ts` vs `local-git*`/`local-sync*`/`blobs*` vs `local-writes*`/`local-ids*`. So three
+workers run against each other continuously. **The width lost is entirely *inside* each ticket**, where the
+units are serial on one or two shared files:
+
+| lane | branch | chain — execution order, not numbering |
+| --- | --- | --- |
+| A — M8.2 | `m8.2/store-v4` | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — fully serial; `.1`–`.6` all write `store.ts` and `.7` shares `store.test.ts` |
+| B — M8.3 | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` |
+| C — M8.4 | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` |
+
+**The roadmap's S3 table was not dispatched.** It plans `3 → 4 → 6 → 6 → 4 → 2 → 1 → 1` on the assumption
+that the orchestrator can merge two workers' versions of one file; it cannot, because integration is by
+copying whole files out of isolated worktrees. The corrected widths and the four collisions are in the
+2026-08-17 Session 3 entry below. **M8.4.7 ∥ M8.4.9 is the dangerous one** — the roadmap marks it isolation
+"none", and the two units write exactly one file each and it is the same file.
+
+### Branch topology — all three start at the same commit, on purpose
+
+`main` → `m8/local-reviews-design` (#69) → `m8.1` (#70) → `m8.6` (#71) → `m8.7` (#72) → **`m8.2` → `m8.3` →
+`m8.4`**. The three new branches all start at **`96b63de`** (the dispatch commit on `m8.2`, itself on
+`d0cc1d0`) because they run concurrently. **Each is rebased onto its true base before its PR opens**, per
+`SESSION_PROTOCOL.md` §6 — the file sets are disjoint, so the rebases are mechanical, but the gate must be
+**re-run after each rebase** because a mechanical rebase is not a proof.
+
+`m8.6/app-creation-flow` was one commit ahead of its remote; **it is now pushed**, so `0c17be9` sits in #71's
+range instead of riding in #72's. Every ref is pushed. `main` is untouched at `177068a`.
+
+### ⚠️ Two guard rails land RED and that is the protocol, not a mistake
+
+`SESSION_PROTOCOL.md` §4 requires a guard rail to land *before* the code it constrains, and both of these
+assert their target modules **exist** — which is exactly what stops them passing vacuously on a tree where
+there is nothing to scan:
+
+- **M8.3.8** (`local-no-github.test.ts`) is red until M8.3.1 and M8.3.2 create `local-git.ts` /
+  `local-git-argv.ts` / `local-sync.ts`.
+- **M8.4.6** (`local-write-isolation.test.ts`) is red until all four files it scans exist — green at M8.4.2.
+- **M8.2.7 is the exception**: it arms nine tripwires on *today's* store, so it lands **green** and armed.
+
+The deliberate red is recorded per commit in each ticket's `## Log`. Anyone who "fixes" one of these by
+weakening the existence assertion has destroyed the guard while leaving it green.
+
+### Rulings propagated into the ticket text this session — the prose, not just the Rulings section
+
+The rulings were already recorded in each ticket's `## Rulings`, but the **unit text a worker actually
+implements from still contradicted them**. A worker reading only its own unit section would have implemented
+the overruled behaviour. Now fixed in the files:
+
+- **M8.2 Goal and M8.2.2's Do said `COALESCE(MAX(id), …) + 1`.** R-B overrules it: ids come from monotonic
+  high-water marks in `meta`. Also propagated: M8.2.1 seeds **two** `meta` rows (review-id *and* entity-id
+  high-water), not one, and the unique key carries R-A's `generation` discriminator.
+- **A discriminating assertion was missing entirely.** Every other assertion in M8.2.2's Check passes
+  *identically* under `MAX(id)+1` and under a high-water mark, so R-B would have landed unguarded. Added: mint
+  two reviews, raw-`DELETE` the newer row, mint a third — its id must be **strictly greater** than the deleted
+  one. `MAX(id)+1` reissues and goes red. This is the sixth measured instance of a guard that would have
+  asserted nothing, and it was found by asking "which assertion here would fail if the ruling were ignored?"
+- **M8.3.6's Do said `git status --porcelain=v1`** with the flag left to git's default. R-B settles it as
+  `-uno`, and the untracked-file Check case now takes `'clean'` explicitly. Noted there that the behavioral
+  case and the argv assertion are **not** redundant: a `-uall` build whose untracked fixture happened to be
+  `.gitignore`d would pass the behavioral case alone.
+
+### Decisions not to relitigate
+
+- **Integration is serial even though the work is parallel.** One main tree, and `bun run check` ends in a
+  repo-wide `vite build`, so gates cannot overlap. Worker time is what parallelises; that is the win.
+- **Every unit goes to an isolated worktree with a mandatory STEP ZERO** (`git log` → `git merge --ff-only
+  <tip>` → `bun install`), because a worktree is created at the repo's BASE commit with no `node_modules` and
+  any result produced before that is void.
+- **Workers never commit.** The orchestrator copies whole files out of the worktree, gates in the main tree,
+  and commits. Never trust a gate run in a worker's tree.
+- **Within a lane, a unit is integrated before the next unit of that lane is dispatched**, because they share
+  files. This is what makes the serial chains real rather than advisory.
+
+### Still unruled, and not this session's to decide
+
+**M8.12 OQ1** (a server-authoritative delete force has nowhere to live in the frozen route set) and
+**M8.10 OQ4** (what `deleteLocalReview` must prove it removes). Both bite at M8.10, neither blocks this
+session. R-B removes M8.10 OQ4's grip on M8.2 but does not close it.
+
+### Two findings still open against M8.1, handed over by the app track and NOT absorbed
+
+Restated because the mock is the specification, so neither is cosmetic, and neither has an owner yet:
+**`dirty: true` is unrepresentable** (no fixture sets it, so the dirty banner's data path has never executed
+against a true value anywhere — one seeded fixture closes it), and **the mock emits a session shape the real
+daemon never produces** (`viewerLogin` omitted while `brokerLogin` is set).
+
+---
+
 ## 2026-08-17 — Session 3 (the app, finished) — **M8.7 COMPLETE and in review on #72**
 
 > **Read this section and the _Standing rulings_ in the 2026-08-14 entry below; both are live.** Nothing is in
