@@ -105,8 +105,36 @@
  * means "there is no text diff to show" and an empty string would mean "the diff
  * is empty", two different claims. Binary files additionally report `-` for both
  * line counts, which become zero.
+ *
+ * ## Commits come back oldest first, because that is the order they are sliced in
+ *
+ * git prints history newest first. The list this module produces is read by
+ * finding a known commit in it and taking everything *after* that position, to
+ * answer "what landed since this draft was written" — an expression that is only
+ * correct while the list runs forwards. Handed a newest-first list, the same
+ * expression returns the commits that came *before* the known one and reports
+ * them as the new ones: a wrong answer shaped exactly like a right one, with
+ * nothing anywhere to notice it. The reversal is asked of git rather than
+ * applied afterwards, so the order is a property of the read.
+ *
+ * ## The pull shape is synthesized, and the address is never in it
+ *
+ * A local review has no pull request behind it, so the shape every surface
+ * downstream of a snapshot reads is built here instead of fetched. Every field
+ * takes a value that shape already declares legal — an unknown mergeable state,
+ * no merge, no requested reviewers — and its author is a sentinel carrying the
+ * reviewer's display **name**. The configured address is the key a person's
+ * stored state is filed under, so it belongs in no document that is handed out;
+ * this module never even asks git for it.
  */
-import type { PullFile, SnapshotImmutable } from '@revu/shared'
+import type {
+  CommitInfo,
+  GhRef,
+  GhUser,
+  PullDetail,
+  PullFile,
+  SnapshotImmutable,
+} from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import { runGit } from './local-git'
 
@@ -881,4 +909,418 @@ export async function readLocalChangeSet(
   const patches = await readLocalPatchSections(runner, cwd, range)
   if (!patches.ok) return patches
   return buildLocalChangeSet(diff.diff, counts.records, patches.sections)
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// The commits the range contains, oldest first.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * The record format the commit read asks for, and never git's default.
+ *
+ * Six fields per commit — the object name, its parents, the author's name and
+ * address, the author date, and the raw message — separated by NUL, written as
+ * git's own `%x00` escape rather than as a byte in this file. A NUL cannot occur
+ * in an object name, an address or a date, and git will not let one into a
+ * message, so no field needs escaping and none can be split by a message that
+ * happens to contain a newline or a tab. The default output is a human-facing
+ * shape no compatibility promise fixes; parsing it would mean parsing whatever
+ * the installed git happens to print.
+ */
+const COMMIT_LOG_FORMAT = '%H%x00%P%x00%an%x00%ae%x00%aI%x00%B'
+
+/**
+ * How many NUL-terminated fields one commit record spans: the five the format
+ * separates, plus the message, which the record terminator closes.
+ */
+const COMMIT_LOG_FIELDS = 6
+
+/** git produced output, but not output in the format the commit read asked for. */
+export interface MalformedCommitLog {
+  readonly ok: false
+  readonly reason: 'malformed_commit_log'
+  readonly detail: string
+}
+
+/** The commit read itself failed. Carries the exit code that was observed. */
+export interface CommitLogFailed {
+  readonly ok: false
+  readonly reason: 'commit_log_failed'
+  readonly code: number
+}
+
+export type CommitLogParse =
+  | { readonly ok: true; readonly commits: readonly CommitInfo[] }
+  | MalformedCommitLog
+
+function malformedCommitLog(detail: string): MalformedCommitLog {
+  return { ok: false, reason: 'malformed_commit_log', detail }
+}
+
+/**
+ * The author date in the spelling the API-shaped producer emits: the instant,
+ * in UTC.
+ *
+ * git prints a strict ISO timestamp carrying the author's own UTC offset. That
+ * names the same instant but does not *compare* the same, and comparison is
+ * what this field is used for: readers decide whether a commit landed after a
+ * draft was written by comparing this string against a UTC-spelled one, and an
+ * offset-bearing string sorts wrong against a UTC-spelled string for every
+ * author outside UTC — a commit from an hour before a draft reads as an hour
+ * after it. The comparison is reached whenever a draft's own head has fallen
+ * out of the range, which on a branch that is amended and rebased is the
+ * ordinary case rather than the rare one.
+ *
+ * Nothing is lost by converting: the offset is not information any reader of
+ * this structure has ever had, because the API-shaped producer discards it too,
+ * and both producers' timestamps then compare against each other.
+ *
+ * A value that cannot be read as an instant is carried through unchanged. A
+ * date this cannot parse is a fact about the repository, and replacing it with
+ * a manufactured one would hide it.
+ */
+function authorDate(printed: string): string {
+  const instant = Date.parse(printed)
+  return Number.isNaN(instant) ? printed : new Date(instant).toISOString()
+}
+
+/**
+ * Reads the record stream `COMMIT_LOG_FORMAT` produces into commit entries.
+ *
+ * Every entry's `author` is null. That field names a hosted account, and there
+ * is no account behind a commit made in a local clone — the API-shaped producer
+ * already answers null whenever the service names none, so null is a value the
+ * consumers of this structure have always had to handle rather than a new one
+ * invented here. The person who wrote the commit is not lost: git's own author
+ * name, address and date travel in the commit's own author field, which is
+ * exactly where the API-shaped producer puts them too.
+ *
+ * The message drops the single terminator git stores it with, so a message reads
+ * the same here as it does from the API-shaped producer; nothing else about it
+ * is touched, and a message that genuinely ends in a blank line keeps it. The
+ * author date is converted to UTC for the same reason and with the same care —
+ * see `authorDate`, where the comparison it exists to make correct is named.
+ *
+ * A stream this cannot read is a typed failure rather than a partial list. A
+ * commit list missing entries is not a smaller truth: it is what a reconciler
+ * slices to decide which commits landed after a draft was written, so a dropped
+ * record silently changes that answer.
+ */
+export function parseCommitLogZ(stdout: string): CommitLogParse {
+  const fields = stdout.split('\0')
+  // Every record is NUL-terminated, so splitting leaves one trailing empty string.
+  if (fields[fields.length - 1] === '') fields.pop()
+  if (fields.length % COMMIT_LOG_FIELDS !== 0) {
+    return malformedCommitLog(
+      `${fields.length} field(s) is not a whole number of ${COMMIT_LOG_FIELDS}-field records`,
+    )
+  }
+
+  const commits: CommitInfo[] = []
+  for (let index = 0; index < fields.length; index += COMMIT_LOG_FIELDS) {
+    const [sha, parentNames, name, address, date, body] = fields.slice(
+      index,
+      index + COMMIT_LOG_FIELDS,
+    )
+    // Both object-name checks also catch a stream that is not this format at
+    // all but happens to hold a multiple of six fields: a misread record puts
+    // something that is not an object name where one belongs.
+    if (!OBJECT_NAME.test(sha)) {
+      return malformedCommitLog(`${JSON.stringify(sha)} is not a full-length object name`)
+    }
+    // A root commit has no parents, and git spells that as an empty field
+    // rather than as an absent one.
+    const parents = parentNames.length === 0 ? [] : parentNames.split(' ')
+    const stray = parents.find((parent) => !OBJECT_NAME.test(parent))
+    if (stray !== undefined) {
+      return malformedCommitLog(`${JSON.stringify(stray)} is not a full-length object name`)
+    }
+    commits.push({
+      sha,
+      commit: {
+        message: body.endsWith('\n') ? body.slice(0, -1) : body,
+        author: { name, email: address, date: authorDate(date) },
+      },
+      author: null,
+      parents: parents.map((parent) => ({ sha: parent })),
+    })
+  }
+  return { ok: true, commits }
+}
+
+/**
+ * Reads the commits a range contains, **oldest first**.
+ *
+ * The order is the whole point of the flag that produces it. git prints history
+ * newest first; the list this produces is sliced by finding a known commit in it
+ * and taking everything after that position, which answers "what landed since"
+ * only while the list runs forwards. Reversed, the same expression answers with
+ * the commits *before* the known one and reports them as new — a wrong answer
+ * that looks exactly like a right one.
+ *
+ * Signature reporting is refused rather than inherited. A repository or a user
+ * may ask for every commit's signature to be verified and reported, and git
+ * writes that report to standard output, ahead of the record the format asked
+ * for — so a stream that was configured elsewhere would arrive with prose in
+ * front of its first field.
+ */
+export async function readLocalCommits(
+  runner: CommandRunner,
+  cwd: string,
+  range: LocalDiffRange,
+): Promise<CommitLogParse | CommitLogFailed> {
+  const result = await runGit(runner, cwd, {
+    args: ['log', '--no-show-signature', '--reverse', '-z', `--format=${COMMIT_LOG_FORMAT}`],
+    revs: [`${range.mergeBaseSha}..${range.headSha}`],
+  })
+  if (!result.ok) return { ok: false, reason: 'commit_log_failed', code: result.code }
+  return parseCommitLogZ(result.stdout)
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// The pull shape a local review presents, synthesized rather than fetched.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * The reviewer's display name as the repository records it, or null when it
+ * records none.
+ *
+ * Only the name is ever asked for. The configured address is the key a person's
+ * stored state is filed under, and a key belongs in no document that is handed
+ * out — so this read does not merely decline to copy the address into a body,
+ * it never obtains it.
+ *
+ * Null rather than a stand-in when git cannot say: a repository that names
+ * nobody is a fact the caller can act on, and a fabricated name would be
+ * indistinguishable from a real one.
+ */
+export async function readLocalAuthorName(
+  runner: CommandRunner,
+  cwd: string,
+): Promise<string | null> {
+  const result = await runGit(runner, cwd, { args: ['config', '--get', 'user.name'] })
+  if (!result.ok) return null
+  const name = result.stdout.trim()
+  return name.length > 0 ? name : null
+}
+
+/**
+ * The sentinel author everything a local review produces is attributed to.
+ *
+ * The display name rides in the login field, the only name-shaped field the
+ * account shape has; the bot type marks it as not a genuine hosted account; the
+ * URLs are empty because there is no page anywhere to link to; and the id is
+ * zero, which sits outside every real band, since hosted account ids are
+ * positive and nothing local mints one.
+ */
+export function synthesizeLocalUser(name: string): GhUser {
+  return {
+    login: name,
+    id: 0,
+    node_id: 'local:user',
+    avatar_url: '',
+    html_url: '',
+    type: 'Bot',
+  }
+}
+
+/** The prefixes a fully qualified ref is displayed without. */
+const REF_DISPLAY_PREFIXES = ['refs/heads/', 'refs/remotes/'] as const
+
+/**
+ * The display form of a fully qualified ref. A remote-tracking ref keeps its
+ * remote, because that is the part that tells it apart from the local branch of
+ * the same name.
+ */
+function shortRefName(ref: string): string {
+  for (const prefix of REF_DISPLAY_PREFIXES) {
+    if (ref.startsWith(prefix)) return ref.slice(prefix.length)
+  }
+  return ref
+}
+
+/** What a local review is, in the parts git cannot answer. */
+export interface LocalReviewIdentity {
+  /** The review's local id. It is both its number and its id on the wire. */
+  readonly id: number
+  /** The repository identity the review is scoped to. */
+  readonly repo: string
+  /** The repository's default branch, as the pull shape reports it on both sides. */
+  readonly defaultBranch: string
+  /** Fully qualified base ref. */
+  readonly baseRef: string
+  /** Fully qualified head ref. */
+  readonly headRef: string
+  readonly title: string
+  /** The pull request that superseded this review, or null while it stands alone. */
+  readonly archivedPr: number | null
+  readonly createdAt: string
+  readonly updatedAt: string
+}
+
+/** Everything the synthesized pull shape is built from. */
+export interface LocalPullDetailInput {
+  readonly review: LocalReviewIdentity
+  /** The reviewer's display name. Never an address. */
+  readonly authorName: string
+  /** The resolved range: both tips and the merge base between them. */
+  readonly range: LocalRange
+  /** The assembled immutable half, which is where the counts come from. */
+  readonly immutable: SnapshotImmutable
+  /** How many review comments the review currently holds. */
+  readonly reviewComments: number
+}
+
+/**
+ * Builds the pull shape a local review presents, so every surface downstream of
+ * a snapshot works without knowing which producer filled it.
+ *
+ * Each field has a legal local value rather than a placeholder:
+ *
+ *   - the id, number and node id are all derived from the local review's id, so
+ *     re-synthesis never churns identity;
+ *   - the state is open until a pull request supersedes the review;
+ *   - the author is the sentinel above — a name, never an address;
+ *   - both sides carry the branch's display name and the tip it resolved to;
+ *     the base side names the base branch's tip, while the merge base travels
+ *     in its own field, because they are different commits and a review that
+ *     confused them would describe a different range;
+ *   - mergeability is unknown and mergeable is null: nothing computes either
+ *     locally, and both values are already part of the shape;
+ *   - the counts are read off the change set the snapshot actually holds. Issue
+ *     comments have no local existence at all, so that count is not one nobody
+ *     filled in — zero is the only true answer.
+ */
+export function synthesizeLocalPullDetail(input: LocalPullDetailInput): PullDetail {
+  const { review, authorName, range, immutable, reviewComments } = input
+  const side = (ref: string, sha: string): GhRef => ({
+    ref: shortRefName(ref),
+    sha,
+    label: shortRefName(ref),
+    repo: { full_name: review.repo, default_branch: review.defaultBranch },
+  })
+
+  let additions = 0
+  let deletions = 0
+  for (const file of immutable.files) {
+    additions += file.additions
+    deletions += file.deletions
+  }
+
+  return {
+    id: review.id,
+    node_id: `local:${review.id}`,
+    number: review.id,
+    state: review.archivedPr === null ? 'open' : 'closed',
+    draft: false,
+    merged_at: null,
+    title: review.title,
+    body: null,
+    user: synthesizeLocalUser(authorName),
+    labels: [],
+    requested_reviewers: [],
+    head: side(review.headRef, range.headSha),
+    base: side(review.baseRef, range.baseSha),
+    created_at: review.createdAt,
+    updated_at: review.updatedAt,
+    merged: false,
+    mergeable: null,
+    mergeable_state: 'unknown',
+    merge_base_sha: range.mergeBaseSha,
+    comments: 0,
+    review_comments: reviewComments,
+    commits: immutable.commits.length,
+    additions,
+    deletions,
+    changed_files: immutable.files.length,
+  }
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// The immutable half, assembled.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** The parts of a resolved range the immutable half is built from. */
+export type LocalSnapshotRange = Pick<LocalRange, 'compareKey' | 'mergeBaseSha' | 'headSha'>
+
+/**
+ * A range's immutable half, and the two details about it that the shape has no
+ * field for.
+ *
+ * They are carried **beside** the immutable half rather than inside it. That
+ * shape is stored verbatim and compared field for field against the one the
+ * API-shaped producer builds, so a local-only detail added to it would be a
+ * quiet divergence in a structure whose whole value is that both producers
+ * agree on it.
+ */
+export interface LocalSnapshot {
+  readonly immutable: SnapshotImmutable
+  /** Head-side path → why that path has no blob index entry. */
+  readonly skippedBlobPaths: Readonly<Record<string, BlobIndexSkipReason>>
+  /** Head-side paths git reported as binary. */
+  readonly binaryPaths: readonly string[]
+}
+
+export type LocalSnapshotResult =
+  | { readonly ok: true; readonly snapshot: LocalSnapshot }
+  | MalformedDiff
+  | DiffFailed
+  | MalformedCommitLog
+  | CommitLogFailed
+
+/**
+ * Assembles the immutable half from a resolved range, its change set and its
+ * commits: exactly the six fields the shape declares and nothing else.
+ *
+ * The base branch's tip is deliberately not among them. The reviewed range
+ * starts at the merge base, and the base tip moves whenever the base branch
+ * does — content keyed by it would be filed under a string that changes without
+ * any of the content changing.
+ *
+ * The two lists are copied rather than referenced. The change set they come
+ * from is read-only and this shape is not, so the copy is what makes the result
+ * a value of its own instead of a mutable view onto something a caller still
+ * holds.
+ */
+export function buildLocalSnapshotImmutable(
+  range: LocalSnapshotRange,
+  changeSet: LocalChangeSet,
+  commits: readonly CommitInfo[],
+): SnapshotImmutable {
+  return {
+    compareKey: range.compareKey,
+    mergeBaseSha: range.mergeBaseSha,
+    headSha: range.headSha,
+    files: [...changeSet.files],
+    blobIndex: changeSet.blobIndex,
+    commits: [...commits],
+  }
+}
+
+/**
+ * Reads everything a range's immutable half is made of: what changed, which
+ * objects hold each side, how many lines moved, each file's own hunks, and the
+ * commits the range contains.
+ *
+ * Four reads of one immutable pair of commits. A read that fails stops the
+ * assembly and is returned as it came, so a caller sees which read failed and
+ * with what — never a snapshot assembled from three of four answers.
+ */
+export async function readLocalSnapshotImmutable(
+  runner: CommandRunner,
+  cwd: string,
+  range: LocalSnapshotRange,
+): Promise<LocalSnapshotResult> {
+  const changeSet = await readLocalChangeSet(runner, cwd, range)
+  if (!changeSet.ok) return changeSet
+  const commits = await readLocalCommits(runner, cwd, range)
+  if (!commits.ok) return commits
+  return {
+    ok: true,
+    snapshot: {
+      immutable: buildLocalSnapshotImmutable(range, changeSet.changeSet, commits.commits),
+      skippedBlobPaths: changeSet.changeSet.skippedBlobPaths,
+      binaryPaths: changeSet.changeSet.binaryPaths,
+    },
+  }
 }

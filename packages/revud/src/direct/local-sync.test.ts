@@ -33,8 +33,8 @@
  * each control is shown to fail on its own rather than only as part of a bundle.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import type { PullFile } from '@revu/shared'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import type { CommitInfo, PullDetail, PullFile, SnapshotImmutable } from '@revu/shared'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandResult, CommandRunner } from './command-runner'
@@ -57,19 +57,27 @@ import type {
   LocalRange,
   LocalRangeFailure,
   LocalRangeResult,
+  LocalReviewIdentity,
   NumstatRecord,
   RawDiffRecord,
 } from './local-sync'
 import {
   buildLocalChangeSet,
   buildLocalDiffFiles,
+  buildLocalSnapshotImmutable,
+  parseCommitLogZ,
   parseNumstatZ,
   parseRawZ,
   patchHunks,
+  readLocalAuthorName,
   readLocalChangeSet,
+  readLocalCommits,
   readLocalDiffFiles,
+  readLocalSnapshotImmutable,
   resolveLocalRange,
   splitPatchSections,
+  synthesizeLocalPullDetail,
+  synthesizeLocalUser,
 } from './local-sync'
 import * as localSyncModule from './local-sync'
 
@@ -577,15 +585,22 @@ describe('every command the resolver runs is hardened, and none is classified by
     expect(Object.keys(localSyncModule).sort()).toEqual([
       'buildLocalChangeSet',
       'buildLocalDiffFiles',
+      'buildLocalSnapshotImmutable',
+      'parseCommitLogZ',
       'parseNumstatZ',
       'parseRawZ',
       'patchHunks',
+      'readLocalAuthorName',
       'readLocalChangeSet',
+      'readLocalCommits',
       'readLocalDiffFiles',
       'readLocalNumstat',
       'readLocalPatchSections',
+      'readLocalSnapshotImmutable',
       'resolveLocalRange',
       'splitPatchSections',
+      'synthesizeLocalPullDetail',
+      'synthesizeLocalUser',
     ])
   })
 
@@ -2529,5 +2544,940 @@ describe('the binary sniff window is imported, never restated', () => {
     // Without this, the assertion above would also pass for a pattern that
     // matches nothing anywhere.
     expect(readFileSync(new URL('./blobs.ts', import.meta.url), 'utf8')).toMatch(/\b8000\b/)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The commits the range contains: git's record stream, read into commit entries.
+// ————————————————————————————————————————————————————————————————————————————
+
+const COMMIT_ROOT_OID = oid('e0')
+const COMMIT_FIRST_OID = oid('e1')
+const COMMIT_SECOND_OID = oid('e2')
+const COMMIT_THIRD_OID = oid('e3')
+const COMMIT_SIDE_OID = oid('e4')
+
+/** An author date as git prints it: strict ISO, carrying the author's own offset. */
+const COMMIT_DATE = '2026-08-17T10:11:12+01:00'
+
+/** The same instant in the spelling the API-shaped producer emits. */
+const COMMIT_DATE_UTC = '2026-08-17T09:11:12.000Z'
+
+/**
+ * One `git log -z` record: six NUL-terminated fields. The last NUL is the record
+ * terminator `-z` writes in place of the newline, which is why a record is six
+ * terminated fields rather than five plus a separator.
+ */
+function logRecord(
+  sha: string,
+  parents: readonly string[],
+  body: string,
+  name = FIXTURE_AUTHOR_NAME,
+  email = FIXTURE_AUTHOR_EMAIL,
+  date = COMMIT_DATE,
+): string {
+  return [sha, parents.join(' '), name, email, date, body]
+    .map((field) => `${field}\0`)
+    .join('')
+}
+
+function parsedCommits(stdout: string): CommitInfo[] {
+  const parsed = parseCommitLogZ(stdout)
+  if (!parsed.ok) throw new Error(`this stream must parse, got ${parsed.detail}`)
+  return [...parsed.commits]
+}
+
+describe('every shape git log can report becomes the commit entry it means', () => {
+  test('a record maps onto the entry a consumer reads', () => {
+    expect(parsedCommits(logRecord(COMMIT_FIRST_OID, [COMMIT_ROOT_OID], 'a subject\n'))).toEqual([
+      {
+        sha: COMMIT_FIRST_OID,
+        commit: {
+          message: 'a subject',
+          author: {
+            name: FIXTURE_AUTHOR_NAME,
+            email: FIXTURE_AUTHOR_EMAIL,
+            date: COMMIT_DATE_UTC,
+          },
+        },
+        // There is no hosted account behind a local commit, and the API-shaped
+        // producer already answers null whenever the service names none — so a
+        // local commit needs no invented account to sit in this field.
+        author: null,
+        parents: [{ sha: COMMIT_ROOT_OID }],
+      },
+    ])
+  })
+
+  test('a root commit has no parents rather than one spelled empty', () => {
+    expect(parsedCommits(logRecord(COMMIT_ROOT_OID, [], 'the first commit\n'))[0].parents).toEqual(
+      [],
+    )
+  })
+
+  test('a merge commit carries every parent git listed, in order', () => {
+    const merged = parsedCommits(
+      logRecord(COMMIT_THIRD_OID, [COMMIT_SECOND_OID, COMMIT_SIDE_OID], 'merge\n'),
+    )
+    expect(merged[0].parents).toEqual([{ sha: COMMIT_SECOND_OID }, { sha: COMMIT_SIDE_OID }])
+  })
+
+  test('the message loses the terminator git stores and keeps everything else', () => {
+    // git stores a commit message with a trailing newline and the API-shaped
+    // producer reports it without one. Only the terminator goes: a message whose
+    // body genuinely ends in a blank line still ends in a blank line.
+    const [subjectOnly, withBody] = parsedCommits(
+      logRecord(COMMIT_FIRST_OID, [], 'a subject\n') +
+        logRecord(COMMIT_SECOND_OID, [COMMIT_FIRST_OID], 'a subject\n\nand a body\n\n'),
+    )
+    expect(subjectOnly.commit.message).toBe('a subject')
+    expect(withBody.commit.message).toBe('a subject\n\nand a body\n')
+  })
+
+  test('several records come back in the order the stream carried them', () => {
+    const stream =
+      logRecord(COMMIT_FIRST_OID, [COMMIT_ROOT_OID], 'one\n') +
+      logRecord(COMMIT_SECOND_OID, [COMMIT_FIRST_OID], 'two\n') +
+      logRecord(COMMIT_THIRD_OID, [COMMIT_SECOND_OID], 'three\n')
+    expect(parsedCommits(stream).map((commit) => commit.sha)).toEqual([
+      COMMIT_FIRST_OID,
+      COMMIT_SECOND_OID,
+      COMMIT_THIRD_OID,
+    ])
+  })
+
+  test('a range with nothing in it is no commits, not a failure', () => {
+    // The merge base equal to the head is an allowed, empty review.
+    expect(parsedCommits('')).toEqual([])
+  })
+})
+
+describe('the author date is comparable to the timestamps it is compared against', () => {
+  const draftCreatedAt = '2026-08-17T09:30:00.000Z'
+
+  /** The exact expression a reconciler falls back to when a draft's head is gone. */
+  function commitsAfterTheDraft(commits: readonly CommitInfo[]): string[] {
+    return commits
+      .filter((commit) => commit.commit.author.date > draftCreatedAt)
+      .map((commit) => commit.sha)
+  }
+
+  test('git prints the author\'s own offset, and that is not what comes back', () => {
+    const [commit] = parsedCommits(logRecord(COMMIT_FIRST_OID, [], 'one\n'))
+    expect(COMMIT_DATE).toMatch(/T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/)
+    expect(commit.commit.author.date).toBe(COMMIT_DATE_UTC)
+  })
+
+  test('and it is the same instant, not a shifted one', () => {
+    const [commit] = parsedCommits(logRecord(COMMIT_FIRST_OID, [], 'one\n'))
+    expect(Date.parse(commit.commit.author.date)).toBe(Date.parse(COMMIT_DATE))
+  })
+
+  test('a date that cannot be read as an instant is carried through, never replaced', () => {
+    const [commit] = parsedCommits(
+      logRecord(COMMIT_FIRST_OID, [], 'one\n', FIXTURE_AUTHOR_NAME, FIXTURE_AUTHOR_EMAIL, 'not a date'),
+    )
+    expect(commit.commit.author.date).toBe('not a date')
+  })
+
+  test('a commit from before the draft is not counted among the ones after it', () => {
+    // The offset spelling sorts as a string ahead of the UTC one it is compared
+    // against — an hour earlier reading as an hour later — so this commit, made
+    // nineteen minutes BEFORE the draft, would be reported as having landed
+    // after it. That comparison is reached whenever the draft's own head has
+    // fallen out of the range, which on a rebased branch is the ordinary case.
+    const before = parsedCommits(logRecord(COMMIT_FIRST_OID, [], 'before the draft\n'))
+    expect(Date.parse(COMMIT_DATE)).toBeLessThan(Date.parse(draftCreatedAt))
+    expect(commitsAfterTheDraft(before)).toEqual([])
+    // And the raw spelling really would have been counted, so the row above is
+    // guarding something rather than restating an ordering that already held.
+    expect(COMMIT_DATE > draftCreatedAt).toBe(true)
+  })
+
+  test('a commit from after the draft still is counted', () => {
+    // The positive control: without it a reader that answered "nothing landed"
+    // for every commit would satisfy the row above.
+    const after = parsedCommits(
+      logRecord(
+        COMMIT_SECOND_OID,
+        [],
+        'after the draft\n',
+        FIXTURE_AUTHOR_NAME,
+        FIXTURE_AUTHOR_EMAIL,
+        '2026-08-17T11:00:00+01:00',
+      ),
+    )
+    expect(commitsAfterTheDraft(after)).toEqual([COMMIT_SECOND_OID])
+  })
+})
+
+describe('the commit parser refuses a stream that is not the one it asked for', () => {
+  const rows: readonly (readonly [string, string])[] = [
+    [
+      'a record short of a field',
+      [COMMIT_FIRST_OID, '', FIXTURE_AUTHOR_NAME, FIXTURE_AUTHOR_EMAIL, 'one\n']
+        .map((field) => `${field}\0`)
+        .join(''),
+    ],
+    [
+      'output in git default format rather than the requested one',
+      `commit ${COMMIT_FIRST_OID}\nAuthor: someone\n\n    one\n`,
+    ],
+    [
+      'a commit name that is not a full-length object name',
+      logRecord(COMMIT_FIRST_OID.slice(0, 7), [], 'one\n'),
+    ],
+    [
+      'a parent that is not a full-length object name',
+      logRecord(COMMIT_FIRST_OID, ['not-an-object-name'], 'one\n'),
+    ],
+  ]
+
+  for (const [label, stdout] of rows) {
+    test(`${label} is a typed failure, never a throw`, () => {
+      expect(parseCommitLogZ(stdout)).toMatchObject({
+        ok: false,
+        reason: 'malformed_commit_log',
+      })
+    })
+  }
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The argv of the commit read.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** A runner that answers the commit read with one canned stream and records argv. */
+function commitLogGit(stdout: string, sink?: string[][], code = 0): CommandRunner {
+  return {
+    async run(args): Promise<CommandResult> {
+      sink?.push(args)
+      return { ok: code === 0, code, stdout, stderr: '' }
+    },
+  }
+}
+
+describe('the commit read asks git for one record stream over one range', () => {
+  const sink: string[][] = []
+
+  beforeAll(async () => {
+    await readLocalCommits(
+      commitLogGit(logRecord(COMMIT_FIRST_OID, [COMMIT_ROOT_OID], 'one\n'), sink),
+      '/repo',
+      DIFF_RANGE,
+    )
+  })
+
+  test('it spawns exactly one command', () => {
+    // An independent literal: a read that grew a second invocation moves this.
+    expect(sink).toHaveLength(1)
+  })
+
+  test('the argv is the one this read is specified to run', () => {
+    expect(sink[0]).toEqual([
+      'git',
+      'log',
+      '--no-show-signature',
+      '--reverse',
+      '-z',
+      '--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%B',
+      '--end-of-options',
+      `${MERGE_BASE_SHA}..${HEAD_SHA}`,
+    ])
+  })
+
+  test('the range is the reviewed one — merge base to head, not base to head', () => {
+    expect(sink[0]).toContain(`${MERGE_BASE_SHA}..${HEAD_SHA}`)
+    expect(sink[0].join(' ')).not.toContain(BASE_SHA)
+  })
+
+  test('the argv satisfies the hardened form', () => {
+    expect(isHardenedArgv(sink[0])).toEqual({ ok: true })
+  })
+
+  test('a non-zero exit carries its code rather than throwing', async () => {
+    await expect(readLocalCommits(commitLogGit('', undefined, 128), '/repo', DIFF_RANGE)).resolves
+      .toEqual({ ok: false, reason: 'commit_log_failed', code: 128 })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The commits the range contains, oldest first — the order a consumer slices on.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('the commits of a range arrive oldest first', () => {
+  let fixture: FixtureRepo
+  let commits: CommitInfo[]
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    const read = await readLocalCommits(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: fixture.headSha,
+    })
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    commits = [...read.commits]
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('the range carries three commits, so a mistake in the middle is visible', () => {
+    // Two commits cannot tell a whole-list reversal apart from a reversal of
+    // everything after the first, and both are mistakes a mapping can make.
+    expect(commits).toHaveLength(3)
+  })
+
+  test('they run oldest to newest and end at the head tip', () => {
+    expect(commits.map((commit) => commit.sha)).toEqual([...fixture.headCommitShas])
+    expect(commits[commits.length - 1].sha).toBe(fixture.headSha)
+  })
+
+  test('slicing after a draft head yields the commits that came AFTER it', () => {
+    // The expression a reconciler runs to answer "what landed since this draft
+    // was written": find the draft's head in the list and take everything past
+    // it. On a list ordered newest first the same expression answers with the
+    // commits *before* the draft instead, silently, and reports them as new.
+    const draftHeadSha = fixture.headCommitShas[1]
+    const draftHeadIndex = commits.findIndex((commit) => commit.sha === draftHeadSha)
+    expect(draftHeadIndex).toBe(1)
+    expect(commits.slice(draftHeadIndex + 1).map((commit) => commit.sha)).toEqual([
+      fixture.headCommitShas[2],
+    ])
+  })
+
+  test('every parent is the one git itself lists for that commit', async () => {
+    // `rev-list --parents` prints each commit followed by its parents, newest
+    // first — an oracle produced by a different command than the one under test.
+    const printed = await git(fixture.dir, [
+      'rev-list',
+      '--parents',
+      `${fixture.mergeBaseSha}..${fixture.headSha}`,
+    ])
+    const expected = new Map(
+      printed.split('\n').map((line) => {
+        const [sha, ...parents] = line.trim().split(' ')
+        return [sha, parents]
+      }),
+    )
+    expect(expected.size).toBe(3)
+    expect(commits).toHaveLength(3)
+    for (const commit of commits) {
+      expect(commit.parents.map((parent) => parent.sha)).toEqual(expected.get(commit.sha))
+    }
+  })
+
+  test('and that oracle names parents at all, so an empty list would be red', () => {
+    // Without this the assertion above would hold over a mapping that answered
+    // "no parents" for every commit, matching an oracle nobody checked was
+    // non-empty — and it would hold over no commits at all.
+    expect(commits.length).toBeGreaterThan(0)
+    expect(commits.every((commit) => commit.parents.length > 0)).toBe(true)
+  })
+
+  test('each commit carries git\'s own author, and no hosted account', () => {
+    expect(commits.length).toBeGreaterThan(0)
+    for (const commit of commits) {
+      expect(commit.commit.author.name).toBe(FIXTURE_AUTHOR_NAME)
+      expect(commit.commit.author.email).toBe(FIXTURE_AUTHOR_EMAIL)
+      expect(Number.isNaN(Date.parse(commit.commit.author.date))).toBe(false)
+      expect(commit.author).toBeNull()
+    }
+  })
+
+  test('the dates come back in UTC, whatever offset the machine authored under', async () => {
+    for (const commit of commits) {
+      expect(commit.commit.author.date).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+    }
+    // The control: git's own stream carries an offset rather than that
+    // spelling, so the conversion above is doing something. It holds on a
+    // machine running in UTC too, where git prints `+00:00`.
+    const printed = await gitRaw(fixture.dir, [
+      'log',
+      '-1',
+      '--format=%aI',
+      fixture.headSha,
+    ])
+    expect(printed.trim()).toMatch(/T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/)
+  })
+
+  test('the messages are the ones the fixture committed', () => {
+    expect(commits.map((commit) => commit.commit.message)).toEqual([
+      'modify one file and add another',
+      'delete one file and rename another',
+      'add a binary file, a symlink and a gitlink',
+    ])
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// A repository whose configuration would otherwise talk over the record stream.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('signature reporting is refused, never inherited from the repository', () => {
+  let fixture: FixtureRepo
+  let signedSha: string
+  let read: Awaited<ReturnType<typeof readLocalCommits>>
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+
+    // A commit carrying a signature header, written directly as an object: the
+    // fixture has no signing key, and the header alone is what makes git run
+    // its verification at all.
+    const tree = await git(fixture.dir, ['rev-parse', `${fixture.headSha}^{tree}`])
+    const objectPath = 'signed-commit-object'
+    writeFileSync(
+      join(fixture.dir, objectPath),
+      [
+        `tree ${tree}`,
+        `parent ${fixture.headSha}`,
+        `author ${FIXTURE_AUTHOR_NAME} <${FIXTURE_AUTHOR_EMAIL}> 1700000000 +0000`,
+        `committer ${FIXTURE_AUTHOR_NAME} <${FIXTURE_AUTHOR_EMAIL}> 1700000000 +0000`,
+        'gpgsig -----BEGIN PGP SIGNATURE-----',
+        ' ',
+        ' this fixture never verifies anything',
+        ' -----END PGP SIGNATURE-----',
+        '',
+        'a commit carrying a signature header',
+        '',
+      ].join('\n'),
+    )
+    signedSha = await git(fixture.dir, ['hash-object', '-t', 'commit', '-w', '--', objectPath])
+    await git(fixture.dir, ['update-ref', `refs/heads/${fixture.headBranch}`, signedSha])
+
+    // A verifier that answers, so git has something to print. Without one git
+    // reports only that it could not run a verifier, and reports it on stderr,
+    // which would make the hostile configuration look harmless.
+    const verifier = join(fixture.dir, 'fake-verifier')
+    writeFileSync(
+      verifier,
+      ['#!/bin/sh', 'echo "gpg: Good signature from fixture" >&2', 'exit 0', ''].join('\n'),
+    )
+    chmodSync(verifier, 0o755)
+    await git(fixture.dir, ['config', 'log.showSignature', 'true'])
+    await git(fixture.dir, ['config', 'gpg.program', verifier])
+
+    read = await readLocalCommits(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: signedSha,
+    })
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('the repository really does talk over a formatted stream', async () => {
+    // The load-bearing half: this is the observation that makes the flag a
+    // guard rather than a word in an argv. The verification report is written
+    // to standard output, ahead of the record the format asked for, so a reader
+    // parsing fields would take those bytes for a commit.
+    const noisy = await gitRaw(fixture.dir, ['log', '-1', '--format=%H', signedSha])
+    expect(noisy).toContain('gpg:')
+    expect(noisy.startsWith(signedSha)).toBe(false)
+  })
+
+  test('the commit read is unaffected and still ends at the head tip', () => {
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    expect(read.commits).toHaveLength(4)
+    expect(read.commits[read.commits.length - 1].sha).toBe(signedSha)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The reviewer's display name, which is the ONLY identity field git is asked for.
+// ————————————————————————————————————————————————————————————————————————————
+
+const LOCAL_REVIEWER_NAME = 'Fixture Reviewer'
+const LOCAL_REVIEW_ID = 900000001
+const LOCAL_REPO_IDENTITY = 'acme/widgets'
+const LOCAL_DEFAULT_BRANCH = 'main'
+
+describe('the reviewer name is read from the repository, and nothing else is', () => {
+  let fixture: FixtureRepo
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('a repository that names nobody answers nothing rather than a guess', async () => {
+    // The fixture passes its identity per commit and configures none, and
+    // ambient configuration is pinned away — so this is a repository where git
+    // genuinely cannot say who the reviewer is.
+    await expect(readLocalAuthorName(createBunCommandRunner(), fixture.dir)).resolves.toBeNull()
+  })
+
+  test('a configured name comes back as the repository spells it', async () => {
+    await git(fixture.dir, ['config', 'user.name', LOCAL_REVIEWER_NAME])
+    await expect(readLocalAuthorName(createBunCommandRunner(), fixture.dir)).resolves.toBe(
+      LOCAL_REVIEWER_NAME,
+    )
+  })
+
+  test('it asks for the name and for nothing else, in the hardened form', async () => {
+    // The whole argv rather than a containment check: the setting this read
+    // names is the only identity the builder is allowed to obtain, so a second
+    // operand — or a different one — has to be visible here.
+    const sink: string[][] = []
+    await readLocalAuthorName(
+      {
+        async run(args): Promise<CommandResult> {
+          sink.push(args)
+          return { ok: true, code: 0, stdout: `${LOCAL_REVIEWER_NAME}\n`, stderr: '' }
+        },
+      },
+      '/repo',
+    )
+    expect(sink).toEqual([['git', 'config', '--get', 'user.name']])
+    expect(isHardenedArgv(sink[0])).toEqual({ ok: true })
+  })
+})
+
+describe('the address is never read, so it cannot be carried', () => {
+  test('the builder never asks git for it', () => {
+    expect(LOCAL_SYNC_SOURCE).not.toMatch(/user\.email/)
+  })
+
+  test('that pattern does fire against a module that does ask for it', () => {
+    // Without this, the assertion above would also pass for a pattern that
+    // matches nothing anywhere.
+    expect(readFileSync(new URL('./local-fixture-repo.ts', import.meta.url), 'utf8')).toMatch(
+      /user\.email/,
+    )
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The synthesized pull detail: a legal local value in every required field.
+// ————————————————————————————————————————————————————————————————————————————
+
+const LOCAL_RANGE: LocalRange = {
+  baseSha: BASE_SHA,
+  headSha: HEAD_SHA,
+  mergeBaseSha: MERGE_BASE_SHA,
+  compareKey: `${MERGE_BASE_SHA}...${HEAD_SHA}`,
+}
+
+function reviewIdentity(overrides: Partial<LocalReviewIdentity> = {}): LocalReviewIdentity {
+  return {
+    id: LOCAL_REVIEW_ID,
+    repo: LOCAL_REPO_IDENTITY,
+    defaultBranch: LOCAL_DEFAULT_BRANCH,
+    baseRef: BASE_REF,
+    headRef: HEAD_REF,
+    title: 'topic',
+    archivedPr: null,
+    createdAt: '2026-08-17T09:00:00.000Z',
+    updatedAt: '2026-08-17T09:30:00.000Z',
+    ...overrides,
+  }
+}
+
+const EMPTY_IMMUTABLE: SnapshotImmutable = {
+  compareKey: LOCAL_RANGE.compareKey,
+  mergeBaseSha: MERGE_BASE_SHA,
+  headSha: HEAD_SHA,
+  files: [],
+  blobIndex: {},
+  commits: [],
+}
+
+function detailFor(
+  overrides: Partial<LocalReviewIdentity> = {},
+  immutable: SnapshotImmutable = EMPTY_IMMUTABLE,
+  reviewComments = 0,
+): PullDetail {
+  return synthesizeLocalPullDetail({
+    review: reviewIdentity(overrides),
+    authorName: LOCAL_REVIEWER_NAME,
+    range: LOCAL_RANGE,
+    immutable,
+    reviewComments,
+  })
+}
+
+describe('the sentinel author says what it is, positively', () => {
+  test('it is the whole account, pinned field by field', () => {
+    // Asserted as the complete object rather than as a set of absences: a
+    // fabricated account that merely avoids an address would satisfy every
+    // "does not contain" check in this file while claiming to be a real user.
+    expect(synthesizeLocalUser(LOCAL_REVIEWER_NAME)).toEqual({
+      login: LOCAL_REVIEWER_NAME,
+      id: 0,
+      node_id: 'local:user',
+      avatar_url: '',
+      html_url: '',
+      type: 'Bot',
+    })
+  })
+
+  test('the pull detail carries that same account', () => {
+    expect(detailFor().user).toEqual(synthesizeLocalUser(LOCAL_REVIEWER_NAME))
+  })
+})
+
+describe('every field a local review cannot compute carries its already-legal value', () => {
+  test('mergeability is unknown rather than invented', () => {
+    const detail = detailFor()
+    expect(detail.mergeable).toBeNull()
+    expect(detail.mergeable_state).toBe('unknown')
+  })
+
+  test('nothing local was ever merged, and nobody was ever asked to review', () => {
+    const detail = detailFor()
+    expect(detail.merged).toBe(false)
+    expect(detail.merged_at).toBeNull()
+    expect(detail.requested_reviewers).toEqual([])
+    expect(detail.labels).toEqual([])
+    expect(detail.draft).toBe(false)
+    expect(detail.body).toBeNull()
+  })
+
+  test('the identity fields are the local review\'s own', () => {
+    const detail = detailFor()
+    expect(detail.id).toBe(LOCAL_REVIEW_ID)
+    expect(detail.number).toBe(LOCAL_REVIEW_ID)
+    expect(detail.node_id).toBe(`local:${LOCAL_REVIEW_ID}`)
+    expect(detail.title).toBe('topic')
+    expect(detail.created_at).toBe('2026-08-17T09:00:00.000Z')
+    expect(detail.updated_at).toBe('2026-08-17T09:30:00.000Z')
+  })
+
+  test('a review still standing alone is open, and one superseded is closed', () => {
+    expect(detailFor().state).toBe('open')
+    expect(detailFor({ archivedPr: 41 }).state).toBe('closed')
+  })
+
+  test('both sides name the branch in display form and the tip it resolved to', () => {
+    const detail = detailFor()
+    expect(detail.head).toEqual({
+      ref: 'topic',
+      sha: HEAD_SHA,
+      label: 'topic',
+      repo: { full_name: LOCAL_REPO_IDENTITY, default_branch: LOCAL_DEFAULT_BRANCH },
+    })
+    expect(detail.base).toEqual({
+      ref: 'main',
+      sha: BASE_SHA,
+      label: 'main',
+      repo: { full_name: LOCAL_REPO_IDENTITY, default_branch: LOCAL_DEFAULT_BRANCH },
+    })
+    // The base side names the branch tip, never the merge base — those are
+    // different commits and the detail carries both, in their own fields.
+    expect(detail.merge_base_sha).toBe(MERGE_BASE_SHA)
+    expect(detail.base.sha).not.toBe(detail.merge_base_sha)
+  })
+
+  test('a remote-tracking base keeps the remote in its display name', () => {
+    const detail = detailFor({ baseRef: 'refs/remotes/origin/main' })
+    expect([detail.base.ref, detail.base.label]).toEqual(['origin/main', 'origin/main'])
+  })
+
+  test('the counts are the ones the change set actually holds', () => {
+    const immutable: SnapshotImmutable = {
+      ...EMPTY_IMMUTABLE,
+      files: [
+        { sha: PLAIN_HEAD_OID, filename: 'a.txt', status: 'modified', additions: 3, deletions: 1, changes: 4 },
+        { sha: ADDED_OID, filename: 'b.txt', status: 'added', additions: 7, deletions: 0, changes: 7 },
+      ],
+      commits: parsedCommits(logRecord(COMMIT_FIRST_OID, [COMMIT_ROOT_OID], 'one\n')),
+    }
+    const detail = detailFor({}, immutable, 5)
+    expect(detail.changed_files).toBe(2)
+    expect(detail.additions).toBe(10)
+    expect(detail.deletions).toBe(1)
+    expect(detail.commits).toBe(1)
+    expect(detail.review_comments).toBe(5)
+    // Issue comments have no local existence at all, so the count is not a
+    // number that was never filled in — it is the only true one.
+    expect(detail.comments).toBe(0)
+  })
+
+  test('an empty review reports four zeros, the same as a store with no diff behind it', () => {
+    const detail = detailFor()
+    expect([
+      detail.commits,
+      detail.additions,
+      detail.deletions,
+      detail.changed_files,
+    ]).toEqual([0, 0, 0, 0])
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The address is a key, never a body — asserted where the body is built.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('the address the fixture commits under never reaches the pull detail', () => {
+  let fixture: FixtureRepo
+  let commitsRawStdout: string
+  let immutable: SnapshotImmutable
+  let detail: PullDetail
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    await git(fixture.dir, ['config', 'user.name', LOCAL_REVIEWER_NAME])
+    const authorName = await readLocalAuthorName(createBunCommandRunner(), fixture.dir)
+    if (authorName === null) throw new Error('the fixture must name a reviewer')
+
+    const range: LocalRange = {
+      baseSha: fixture.baseSha,
+      headSha: fixture.headSha,
+      mergeBaseSha: fixture.mergeBaseSha,
+      compareKey: `${fixture.mergeBaseSha}...${fixture.headSha}`,
+    }
+    const snapshot = await readLocalSnapshotImmutable(createBunCommandRunner(), fixture.dir, range)
+    if (!snapshot.ok) throw new Error(`the fixture range must read, got ${snapshot.reason}`)
+    immutable = snapshot.snapshot.immutable
+
+    // The same range, read again outside the seam, so the control below reports
+    // what the builder was handed rather than what this test hoped it was.
+    commitsRawStdout = await gitRaw(fixture.dir, [
+      'log',
+      '--no-show-signature',
+      '--reverse',
+      '-z',
+      '--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%B',
+      `${fixture.mergeBaseSha}..${fixture.headSha}`,
+    ])
+
+    detail = synthesizeLocalPullDetail({
+      review: reviewIdentity({ repo: fixture.dir, title: fixture.headBranch }),
+      authorName,
+      range,
+      immutable,
+      reviewComments: 0,
+    })
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('the address IS present in what the builder read', () => {
+    // The control, and the load-bearing half: without it the absence below
+    // would pass just as well over a range nothing ever read.
+    expect(commitsRawStdout).toContain(FIXTURE_AUTHOR_EMAIL)
+  })
+
+  test('the pull detail carries no address at all', () => {
+    const serialized = JSON.stringify(detail)
+    expect(serialized).not.toContain(FIXTURE_AUTHOR_EMAIL)
+    expect(serialized).not.toContain('fixture-author')
+    // The blanket ban is possible here only because a pull detail carries no
+    // document that could legitimately hold the character: no patch text, no
+    // commit message, and no address of any kind. A structure carrying diff
+    // hunks could not be scanned this way, because a unified diff's own file
+    // headers are spelled with it.
+    expect(serialized).not.toContain('@')
+  })
+
+  test('the three bans are not three independent defenses', () => {
+    // Measured over the bodies a defective builder could actually produce,
+    // rather than assumed: the whole address is caught by all three, so it is
+    // never the sole catch, while the local part alone is caught only by the
+    // name ban and some other address only by the character ban. Pinned as an
+    // assertion so the subsumption cannot quietly stop being true.
+    const bans: readonly (readonly [string, (body: string) => boolean])[] = [
+      ['whole address', (body) => body.includes(FIXTURE_AUTHOR_EMAIL)],
+      ['name', (body) => body.includes('fixture-author')],
+      ['character', (body) => body.includes('@')],
+    ]
+    const leaks = [FIXTURE_AUTHOR_EMAIL, 'fixture-author', 'someone@else.invalid']
+    const soleCatchers = new Set<string>()
+    for (const leak of leaks) {
+      const caught = bans.filter(([, fires]) => fires(leak))
+      expect(caught.length).toBeGreaterThan(0)
+      if (caught.length === 1) soleCatchers.add(caught[0][0])
+    }
+    expect([...soleCatchers].sort()).toEqual(['character', 'name'])
+  })
+
+  test('the commits DO carry the address, where the API-shaped producer carries it too', () => {
+    // The address is not scrubbed from the world: it is a commit's own author
+    // field, exactly where the API-shaped producer reports it, and a reviewer
+    // reading history needs it. What must never carry it is the pull detail —
+    // a document keyed by nothing and handed to every surface.
+    const addresses = immutable.commits.map((commit) => commit.commit.author.email)
+    expect(addresses).toEqual([
+      FIXTURE_AUTHOR_EMAIL,
+      FIXTURE_AUTHOR_EMAIL,
+      FIXTURE_AUTHOR_EMAIL,
+    ])
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The assembled immutable half: exactly the six fields the contract declares.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('the assembled snapshot has exactly the contract shape, at runtime', () => {
+  let fixture: FixtureRepo
+  let read: Awaited<ReturnType<typeof readLocalSnapshotImmutable>>
+  let range: LocalRange
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    range = {
+      baseSha: fixture.baseSha,
+      headSha: fixture.headSha,
+      mergeBaseSha: fixture.mergeBaseSha,
+      compareKey: `${fixture.mergeBaseSha}...${fixture.headSha}`,
+    }
+    read = await readLocalSnapshotImmutable(createBunCommandRunner(), fixture.dir, range)
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('it carries the six declared fields and nothing else', () => {
+    // A compiler cannot catch an extra property assigned to a value already
+    // typed as the contract shape, and an extra field is exactly how a
+    // local-only detail leaks into a shape the store persists verbatim.
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    expect(Object.keys(read.snapshot.immutable).sort()).toEqual([
+      'blobIndex',
+      'commits',
+      'compareKey',
+      'files',
+      'headSha',
+      'mergeBaseSha',
+    ])
+  })
+
+  test('the local-only details are carried beside the shape, never inside it', () => {
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    const serialized = JSON.stringify(read.snapshot.immutable)
+    expect(serialized).not.toContain('skippedBlobPaths')
+    expect(serialized).not.toContain('binaryPaths')
+    // And they are genuinely available — the assertion above is about where
+    // they live, not about their having been dropped.
+    expect(read.snapshot.skippedBlobPaths).toEqual({
+      [fixture.paths.symlink]: 'symlink',
+      [fixture.paths.gitlink]: 'gitlink',
+    })
+    expect(read.snapshot.binaryPaths).toEqual([fixture.paths.binary])
+  })
+
+  test('the range fields are the ones it was asked about', () => {
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    const { immutable } = read.snapshot
+    expect(immutable.compareKey).toBe(range.compareKey)
+    expect(immutable.mergeBaseSha).toBe(fixture.mergeBaseSha)
+    expect(immutable.headSha).toBe(fixture.headSha)
+    // The base tip is not one of the six: the reviewed range starts at the
+    // merge base, and a snapshot keyed by the base tip would key content under
+    // a string that moves whenever the base branch does.
+    expect(JSON.stringify(immutable)).not.toContain(fixture.baseSha)
+  })
+
+  test('the files and commits are the ones the two reads produced', async () => {
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    const changeSet = await readLocalChangeSet(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: fixture.headSha,
+    })
+    if (!changeSet.ok) throw new Error(`the change set must read, got ${changeSet.reason}`)
+    expect(read.snapshot.immutable.files).toEqual(changeSet.changeSet.files)
+    expect(read.snapshot.immutable.blobIndex).toEqual(changeSet.changeSet.blobIndex)
+    expect(read.snapshot.immutable.commits.map((commit) => commit.sha)).toEqual([
+      ...fixture.headCommitShas,
+    ])
+  })
+
+  test('the assembly is a fresh pair of arrays, not the ones handed to it', async () => {
+    // The immutable half is persisted and handed out; sharing an array with the
+    // structure it was assembled from would let a later reader's edit reach a
+    // stored snapshot.
+    const changeSet = await readLocalChangeSet(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: fixture.headSha,
+    })
+    if (!changeSet.ok) throw new Error(`the change set must read, got ${changeSet.reason}`)
+    const commits = parsedCommits(logRecord(COMMIT_FIRST_OID, [COMMIT_ROOT_OID], 'one\n'))
+    const assembled = buildLocalSnapshotImmutable(range, changeSet.changeSet, commits)
+    expect(assembled.commits).not.toBe(commits)
+    expect(assembled.files).not.toBe(changeSet.changeSet.files)
+    expect(assembled.commits).toEqual(commits)
+    expect(assembled.files).toEqual(changeSet.changeSet.files)
+  })
+})
+
+describe('the declared return type is load-bearing, not a formality', () => {
+  test('the builder never casts its way into the contract shape', () => {
+    expect(LOCAL_SYNC_SOURCE).not.toMatch(/ as SnapshotImmutable/)
+    expect(LOCAL_SYNC_SOURCE).not.toMatch(/ as unknown as /)
+  })
+
+  test('both patterns fire against source written the way a cast is written', () => {
+    const probe = [
+      'const immutable = assembled as SnapshotImmutable',
+      'const detail = record as unknown as PullDetail',
+    ].join('\n')
+    expect(probe).toMatch(/ as SnapshotImmutable/)
+    expect(probe).toMatch(/ as unknown as /)
+  })
+})
+
+describe('assembling a snapshot asks git for exactly four things', () => {
+  const sink: string[][] = []
+
+  beforeAll(async () => {
+    await readLocalSnapshotImmutable(
+      {
+        async run(args): Promise<CommandResult> {
+          sink.push(args)
+          const which = args.includes('--raw')
+            ? ZIP_RAW
+            : args.includes('--numstat')
+              ? ZIP_COUNTS
+              : args.includes('log')
+                ? logRecord(COMMIT_FIRST_OID, [COMMIT_ROOT_OID], 'one\n')
+                : ZIP_PATCH
+          return { ok: true, code: 0, stdout: which, stderr: '' }
+        },
+      },
+      '/repo',
+      LOCAL_RANGE,
+    )
+  })
+
+  test('three change-set reads and one commit read', () => {
+    // An independent literal: an assembly that quietly gained or lost a read
+    // moves this.
+    expect(sink).toHaveLength(4)
+  })
+
+  test('every captured argv satisfies the hardened form — no sampling', () => {
+    for (const args of sink) {
+      expect(isHardenedArgv(args)).toEqual({ ok: true })
+    }
+  })
+
+  test('a failing read fails the assembly, never throws', async () => {
+    await expect(
+      readLocalSnapshotImmutable(
+        {
+          async run(args): Promise<CommandResult> {
+            if (args.includes('log')) return { ok: false, code: 128, stdout: '', stderr: '' }
+            const which = args.includes('--raw')
+              ? ZIP_RAW
+              : args.includes('--numstat')
+                ? ZIP_COUNTS
+                : ZIP_PATCH
+            return { ok: true, code: 0, stdout: which, stderr: '' }
+          },
+        },
+        '/repo',
+        LOCAL_RANGE,
+      ),
+    ).resolves.toEqual({ ok: false, reason: 'commit_log_failed', code: 128 })
   })
 })
