@@ -49,6 +49,7 @@ const DIRECT_DIR = import.meta.dir
  * leave the scan with less to read instead of failing.
  */
 const LOCAL_MODULE_FILES = [
+  'local-ids.test.ts',
   'local-ids.ts',
   'local-write-fakes.ts',
   'local-writes.test.ts',
@@ -204,10 +205,17 @@ function githubModulesAmong(paths: readonly string[]): string[] {
 }
 
 describe('the scanners cannot pass by reading nothing', () => {
-  test('the scanned file set is exactly the four local write-path files', () => {
+  test('the scanned file set is exactly the five local write-path files', () => {
     // The expectation is written out independently of the constant, so a
     // rename or a typo in one has to be repeated in the other to stay green.
+    //
+    // Both test files are in the set on purpose. The local tests construct no
+    // GitHub client, and that absence is as load-bearing as the modules' own:
+    // a test that reached for one would prove the path can be reached, whatever
+    // the modules say. Leaving either test file out would make the scan's
+    // coverage depend on which file a future import happened to land in.
     expect([...LOCAL_MODULE_FILES].sort()).toEqual([
+      'local-ids.test.ts',
       'local-ids.ts',
       'local-write-fakes.ts',
       'local-writes.test.ts',
