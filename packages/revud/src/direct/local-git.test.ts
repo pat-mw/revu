@@ -28,9 +28,18 @@
  *      silently invalidating a comment.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { BranchRef } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import { createBunCommandRunner } from './command-runner'
 import type { FixtureRepo } from './local-fixture-repo'
@@ -42,7 +51,9 @@ import {
   GIT_ARGV_BLOCKED,
   checkRefFormat,
   discoverRepoRoot,
+  listBranches,
   normalizeRef,
+  parseForEachRefZ,
   repoIdentity,
   runGit,
 } from './local-git'
@@ -107,11 +118,24 @@ async function validateRef(
 
 let fixture: FixtureRepo
 
+/**
+ * A repository that has been initialized and nothing else: no commit, and
+ * therefore not one ref in either namespace. It is created after the fixture so
+ * it inherits the fixture's pinned configuration paths, and it is a second
+ * repository rather than a state of the first because the seeded one must keep
+ * its branches for every other assertion here.
+ */
+let emptyRepoDir: string
+
 beforeAll(async () => {
   fixture = await createFixtureRepo()
+  emptyRepoDir = mkdtempSync(join(tmpdir(), 'revu-empty-repo-'))
+  const init = await createBunCommandRunner().run(['git', 'init', '-q', '-b', 'main', emptyRepoDir])
+  if (!init.ok) throw new Error(`the empty repository could not be initialized: ${init.stderr}`)
 })
 
 afterAll(() => {
+  rmSync(emptyRepoDir, { recursive: true, force: true })
   fixture.dispose()
 })
 
@@ -528,10 +552,12 @@ describe('every argv the exported seam emits satisfies the predicate', () => {
       ),
       '/repo',
     )
-    // The independent literal that keeps this sweep honest: five drives produce
-    // exactly six spawned commands (the identity fallback spawns twice). A
-    // drive that silently stopped calling the runner shrinks this count.
-    expect(sink).toHaveLength(6)
+    await listBranches(fakeRunner({ ok: true, code: 0, stdout: '' }, sink), '/repo')
+    // The independent literal that keeps this sweep honest: six drives produce
+    // exactly eight spawned commands (the identity fallback spawns twice, and
+    // the branch listing spawns the namespace read and the default-branch probe).
+    // A drive that silently stopped calling the runner shrinks this count.
+    expect(sink).toHaveLength(8)
     for (const args of sink) {
       expect(isHardenedArgv(args)).toEqual({ ok: true })
     }
@@ -545,7 +571,9 @@ describe('every argv the exported seam emits satisfies the predicate', () => {
       'GIT_ARGV_BLOCKED',
       'checkRefFormat',
       'discoverRepoRoot',
+      'listBranches',
       'normalizeRef',
+      'parseForEachRefZ',
       'repoIdentity',
       'runGit',
     ])
@@ -681,6 +709,336 @@ describe('repoIdentity', () => {
   test('the fixture repo, which has no origin, keys on its resolved toplevel', async () => {
     const result = await repoIdentity(createBunCommandRunner(), fixture.dir)
     expect(result).toEqual({ ok: true, identity: fixture.dir, source: 'root' })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The branch listing the review-side pickers read.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * The only command shape the listing may take, restated here as an independent
+ * literal rather than read back out of the module. The whole array is asserted
+ * because a silently dropped `--format` would hand the parser git's own default
+ * output — a different, unrequested shape that this seam never agreed to parse —
+ * and an assertion that merely looked for the two namespaces would not notice.
+ */
+const FOR_EACH_REF_ARGV = [
+  'git',
+  'for-each-ref',
+  '--format=%(refname)%00%(objectname)%00%(HEAD)',
+  '--end-of-options',
+  'refs/heads',
+  'refs/remotes',
+]
+
+/**
+ * The probe the default-branch marker comes from. `--quiet` is what turns an
+ * absent symbolic ref into a plain non-zero exit with no diagnostic, which is
+ * the ordinary state of a repository that has no remote at all.
+ */
+const SYMBOLIC_REF_ARGV = [
+  'git',
+  'symbolic-ref',
+  '--quiet',
+  '--end-of-options',
+  'refs/remotes/origin/HEAD',
+]
+
+/** A listing carrying both namespaces, the symbolic ref, and a checked-out branch. */
+const TWO_NAMESPACE_LISTING =
+  `refs/heads/feature/x\0${SHA_A}\0 \n` +
+  `refs/heads/main\0${SHA_B}\0*\n` +
+  `refs/remotes/origin/HEAD\0${SHA_B}\0 \n` +
+  `refs/remotes/origin/main\0${SHA_B}\0 \n`
+
+/** What `TWO_NAMESPACE_LISTING` parses to before any default marker is applied. */
+const TWO_NAMESPACE_BRANCHES: BranchRef[] = [
+  { ref: 'refs/heads/feature/x', name: 'feature/x', kind: 'local', isDefault: false },
+  { ref: 'refs/heads/main', name: 'main', kind: 'local', isDefault: false },
+  { ref: 'refs/remotes/origin/main', name: 'origin/main', kind: 'remote', isDefault: false },
+]
+
+describe('the branch listing reads both namespaces in one hardened command', () => {
+  async function captureListing(): Promise<string[][]> {
+    const sink: string[][] = []
+    await listBranches(fakeRunner({ ok: true, code: 0, stdout: '' }, sink), '/repo')
+    return sink
+  }
+
+  test('the namespace read is exactly the format-pinned command', async () => {
+    expect((await captureListing())[0]).toEqual(FOR_EACH_REF_ARGV)
+  })
+
+  test('the namespace read is in the hardened argv form', async () => {
+    expect(isHardenedArgv((await captureListing())[0])).toEqual({ ok: true })
+  })
+
+  test('the default-branch probe is exactly the quiet symbolic-ref read', async () => {
+    expect((await captureListing())[1]).toEqual(SYMBOLIC_REF_ARGV)
+  })
+
+  test('the default-branch probe is in the hardened argv form', async () => {
+    expect(isHardenedArgv((await captureListing())[1])).toEqual({ ok: true })
+  })
+
+  test('the listing spawns those two commands and nothing else', async () => {
+    expect(await captureListing()).toHaveLength(2)
+  })
+
+  test('the cwd is threaded to both commands', async () => {
+    const seen: (string | undefined)[] = []
+    const runner: CommandRunner = {
+      async run(_args, opts): Promise<CommandResult> {
+        seen.push(opts?.cwd)
+        return { ok: true, code: 0, stdout: '', stderr: '' }
+      },
+    }
+    await listBranches(runner, '/somewhere/specific')
+    expect(seen).toEqual(['/somewhere/specific', '/somewhere/specific'])
+  })
+})
+
+interface ForEachRefRow {
+  readonly label: string
+  readonly stdout: string
+  readonly expected: BranchRef[]
+}
+
+/**
+ * One row per shape the record stream can take. Every row asserts the whole
+ * parsed array, so a row proves what is produced as well as what is dropped.
+ *
+ * The symbolic ref `refs/remotes/<remote>/HEAD` is excluded because it is not a
+ * branch: it points at whichever remote-tracking branch the remote calls its
+ * default, so offering it would put a second, differently-spelled copy of that
+ * branch in the picker — one that silently follows the remote if the default
+ * ever changes. The default it names is read separately, as a marker on the
+ * branch itself.
+ */
+const PARSE_ROWS: readonly ForEachRefRow[] = [
+  {
+    label: 'a local branch, a remote-tracking branch and the remote HEAD symref yield two branches',
+    stdout:
+      `refs/heads/main\0${SHA_A}\0*\n` +
+      `refs/remotes/origin/HEAD\0${SHA_B}\0 \n` +
+      `refs/remotes/origin/main\0${SHA_B}\0 \n`,
+    expected: [
+      { ref: 'refs/heads/main', name: 'main', kind: 'local', isDefault: false },
+      { ref: 'refs/remotes/origin/main', name: 'origin/main', kind: 'remote', isDefault: false },
+    ],
+  },
+  {
+    label: 'the remote HEAD symref on its own yields nothing',
+    stdout: `refs/remotes/origin/HEAD\0${SHA_B}\0 \n`,
+    expected: [],
+  },
+  {
+    label: 'a remote branch whose name merely begins with HEAD is kept',
+    stdout: `refs/remotes/origin/HEADless\0${SHA_A}\0 \n`,
+    expected: [
+      {
+        ref: 'refs/remotes/origin/HEADless',
+        name: 'origin/HEADless',
+        kind: 'remote',
+        isDefault: false,
+      },
+    ],
+  },
+  {
+    label: 'a remote branch named HEAD below a further segment is kept',
+    stdout: `refs/remotes/origin/feature/HEAD\0${SHA_A}\0 \n`,
+    expected: [
+      {
+        ref: 'refs/remotes/origin/feature/HEAD',
+        name: 'origin/feature/HEAD',
+        kind: 'remote',
+        isDefault: false,
+      },
+    ],
+  },
+  {
+    label: 'a local branch literally named HEAD is kept',
+    stdout: `refs/heads/HEAD\0${SHA_A}\0 \n`,
+    expected: [{ ref: 'refs/heads/HEAD', name: 'HEAD', kind: 'local', isDefault: false }],
+  },
+  {
+    label: 'a local branch named HEAD at the same depth as the symref is kept',
+    // The row that anchors the exclusion to the remotes namespace: this ref has
+    // the same segment count and the same last segment as the symbolic ref, and
+    // differs from it only by the namespace it lives in.
+    stdout: `refs/heads/feature/HEAD\0${SHA_A}\0 \n`,
+    expected: [
+      { ref: 'refs/heads/feature/HEAD', name: 'feature/HEAD', kind: 'local', isDefault: false },
+    ],
+  },
+  {
+    label: 'a ref in neither branch namespace is not a branch',
+    stdout: `refs/tags/v1\0${SHA_A}\0 \n`,
+    expected: [],
+  },
+  {
+    label: 'empty output yields an empty listing',
+    stdout: '',
+    expected: [],
+  },
+  {
+    label: 'a final record with no trailing newline is not lost',
+    stdout: `refs/heads/main\0${SHA_A}\0*`,
+    expected: [{ ref: 'refs/heads/main', name: 'main', kind: 'local', isDefault: false }],
+  },
+  {
+    label: "git's own default output carries no NUL fields and yields nothing",
+    stdout: `${SHA_A} commit\trefs/heads/main\n${SHA_B} commit\trefs/remotes/origin/main\n`,
+    expected: [],
+  },
+  {
+    label: 'a record carrying only the ref name is not the requested format and yields nothing',
+    // The shape a reduced format would produce. Its refname is in the right
+    // namespace and would parse perfectly well, which is exactly why the record
+    // shape has to be checked rather than assumed: a stream this parser did not
+    // ask for is not guessed at, whatever it happens to contain.
+    stdout: 'refs/heads/main\n',
+    expected: [],
+  },
+  {
+    label: 'a record carrying an extra field is not the requested format either',
+    // The other side of the record-shape check. Without this row the count
+    // could be a lower bound and nothing would say so, since the requested
+    // format cannot itself produce a longer record.
+    stdout: `refs/heads/main\0${SHA_A}\0*\0extra\n`,
+    expected: [],
+  },
+]
+
+describe('parseForEachRefZ reads the records on their NUL boundaries', () => {
+  for (const row of PARSE_ROWS) {
+    test(row.label, () => {
+      expect(parseForEachRefZ(row.stdout)).toEqual(row.expected)
+    })
+  }
+
+  test('the listing a two-namespace read produces carries the namespace on every entry', () => {
+    expect(parseForEachRefZ(TWO_NAMESPACE_LISTING)).toEqual(TWO_NAMESPACE_BRANCHES)
+  })
+})
+
+describe('the default-branch marker comes from the remote HEAD symref', () => {
+  async function listWith(marker: Partial<CommandResult>): Promise<BranchRef[]> {
+    return listBranches(
+      fakeScriptRunner([{ ok: true, code: 0, stdout: TWO_NAMESPACE_LISTING }, marker]),
+      '/repo',
+    )
+  }
+
+  test('the branch the symref names is marked, and the remote copy of it is not', async () => {
+    // The positive control for every "no marker" assertion below: the same
+    // listing, the same code path, a symref that resolves — and the marker
+    // appears. A builder that never sets the field cannot pass this row.
+    expect(await listWith({ ok: true, code: 0, stdout: 'refs/remotes/origin/main\n' })).toEqual([
+      { ref: 'refs/heads/feature/x', name: 'feature/x', kind: 'local', isDefault: false },
+      { ref: 'refs/heads/main', name: 'main', kind: 'local', isDefault: true },
+      { ref: 'refs/remotes/origin/main', name: 'origin/main', kind: 'remote', isDefault: false },
+    ])
+  })
+
+  test('exactly one entry is marked', async () => {
+    const branches = await listWith({ ok: true, code: 0, stdout: 'refs/remotes/origin/main\n' })
+    expect(branches.filter((branch) => branch.isDefault)).toHaveLength(1)
+  })
+
+  test('a repository with no remote HEAD symref carries no marker at all', async () => {
+    // Empty stderr is load-bearing: an implementation that decided what this
+    // exit meant by reading its diagnostic text could not pass this row.
+    const branches = await listWith({ ok: false, code: 1, stdout: '', stderr: '' })
+    expect(branches.filter((branch) => branch.isDefault)).toEqual([])
+  })
+
+  test('the listing itself survives an absent symref unchanged', async () => {
+    expect(await listWith({ ok: false, code: 1, stdout: '', stderr: '' })).toEqual(
+      TWO_NAMESPACE_BRANCHES,
+    )
+  })
+
+  test('a symref naming a branch the listing does not carry marks nothing', async () => {
+    const branches = await listWith({ ok: true, code: 0, stdout: 'refs/remotes/origin/trunk\n' })
+    expect(branches.filter((branch) => branch.isDefault)).toEqual([])
+  })
+
+  test('a probe that could not be spawned at all degrades to no marker', async () => {
+    // The runner reports an unspawnable executable as a negative code rather
+    // than a rejection, so this is the same non-zero path as an absent symref
+    // and must degrade identically rather than fail the listing.
+    const branches = await listWith({ ok: false, code: -1, stdout: '', stderr: '' })
+    expect(branches.filter((branch) => branch.isDefault)).toEqual([])
+  })
+
+  test('a probe that succeeds with empty output marks nothing', async () => {
+    const branches = await listWith({ ok: true, code: 0, stdout: '' })
+    expect(branches.filter((branch) => branch.isDefault)).toEqual([])
+  })
+})
+
+describe('a failed namespace read is a failure, never an empty listing', () => {
+  test('a non-zero exit rejects rather than reporting a repository with no branches', async () => {
+    await expect(
+      listBranches(fakeRunner({ ok: false, code: 128, stdout: '', stderr: '' }), '/not-a-repo'),
+    ).rejects.toThrow()
+  })
+
+  test('nothing further is spawned once the namespace read has failed', async () => {
+    const sink: string[][] = []
+    await listBranches(
+      fakeRunner({ ok: false, code: 128, stdout: '', stderr: '' }, sink),
+      '/not-a-repo',
+    ).catch(() => undefined)
+    expect(sink).toHaveLength(1)
+  })
+})
+
+describe('listBranches against real repositories', () => {
+  test('the seeded repository offers both of its local branches, fully qualified', async () => {
+    expect(await listBranches(createBunCommandRunner(), fixture.dir)).toEqual([
+      {
+        ref: `refs/heads/${fixture.headBranch}`,
+        name: fixture.headBranch,
+        kind: 'local',
+        isDefault: false,
+      },
+      {
+        ref: `refs/heads/${fixture.baseBranch}`,
+        name: fixture.baseBranch,
+        kind: 'local',
+        isDefault: false,
+      },
+    ])
+  })
+
+  test('a repository with no remote offers no remote-tracking ref', async () => {
+    const branches = await listBranches(createBunCommandRunner(), fixture.dir)
+    expect(branches.filter((branch) => branch.kind === 'remote')).toEqual([])
+  })
+
+  test('the unmarked listing is caused by an absent symref, not by an unset field', async () => {
+    // The accompanying control for the unmarked fixture listing above. Without
+    // it, "no branch is marked" is equally satisfied by a builder that never
+    // marks anything at all; with it, the marker's only input is proved absent
+    // in this repository by the very probe the builder runs.
+    const probe = await createBunCommandRunner().run(SYMBOLIC_REF_ARGV, { cwd: fixture.dir })
+    expect(probe.code).toBe(1)
+  })
+
+  test('a repository with no commits and no branches resolves to an empty listing', async () => {
+    // The resolve form, so a throw fails this test rather than escaping as an
+    // unhandled rejection the runner might report somewhere else entirely.
+    await expect(listBranches(createBunCommandRunner(), emptyRepoDir)).resolves.toEqual([])
+  })
+
+  test('that empty listing is a clean read of a repository with no refs', async () => {
+    // Distinguishes "empty because there is nothing to list" from "empty
+    // because the read failed and the failure was swallowed".
+    const probe = await createBunCommandRunner().run(FOR_EACH_REF_ARGV, { cwd: emptyRepoDir })
+    expect(probe).toEqual({ ok: true, code: 0, stdout: '', stderr: '' })
   })
 })
 

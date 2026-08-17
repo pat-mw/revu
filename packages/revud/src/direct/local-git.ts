@@ -32,6 +32,7 @@
  * toplevel, so a worktree or subdirectory invocation acts on the repository it
  * is actually inside rather than on wherever the daemon happened to start.
  */
+import type { BranchRef } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import { isHardenedArgv } from './local-git-argv'
 import { resolveRepo } from './repo'
@@ -224,4 +225,165 @@ export async function repoIdentity(
   const root = await discoverRepoRoot(runner, cwd)
   if (!root.ok) return { ok: false, code: root.code }
   return { ok: true, identity: root.root, source: 'root' }
+}
+
+/**
+ * The record format the branch listing asks for, and never git's default.
+ *
+ * An explicit format is mandatory. The default `for-each-ref` output is a
+ * human-facing shape that no compatibility promise fixes, so parsing it would
+ * mean parsing whatever the installed git happens to print — and a listing that
+ * silently lost its format would hand this module's parser a stream it never
+ * agreed to read. Fields are separated by NUL, the one byte a ref name can never
+ * contain, and records by newline, so no field needs escaping and none can be
+ * split by a name carrying a slash or whitespace.
+ *
+ * Three fields are requested where a branch listing needs one. The object name
+ * and the checked-out marker have no home in the listing's shape, but a fixed
+ * field count is what lets the parser tell the requested format apart from any
+ * other output — the second line of defense behind the argv itself.
+ */
+const FOR_EACH_REF_FORMAT = '%(refname)%00%(objectname)%00%(HEAD)'
+
+/**
+ * The two namespaces a review side may come from. Remote-tracking refs are
+ * listed alongside local branches because a base is frequently tracked and never
+ * checked out; the namespace travels with each entry so a caller can offer the
+ * right set on each side without re-reading the ref name.
+ */
+const BRANCH_NAMESPACES = ['refs/heads', 'refs/remotes'] as const
+
+const LOCAL_BRANCH_PREFIX = 'refs/heads/'
+const REMOTE_BRANCH_PREFIX = 'refs/remotes/'
+
+/**
+ * The symbolic ref recording which branch the origin remote calls its default,
+ * and the prefix its target is expected to carry. A repository with no origin
+ * simply does not have this ref.
+ */
+const REMOTE_HEAD_REF = 'refs/remotes/origin/HEAD'
+const ORIGIN_BRANCH_PREFIX = 'refs/remotes/origin/'
+
+/**
+ * True for `refs/remotes/<remote>/HEAD` exactly.
+ *
+ * That ref is a symbolic ref, not a branch: it points at whichever
+ * remote-tracking branch the remote calls its default, so listing it would put a
+ * second, differently-spelled copy of that branch in front of the reader — one
+ * that silently follows the remote if the default ever changes. The default it
+ * names is read separately and applied as a marker on the branch itself.
+ *
+ * The test is anchored on the namespace and on the segment depth rather than on
+ * a `/HEAD` suffix, because every looser spelling excludes a real branch: one
+ * named `HEAD` under a further segment (`refs/remotes/origin/feature/HEAD`), one
+ * merely beginning with those letters (`refs/remotes/origin/HEADless`), and any
+ * local branch at all, which is never a remote's symbolic ref however it is
+ * spelled.
+ */
+function isRemoteDefaultSymref(ref: string): boolean {
+  if (!ref.startsWith(REMOTE_BRANCH_PREFIX)) return false
+  const withinRemotes = ref.slice(REMOTE_BRANCH_PREFIX.length).split('/')
+  return withinRemotes.length === 2 && withinRemotes[1] === 'HEAD'
+}
+
+/**
+ * Parses the record stream `FOR_EACH_REF_FORMAT` produces. Pure, so the record
+ * shapes can be asserted without a repository or a runner standing behind them.
+ *
+ * Every ref comes back fully qualified — the same form ref normalization
+ * produces — so the string a caller hands back is the string everything
+ * downstream keys on, with no re-derivation anywhere. A record whose field count
+ * is not the requested one is not the format this parser asked for and is
+ * skipped, as is any ref outside the two branch namespaces.
+ *
+ * No entry is marked as the default here: the default is not in this stream.
+ */
+export function parseForEachRefZ(stdout: string): BranchRef[] {
+  const branches: BranchRef[] = []
+  for (const record of stdout.split('\n')) {
+    // Exactly the requested field count, and no other: a record of any other
+    // shape did not come from the format above, and the one this parser would
+    // most readily mis-read is the shortest — a bare ref name, which parses
+    // perfectly well and means nothing was pinned. This also disposes of the
+    // empty record left behind by the stream's final newline.
+    const fields = record.split('\0')
+    if (fields.length !== 3) continue
+    const ref = fields[0]
+    if (isRemoteDefaultSymref(ref)) continue
+    if (ref.startsWith(LOCAL_BRANCH_PREFIX)) {
+      const name = ref.slice(LOCAL_BRANCH_PREFIX.length)
+      branches.push({ ref, name, kind: 'local', isDefault: false })
+      continue
+    }
+    // Each namespace is tested in turn rather than one being the other's
+    // fallback: a ref under neither is not a branch and must not be admitted as
+    // whichever kind happens to be written last.
+    if (ref.startsWith(REMOTE_BRANCH_PREFIX)) {
+      const name = ref.slice(REMOTE_BRANCH_PREFIX.length)
+      branches.push({ ref, name, kind: 'remote', isDefault: false })
+    }
+  }
+  return branches
+}
+
+/**
+ * The local branch the origin remote calls its default, fully qualified, or
+ * `null` when the repository cannot say.
+ *
+ * A clone with no origin has no such symbolic ref and the probe exits non-zero
+ * with `--quiet` suppressing any diagnostic — the ordinary state of a repository
+ * reviewed purely locally. So every non-zero exit degrades to "no default is
+ * known" rather than to a failure, and the outcome is decided by the exit code
+ * alone; the diagnostic text is never read.
+ *
+ * The symbolic ref names a remote-tracking branch, and the marker is moved onto
+ * the local branch of the same name because a remote-tracking ref is a second
+ * copy of one branch: marking it would preselect a base spelled differently from
+ * the branch the reader thinks of as the default. When no local branch of that
+ * name is listed, nothing is marked.
+ */
+async function readDefaultBranchRef(
+  runner: CommandRunner,
+  cwd: string,
+): Promise<string | null> {
+  const probe = await runGit(runner, cwd, {
+    args: ['symbolic-ref', '--quiet'],
+    revs: [REMOTE_HEAD_REF],
+  })
+  if (!probe.ok) return null
+  const target = probe.stdout.trim()
+  // The probe asks about one remote, so its target is expected under that
+  // remote; anything else is not a shape this can translate. Being wrong here
+  // costs a marker that matches no listed branch, never a marker on the wrong
+  // branch, because only an exact ref match applies it.
+  if (!target.startsWith(ORIGIN_BRANCH_PREFIX)) return null
+  return `${LOCAL_BRANCH_PREFIX}${target.slice(ORIGIN_BRANCH_PREFIX.length)}`
+}
+
+/**
+ * Every branch this repository can offer as a review side: local branches and
+ * remote-tracking refs together, each fully qualified and carrying which
+ * namespace it came from, with the default branch marked when the repository
+ * knows one.
+ *
+ * A repository with no branches at all — freshly initialized, nothing committed
+ * — lists nothing and is an empty array, never a failure. A read that actually
+ * fails is not quietly turned into that same empty array: an unreadable
+ * repository and a repository with no branches are different facts and must not
+ * arrive as one.
+ */
+export async function listBranches(runner: CommandRunner, cwd: string): Promise<BranchRef[]> {
+  const listed = await runGit(runner, cwd, {
+    args: ['for-each-ref', `--format=${FOR_EACH_REF_FORMAT}`],
+    revs: BRANCH_NAMESPACES,
+  })
+  if (!listed.ok) {
+    throw new Error(`branches could not be listed: git for-each-ref exited ${listed.code}`)
+  }
+  const branches = parseForEachRefZ(listed.stdout)
+  const defaultRef = await readDefaultBranchRef(runner, cwd)
+  if (defaultRef === null) return branches
+  return branches.map((branch) =>
+    branch.ref === defaultRef ? { ...branch, isDefault: true } : branch,
+  )
 }
