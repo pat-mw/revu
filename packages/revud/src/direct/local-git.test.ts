@@ -696,7 +696,7 @@ describe('repoIdentity', () => {
  * is included even though it spawns nothing — scanning a module that cannot need
  * a working directory costs nothing and keeps the membership rule mechanical.
  */
-const CWD_SCANNED_MODULES = ['local-git-argv.ts', 'local-git.ts'] as const
+const CWD_SCANNED_MODULES = ['local-git-argv.ts', 'local-git.ts', 'local-sync.ts'] as const
 
 const CWD_PATTERN = /process\.cwd/
 
