@@ -5,6 +5,12 @@
  * unreadable row is distinguished from an absent one; and a store-version bump
  * migrates IN PLACE, preserving drafts. The two-half cache table (`immutables`)
  * is exercised for reuse-across-restart.
+ *
+ * The last block installs SQLite tripwires on the three tables whose integer key
+ * is a real GitHub pull-request number, and proves they abort a write. That is
+ * the negative control every absence-shaped claim about those tables depends on:
+ * "nothing wrote `snapshots`" is worth something only while a write that did
+ * reach `snapshots` would fail loudly.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -498,5 +504,278 @@ describe('the pull-request author attribution seam', () => {
     }
     expect(Number(after.value)).toBe(STORE_VERSION)
     check.close()
+  })
+})
+
+/**
+ * The tables whose integer key is a REAL GitHub pull-request number:
+ * `snapshots.pr_number`, `audit_log.pr` and `pr_author.pr`. Their readers — the
+ * host-side collector's write reconciler, the poll loop's per-pull annotations,
+ * and the out-of-band-write detector — all interpret those columns as pull
+ * requests that exist on GitHub. A synthetic identifier written into any of them
+ * is not a wrong row that surfaces later; it is a row those readers cannot tell
+ * from a real one, so the damage lands as misattributed provenance months away
+ * from the statement that caused it.
+ */
+const PR_KEYED_TABLES = ['snapshots', 'audit_log', 'pr_author'] as const
+
+/** Every statement kind a tripwire has to intercept to guard a whole table. */
+const TRIPWIRE_EVENTS = ['INSERT', 'UPDATE', 'DELETE'] as const
+
+/** The trigger name for one (table, statement kind) pair. */
+function tripwireName(table: string, event: string): string {
+  return `tripwire_${table}_${event.toLowerCase()}`
+}
+
+/**
+ * The abort message one tripwire raises. It names its own table and its own
+ * statement kind, so a failure identifies which statement reached which table —
+ * and so a test can tell nine live tripwires apart from one live tripwire and
+ * eight that were never installed.
+ */
+function tripwireMessage(table: string, event: string): string {
+  return `tripwire: ${event} on the PR-keyed table ${table}`
+}
+
+/**
+ * Arm the tripwires on the current data dir's store file: one `BEFORE
+ * INSERT|UPDATE|DELETE` trigger per PR-keyed table, each raising `RAISE(ABORT,
+ * …)`, which the store's write wrapper turns into a `StoreWriteError`.
+ *
+ * Closes the store passed in, installs the triggers through a raw handle, and
+ * returns a freshly opened store — so every statement the returned store issues
+ * was prepared against the armed schema, and the reopen itself is a live check
+ * that opening a store touches no guarded table.
+ *
+ * A trigger is what makes an absence provable. A `COUNT(*) === 0` assertion
+ * cannot distinguish a table nothing wrote from one that was written and then
+ * cleaned up, and it reports nothing at all about a write that happened inside a
+ * transaction which later rolled back. An aborting trigger fires on the
+ * statement, so the failure names the write rather than its leftovers.
+ */
+function armPrKeyedTripwires(store: DirectStore): DirectStore {
+  store.close()
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  for (const table of PR_KEYED_TABLES) {
+    for (const event of TRIPWIRE_EVENTS) {
+      raw.run(
+        `CREATE TRIGGER ${tripwireName(table, event)} BEFORE ${event} ON ${table} ` +
+          `BEGIN SELECT RAISE(ABORT, '${tripwireMessage(table, event)}'); END`,
+      )
+    }
+  }
+  raw.close()
+  return open()
+}
+
+/**
+ * Run `fn` and return the `StoreWriteError` it threw. Fails loudly when the
+ * statement completes instead: "the write was refused" is the assertion, and a
+ * silent completion is exactly the outcome that must not read as a pass.
+ */
+function writeErrorFrom(fn: () => void): StoreWriteError {
+  try {
+    fn()
+  } catch (err) {
+    if (err instanceof StoreWriteError) return err
+    throw err
+  }
+  throw new Error('expected a StoreWriteError; the statement completed instead')
+}
+
+describe('local writes never touch a PR-keyed table', () => {
+  test('the harness arms nine tripwires and nothing else', () => {
+    const armed = armPrKeyedTripwires(open())
+    armed.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    const names = (
+      raw
+        .query("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .all() as { name: string }[]
+    ).map((r) => r.name)
+    raw.close()
+
+    // Written out rather than rebuilt from the constants the harness loops over:
+    // a membership list derived from the generator agrees with the generator
+    // however wrong it becomes, and would stay green if the loop stopped running.
+    expect(names).toEqual([
+      'tripwire_audit_log_delete',
+      'tripwire_audit_log_insert',
+      'tripwire_audit_log_update',
+      'tripwire_pr_author_delete',
+      'tripwire_pr_author_insert',
+      'tripwire_pr_author_update',
+      'tripwire_snapshots_delete',
+      'tripwire_snapshots_insert',
+      'tripwire_snapshots_update',
+    ])
+  })
+
+  test('all nine tripwires fire: every guarded table aborts INSERT, UPDATE and DELETE', () => {
+    const store = open()
+    // One row per guarded table before arming. SQLite runs a BEFORE UPDATE or
+    // BEFORE DELETE trigger once per MATCHED row, so a statement that matches
+    // nothing runs no trigger at all — six of the nine would be written down as
+    // installed while never having fired once.
+    store.putSnapshot(snapshot(204, 'base...head'))
+    store.appendAudit(auditEntry({ githubId: 1, pr: 204 }))
+    store.recordPrAuthor(204, 'h-priya')
+    const armed = armPrKeyedTripwires(store)
+    armed.close()
+
+    const probes: { table: string; event: string; sql: string }[] = [
+      {
+        table: 'snapshots',
+        event: 'INSERT',
+        sql: "INSERT INTO snapshots (pr_number, data) VALUES (999, '{}')",
+      },
+      {
+        table: 'snapshots',
+        event: 'UPDATE',
+        sql: "UPDATE snapshots SET data = '{}' WHERE pr_number = 204",
+      },
+      {
+        table: 'snapshots',
+        event: 'DELETE',
+        sql: 'DELETE FROM snapshots WHERE pr_number = 204',
+      },
+      {
+        table: 'audit_log',
+        event: 'INSERT',
+        sql:
+          'INSERT INTO audit_log (github_id, human_id, workspace, endpoint, pr, created_at) ' +
+          "VALUES (2, 'alice@x.io', 'ws-o-r', 'submitReview', 205, '2026-01-01T00:00:00.000Z')",
+      },
+      {
+        table: 'audit_log',
+        event: 'UPDATE',
+        sql: 'UPDATE audit_log SET pr = 205 WHERE github_id = 1',
+      },
+      {
+        table: 'audit_log',
+        event: 'DELETE',
+        sql: 'DELETE FROM audit_log WHERE github_id = 1',
+      },
+      {
+        table: 'pr_author',
+        event: 'INSERT',
+        sql:
+          "INSERT INTO pr_author (pr, human_id, recorded_at) VALUES (205, 'h-marcus', " +
+          "'2026-01-01T00:00:00.000Z')",
+      },
+      {
+        table: 'pr_author',
+        event: 'UPDATE',
+        sql: "UPDATE pr_author SET human_id = 'h-marcus' WHERE pr = 204",
+      },
+      {
+        table: 'pr_author',
+        event: 'DELETE',
+        sql: 'DELETE FROM pr_author WHERE pr = 204',
+      },
+    ]
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    const observed: string[] = []
+    for (const probe of probes) {
+      try {
+        raw.run(probe.sql)
+        observed.push(`${probe.event} on ${probe.table}: NO ABORT`)
+      } catch (err) {
+        observed.push(err instanceof Error ? err.message : String(err))
+      }
+    }
+    const counts = raw
+      .query(
+        'SELECT (SELECT COUNT(*) FROM snapshots) AS snapshots, ' +
+          '(SELECT COUNT(*) FROM audit_log) AS audit_log, ' +
+          '(SELECT COUNT(*) FROM pr_author) AS pr_author',
+      )
+      .get() as { snapshots: number; audit_log: number; pr_author: number }
+    raw.close()
+
+    // Each abort names its own table and statement kind, so this list falsifies a
+    // missing tripwire and a duplicated one alike. The literals are copied out
+    // rather than rebuilt from the harness's own generator, for the same reason
+    // the membership list above is.
+    expect(observed).toEqual([
+      'tripwire: INSERT on the PR-keyed table snapshots',
+      'tripwire: UPDATE on the PR-keyed table snapshots',
+      'tripwire: DELETE on the PR-keyed table snapshots',
+      'tripwire: INSERT on the PR-keyed table audit_log',
+      'tripwire: UPDATE on the PR-keyed table audit_log',
+      'tripwire: DELETE on the PR-keyed table audit_log',
+      'tripwire: INSERT on the PR-keyed table pr_author',
+      'tripwire: UPDATE on the PR-keyed table pr_author',
+      'tripwire: DELETE on the PR-keyed table pr_author',
+    ])
+    // ABORT rolled every statement back, so refusing the write is what happened
+    // rather than raising after it landed: each table still holds its one seed row.
+    expect(counts).toEqual({ snapshots: 1, audit_log: 1, pr_author: 1 })
+  })
+
+  test('putSnapshot is refused under the tripwires, as a StoreWriteError', () => {
+    const armed = armPrKeyedTripwires(open())
+    const err = writeErrorFrom(() => armed.putSnapshot(snapshot(204, 'base...head')))
+    armed.close()
+    expect(err.table).toBe('snapshots')
+    expect(err.message).toContain('tripwire: INSERT on the PR-keyed table snapshots')
+  })
+
+  test('appendAudit is refused under the tripwires, as a StoreWriteError', () => {
+    const armed = armPrKeyedTripwires(open())
+    const err = writeErrorFrom(() => armed.appendAudit(auditEntry({ githubId: 4242, pr: 204 })))
+    armed.close()
+    expect(err.table).toBe('audit_log')
+    expect(err.message).toContain('tripwire: INSERT on the PR-keyed table audit_log')
+  })
+
+  test('recordPrAuthor is refused under the tripwires, as a StoreWriteError', () => {
+    const armed = armPrKeyedTripwires(open())
+    const err = writeErrorFrom(() => armed.recordPrAuthor(204, 'h-priya'))
+    armed.close()
+    expect(err.table).toBe('pr_author')
+    expect(err.message).toContain('tripwire: INSERT on the PR-keyed table pr_author')
+  })
+
+  test('a store still opens under armed tripwires: migration touches no guarded table', () => {
+    const store = open()
+    store.putDraft(draft('h1', 204, 'work that must survive a boot under tripwires'))
+    store.putSnapshot(snapshot(204, 'base...head'))
+    store.appendAudit(auditEntry({ githubId: 1, pr: 204 }))
+    const armed = armPrKeyedTripwires(store)
+    armed.close()
+
+    // Knock the recorded version back so the reopen runs the guarded ladder and
+    // the version stamp, not only the create-when-absent shape. `meta` is not a
+    // PR-keyed table, so the stamp itself is never a candidate for interception —
+    // and the day a migration step does write one of the three, this boots red,
+    // which is the signal wanted rather than a surprise.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE meta SET value = '1' WHERE key = 'store_version'")
+    raw.close()
+
+    const reopened = open()
+    expect(reopened.getDraft('h1', 204)!.body).toBe(
+      'work that must survive a boot under tripwires',
+    )
+    expect(reopened.getSnapshot(204)!.immutable.compareKey).toBe('base...head')
+    expect(reopened.listAudit()).toHaveLength(1)
+    // The migration left the tripwires ARMED, not merely present — asserted by
+    // taking a real abort out of one, so an absence claimed after a boot still has
+    // a working negative control underneath it.
+    const stillArmed = writeErrorFrom(() =>
+      reopened.appendAudit(auditEntry({ githubId: 2, pr: 204 })),
+    )
+    expect(stillArmed.message).toContain('tripwire: INSERT on the PR-keyed table audit_log')
+    reopened.close()
+
+    const check = new Database(join(dir, 'direct.sqlite'))
+    const after = check.query("SELECT value FROM meta WHERE key = 'store_version'").get() as {
+      value: string
+    }
+    check.close()
+    expect(Number(after.value)).toBe(STORE_VERSION)
   })
 })

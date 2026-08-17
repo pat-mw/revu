@@ -16,9 +16,14 @@ against each other while integration and gating stay serial in the main tree.
 
 | lane | branch | chain (execution order, not numbering) | status |
 | --- | --- | --- | --- |
-| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — **fully serial**: .1–.6 all write `direct/store.ts`, and .7 shares `store.test.ts` | dispatching `.7` |
-| **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | dispatching `.8` |
-| **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | dispatching `.6` |
+| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` — **fully serial**: .1–.6 all write `direct/store.ts`, and .7 shares `store.test.ts` | **`.7` landed** (1617 pass); `.1` dispatched |
+| **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | `.8` dispatched |
+| **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | `.6` dispatched |
+
+**All three lane branches are at `ef6b851`** — that is the STEP ZERO fast-forward target for the next dispatch
+in every lane, and it advances as each lane's units land. A worker whose worktree is still at the repo base
+commit has neither the lane's landed modules nor `node_modules`, and any result it produces before
+fast-forwarding is void.
 
 **Two guard rails land first in their lanes and are deliberately RED at their landing commit** — the protocol
 requires a guard rail to land before the code it constrains, and both assert their target modules *exist*:
