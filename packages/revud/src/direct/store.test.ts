@@ -581,6 +581,20 @@ function metaValue(key: string): string | null {
   return row ? row.value : null
 }
 
+/**
+ * Overwrite one id high-water mark through a raw handle, modelling a file that
+ * was edited outside this store.
+ *
+ * Raw is the only honest shape available: nothing on the store surface writes a
+ * mark to anything but its own successor, so a corrupt one cannot be produced
+ * through the API that has to survive it.
+ */
+function corruptMarkRaw(key: string, value: string): void {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run('UPDATE meta SET value = ? WHERE key = ?', [value, key])
+  raw.close()
+}
+
 /** Every table name in the store file, alphabetical. */
 function tableNames(): string[] {
   const raw = new Database(join(dir, 'direct.sqlite'))
@@ -734,10 +748,15 @@ describe('the local-review keyspace arrives as a purely additive version step', 
       { name: 'data', type: 'TEXT', notnull: 1, dflt: null, pk: 0 },
     ])
 
-    // `review_id` is declared INTEGER, never REAL: the ids stored here come from
-    // a band around 9e12, and a float column round-trips such a value without
-    // complaint while losing its low bits — a corruption no value-equality
-    // assertion on a smaller id would ever surface.
+    // `review_id` is declared INTEGER, never REAL. The ids stored here come from
+    // a band around 9e12 — some three orders of magnitude below the largest
+    // integer a double represents exactly — so a REAL column would round-trip
+    // today's ids with every digit intact and every value-equality assertion
+    // green. The two checks see different things: `typeof` is the only detector
+    // of a REAL column, and value equality is the only detector of a lossy write
+    // into the key column. What makes INTEGER the requirement is not the current
+    // band but the one after it: a float stops being exact somewhere above this
+    // range, and nothing in the schema would be left to say where.
     expect(columnShape('local_reviews_submitted')).toEqual([
       { name: 'local_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 1 },
       { name: 'review_id', type: 'INTEGER', notnull: 1, dflt: null, pk: 2 },
@@ -968,6 +987,70 @@ describe('local reviews: mint, read, list', () => {
     // notices the transaction being dropped: without it the bump commits on its
     // own and the mark walks forward on every failed create.
     expect(metaValue('local_review_id_high_water')).toBe(before)
+    expect(localReviewCount()).toBe(0)
+  })
+
+  // The next three tests are the corrupt-mark counterpart of the missing-mark
+  // refusal the entity allocator carries, and they exist because the two
+  // conditions used to part company here. SQLite casts a non-numeric string to 0,
+  // so an increment that trusts the stored text resolves to 1 — a value squarely
+  // inside the pull-request number range, in the one table whose whole purpose is
+  // to stay out of it — inserts a review under it, and writes the 1 back over the
+  // unreadable mark. Measured, not assumed: with the mark set to `not-a-number`
+  // the mint returned id 1, left one row behind it, and the mark read back as
+  // `"1"` afterwards. The claims are split across three bodies because the runner
+  // abandons a test at its first failing assertion, and the mark surviving
+  // untouched is the half most likely to come back.
+
+  test('a corrupt review id mark refuses the mint rather than minting inside the pull-request range', () => {
+    const store = open()
+    store.close()
+    corruptMarkRaw('local_review_id_high_water', 'not-a-number')
+
+    const reopened = open()
+    // `StoreUnreadableError`, not a write failure, and the distinction is the
+    // caller's to act on: a write failure is worth retrying, while a mark that
+    // cannot be read re-reads the same bytes forever and only a human can repair
+    // it. It is the same class this file already gives every other present-but-
+    // unparseable row, and the write wrapper carries it out unchanged.
+    expect(() => reopened.createLocalReview(newLocalReview({}))).toThrow(StoreUnreadableError)
+    reopened.close()
+    expect(localReviewCount()).toBe(0)
+  })
+
+  test('the refused mint leaves the corrupt review id mark byte for byte as it was found', () => {
+    const store = open()
+    store.close()
+    corruptMarkRaw('local_review_id_high_water', 'not-a-number')
+
+    const reopened = open()
+    try {
+      reopened.createLocalReview(newLocalReview({}))
+    } catch {
+      // The refusal is the previous test's claim. What this one watches is the
+      // disk afterwards.
+    }
+    reopened.close()
+
+    // Never reseeded over. A present-but-unreadable value is real state: the file
+    // holds it because something put it there, and overwriting it with a
+    // fabricated starting value destroys the only evidence of what went wrong
+    // while handing out ids that may already have been issued.
+    expect(metaValue('local_review_id_high_water')).toBe('not-a-number')
+  })
+
+  test('a review id mark of digits below the reserved band is refused, not incremented into it', () => {
+    const store = open()
+    store.close()
+    // Digits, so the charset half of the guard is satisfied and this case can
+    // only be refused by the band floor — which is what makes the floor
+    // falsifiable rather than decorative. Incrementing this mark would yield 6.
+    corruptMarkRaw('local_review_id_high_water', '5')
+
+    const reopened = open()
+    expect(() => reopened.createLocalReview(newLocalReview({}))).toThrow(StoreUnreadableError)
+    reopened.close()
+    expect(metaValue('local_review_id_high_water')).toBe('5')
     expect(localReviewCount()).toBe(0)
   })
 
@@ -1214,6 +1297,63 @@ describe('the local entity id allocator', () => {
     const reopened = open()
     expect(() => reopened.nextLocalEntityId()).toThrow(StoreWriteError)
     reopened.close()
+  })
+
+  // A PRESENT mark that cannot be read is the sibling of the missing one above,
+  // and it is the more dangerous of the two: an absent row has nothing to
+  // destroy, while a corrupt one is real state that a fabricated restart writes
+  // over. Measured before the guard existed: with the mark set to `corrupt` this
+  // allocator returned 1 and left the mark reading `"1"`, so a locally minted
+  // entity id landed in the pull-request number range and the evidence of the
+  // corruption was gone in the same statement.
+
+  test('a corrupt entity id mark refuses to allocate rather than restarting inside the pull-request range', () => {
+    const store = open()
+    store.nextLocalEntityId()
+    store.close()
+    corruptMarkRaw('local_entity_id_high_water', 'corrupt')
+
+    const reopened = open()
+    // Unreadable, not unwritable — the same class every other present-but-
+    // unparseable row in this store surfaces, and a different answer from the
+    // retryable write failure the missing-mark case above produces.
+    expect(() => reopened.nextLocalEntityId()).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('the refused allocation leaves the corrupt entity id mark byte for byte as it was found', () => {
+    const store = open()
+    store.nextLocalEntityId()
+    store.close()
+    corruptMarkRaw('local_entity_id_high_water', 'corrupt')
+
+    const reopened = open()
+    try {
+      reopened.nextLocalEntityId()
+    } catch {
+      // The refusal is the previous test's claim. What this one watches is the
+      // disk afterwards — and this allocator runs its statement with no
+      // surrounding transaction, so nothing would roll a stray write back.
+    }
+    reopened.close()
+
+    expect(metaValue('local_entity_id_high_water')).toBe('corrupt')
+  })
+
+  test('an entity id mark of digits with a trailing non-digit is refused, not truncated to its digits', () => {
+    const store = open()
+    store.nextLocalEntityId()
+    store.close()
+    // A mark whose leading digits are already inside the band, so incrementing
+    // its cast would clear the band floor and hand back a plausible-looking id
+    // built from a value nothing wrote. Only the charset half of the guard
+    // refuses this one, which is what makes that half falsifiable on its own.
+    corruptMarkRaw('local_entity_id_high_water', `${LOCAL_ENTITY_ID_BASE}junk`)
+
+    const reopened = open()
+    expect(() => reopened.nextLocalEntityId()).toThrow(StoreUnreadableError)
+    reopened.close()
+    expect(metaValue('local_entity_id_high_water')).toBe(`${LOCAL_ENTITY_ID_BASE}junk`)
   })
 })
 

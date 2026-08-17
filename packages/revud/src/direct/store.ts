@@ -633,21 +633,62 @@ function selectLocalReview(db: Database, key: NewLocalReview): LocalReviewRow | 
  * created and again on every path that upgrades a file into it, so an absent one
  * means the file was edited outside this store — and fabricating a starting value
  * there could hand back an id that was already issued.
+ *
+ * A mark that is PRESENT but not a decimal integer refuses too, and the guards
+ * that decide it live in the WHERE clause rather than in a check on the result.
+ * That placement is load-bearing rather than a stylistic preference:
+ * SQLite casts a non-numeric string to 0, so an unguarded increment resolves to
+ * `'1'` — a value squarely inside the pull-request number range this keyspace
+ * exists to stay out of — writes it back over the unreadable one, and hands it
+ * out as an id. Refusing in the WHERE clause means the statement matches no row,
+ * so nothing is written and the value stays byte for byte as it was found; a
+ * check on the returned value could only refuse after the overwrite had already
+ * committed, and the entity allocator runs its statement in autocommit with no
+ * transaction to roll back. The same clause carries the band floor, so a mark
+ * that IS a decimal integer but would yield an id below the caller's reserved
+ * base is refused on the same terms and for the same reason.
+ *
+ * The refusal is a `StoreUnreadableError`, not a write failure. The two say
+ * different things to a caller: a write failure is retryable (the disk was full,
+ * the handle was closed), while a present-but-unreadable row re-reads the same
+ * bytes forever and only a human can repair it. A corrupt mark is the second,
+ * and the doctrine it belongs to is the one that already governs every other
+ * present-but-unparseable row in this file — surface it, and never reseed over
+ * it. The MISSING case stays a plain error that the write wrapper types as a
+ * write failure, because an absent row is not a present one and its long-
+ * standing behaviour is not this refusal's to change.
  */
-function bumpIdHighWater(db: Database, key: string): number {
+function bumpIdHighWater(db: Database, key: string, base: number): number {
   const row = db
     .query(
       'UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) ' +
-        'WHERE key = ? RETURNING value',
+        // `NOT GLOB '*[^0-9]*'` is "contains no non-digit"; paired with a
+        // non-empty length it is exactly an all-digits value, spelled in the
+        // only pattern language the statement itself can apply.
+        "WHERE key = ? AND length(value) > 0 AND value NOT GLOB '*[^0-9]*' " +
+        'AND CAST(value AS INTEGER) + 1 >= ? RETURNING value',
     )
-    .get(key) as { value: string } | null
-  if (!row) {
+    .get(key, base) as { value: string } | null
+  if (row) return Number(row.value)
+
+  // No row matched, so no row was written. Which refusal applies needs the
+  // stored value, and reading it here costs the successful path nothing.
+  const stored = db.query('SELECT value FROM meta WHERE key = ?').get(key) as
+    | { value: string }
+    | null
+  if (!stored) {
     throw new Error(
       `the id high-water mark "${key}" is missing, so no id can be allocated ` +
         'without risking one that has already been handed out',
     )
   }
-  return Number(row.value)
+  // The value itself is deliberately absent from the message: this file's errors
+  // name the row, never its contents.
+  throw new StoreUnreadableError(
+    'meta',
+    key,
+    `the id high-water mark is not a decimal integer that yields an id of ${base} or above`,
+  )
 }
 
 /**
@@ -1044,19 +1085,34 @@ export function openDirectStore(
           // retried request.
           if (selectLocalReview(db, input)) return
 
-          const id = bumpIdHighWater(db, LOCAL_REVIEW_ID_META_KEY)
+          const id = bumpIdHighWater(db, LOCAL_REVIEW_ID_META_KEY, LOCAL_REVIEW_ID_BASE)
           const at = new Date().toISOString()
           // The id is supplied explicitly — never omitted and never NULL, which
           // SQLite would answer by assigning a small rowid inside the
           // pull-request number range.
           //
           // `ON CONFLICT … DO NOTHING` rather than a failure, because the unique
-          // key is the real serializer: if another writer recorded this branch
-          // pair between the lookup above and here, the insert yields to it and
-          // the read below returns the row that won. Spelled as `ON CONFLICT`
-          // and not as a blanket ignoring insert so that any OTHER constraint
+          // key is the last line of defence on the branch pair's identity: an
+          // insert that lost the race to another writer must not be the thing
+          // that decides the pair has two reviews. Spelled as `ON CONFLICT` and
+          // not as a blanket ignoring insert so that any OTHER constraint
           // violation — a NULL in a NOT NULL column — still aborts loudly
           // instead of being indistinguishable from a yielded duplicate.
+          //
+          // It does NOT make a genuinely concurrent create idempotent, and an
+          // interleaved pair of writers never reaches it at all. Two daemons on
+          // one file are two connections; this transaction takes its snapshot at
+          // the lookup above, and a write that commits after that snapshot
+          // leaves this one unable to proceed. No busy timeout is set on the
+          // connection, so the loser is refused immediately — at the mark's
+          // update, before the insert exists to conflict — and the caller
+          // receives a write failure rather than the row the winner wrote. The
+          // STATE that failure leaves is still correct, which is why the clause
+          // stays: one row for the pair, a mark consistent with it, nothing
+          // half-written, and a retry that finds the winner's row at the lookup
+          // and returns it. Turning the refusal into a wait is a busy timeout,
+          // which belongs to whatever opens the connection, not to this
+          // statement.
           db.run(
             'INSERT INTO local_reviews (id, repo, base_ref, head_ref, generation, title, ' +
               'created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ' +
@@ -1128,7 +1184,9 @@ export function openDirectStore(
       // add a round trip and no guarantee. The mint of a review id is different —
       // it bumps a mark AND inserts a row, two statements that must commit or fail
       // together — and it wraps them accordingly.
-      return write('meta', () => bumpIdHighWater(db, LOCAL_ENTITY_ID_META_KEY))
+      return write('meta', () =>
+        bumpIdHighWater(db, LOCAL_ENTITY_ID_META_KEY, LOCAL_ENTITY_ID_BASE),
+      )
     },
 
     getLocalSnapshot(localId: number): Snapshot | null {
