@@ -15,11 +15,20 @@ everything landed is committed and pushed. **M8.7 is `In Review` on PR [#72](htt
 (base `m8.6`): all thirteen units landed, `Verify` green, the fable-tier adversarial review of the full diff
 run and its findings closed.
 
-**Execution order for the rest, decided 2026-08-17 and recorded so it is not re-derived:**
-**M8.7.5 → M8.7.6 → M8.7.8 → M8.7.12 → M8.7.11 → M8.7.7.** Serial by file contention. M8.7.12 lands before
-M8.7.7 because it is the last `pr-layout.tsx` writer and M8.7.7 is the closing proof, which the ticket says
-runs after every other unit. M8.7.11 (`state/threads.ts`) is genuinely disjoint from all of them and is placed
-second-to-last only to keep M8.7.7 last.
+**The next work is the daemon track**, which is untouched and unblocked: **M8.2, M8.3 and M8.4 are mutually
+independent**, own genuinely disjoint file sets, and each needs only M8.1. That is the first three-lane
+parallel wave in this workstream. ⚠️ **The roadmap's S3 wave table cannot be dispatched as written** — see
+`HANDOVER.md`'s top entry, which carries the corrected widths and names the four collisions.
+
+**The stack, bottom-up — four PRs open, none merged.** `main` → `m8/local-reviews-design`
+([#69](https://github.com/pat-mw/revu/pull/69)) → `m8.1` ([#70](https://github.com/pat-mw/revu/pull/70)) →
+`m8.6` ([#71](https://github.com/pat-mw/revu/pull/71)) → `m8.7` ([#72](https://github.com/pat-mw/revu/pull/72)).
+#69 has no ticket row below because it is the design/board PR, not a ticket — but it gates the merge order.
+
+⚠️ **One ref is not pushed:** local `m8.6/app-creation-flow` is **ahead of its remote by one commit**
+(`0c17be9`, a board-docs commit). Its *content* is safe — it is an ancestor of `m8.7`'s tip and therefore on
+the remote — but PR #71's diff does not contain it and it rides in #72's range instead. Push `m8.6` and it
+moves to where it belongs.
 
 | ticket | state | where |
 | --- | --- | --- |
@@ -27,8 +36,10 @@ second-to-last only to keep M8.7.7 last.
 | M8.6 | `In Review` — 7 units, Verify green incl. the browser walk | PR [#71](https://github.com/pat-mw/revu/pull/71), base `m8.1` |
 | **M8.7** | `In Review` — 13 units, `Verify` green, fable review run | PR [#72](https://github.com/pat-mw/revu/pull/72), base `m8.6` |
 
-**M8.7's PR opened the moment its `Verify` went green**, mid-session, and the fable-tier review ran against
-the full diff before it. `main` is still untouched at `177068a`; nothing has merged.
+**M8.7's PR opened mid-session, in the order the protocol requires: `Verify` green (`3e7bfa6`) → the
+fable-tier adversarial review of the full diff → its fixes (`de30223`) → PR #72, one minute later.** Review
+before the PR opens is §8 of the protocol; the PR is not batched to session end. `main` is still untouched at
+`177068a`; nothing has merged.
 
 ### M8.7 — exactly what has landed, and what has not
 
@@ -66,7 +77,7 @@ one. `main` is untouched at **`177068a`**; nothing merged.
 
 ## Tickets
 
-**94 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**95 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
 count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
 from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14).
@@ -142,7 +153,9 @@ gap in the plan, not a gap in the work.
 ## Conventions
 
 - States: `Backlog` · `Todo` · `In Progress` · `In Review` · `Done` (+ `Canceled`).
-- A ticket goes `In Review` when its PR is open, `Done` only when **its `Verify` has actually run green**.
+- A ticket goes `In Review` when its PR is open. `Done` needs **both** its `Verify` run green **and** its PR
+  merged — Verify alone is not sufficient, or a ticket would be `Done` while its code is still only on a
+  branch. M8.6 and M8.7 both have green Verifies and stay `In Review` for exactly that reason.
 - Units are `M8.x.n` inside each ticket file, numbered in default execution order. Append-only — never
   renumber; new units continue the sequence.
 - Branch names carry the M-ID. A unit gets its own branch only if it ships as its own PR in a stack.

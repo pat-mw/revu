@@ -91,6 +91,58 @@ a *server-authoritative* delete force has nowhere to live. Either the confirmati
 or it is a frozen-contract change and a §5.2 stop. **Must be settled with M8.10 before either ticket
 dispatches.**
 
+### ⚠️ The daemon track's wave plan — corrected before dispatch, not after
+
+The roadmap's S3 table plans **3 → 4 → 6 → 6 → 4 → 2 → 1 → 1**. **It repeats the exact assumption that already
+cost the app track a re-plan**: that the orchestrator can merge two workers' versions of one file. It cannot —
+integration is by copying whole files out of isolated worktrees, so two workers on one file means one of them
+is silently discarded. Verified against the tickets' own Files lines, the honest widths are
+**3 → 4 → 3 → 4 → 2 → 1 → 1 → 1**.
+
+**Four collisions, named so they are not rediscovered:**
+
+| wave | roadmap says | reality |
+| --- | --- | --- |
+| W3 | 6 wide | **M8.2.2, .3, .4, .5 all write `direct/store.ts` AND `store.test.ts`** — serialize the four; M8.3.2 and M8.4.8 run beside them |
+| W4 | 6 wide | **M8.3.3, .4, .5 all write `local-sync.ts` AND `local-sync.test.ts`** — serialize; M8.2.6, M8.3.7, M8.4.2 run beside |
+| W5 | 4 wide | **M8.4.3, .4, .5 all write `local-writes.ts` AND `local-writes.test.ts`** — serialize; only M8.3.9 is genuinely parallel |
+| W6 | 2 wide, **isolation "none"** | **M8.4.7 and M8.4.9 write exactly one file each and it is the SAME file** (`local-writes.test.ts`). This is the dangerous one: unlike W3/W4/W5 there is no worktree note, so it is the wave most likely to be dispatched two-wide and lose a unit silently. |
+
+Plus a **file-creation inversion**: M8.3.6 (W2) creates `local-sync.ts`; M8.3.2 (W3) declares it `(new)`.
+Land M8.3.2 first, or brief M8.3.6 that the file already exists and must be extended. Recorded in M8.3's ticket.
+
+**And the isolation column is wrong wherever it says "none" with 2+ units.** `bun run check` ends in a vite
+build and is repo-wide, so *any* concurrent pair needs worktree isolation even though every unit is
+revud-only. The previous session recorded this as a deviation; the S3 table repeats "none" for W1, W2 and W6.
+
+**The three-lane width is real and is the win worth taking.** M8.2 (`store.ts`), M8.3 (`local-git*`,
+`local-sync*`, `blobs*`), M8.4 (`local-writes*`, `local-ids*`) own genuinely disjoint file sets — M8.4.1
+deliberately defines its own store-slice interface rather than `Pick<DirectStore, …>` precisely so M8.4 is
+completable against M8.1 alone. Three workers can run against each other all session; the width lost is
+entirely *inside* each ticket.
+
+### Rulings propagated into the daemon tickets this session
+
+Three questions the tickets still present as open are **settled**, and a cold session reading only the ticket
+would have stopped on them. Now recorded in the ticket files themselves:
+
+- **M8.2 OQ1 — an archived triple is a ONE-WAY DOOR** (owner, 2026-08-14; it mints no successor). The ticket
+  said it "must be decided before M8.2 ships"; it was decided three days before this session. The generation
+  discriminator stays in the unique key as a no-migration escape hatch.
+- **M8.2 OQ3 — ids come from a monotonic high-water mark in `meta`, never `MAX(id)+1`.** This does *not* close
+  M8.10 OQ4, but it removes that question's grip on M8.2.
+- **M8.3 OQ4 / OQ2 — the builder lives in `direct/`; dirty is `--porcelain -uno`** (untracked files do not
+  make a worktree dirty, or the banner fires on almost every working repo and trains the reader to ignore it).
+
+### Board corrections made this session, after a verification sweep
+
+The board claimed six things the repo did not bear out — a stale unit total (94 vs 95), a dispatch plan for
+already-landed units written in the future tense, a PR-timing claim its own timestamps refute, an
+"everything is pushed" that missed `m8.6` being one commit ahead of its remote, no mention of **#69** in a
+stack inventory presenting itself as complete, and a `Done` convention that, read literally, was already
+satisfied by two `In Review` tickets. All six are fixed. **The lesson is the board's own opening line:** a file
+that claims to describe *right now* has to be re-verified against `git` and `gh`, not just appended to.
+
 ### Hazards for the next session
 
 1. **An isolated agent worktree is created at the repo's BASE commit and has no `node_modules`.** Every
