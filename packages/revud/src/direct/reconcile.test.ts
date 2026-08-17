@@ -130,6 +130,11 @@ function fakeStore(opts: {
     deleteLocalDraft: unexpected('deleteLocalDraft'),
     getLocalViewed: unexpected('getLocalViewed'),
     setLocalViewed: unexpected('setLocalViewed'),
+    listLocalThreads: unexpected('listLocalThreads'),
+    getLocalThread: unexpected('getLocalThread'),
+    putLocalThread: unexpected('putLocalThread'),
+    listLocalSubmittedReviews: unexpected('listLocalSubmittedReviews'),
+    putLocalSubmittedReview: unexpected('putLocalSubmittedReview'),
     close: () => {},
   }
 }

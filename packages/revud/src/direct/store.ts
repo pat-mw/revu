@@ -8,6 +8,8 @@ import type {
   HumanPreferences,
   LocalReviewSummary,
   ReviewDraft,
+  ReviewSummary,
+  ReviewThread,
   Snapshot,
   SnapshotImmutable,
 } from '@revu/shared'
@@ -413,6 +415,61 @@ export interface DirectStore {
   getLocalViewed(humanId: string, localId: number): FileViewedState
   /** Replace one human's per-file viewed state on one local review. */
   setLocalViewed(humanId: string, localId: number, state: FileViewedState): void
+  /**
+   * Every review thread on one local review, in **insertion order** — the order
+   * the threads were first stored, which is the order they were created against
+   * the review. The order is part of the contract because a caller renders the
+   * list in the order it arrives, and an opaque thread id sorts by nothing a
+   * reader would recognise as meaningful.
+   *
+   * Re-storing a thread rewrites it where it already sits rather than moving it
+   * to the end, so resolving one thread does not reshuffle the list underneath
+   * the reader.
+   *
+   * Throws `StoreUnreadableError` when a stored thread cannot be parsed, rather
+   * than dropping it from the result: a list silently one thread short reads as a
+   * review that has fewer comments than it really does.
+   */
+  listLocalThreads(localId: number): ReviewThread[]
+  /**
+   * One thread on one local review, or `null` when that review carries no thread
+   * under that id — the correct empty answer, and never another review's thread.
+   *
+   * Both key columns are matched. A thread id is opaque and nothing parses it, so
+   * nothing makes one unique across reviews; a read keyed on the thread id alone
+   * would hand back whichever review happened to store it.
+   */
+  getLocalThread(localId: number, threadId: string): ReviewThread | null
+  /**
+   * Store a thread on a local review, replacing whatever was stored under its id.
+   *
+   * Replacing rather than appending is what makes resolving work: a resolve
+   * rewrites the same thread with `isResolved` flipped, and a second row under
+   * the same id would render that thread twice, once in each state. The stored
+   * document is an unchanged `ReviewThread`, so nothing downstream needs a second
+   * thread type.
+   */
+  putLocalThread(localId: number, thread: ReviewThread): void
+  /**
+   * Every submitted review summary on one local review, in **insertion order** —
+   * the order they were submitted. Ordered for the same reason the thread list is:
+   * a caller renders them in the order they arrive.
+   *
+   * Throws `StoreUnreadableError` when a stored summary cannot be parsed, rather
+   * than dropping it: a submitted review that silently vanishes from the list is a
+   * review the human made and can no longer see.
+   */
+  listLocalSubmittedReviews(localId: number): ReviewSummary[]
+  /**
+   * Record a submitted review summary against a local review, replacing any
+   * summary already stored under its id.
+   *
+   * Named for the table it writes rather than for the domain concept, because the
+   * store's own vocabulary already spends "local review" on the review of a branch
+   * pair — the thing these summaries are submitted *against*. The stored document
+   * is an unchanged `ReviewSummary`.
+   */
+  putLocalSubmittedReview(localId: number, review: ReviewSummary): void
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -1115,6 +1172,71 @@ export function openDirectStore(
       })
     },
 
+    listLocalThreads(localId: number): ReviewThread[] {
+      const rows = db
+        .query('SELECT thread_id, data FROM local_threads WHERE local_id = ? ORDER BY rowid ASC')
+        .all(localId) as { thread_id: string; data: string }[]
+      return rows.map((row) =>
+        parseRow<ReviewThread>('local_threads', `${localId}/${row.thread_id}`, row.data),
+      )
+    },
+
+    getLocalThread(localId: number, threadId: string): ReviewThread | null {
+      const row = db
+        .query('SELECT data FROM local_threads WHERE local_id = ? AND thread_id = ?')
+        .get(localId, threadId) as { data: string } | null
+      if (!row) return null
+      return parseRow<ReviewThread>('local_threads', `${localId}/${threadId}`, row.data)
+    },
+
+    putLocalThread(localId: number, thread: ReviewThread): void {
+      write('local_threads', () => {
+        // An upsert rather than an insert, because a resolve rewrites the thread
+        // it resolves: a plain insert leaves the row behind twice — once
+        // unresolved and once resolved — and the read has no way to tell which
+        // copy is current. Spelled as `ON CONFLICT` on the key rather than as a
+        // blanket ignoring insert so that any OTHER constraint violation still
+        // aborts loudly instead of being indistinguishable from a rewrite.
+        //
+        // The conflicting row is updated where it already sits, so the thread
+        // keeps its position in the list and a resolve does not reorder the
+        // review under whoever is reading it.
+        db.run(
+          'INSERT INTO local_threads (local_id, thread_id, data) VALUES (?, ?, ?) ' +
+            'ON CONFLICT(local_id, thread_id) DO UPDATE SET data = excluded.data',
+          [localId, thread.id, JSON.stringify(thread)],
+        )
+      })
+    },
+
+    listLocalSubmittedReviews(localId: number): ReviewSummary[] {
+      const rows = db
+        .query(
+          'SELECT review_id, data FROM local_reviews_submitted WHERE local_id = ? ORDER BY rowid ASC',
+        )
+        .all(localId) as { review_id: number; data: string }[]
+      return rows.map((row) =>
+        parseRow<ReviewSummary>('local_reviews_submitted', `${localId}/${row.review_id}`, row.data),
+      )
+    },
+
+    putLocalSubmittedReview(localId: number, review: ReviewSummary): void {
+      write('local_reviews_submitted', () => {
+        // The id is bound as a JavaScript number, which is what keeps the key
+        // column an integer: the ids stored here come from a band around 9e12,
+        // and the column is declared INTEGER so the value is stored as one rather
+        // than converted to a float. Both the band and its neighbourhood are far
+        // inside the range a double represents exactly, so nothing is lost today
+        // — the declaration is what keeps that true if the band, or the
+        // arithmetic done on an id, ever reaches past where doubles stay exact.
+        db.run(
+          'INSERT INTO local_reviews_submitted (local_id, review_id, data) VALUES (?, ?, ?) ' +
+            'ON CONFLICT(local_id, review_id) DO UPDATE SET data = excluded.data',
+          [localId, review.id, JSON.stringify(review)],
+        )
+      })
+    },
+
     putLocalSnapshot(snapshot: Snapshot): void {
       // The local review's id is what `prNumber` carries here, so the envelope
       // lands under `local_id` while the immutable half goes to the same shared
@@ -1203,9 +1325,15 @@ const CREATE_LOCAL_THREADS =
 
 /**
  * Submitted review summaries on a local review. `review_id` is declared INTEGER
- * and must stay INTEGER: the ids stored here come from a band around 9e12, and a
- * REAL column round-trips such a value without complaint while losing its low
- * bits.
+ * and must stay INTEGER.
+ *
+ * The ids stored here come from a band around 9e12. That is roughly three orders
+ * of magnitude below the largest integer a double represents exactly, so a REAL
+ * column would round-trip today's ids with every digit intact — the hazard is not
+ * that the current band loses bits, it is that a float column silently stops
+ * being exact somewhere above it, with nothing in the schema left to say where.
+ * The declaration is the guarantee: an INTEGER column holds a 64-bit integer
+ * exactly no matter how far the band or the arithmetic done on an id moves.
  */
 const CREATE_LOCAL_REVIEWS_SUBMITTED =
   'CREATE TABLE IF NOT EXISTS local_reviews_submitted (local_id INTEGER NOT NULL, ' +

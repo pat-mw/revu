@@ -20,6 +20,8 @@ import { Database } from 'bun:sqlite'
 import type {
   FileBlob,
   ReviewDraft,
+  ReviewSummary,
+  ReviewThread,
   Snapshot,
   SnapshotImmutable,
 } from '@revu/shared'
@@ -1425,6 +1427,457 @@ describe('local snapshots: an envelope of their own, the immutable half shared',
       .get() as { data: string }
     check.close()
     expect(row.data).toBe('{not valid json')
+  })
+})
+
+/**
+ * A review thread as stored: an unchanged contract document. The id and the
+ * resolved flag are the two fields every claim below turns on — the id is the
+ * key, and the flag is what a resolve rewrites.
+ */
+function localThread(id: string, over: Partial<ReviewThread> = {}): ReviewThread {
+  return {
+    id,
+    isResolved: false,
+    isOutdated: false,
+    path: 'a.ts',
+    line: 3,
+    originalLine: 3,
+    startLine: null,
+    originalStartLine: null,
+    diffSide: 'RIGHT',
+    startDiffSide: null,
+    subjectType: 'LINE',
+    resolvedBy: null,
+    comments: [],
+    ...over,
+  }
+}
+
+/** A submitted review summary as stored: an unchanged contract document. */
+function submittedReview(id: number, over: Partial<ReviewSummary> = {}): ReviewSummary {
+  return {
+    id,
+    node_id: `local:review:${id}`,
+    user: {
+      login: 'alice',
+      id: 1,
+      node_id: 'U_1',
+      avatar_url: '',
+      html_url: '',
+      type: 'User',
+    },
+    body: 'looks good',
+    state: 'COMMENTED',
+    submitted_at: '2026-01-01T00:00:00.000Z',
+    commit_id: 'head',
+    ...over,
+  }
+}
+
+/**
+ * Three thread ids whose alphabetical order is NOT their insertion order.
+ *
+ * Load-bearing rather than decorative. The composite primary key indexes
+ * `local_id` first and `thread_id` second, so an unordered read already comes
+ * back sorted by thread id — with ids that happen to be inserted alphabetically,
+ * a list ordered by insertion and a list ordered by nothing at all are the same
+ * list, and the order assertion would hold with the ordering clause deleted.
+ */
+const THREAD_IDS_OUT_OF_ALPHABETICAL_ORDER = ['t-c', 't-a', 't-b']
+
+/**
+ * Three submitted-review ids whose ascending-id order is NOT their insertion
+ * order, for the same reason the thread ids above are out of alphabetical order.
+ */
+const SUBMITTED_IDS_OUT_OF_ASCENDING_ORDER = [
+  LOCAL_ENTITY_ID_BASE + 9,
+  LOCAL_ENTITY_ID_BASE + 3,
+  LOCAL_ENTITY_ID_BASE + 5,
+]
+
+/** How many rows one local table holds for one local review, read through a raw handle. */
+function localRowCount(table: 'local_threads' | 'local_reviews_submitted', localId: number): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw
+    .query(`SELECT COUNT(*) AS n FROM ${table} WHERE local_id = ?`)
+    .get(localId) as { n: number }
+  raw.close()
+  return row.n
+}
+
+describe('local threads: keyed by review and by thread, rewritten in place', () => {
+  test('a thread round-trips through the point read and through the list', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    const thread = localThread('t-1', { comments: [] })
+    store.putLocalThread(id, thread)
+
+    // The stored document is an unchanged `ReviewThread`, so the whole document
+    // is pinned rather than a field or two: a getter that reconstructed a thread
+    // from columns instead of returning what was stored would pass a spot check
+    // on the id and fail this.
+    expect(store.getLocalThread(id, 't-1')).toEqual(thread)
+    expect(store.listLocalThreads(id)).toEqual([thread])
+    store.close()
+  })
+
+  test('a thread survives a restart (reopen the same data dir)', () => {
+    const first = open()
+    const id = first.createLocalReview(newLocalReview({})).id
+    first.putLocalThread(id, localThread('t-1'))
+    first.close()
+
+    const second = open()
+    expect(second.getLocalThread(id, 't-1')!.path).toBe('a.ts')
+    second.close()
+  })
+
+  test('getLocalThread is null for a thread that was never stored', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Absent is the correct empty answer, not an error: a review with no threads
+    // on it is the ordinary state right after creation.
+    expect(store.getLocalThread(id, 't-missing')).toBeNull()
+    store.close()
+  })
+
+  test('listLocalThreads is empty for a review with no threads on it', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Its own test rather than a second assertion beside the point read: the
+    // runner stops at the first failed assertion, so two empty-answer claims
+    // sharing one body means only the first is ever observed failing.
+    expect(store.listLocalThreads(id)).toEqual([])
+    store.close()
+  })
+
+  test('a second put for the same thread leaves exactly one row', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalThread(id, localThread('t-1'))
+    store.putLocalThread(id, localThread('t-1', { isResolved: true, resolvedBy: { login: 'a' } }))
+
+    // Resolving a thread rewrites the same thread. A second row under the same
+    // id would render that thread twice, once in each state, and nothing in the
+    // read path could tell which of the two is current.
+    expect(localRowCount('local_threads', id)).toBe(1)
+    store.close()
+  })
+
+  test('a second put for the same thread is what the read gives back', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalThread(id, localThread('t-1'))
+    store.putLocalThread(id, localThread('t-1', { isResolved: true, resolvedBy: { login: 'a' } }))
+
+    // Split from the row-count claim above deliberately, not stylistically: the
+    // runner stops a test at its first failed assertion, so two claims sharing
+    // one body means the second is never independently observed failing.
+    expect(store.getLocalThread(id, 't-1')!.isResolved).toBe(true)
+    expect(store.listLocalThreads(id).map((t) => t.isResolved)).toEqual([true])
+    store.close()
+  })
+
+  test('rewriting a thread keeps its place in the list rather than moving it to the end', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalThread(id, localThread('t-c'))
+    store.putLocalThread(id, localThread('t-a'))
+    store.putLocalThread(id, localThread('t-c', { isResolved: true }))
+
+    // A list that reordered on every resolve would move a thread out from under
+    // a reader mid-review, which is why the write updates the row in place
+    // instead of removing and re-adding it.
+    expect(store.listLocalThreads(id).map((t) => t.id)).toEqual(['t-c', 't-a'])
+    store.close()
+  })
+
+  test('a thread on one local review is invisible to the point read on another', () => {
+    const store = open()
+    const a = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/a' })).id
+    const b = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/b' })).id
+    store.putLocalThread(a, localThread('t-1'))
+
+    // A thread id is opaque and nothing parses it, so nothing makes one unique
+    // across reviews. A read keyed on the thread id alone would answer this with
+    // the other review's thread — the same id, a different review's discussion.
+    expect(store.getLocalThread(b, 't-1')).toBeNull()
+    store.close()
+  })
+
+  test('a thread on one local review is invisible to the list on another', () => {
+    const store = open()
+    const a = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/a' })).id
+    const b = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/b' })).id
+    store.putLocalThread(a, localThread('t-1'))
+
+    // Its own test rather than a second assertion beside the point read: the two
+    // readers are two statements with two predicates, and one can lose its
+    // review-id filter while the other keeps it.
+    //
+    // The positive control runs FIRST and the absence last, deliberately. An
+    // absence assertion passes vacuously when the fixture never stored anything,
+    // so the claim that the thread IS on review `a` has to be checked while the
+    // runner is still executing assertions.
+    expect(store.listLocalThreads(a).map((t) => t.id)).toEqual(['t-1'])
+    expect(store.listLocalThreads(b)).toEqual([])
+    store.close()
+  })
+
+  test('a present-but-corrupt thread row throws rather than reading as absent', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalThread(id, localThread('t-1'))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_threads SET data = '{not valid json' WHERE thread_id = 't-1'")
+    raw.close()
+
+    const reopened = open()
+    expect(() => reopened.getLocalThread(id, 't-1')).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('a present-but-corrupt thread row throws rather than shortening the list', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalThread(id, localThread('t-1'))
+    store.putLocalThread(id, localThread('t-2'))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_threads SET data = '{not valid json' WHERE thread_id = 't-1'")
+    raw.close()
+
+    // Skipping the unreadable row would hand back a shorter list that reads as
+    // complete — a review with one fewer discussion than it has, and no signal
+    // that anything is wrong.
+    const reopened = open()
+    expect(() => reopened.listLocalThreads(id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('threads list in insertion order, and that order survives a close and reopen', () => {
+    const first = open()
+    const id = first.createLocalReview(newLocalReview({})).id
+    for (const threadId of THREAD_IDS_OUT_OF_ALPHABETICAL_ORDER) {
+      first.putLocalThread(id, localThread(threadId))
+    }
+    expect(first.listLocalThreads(id).map((t) => t.id)).toEqual(
+      THREAD_IDS_OUT_OF_ALPHABETICAL_ORDER,
+    )
+    first.close()
+
+    // Insertion order is a stored property (the row's position in the table), not
+    // a property of the handle that wrote the rows, so a restart must not resort
+    // the list into whatever the index happens to yield.
+    const second = open()
+    expect(second.listLocalThreads(id).map((t) => t.id)).toEqual(
+      THREAD_IDS_OUT_OF_ALPHABETICAL_ORDER,
+    )
+    second.close()
+  })
+
+  test('putLocalThread against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.close()
+    expect(() => store.putLocalThread(id, localThread('t-1'))).toThrow(StoreWriteError)
+  })
+
+  test('putLocalThread writes local_threads and no PR-keyed table', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Armed BEFORE the write, so a misrouted statement aborts at the statement
+    // rather than being counted absent afterwards.
+    const armed = armPrKeyedTripwires(store)
+    armed.putLocalThread(id, localThread('t-1'))
+    // The write completed rather than being silently skipped, which is what makes
+    // the survived tripwires mean something.
+    expect(armed.getLocalThread(id, 't-1')!.id).toBe('t-1')
+    armed.close()
+  })
+})
+
+describe('local submitted reviews: recorded per review, ids kept exact', () => {
+  test('a submitted review round-trips through the list', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    const review = submittedReview(LOCAL_ENTITY_ID_BASE + 1)
+    store.putLocalSubmittedReview(id, review)
+
+    // The whole document, not a field or two: what is stored is an unchanged
+    // `ReviewSummary` and a reader gets back exactly what was written.
+    expect(store.listLocalSubmittedReviews(id)).toEqual([review])
+    store.close()
+  })
+
+  test('a submitted review survives a restart (reopen the same data dir)', () => {
+    const first = open()
+    const id = first.createLocalReview(newLocalReview({})).id
+    first.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + 1))
+    first.close()
+
+    const second = open()
+    expect(second.listLocalSubmittedReviews(id).map((r) => r.state)).toEqual(['COMMENTED'])
+    second.close()
+  })
+
+  test('listLocalSubmittedReviews is empty for a review nobody has submitted against', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Empty is the answer, never an error: a local review with no submissions is
+    // the ordinary state right after creation.
+    expect(store.listLocalSubmittedReviews(id)).toEqual([])
+    store.close()
+  })
+
+  test('a second put for the same summary id leaves exactly one row', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    const reviewId = LOCAL_ENTITY_ID_BASE + 1
+    store.putLocalSubmittedReview(id, submittedReview(reviewId))
+    store.putLocalSubmittedReview(id, submittedReview(reviewId, { state: 'APPROVED' }))
+
+    expect(localRowCount('local_reviews_submitted', id)).toBe(1)
+    store.close()
+  })
+
+  test('a second put for the same summary id is what the read gives back', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    const reviewId = LOCAL_ENTITY_ID_BASE + 1
+    store.putLocalSubmittedReview(id, submittedReview(reviewId))
+    store.putLocalSubmittedReview(id, submittedReview(reviewId, { state: 'APPROVED' }))
+
+    // Split from the row-count claim for the same reason the thread pair is: the
+    // runner stops at the first failed assertion in a body.
+    expect(store.listLocalSubmittedReviews(id).map((r) => r.state)).toEqual(['APPROVED'])
+    store.close()
+  })
+
+  test('submitted reviews on one local review are invisible to another', () => {
+    const store = open()
+    const a = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/a' })).id
+    const b = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/b' })).id
+    store.putLocalSubmittedReview(a, submittedReview(LOCAL_ENTITY_ID_BASE + 1))
+
+    // Summary ids come from one allocator shared by every local review, so an id
+    // never collides across reviews — but a read that dropped its review filter
+    // would still pool every review's submissions into one list.
+    //
+    // Positive control first, absence last: an empty list proves nothing while
+    // the fixture might have stored nothing.
+    expect(store.listLocalSubmittedReviews(a)).toHaveLength(1)
+    expect(store.listLocalSubmittedReviews(b)).toEqual([])
+    store.close()
+  })
+
+  test('a present-but-corrupt submitted review row throws rather than reading as absent', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + 1))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_reviews_submitted SET data = '{not valid json' WHERE local_id = ?", [id])
+    raw.close()
+
+    // An empty list here would read as "this human never submitted a review",
+    // which is exactly the state a caller would then overwrite.
+    const reopened = open()
+    expect(() => reopened.listLocalSubmittedReviews(id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('submitted reviews list in insertion order, and that order survives a close and reopen', () => {
+    const first = open()
+    const id = first.createLocalReview(newLocalReview({})).id
+    for (const reviewId of SUBMITTED_IDS_OUT_OF_ASCENDING_ORDER) {
+      first.putLocalSubmittedReview(id, submittedReview(reviewId))
+    }
+    expect(first.listLocalSubmittedReviews(id).map((r) => r.id)).toEqual(
+      SUBMITTED_IDS_OUT_OF_ASCENDING_ORDER,
+    )
+    first.close()
+
+    const second = open()
+    expect(second.listLocalSubmittedReviews(id).map((r) => r.id)).toEqual(
+      SUBMITTED_IDS_OUT_OF_ASCENDING_ORDER,
+    )
+    second.close()
+  })
+
+  test('a summary id from the entity band reads back as the exact same number', () => {
+    const first = open()
+    const id = first.createLocalReview(newLocalReview({})).id
+    const reviewId = LOCAL_ENTITY_ID_BASE + 7
+    first.putLocalSubmittedReview(id, submittedReview(reviewId))
+    first.close()
+
+    // Read after a reopen, so the number crossed the disk rather than being
+    // handed back out of the handle that wrote it. Measured as SUBSUMED by the
+    // round-trip case above, which pins the whole document: every defect that
+    // reaches the id inside the stored JSON turns both red. It is kept because it
+    // is the read a caller actually performs, and because the column read below
+    // proves nothing about what the caller receives.
+    const second = open()
+    expect(second.listLocalSubmittedReviews(id)[0].id).toBe(reviewId)
+    second.close()
+
+    // The same value read straight out of the key column, not out of the JSON
+    // document beside it — and this half is NOT subsumed. The document is text
+    // and holds whatever digits were written into it; the column is typed, is
+    // what a later lookup keys on, and is where a value that went through a
+    // lossy conversion on the way to disk would land short.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    const row = raw
+      .query('SELECT review_id FROM local_reviews_submitted WHERE local_id = ?')
+      .get(id) as { review_id: number }
+    raw.close()
+    expect(row.review_id).toBe(reviewId)
+  })
+
+  test('the key column stores an integer, never a float', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + 7))
+    store.close()
+
+    // The value-equality assertion above CANNOT catch a REAL column at this
+    // magnitude: an id near 9e12 is three orders of magnitude below the largest
+    // integer a double represents exactly, so it round-trips through a float with
+    // every digit intact and every equality check green. What a REAL column
+    // changes is the stored type — and it is the stored type that decides what
+    // happens when the band, or the arithmetic done on an id, later grows past
+    // where doubles stay exact. Only `typeof` can see that today, which is why
+    // this assertion is separate from the one above rather than folded into it.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    const row = raw
+      .query('SELECT typeof(review_id) AS ty FROM local_reviews_submitted WHERE local_id = ?')
+      .get(id) as { ty: string }
+    raw.close()
+    expect(row.ty).toBe('integer')
+  })
+
+  test('putLocalSubmittedReview against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.close()
+    expect(() =>
+      store.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + 1)),
+    ).toThrow(StoreWriteError)
+  })
+
+  test('putLocalSubmittedReview writes local_reviews_submitted and no PR-keyed table', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    const armed = armPrKeyedTripwires(store)
+    armed.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + 1))
+    expect(armed.listLocalSubmittedReviews(id)).toHaveLength(1)
+    armed.close()
   })
 })
 
