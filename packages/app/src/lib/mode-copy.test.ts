@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs'
 import {
   authorBannerCopy,
   conversationEmptyCopy,
+  dirtyWorktreeCopy,
   draftSavedCopy,
   neverSyncedCopy,
   notFoundCopy,
@@ -30,6 +31,7 @@ import {
   syncErrorCopy,
   tooLargeDiffCopy,
 } from './mode-copy'
+import type { DirtyWorktreeCopy } from './mode-copy'
 import type { ReviewMode } from './review-mode'
 
 /**
@@ -456,6 +458,69 @@ describe('what a sync that did not land falls back on saying', () => {
 
   test('and claims no pull request', () => {
     expect(syncErrorText('local')).not.toMatch(/pull request/i)
+  })
+})
+
+/**
+ * The banner's lines, or a failure naming the mode that had none.
+ *
+ * Thrown rather than defaulted, so a mode that stops having a sentence fails in
+ * the test that expected one instead of being quietly compared against a blank.
+ */
+function dirtyWorktreeLines(mode: ReviewMode): DirtyWorktreeCopy {
+  const copy = dirtyWorktreeCopy(mode)
+  if (copy === null) {
+    throw new Error(`the dirty-worktree banner says nothing on a ${mode} review`)
+  }
+  return copy
+}
+
+/** Every line of the banner as one string, or none where it has nothing to say. */
+function dirtyWorktreeText(mode: ReviewMode): string {
+  const copy = dirtyWorktreeCopy(mode)
+  return copy === null ? '' : Object.values(copy).join(' ')
+}
+
+describe('the banner over a review whose working tree held uncommitted changes', () => {
+  test('a branch pair is told what is missing and what closes the gap', () => {
+    // Both lines pinned character for character. This is the ONLY assertion in
+    // this block that a mode-blind copy function fails on the branch-pair side,
+    // and the reason is worth stating: the wording below names none of the
+    // three banned words in the first place, so every absence in this block is
+    // satisfied for free by copy that ignored its argument entirely.
+    const copy = dirtyWorktreeLines('local')
+    expect(copy.title).toBe('Uncommitted changes are not in this review')
+    expect(copy.hint).toBe(
+      'This review covers committed content only. Commit the rest and re-sync to bring it in.',
+    )
+  })
+
+  test('and the rule it turns on is named rather than left to be inferred', () => {
+    // The required half. Without the rule the banner is a complaint about the
+    // reader's own working tree instead of a statement about what is on the
+    // screen, and a later sweep could shorten it to that and satisfy every
+    // absence below.
+    expect(dirtyWorktreeText('local')).toContain('covers committed content only')
+  })
+
+  test('a pull request has no such sentence at all, rather than a reworded one', () => {
+    // The other pin, and the one that carries this block. A review mediated
+    // elsewhere is built from what was pushed, so no working tree on this
+    // machine bears on what it contains and the banner never renders there.
+    // `null` states that; a softened warning would invent a fact.
+    expect(dirtyWorktreeCopy('github')).toBeNull()
+  })
+
+  test('and the branch-pair wording claims no pull request', () => {
+    expect(dirtyWorktreeText('local')).not.toMatch(/pull request/i)
+  })
+
+  test('and names no github', () => {
+    expect(dirtyWorktreeText('local')).not.toMatch(/github/i)
+  })
+
+  test('and no broker either', () => {
+    expect(dirtyWorktreeText('local')).not.toMatch(/\bbroker\b/i)
   })
 })
 

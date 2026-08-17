@@ -24,6 +24,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { useToast } from '@/components/ui/toast'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ReviewBar } from '@/components/review/review-bar'
+import { ReviewDirtyBanner } from '@/components/review/dirty-banner'
 import { AuthorBanner } from '@/components/author/author-banner'
 
 /**
@@ -585,6 +586,7 @@ export function PrLayout() {
             about the review down to the narrowest: what has superseded it,
             then what it does not cover, then what it is waiting on. */}
         <div className="flex flex-col gap-2 py-2 empty:hidden">
+          <ReviewDirtyBanner prNumber={prNumber} mode={mode} />
           <AuthorBanner prNumber={prNumber} mode={mode} />
         </div>
 

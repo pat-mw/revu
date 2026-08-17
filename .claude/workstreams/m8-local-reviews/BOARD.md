@@ -10,10 +10,9 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.7.8** — the dirty-worktree banner (D3's user-facing half). Dispatched to an isolated worktree at `opus`.
-Files: `pages/pr-layout.tsx`, `lib/mode-copy.ts` + `.test.ts`, `components/review/dirty-banner.tsx` (new) +
-`dirty-banner.test.ts` (new). Nothing is committed for it yet; if this session dies now, discard the worktree
-and re-dispatch from M8.7.8 — nothing else is running.
+**M8.7.12** — the header draws the branch pair twice. Dispatched to an isolated worktree at `opus`. Files:
+`pages/pr-layout.tsx`, `pages/pr-layout.test.ts`. Nothing is committed for it yet; if this session dies now,
+discard the worktree and re-dispatch from M8.7.12 — nothing else is running.
 
 **Execution order for the rest, decided 2026-08-17 and recorded so it is not re-derived:**
 **M8.7.5 → M8.7.6 → M8.7.8 → M8.7.12 → M8.7.11 → M8.7.7.** Serial by file contention. M8.7.12 lands before
@@ -42,7 +41,8 @@ partial ticket parked at a session boundary.
 | M8.7.4 — Conversation: threads only | `548f8e5` | 1411 pass · 1 skip · 0 fail · 81 files |
 | M8.7.3 — header identity, state chip, 404, banner stack | `4a9cd44` | 1440 pass · 1 skip · 0 fail · 81 files |
 | M8.7.5 — review-bar: no lock, no API claim, no broker | `27453da` | 1472 pass · 1 skip · 0 fail · 81 files |
-| M8.7.6 — residual sweep, rate chip, org-member title | `pending` | **1534 pass · 1 skip · 0 fail · 82 files** |
+| M8.7.6 — residual sweep, rate chip, org-member title | `71c71e0` | 1534 pass · 1 skip · 0 fail · 82 files |
+| M8.7.8 — the dirty-worktree banner | `pending` | **1551 pass · 1 skip · 0 fail · 83 files** |
 
 **NOT landed — the next session's work, in this order** (serial by file contention, not by dependency; the
 reasoning is in the ticket's own `## Wave plan as actually run`):

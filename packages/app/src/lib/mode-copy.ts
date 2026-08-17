@@ -396,6 +396,44 @@ export function syncErrorCopy(mode: ReviewMode): SyncErrorCopy {
   }
 }
 
+/** The lines of the banner that says what a review does not cover. */
+export interface DirtyWorktreeCopy {
+  /** The fact and its consequence, in one line. */
+  title: string
+  /** The rule the fact follows from, and the one move that closes the gap. */
+  hint: string
+}
+
+/**
+ * The banner over a review whose working tree held changes nobody had committed
+ * when it was last read.
+ *
+ * A review of two local branches is assembled out of commits: the diff is the
+ * merge base of the pair against the tip of the head branch, and every blob in
+ * it is addressed by content the repository already holds. Edits still sitting
+ * in the working tree are in none of that — and the gap is invisible from the
+ * screen, because the files are listed by the same paths the reader has open in
+ * an editor beside them. Nothing else in the chrome would ever mention it.
+ *
+ * So the wording states the fact and its consequence together rather than
+ * warning vaguely, and names the one move that closes the gap. A hedge ("some
+ * changes may not appear") would leave the reader unsure whether what they are
+ * reading is the work, which is the confusion this banner exists to end.
+ *
+ * `null` on the other reading, and null rather than a softer sentence: a
+ * mediated review is built from what was pushed, so no working tree on this
+ * machine bears on what it contains. There is nothing true to say, the banner
+ * never renders there, and inventing a line for it would be inventing the fact
+ * behind the line.
+ */
+export function dirtyWorktreeCopy(mode: ReviewMode): DirtyWorktreeCopy | null {
+  if (mode !== 'local') return null
+  return {
+    title: 'Uncommitted changes are not in this review',
+    hint: 'This review covers committed content only. Commit the rest and re-sync to bring it in.',
+  }
+}
+
 /**
  * The notice standing in for a diff that was never inlined.
  *

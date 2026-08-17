@@ -56,6 +56,7 @@ import * as modeCopy from './mode-copy'
 import {
   authorBannerCopy,
   conversationEmptyCopy,
+  dirtyWorktreeCopy,
   draftSavedCopy,
   neverSyncedCopy,
   notFoundCopy,
@@ -103,6 +104,7 @@ const SCANNED: ScannedFile[] = [
   { path: 'components/review/review-bar.tsx', marker: /export function ReviewBar\(/ },
   { path: 'components/review/reconcile-dialog.tsx', marker: /export function ReconcileDialog\(/ },
   { path: 'components/author/author-banner.tsx', marker: /export function AuthorBanner\(/ },
+  { path: 'components/review/dirty-banner.tsx', marker: /export function DirtyWorktreeBanner\(/ },
 ]
 
 /**
@@ -199,6 +201,9 @@ const BANNED: BannedLiteral[] = [
   { pattern: /Drafts live on the broker/i },
   // The authorship claim on a branch nobody opened anything with.
   { pattern: /You authored this PR/i },
+  // The rule that says what a review is built from, which is the one sentence
+  // in the header that a reader with an editor open beside it depends on.
+  { pattern: /covers committed content only/i },
   // Three more sentences the module owns whose wording is CORRECT on a
   // mediated pull request. They are banned inline for the same reason the wrong
   // ones are: a second copy of a right sentence is a second source of truth,
@@ -285,6 +290,29 @@ describe('every swept surface asks the copy module for its sentence', () => {
       importsFrom('components/files/use-flat-rows.ts', '@/lib/mode-copy', 'tooLargeDiffCopy'),
     ).toBe(true)
   })
+
+  test('the dirty-worktree banner asks for the sentence it draws', () => {
+    expect(
+      importsFrom('components/review/dirty-banner.tsx', '@/lib/mode-copy', 'dirtyWorktreeCopy'),
+    ).toBe(true)
+  })
+})
+
+describe('the review header mounts the banners hung under it', () => {
+  test('the header still mounts the dirty-worktree banner', () => {
+    // The one regression in this sweep that adds no sentence and removes none:
+    // a banner that is simply never mounted leaves every string assertion in
+    // the suite green — the component renders correctly, in all four of its
+    // states, on no screen at all. Its own suite asserts what it draws when
+    // rendered; only a read of the header can say that anything renders it.
+    //
+    // Presence, not execution, and anchored to the import STATEMENT and the
+    // module it names, so the name in a comment or a leftover local does not
+    // satisfy it.
+    expect(
+      importsFrom('pages/pr-layout.tsx', '@/components/review/dirty-banner', 'ReviewDirtyBanner'),
+    ).toBe(true)
+  })
 })
 
 describe('the topbar consults the rate-chip gate', () => {
@@ -352,6 +380,7 @@ const SWEPT: SweptCopy[] = [
   { name: 'tooLargeDiffCopy', text: flatten(tooLargeDiffCopy('local')) },
   { name: 'orgMemberChip', text: flatten(orgMemberChip('local')) },
   { name: 'orgMemberTitle', text: flatten(orgMemberTitle('local')) },
+  { name: 'dirtyWorktreeCopy', text: flatten(dirtyWorktreeCopy('local')) },
 ]
 
 describe('the copy sweep covers the module it is sweeping', () => {
