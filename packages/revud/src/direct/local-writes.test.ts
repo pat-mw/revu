@@ -2808,3 +2808,548 @@ describe('a created document is stamped with the head the write was guarded agai
     ])
   })
 })
+
+/**
+ * The four verbs over ONE local review, each addressed at state the verb before
+ * it produced.
+ *
+ * Every other case in this file starts a verb from a SEEDED fixture, which is
+ * what makes each verb's own postconditions measurable — and is also the one
+ * thing such a case can never see. A fixture is written out by the test, so a
+ * value one verb derives from another verb's output is, in a single-verb case,
+ * derived from a literal the test chose. Nothing there can notice that the id a
+ * reply mints collides with the id of the comment it answers, that the thread id
+ * a submit mints is not the id a later lookup finds, or that a fourth write
+ * carries away what the third one changed. Those are properties of the
+ * COMPOSITION, and the composition is what this suite drives.
+ *
+ * ONE DEPENDENCY SET FOR ALL FOUR VERBS, and that is the point rather than a
+ * convenience. A dependency set built per verb carries an allocator of its own,
+ * so each verb mints from a sequence starting where every other verb's does and
+ * no two of them can be shown to agree about which ids are already spent. Driven
+ * through one, the ids the four verbs mint come out of one sequence and can be
+ * required to be distinct — a claim about the verbs together, and unstatable
+ * about any one of them alone.
+ *
+ * THE IDS THE LATER VERBS ARE ADDRESSED WITH ARE READ BACK from what the submit
+ * wrote, never written out here. A thread id written out as a literal is
+ * compared against the minter that produced it, and such a case holds however
+ * the two drift apart; read back, the reply and the resolve reach their thread
+ * only if the id the submit minted really is the id a lookup finds.
+ *
+ * THE AUTHORSHIP MAP STARTS WITH SOMEBODY ELSE'S COMMENT IN IT, so "an entry for
+ * every id this run created, keyed to this reviewer" is a claim a uniformly
+ * filled map would fail. Were every entry this reviewer's, a map that attributed
+ * every comment on the review to whoever wrote last would satisfy the same
+ * comparison and the case would measure nothing.
+ *
+ * ONE CLAIM IS MADE ON WHAT WAS WRITTEN RATHER THAN ON WHAT READS BACK. This
+ * store keeps threads as rows and upserts them, so an envelope written with a
+ * thread DROPPED still reads back complete — a removal cannot be seen from the
+ * read side at all. The claim that the last write carried the earlier writes'
+ * changes through is therefore made against the envelope handed to storage.
+ */
+describe('the four verbs compose over one local review, each answering what the last one left', () => {
+  const PRIOR_PATH = 'src/pool.ts'
+  const FIRST_PATH = 'src/retry.ts'
+  const SECOND_PATH = 'src/queue.ts'
+
+  /** A comment already on the review before this run, written by another human. */
+  const PRIOR_AUTHOR_ID = 'wren.abbot@example.test'
+  const PRIOR_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 700
+  const PRIOR_THREAD_ID = `local:${LOCAL_ID}:${PRIOR_COMMENT_ID}`
+
+  const SUMMARY_BODY = 'Two things to change before this goes anywhere.'
+  const FIRST_BODY = 'This retries on a 4xx too, which will never succeed.'
+  const SECOND_BODY = 'The queue drains on shutdown but nothing awaits the drain.'
+  const REPLY_BODY = 'Agreed — it should stop at the first 4xx rather than retrying it.'
+  const REACTION: ReactionKey = 'rocket'
+
+  /** Another reviewer's unsent text on the SAME local review, which this run must not reach. */
+  const OTHER_DRAFT: ReviewDraft = {
+    ...SEEDED_DRAFT,
+    humanId: PRIOR_AUTHOR_ID,
+    body: 'Another reviewer’s unsent text, on the same local review.',
+  }
+
+  const pending = (seed: {
+    key: string
+    path: string
+    line: number
+    body: string
+  }): PendingComment => ({
+    key: seed.key,
+    path: seed.path,
+    side: 'RIGHT',
+    start_side: null,
+    line: seed.line,
+    start_line: null,
+    body: seed.body,
+    createdAt: FIXED_NOW,
+    updatedAt: FIXED_NOW,
+    anchor: { lineText: `line ${seed.line}`, contextBefore: [], contextAfter: [] },
+  })
+
+  /** Two pending comments on different files, so the two threads they become cannot be confused. */
+  const PENDING: readonly PendingComment[] = [
+    pending({ key: 'one', path: FIRST_PATH, line: 12, body: FIRST_BODY }),
+    pending({ key: 'two', path: SECOND_PATH, line: 40, body: SECOND_BODY }),
+  ]
+
+  /** A synced review already carrying one thread, written by somebody who is not the reviewer. */
+  const seeded = (): Snapshot =>
+    localSnapshot({
+      localId: LOCAL_ID,
+      headSha: HEAD_SHA,
+      at: FIXED_NOW,
+      mergeBaseSha: BASE_SHA,
+      paths: [PRIOR_PATH, FIRST_PATH, SECOND_PATH],
+      threads: [{ id: PRIOR_THREAD_ID, path: PRIOR_PATH, comments: [{ id: PRIOR_COMMENT_ID }] }],
+      commentAuthors: { [PRIOR_COMMENT_ID]: PRIOR_AUTHOR_ID },
+    })
+
+  interface Loop {
+    readonly store: FakeLocalStore
+    readonly deps: LocalWriteDeps
+    /** Every envelope handed to storage over the whole run, in write order. */
+    readonly envelopes: readonly Snapshot[]
+    readonly review: ReviewSummary
+    readonly reply: ReviewComment
+    readonly resolved: ReviewThread
+    readonly rollup: ReactionRollup
+    /** The thread the reply and the resolve addressed, as the submit minted its id. */
+    readonly answeredThreadId: string
+    /** The thread holding the reacted comment — the one the other two verbs never touched. */
+    readonly reactedThreadId: string
+    /** The comment the reaction addressed, as the submit minted its id. */
+    readonly reactedCommentId: number
+  }
+
+  /** The stored snapshot, or a loud failure — a null read would make every case here vacuous. */
+  const storedSnapshot = (store: FakeLocalStore): Snapshot => {
+    const held = store.getLocalSnapshot(LOCAL_ID)
+    if (held === null) throw new Error('no snapshot is stored for the local review under test')
+    return held
+  }
+
+  /**
+   * submit, then reply, then resolve, then react — through one store, one
+   * allocator and one clock, with every id after the first step read back out of
+   * what the step before it wrote.
+   */
+  const runLoop = async (): Promise<Loop> => {
+    const store = makeLocalStore({
+      snapshots: [seeded()],
+      drafts: [SEEDED_DRAFT, OTHER_DRAFT],
+    })
+    const { deps, envelopes } = capturing(store)
+
+    const submitted = await localWrites.submitLocalReview(deps, {
+      prNumber: LOCAL_ID,
+      expectedHeadSha: HEAD_SHA,
+      event: 'APPROVE',
+      body: SUMMARY_BODY,
+      comments: [...PENDING],
+    })
+    if (submitted.status !== 'ok') {
+      throw new Error(`the submit answered '${submitted.status}' where 'ok' was required`)
+    }
+
+    const materialized = storedSnapshot(store).mutable.threads.filter(
+      (thread) => thread.id !== PRIOR_THREAD_ID,
+    )
+    const [answered, reactedOn] = materialized
+    if (answered === undefined || reactedOn === undefined) {
+      throw new Error('the submit did not materialize the two threads this run is driven over')
+    }
+    const reactedComment = reactedOn.comments[0]
+    if (reactedComment === undefined) {
+      throw new Error('the thread the reaction is addressed at holds no comment')
+    }
+
+    const reply = await localWrites.replyToLocalThread(deps, LOCAL_ID, answered.id, REPLY_BODY)
+    const resolved = await localWrites.resolveLocalThread(deps, LOCAL_ID, answered.id, true)
+    const rollup = await localWrites.addLocalReaction(deps, LOCAL_ID, reactedComment.id, REACTION)
+
+    return {
+      store,
+      deps,
+      envelopes,
+      review: submitted.review,
+      reply,
+      resolved,
+      rollup,
+      answeredThreadId: answered.id,
+      reactedThreadId: reactedOn.id,
+      reactedCommentId: reactedComment.id,
+    }
+  }
+
+  /** Every comment this run created, in stored order: the submit's two with the reply between them. */
+  const createdComments = (loop: Loop): ReviewComment[] =>
+    storedSnapshot(loop.store)
+      .mutable.threads.filter((thread) => thread.id !== PRIOR_THREAD_ID)
+      .flatMap((thread) => thread.comments)
+
+  test('the fixture disagrees with itself everywhere the cases below compare', async () => {
+    // Each clause names a coincidence that would satisfy a case below however
+    // the code behaved: an authorship map holding one name, a prior comment
+    // whose id is among the minted ones, and two threads that cannot be told
+    // apart, so a verb landing on the wrong one reads as landing on the right.
+    const loop = await runLoop()
+    expect(PRIOR_AUTHOR_ID).not.toBe(SESSION.human.id)
+    expect(loop.answeredThreadId).not.toBe(loop.reactedThreadId)
+    expect(new Set(PENDING.map((comment) => comment.path)).size).toBe(PENDING.length)
+    expect(createdComments(loop).map((comment) => comment.id)).not.toContain(PRIOR_COMMENT_ID)
+  })
+
+  test('exactly one review summary is stored, and the three verbs after the submit wrote none', async () => {
+    const loop = await runLoop()
+    expect(loop.store.listLocalSubmittedReviews(LOCAL_ID)).toEqual([loop.review])
+  })
+
+  test('the review’s two timelines are still empty when the run is over', async () => {
+    const loop = await runLoop()
+    const held = storedSnapshot(loop.store)
+    // One comparison rather than two, so a non-empty first list cannot abort the
+    // case before the second one has been looked at.
+    expect([held.mutable.reviews, held.mutable.issueComments]).toEqual([[], []])
+  })
+
+  test('the review holds the thread it started with plus one per pending comment, and no more', async () => {
+    const loop = await runLoop()
+    expect(storedSnapshot(loop.store).mutable.threads.map((thread) => thread.id)).toEqual([
+      PRIOR_THREAD_ID,
+      loop.answeredThreadId,
+      loop.reactedThreadId,
+    ])
+    // The rows as well as the envelope: three of the four verbs write a thread
+    // row, and a row keyed differently from the one it replaces leaves the
+    // review holding a thread twice while the envelope still reads as three.
+    expect(loop.store.listLocalThreads(LOCAL_ID)).toHaveLength(3)
+  })
+
+  test('every id the four verbs minted is positive, inside the local band, and distinct from the rest', async () => {
+    const loop = await runLoop()
+    const commentIds = createdComments(loop).map((comment) => comment.id)
+    // Pinned first: every clause below is vacuously true over an empty list.
+    expect(commentIds).toHaveLength(3)
+    const minted = [loop.review.id, ...commentIds]
+    expect(minted.filter((id) => id <= 0)).toEqual([])
+    expect(minted.filter((id) => id < LOCAL_ENTITY_ID_BASE)).toEqual([])
+    // Drawn from ONE allocator across four verbs, which is the only arrangement
+    // in which this can fail. A verb minting from a sequence of its own, or
+    // reusing an id it read off a document it was handed, collides here and
+    // nowhere else: a case driving a single verb builds its expectation out of
+    // the id that verb answered with, so the same id twice still matches. The
+    // client swaps its optimistic entries by id, and a duplicate orphans the
+    // entry it was meant to replace.
+    expect(new Set(minted).size).toBe(minted.length)
+  })
+
+  test('every comment this run created is attributed to the reviewer, and the one it did not is left alone', async () => {
+    const loop = await runLoop()
+    const commentIds = createdComments(loop).map((comment) => comment.id)
+    const authors = storedSnapshot(loop.store).mutable.commentAuthors ?? {}
+    expect(commentIds.map((id) => authors[id])).toEqual([
+      SESSION.human.id,
+      SESSION.human.id,
+      SESSION.human.id,
+    ])
+    // The map is NOT uniformly this reviewer's, which is what makes the
+    // comparison above a claim about which ids are covered rather than one any
+    // filled map satisfies.
+    expect(authors[PRIOR_COMMENT_ID]).toBe(PRIOR_AUTHOR_ID)
+    expect(Object.keys(authors).map(Number).sort((a, b) => a - b)).toEqual(
+      [PRIOR_COMMENT_ID, ...commentIds].sort((a, b) => a - b),
+    )
+  })
+
+  test('the submit took this reviewer’s draft and only this reviewer’s', async () => {
+    const loop = await runLoop()
+    expect(loop.deps.getLocalDraft(SESSION.human.id, LOCAL_ID)).toBeNull()
+    // Keyed per human as well as per review. A delete that cleared the review's
+    // drafts would take unsent text belonging to somebody who never submitted,
+    // and no case driving a store holding one draft can see that.
+    expect(JSON.stringify(loop.store.getLocalDraft(PRIOR_AUTHOR_ID, LOCAL_ID))).toBe(
+      JSON.stringify(OTHER_DRAFT),
+    )
+  })
+
+  test('the reply is bound to the review summary and the root comment this same run minted', async () => {
+    const loop = await runLoop()
+    const root = createdComments(loop)[0]
+    if (root === undefined) throw new Error('the run created no comment for the reply to answer')
+    // Both values come out of documents the SUBMIT produced moments earlier. A
+    // case driving the reply alone reads them from a seeded fixture, so it can
+    // only show the reply copied the literal the test chose.
+    expect([loop.reply.pull_request_review_id, loop.reply.in_reply_to_id]).toEqual([
+      loop.review.id,
+      root.id,
+    ])
+  })
+
+  test('the resolve answers with the thread as the reply left it', async () => {
+    const loop = await runLoop()
+    const createdIds = createdComments(loop).map((comment) => comment.id)
+    expect(createdIds).toHaveLength(3)
+    expect(loop.resolved.id).toBe(loop.answeredThreadId)
+    // The thread the resolve read already carried the reply, which is a state no
+    // seeded fixture put it in: the verb before it appended that comment.
+    expect(loop.resolved.comments.map((comment) => comment.id)).toEqual(createdIds.slice(0, 2))
+    expect(createdIds[1]).toBe(loop.reply.id)
+    expect(loop.resolved.isResolved).toBe(true)
+  })
+
+  test('the reaction moves the comment the submit created, off the zero it was created with', async () => {
+    const loop = await runLoop()
+    const created = createdComments(loop)
+    const reacted = created.find((comment) => comment.id === loop.reactedCommentId)
+    const untouched = created.find((comment) => comment.id !== loop.reactedCommentId)
+    if (reacted === undefined || untouched === undefined) {
+      throw new Error('the run did not create the two comments this case compares')
+    }
+    // The baseline is read off a sibling the same submit created rather than
+    // assumed: a comment a submit materializes carries a zeroed rollup, so a
+    // count of one here is a movement and not a value somebody seeded.
+    expect([untouched.reactions[REACTION], reacted.reactions[REACTION]]).toEqual([0, 1])
+    expect(loop.rollup).toEqual(reacted.reactions)
+  })
+
+  test('the last envelope handed to storage still carries every change the earlier verbs made', async () => {
+    // Asserted on what was WRITTEN. This store keeps threads as rows and upserts
+    // them, so an envelope written with a thread dropped reads back complete —
+    // a removal cannot be seen from the read side at all.
+    const loop = await runLoop()
+    expect(loop.envelopes).toHaveLength(4)
+    const last = loop.envelopes[loop.envelopes.length - 1]
+    if (last === undefined) throw new Error('no snapshot was handed to storage')
+    expect(last.mutable.threads.map((thread) => thread.id)).toEqual([
+      PRIOR_THREAD_ID,
+      loop.answeredThreadId,
+      loop.reactedThreadId,
+    ])
+    const answered = last.mutable.threads.find((thread) => thread.id === loop.answeredThreadId)
+    // The reply and the resolve landed on this thread two writes and one write
+    // before the last one. A verb rebuilding the review from the state it was
+    // handed at the start of the run would carry neither.
+    expect([answered?.isResolved, answered?.comments.length]).toEqual([true, 2])
+    expect(last.mutable.commentAuthors).toEqual({
+      [PRIOR_COMMENT_ID]: PRIOR_AUTHOR_ID,
+      ...Object.fromEntries(createdComments(loop).map((comment) => [comment.id, SESSION.human.id])),
+    })
+  })
+})
+
+/**
+ * The reviewer's unsent text across every outcome short of a confirmed submit.
+ *
+ * A draft is the one thing on a local review that exists nowhere else. A thread
+ * that fails to materialize can be written again; text deleted after a write
+ * that did not land is gone, and the product exists to stop exactly that. So the
+ * property is stated once over every non-success outcome rather than case by
+ * case, and it is stated as BYTE-IDENTICAL rather than as still-present: a draft
+ * silently rewritten by a write that failed costs the reviewer the same words a
+ * deleted one does, and only a serialized comparison can tell the two apart from
+ * a draft that was left alone.
+ *
+ * EVERY ROW HERE DRIVES A REVIEW WHOSE SNAPSHOT IS STORED, and that is what
+ * separates this matrix from the refusal cases at the top of the file. Those
+ * drive a review that has never been synced, where a reply and a reaction refuse
+ * because there is no snapshot at all and the branch that refuses because the
+ * THREAD or the COMMENT is unknown is never reached. Measured against a sink
+ * that deleted the draft only on that second branch, the whole existing suite
+ * stayed green; these rows are the ones that go red.
+ *
+ * THE MATRIX CANNOT BE GREEN BECAUSE NOTHING HAPPENED. Two controls stand
+ * beside it. The first pins what each row actually answers — a returned moved
+ * head, a typed not-found, and the injected storage failure named by the message
+ * the store raised — so a row that quietly SUCCEEDED, because its id named
+ * something real or its failure injection never fired, is named rather than
+ * counted as a draft that survived. The second
+ * drives the same submit through to a confirmation on the same fixture and
+ * requires the draft to be GONE, because a fixture whose draft nothing could
+ * reach would produce this identical column of greens.
+ */
+describe('no outcome short of a confirmed submit costs the reviewer a byte of their draft', () => {
+  const MOVED_SHA = 'c'.repeat(40)
+  const SEEDED_PATH = 'src/retry.ts'
+  const KNOWN_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 800
+  const KNOWN_THREAD_ID = `local:${LOCAL_ID}:${KNOWN_COMMENT_ID}`
+  const UNKNOWN_THREAD_ID = `local:${LOCAL_ID}:${LOCAL_ENTITY_ID_BASE + 801}`
+  const UNKNOWN_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 802
+  const REPLY_BODY = 'Agreed, will fix.'
+
+  /**
+   * One pending comment, so a submit really reaches the thread write. With an
+   * empty comment list the loop that writes threads runs zero times, the
+   * injected failure on that method never fires, and the persistence row below
+   * would be a second test of a submit that simply confirmed.
+   */
+  const PENDING: readonly PendingComment[] = [
+    {
+      key: 'one',
+      path: SEEDED_PATH,
+      side: 'RIGHT',
+      start_side: null,
+      line: 12,
+      start_line: null,
+      body: 'This retries on a 4xx too, which will never succeed.',
+      createdAt: FIXED_NOW,
+      updatedAt: FIXED_NOW,
+      anchor: { lineText: 'line 12', contextBefore: [], contextAfter: [] },
+    },
+  ]
+
+  /** A SYNCED review carrying one thread, so an id can be unknown rather than merely unreachable. */
+  const syncedStore = (options: FakeLocalStoreOptions = {}): FakeLocalStore =>
+    makeLocalStore({
+      snapshots: [
+        localSnapshot({
+          localId: LOCAL_ID,
+          headSha: HEAD_SHA,
+          at: FIXED_NOW,
+          mergeBaseSha: BASE_SHA,
+          paths: [SEEDED_PATH],
+          threads: [
+            { id: KNOWN_THREAD_ID, path: SEEDED_PATH, comments: [{ id: KNOWN_COMMENT_ID }] },
+          ],
+        }),
+      ],
+      ...options,
+    })
+
+  const submitInput = (over: Partial<SubmitReviewInput> = {}): SubmitReviewInput => ({
+    prNumber: LOCAL_ID,
+    expectedHeadSha: HEAD_SHA,
+    event: 'COMMENT',
+    body: SEEDED_DRAFT.body,
+    comments: [...PENDING],
+    ...over,
+  })
+
+  /**
+   * How a verb that refused answered, as a label a table can compare.
+   *
+   * An untyped throw is labelled with its MESSAGE rather than with the fact that
+   * it was untyped, because one of the rows below reaches exactly that. A
+   * storage failure before the draft is touched is not wrapped by the sink —
+   * only a draft deletion that fails after the review has landed is, and that
+   * one is a different outcome with a different answer — so the injected failure
+   * arrives here as the store's own error. Labelling it by message is what makes
+   * the row's control discriminate: it says the INJECTION is what failed the
+   * submit, where 'an untyped error' would be satisfied by any accident.
+   */
+  const refusal = async (call: Promise<unknown>): Promise<string> =>
+    call.then(
+      () => 'returned without failing',
+      (error: unknown) => {
+        if (error instanceof ApiError) return `threw ${error.code}`
+        return error instanceof Error ? `threw ${error.message}` : 'threw a non-error'
+      },
+    )
+
+  /**
+   * The four non-success outcomes: the store each one needs, the call that
+   * reaches it answering a label for what happened, and the label it must
+   * answer. One table drives both the survival matrix and the control that pins
+   * the outcomes, so a row cannot be exercised by one and forgotten by the other.
+   */
+  const OUTCOMES: readonly (readonly [
+    string,
+    () => FakeLocalStore,
+    (deps: LocalWriteDeps) => Promise<string>,
+    string,
+  ])[] = [
+    [
+      'a submit whose head has moved',
+      () => syncedStore(),
+      async (deps) => {
+        const result = await localWrites.submitLocalReview(
+          deps,
+          submitInput({ expectedHeadSha: MOVED_SHA }),
+        )
+        return `returned ${result.status}`
+      },
+      'returned head_moved',
+    ],
+    [
+      'a reply to a thread this review has never held',
+      () => syncedStore(),
+      (deps) =>
+        refusal(localWrites.replyToLocalThread(deps, LOCAL_ID, UNKNOWN_THREAD_ID, REPLY_BODY)),
+      'threw not_found',
+    ],
+    [
+      'a reaction to a comment this review has never held',
+      () => syncedStore(),
+      (deps) => refusal(localWrites.addLocalReaction(deps, LOCAL_ID, UNKNOWN_COMMENT_ID, '+1')),
+      'threw not_found',
+    ],
+    [
+      'a submit whose thread write fails',
+      () => syncedStore({ throwOn: 'putLocalThread' }),
+      (deps) => refusal(localWrites.submitLocalReview(deps, submitInput())),
+      'threw the fake local store was built to fail on putLocalThread, and putLocalThread was called',
+    ],
+  ]
+
+  // One independently named case per row, written as a loop over the table
+  // rather than through the runner's own table helper, which this package's
+  // ambient declarations for the test runner do not describe. The shape is the
+  // same either way, and it is the shape the storage-failure cases above
+  // already use: each row is its own test, so a row that fails names itself and
+  // does not stop the rows after it from running.
+  for (const [outcome, store, drive] of OUTCOMES) {
+    test(`${outcome} leaves the draft byte-identical`, async () => {
+      const deps = makeLocalDeps(store())
+      const before = deps.getLocalDraft(SESSION.human.id, LOCAL_ID)
+      expect(before).not.toBeNull()
+      await drive(deps)
+      const after = deps.getLocalDraft(SESSION.human.id, LOCAL_ID)
+      expect(after).not.toBeNull()
+      expect(JSON.stringify(after)).toBe(JSON.stringify(before))
+    })
+  }
+
+  test('each row really reaches the outcome it is named for', async () => {
+    // Collected and compared in one shot rather than asserted per row, so a row
+    // that quietly succeeded is NAMED instead of aborting the run before the
+    // rows after it have been driven.
+    const observed = await Promise.all(
+      OUTCOMES.map(
+        async ([outcome, store, drive]) => [outcome, await drive(makeLocalDeps(store()))] as const,
+      ),
+    )
+    expect(observed).toEqual(
+      OUTCOMES.map(([outcome, , , answered]) => [outcome, answered] as const),
+    )
+  })
+
+  test('the ids the two refusing rows name really are unknown to the seeded review', async () => {
+    // Without this the two not-found rows could be refusing for the wrong
+    // reason. The thread the review DOES hold is answered, which is what makes
+    // the unknown one a statement about the id rather than about the fixture.
+    const deps = makeLocalDeps(syncedStore())
+    const comment = await localWrites.replyToLocalThread(
+      deps,
+      LOCAL_ID,
+      KNOWN_THREAD_ID,
+      REPLY_BODY,
+    )
+    expect(comment.in_reply_to_id).toBe(KNOWN_COMMENT_ID)
+    expect(KNOWN_THREAD_ID).not.toBe(UNKNOWN_THREAD_ID)
+    expect(KNOWN_COMMENT_ID).not.toBe(UNKNOWN_COMMENT_ID)
+  })
+
+  test('the same submit, allowed to confirm, does take the draft', async () => {
+    // The matrix's positive control. Every row above leaves the draft in place,
+    // and a fixture whose draft no call could reach would report the same four
+    // greens; this is the one call on this fixture that must remove it.
+    const deps = makeLocalDeps(syncedStore())
+    expect(deps.getLocalDraft(SESSION.human.id, LOCAL_ID)).not.toBeNull()
+    const result = await localWrites.submitLocalReview(deps, submitInput())
+    expect(result.status).toBe('ok')
+    expect(deps.getLocalDraft(SESSION.human.id, LOCAL_ID)).toBeNull()
+  })
+})
