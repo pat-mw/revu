@@ -64,11 +64,22 @@
  * failure — because the caller reads a successful submit as permission to
  * discard the draft it just sent, so a verb that answered while materializing
  * nothing would destroy the reviewer's text with no error anywhere to notice.
- * Every failure below is therefore an `ApiError` carrying a contract code the
- * transport can map, rather than a bare internal throw, and that shape is
- * asserted over the whole verb list rather than verb by verb: a verb added later
- * whose body could not answer in full would have to fail that assertion to reach
- * green.
+ * Every failure this module RAISES is therefore an `ApiError` carrying a
+ * contract code the transport can map, rather than a bare internal throw, and
+ * that shape is asserted over the whole verb list rather than verb by verb: a
+ * verb added later whose body could not answer in full would have to fail that
+ * assertion to reach green.
+ *
+ * The failures it merely PROPAGATES are a different matter, and the claim above
+ * does not reach them. A store write that throws, and a head resolution that
+ * rejects, travel out of here exactly as they arrived — untyped. That is
+ * deliberate rather than an oversight: the code such a failure should carry is a
+ * property of the storage and git seams, which the caller owns and this module
+ * only borrows, and a code invented here would describe a layer this module
+ * cannot see. The one exception is a draft deletion that fails AFTER the review
+ * has been materialized, which is wrapped because the wrapping is the only place
+ * the "it landed anyway, do not resubmit" warning can be carried. The behaviour
+ * is pinned by the suite; only the shape of the claim is narrower than it reads.
  *
  * PERSIST FIRST, DELETE THE DRAFT LAST. Every write here that materializes state
  * writes that state through the store and only then, on a confirmed success,
@@ -80,6 +91,28 @@
  * to clear the draft it just sent and to re-read the review expecting the new
  * threads, so an answer of success with nothing stored deletes the reviewer's
  * text and shows them nothing in its place.
+ *
+ * RE-READ AFTER THE LAST AWAIT, AND BUILD THE ENVELOPE FROM THAT READ. Two
+ * verbs here suspend in the middle of their work: submitting and replying both
+ * await the branch head between reading the review's snapshot and writing a
+ * whole envelope back. Every store method this module is given is SYNCHRONOUS,
+ * so that await is the only point at which either verb yields — and another
+ * write on the same review can run to completion while one is parked there. An
+ * envelope built from the read taken BEFORE the await then republishes the old
+ * thread list and the old authorship map over whatever landed in between: the
+ * other write's comment disappears, its authorship entry disappears with it —
+ * and a local comment with no entry can never be recognized as its writer's own
+ * again — while both verbs answer success. Text the reviewer was told had been
+ * saved would be gone, with nothing anywhere reporting it.
+ *
+ * The synchrony of the store is what makes a re-read a fix rather than a
+ * narrowing. Once a verb resumes, its whole tail runs to completion with no
+ * further interleaving, so a read taken at the top of that tail already carries
+ * every write that landed during the await and nothing can land after it. The
+ * obligation this places on later work is worth stating, because nothing about
+ * the shape of such a change looks like a lost update: a verb that awaits
+ * anywhere between its read and its write, or a store slice that grows an
+ * asynchronous method, reopens the window in silence.
  */
 import type {
   GhUser,
@@ -153,10 +186,22 @@ export interface LocalWriteDeps extends LocalWriteStore {
   /** Who is writing. `human.id` is the authorship key; it never enters a body. */
   session: Session
   /**
-   * The local branch's current head and its commit count, resolved by the
-   * caller. Injected as a resolved function rather than as a process runner so
-   * this module spawns nothing and ref-name hardening lives in exactly one
-   * place.
+   * The local branch's current head, and the number of commits in the SAME
+   * COMPARE the stored snapshot was built from — the range from the merge base
+   * to that head, and never the branch's whole history.
+   *
+   * The scope is part of the contract rather than an implementation detail of
+   * whoever wires this up, because the moved-head answer subtracts the stored
+   * compare's commit list from this number. Counted over the whole of the
+   * current head, it would be that list plus every commit the base branch
+   * already carried, and the answer would report the repository's age as new
+   * work on the branch. The pull-request path compares the same two quantities
+   * — a pull's own commit count against the commits its stored compare holds —
+   * and the subtraction only means anything while both are counted over one
+   * range.
+   *
+   * Injected as a resolved function rather than as a process runner so this
+   * module spawns nothing and ref-name hardening lives in exactly one place.
    */
   resolveHead: () => Promise<{ sha: string; commitCount: number }>
   /**
@@ -240,6 +285,26 @@ function timestamp(deps: LocalWriteDeps): string {
 }
 
 /**
+ * The stored snapshot for a local review, or the typed refusal that names the
+ * fix. Written as one helper because a submit reads it TWICE — once to refuse
+ * before the head is resolved, and once after, so the envelope it writes is
+ * built from state no concurrent write can have already replaced — and the two
+ * reads have to answer identically for the second one to be invisible to a
+ * caller.
+ */
+function requireStoredSnapshot(deps: LocalWriteDeps, localId: number): Snapshot {
+  const snapshot = deps.getLocalSnapshot(localId)
+  if (snapshot === null) {
+    throw new ApiError(
+      'unprocessable',
+      `Local review ${localId} has no stored snapshot for its threads to appear in — ` +
+        `sync it, then submit.`,
+    )
+  }
+  return snapshot
+}
+
+/**
  * Submit a local review: guard the head, materialize one thread per pending
  * comment plus one review summary, then — and only then — delete the draft.
  *
@@ -297,14 +362,7 @@ export async function submitLocalReview(
   const localId = input.prNumber
   const humanId = deps.session.human.id
 
-  const snapshot = deps.getLocalSnapshot(localId)
-  if (snapshot === null) {
-    throw new ApiError(
-      'unprocessable',
-      `Local review ${localId} has no stored snapshot for its threads to appear in — ` +
-        `sync it, then submit.`,
-    )
-  }
+  const snapshot = requireStoredSnapshot(deps, localId)
 
   // 1. Head guard. A mismatch is a returned value, never a throw, and nothing
   //    below this point runs: no document is created and the draft is untouched.
@@ -388,15 +446,24 @@ export async function submitLocalReview(
 
   // 3. Persist, in the order that keeps a partial failure recoverable, and then
   //    delete the draft. Nothing above this line touches the draft.
+  //
+  //    The envelope is built from a snapshot re-read HERE rather than from the
+  //    one the head guard was checked against. The head resolution above is the
+  //    only await in this verb, and another write on the same review can have
+  //    completed while it was outstanding; an envelope built from the earlier
+  //    read would republish that write's thread list and authorship map away.
+  //    Everything from this line to the end is synchronous, so this read carries
+  //    every such write and no further one can interleave.
+  const current = requireStoredSnapshot(deps, localId)
   for (const thread of threads) deps.putLocalThread(localId, thread)
   deps.putLocalReviewSummary(localId, review)
   deps.putLocalSnapshot({
-    ...snapshot,
+    ...current,
     mutable: {
-      ...snapshot.mutable,
+      ...current.mutable,
       // Appended, never replaced: a submit adds to the review's conversation.
-      threads: [...snapshot.mutable.threads, ...threads],
-      commentAuthors: { ...(snapshot.mutable.commentAuthors ?? {}), ...authored },
+      threads: [...current.mutable.threads, ...threads],
+      commentAuthors: { ...(current.mutable.commentAuthors ?? {}), ...authored },
     },
   })
 
@@ -438,6 +505,33 @@ function requireStoredThread(
     throw new ApiError('not_found', `Thread ${threadId} was not found on local review ${localId}.`)
   }
   return { snapshot, thread }
+}
+
+/**
+ * The stored thread, the snapshot it came out of, and the comment a reply is
+ * addressed to — or the typed not-found that either missing state answers with.
+ *
+ * Bundled into one helper because a reply reads all three TWICE: once before the
+ * branch head is resolved, so a thread that does not exist refuses without
+ * costing a git read, and once after, so every field the reply derives comes
+ * from state no concurrent write can already have replaced. Both reads must
+ * answer identically for the second one to be invisible to a caller, which a
+ * single helper guarantees and two written-out copies would not.
+ */
+function requireThreadWithRoot(
+  deps: LocalWriteDeps,
+  localId: number,
+  threadId: string,
+): { snapshot: Snapshot; thread: ReviewThread; root: ReviewComment } {
+  const { snapshot, thread } = requireStoredThread(deps, localId, threadId)
+  const root = thread.comments[0]
+  if (root === undefined) {
+    throw new ApiError(
+      'not_found',
+      `Thread ${threadId} on local review ${localId} has no comment to reply to.`,
+    )
+  }
+  return { snapshot, thread, root }
 }
 
 /**
@@ -513,18 +607,21 @@ export async function replyToLocalThread(
   threadId: string,
   body: string,
 ): Promise<ReviewComment> {
-  const { snapshot, thread } = requireStoredThread(deps, localId, threadId)
-  const root = thread.comments[0]
-  if (root === undefined) {
-    throw new ApiError(
-      'not_found',
-      `Thread ${threadId} on local review ${localId} has no comment to reply to.`,
-    )
-  }
+  // Read once before the branch is, so a thread this review does not hold
+  // refuses without costing a git read. The read this reply is BUILT from is
+  // taken again below, after the await.
+  requireThreadWithRoot(deps, localId, threadId)
 
   // Resolved before anything is minted, so a failure to read the branch costs
   // no id: the allocator's high-water mark only ever moves forward.
   const head = await deps.resolveHead()
+
+  // Re-read after the last await, and derive everything from this read. Another
+  // write on the same review can have completed while the head resolution was
+  // outstanding, and the envelope persisted below is rebuilt from the snapshot —
+  // so a snapshot read earlier would republish that write away. Everything from
+  // this line to the end is synchronous, so nothing further can interleave.
+  const { snapshot, thread, root } = requireThreadWithRoot(deps, localId, threadId)
   const at = timestamp(deps)
   const id = mintLocalEntityId(deps.nextEntityId)
   const comment: ReviewComment = {

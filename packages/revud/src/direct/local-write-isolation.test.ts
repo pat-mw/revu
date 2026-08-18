@@ -36,6 +36,26 @@
  * tests construct no GitHub client at all — unlike the GitHub write tests,
  * which spread a throwing client to prove nothing unexpected reached it — and
  * that absence is itself part of what is asserted.
+ *
+ * Why a RELATIVE specifier is checked against an ALLOWLIST rather than against
+ * a list of bad names. The import-graph walk below resolves a relative
+ * specifier by appending exactly one extension, so a helper landed beside these
+ * files under any other resolvable extension — or as a directory with an index
+ * — would be an invisible node in that graph: the walk reads nothing there, and
+ * because such a file belongs to neither pinned set, its own imports and its
+ * own egress vocabulary are never scanned either. A client reached through one
+ * would be genuinely loaded at runtime with every assertion here still green.
+ * Enumerating the extensions the walk should also try would answer that with a
+ * ban list, and a ban list is only ever as complete as the next extension
+ * somebody remembers. The rule is therefore stated from the other side,
+ * mirroring what the bare-specifier vocabulary ban already does: every relative
+ * specifier a scanned file writes must resolve to a MEMBER of the scanned set,
+ * compared against the written-out path including its extension. Anything else
+ * — a different extension, a directory index, a sibling module, a path that
+ * resolves to nothing at all — is a violation rather than a branch the walk
+ * quietly stops following. The scanned set is closed under relative imports by
+ * construction, which is what makes "at any depth" true independently of how
+ * many extensions the walk happens to know about.
  */
 import { describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
@@ -57,6 +77,16 @@ const LOCAL_MODULE_FILES = [
 ] as const
 
 /**
+ * The same set as absolute paths, which is the form a resolved specifier can be
+ * compared against. The extension is part of each member on purpose: a
+ * comparison that dropped it would accept a same-named file landed under a
+ * different extension, which is exactly the hole the allowlist exists to close.
+ */
+const LOCAL_MODULE_PATHS: readonly string[] = LOCAL_MODULE_FILES.map((file) =>
+  join(DIRECT_DIR, file),
+)
+
+/**
  * Egress vocabulary is scanned over the modules only, not over the test file.
  * A test fixture may legitimately carry a URL-shaped string inside a stored
  * document, whereas none of the three modules has any reason to name a host, a
@@ -69,6 +99,7 @@ const EGRESS_BANS = ['fetch(', 'https://', 'api.github.com', 'Bun.spawn'] as con
 
 const BASENAME_BAN_LABEL = 'a module whose basename contains "github"'
 const VOCABULARY_BAN_LABEL = 'a specifier outside { @revu/shared, bun:test }'
+const SCANNED_SET_BAN_LABEL = 'a relative specifier resolving outside the scanned file set'
 
 /** Sibling modules the local write path must never pull in, by resolved path. */
 const BANNED_SIBLINGS = ['./github-client', './write-decorator', './command-runner'] as const
@@ -111,8 +142,30 @@ function importSpecifiers(source: string): string[] {
  * `./github-client` is.
  */
 function resolveRelative(spec: string, fromDir: string): string | null {
-  if (!spec.startsWith('./') && !spec.startsWith('../')) return null
+  if (!isRelativeSpecifier(spec)) return null
   return resolve(fromDir, spec).replace(MODULE_EXTENSION, '')
+}
+
+/** Whether a specifier names a path rather than a package. */
+function isRelativeSpecifier(spec: string): boolean {
+  return spec.startsWith('./') || spec.startsWith('../')
+}
+
+/**
+ * Whether a relative specifier names a member of the scanned set — the only
+ * place a scanned file is allowed to import from.
+ *
+ * The comparison is against the members' WRITTEN-OUT paths, extension included,
+ * and it accepts the two spellings that reach one: the path as written, and the
+ * extensionless form these files actually use. That is deliberately stricter
+ * than the extension-stripping resolution the sibling bans do. Stripping the
+ * extension would read a specifier naming a same-named neighbour under a
+ * different one as if it named the scanned member itself, which would hand back
+ * the hole this allowlist exists to close.
+ */
+function resolvesIntoScannedSet(spec: string, fromDir: string): boolean {
+  const target = resolve(fromDir, spec)
+  return LOCAL_MODULE_PATHS.includes(target) || LOCAL_MODULE_PATHS.includes(`${target}.ts`)
 }
 
 /**
@@ -142,6 +195,11 @@ const SPECIFIER_BANS: readonly SpecifierBan[] = [
     label: VOCABULARY_BAN_LABEL,
     hit: (spec: string, fromDir: string) =>
       resolveRelative(spec, fromDir) === null && !isAllowedVocabulary(spec),
+  },
+  {
+    label: SCANNED_SET_BAN_LABEL,
+    hit: (spec: string, fromDir: string) =>
+      isRelativeSpecifier(spec) && !resolvesIntoScannedSet(spec, fromDir),
   },
 ]
 
@@ -181,6 +239,16 @@ const readFromDisk: ReadModule = (absolutePath) =>
  * depth. Bare specifiers end a branch: they name a package, not a file in this
  * graph. An unreadable module also ends a branch, which is why the callers
  * assert separately that the entry itself was readable.
+ *
+ * A relative target is resolved by appending ONE extension, so this walk sees a
+ * graph of `.ts` files and nothing else — a limitation it cannot detect from
+ * the inside, since a target it fails to resolve is indistinguishable from a
+ * branch that ends. Over the scanned set that limitation is unreachable rather
+ * than merely unlikely: the allowlist above requires every relative specifier
+ * there to name a scanned member, and every scanned member is a `.ts` file. The
+ * two layers are therefore not redundant statements of one rule — the allowlist
+ * is what makes the closure hold, and this walk is what reads the closure back
+ * out and reports what is in it.
  */
 function reachableModules(entryPath: string, read: ReadModule): string[] {
   const visited: string[] = []
@@ -262,6 +330,7 @@ describe('the specifier extractor is proven to see what it is meant to ban', () 
     expect(violations).toEqual([
       "fixture.ts imports './github-client' — banned: ./github-client",
       `fixture.ts imports './github-client' — banned: ${BASENAME_BAN_LABEL}`,
+      `fixture.ts imports './github-client' — banned: ${SCANNED_SET_BAN_LABEL}`,
     ])
   })
 
@@ -292,24 +361,55 @@ describe('the specifier extractor is proven to see what it is meant to ban', () 
 
 describe('every banned specifier is proven able to fire', () => {
   const SPECIFIER_FIXTURES: readonly (readonly [string, readonly string[]])[] = [
-    ['./write-decorator', ['./write-decorator']],
-    ['./command-runner', ['./command-runner']],
-    // The exact-path ban on the client is subsumed by the basename ban: any
-    // specifier resolving to that sibling also has "github" in its basename,
-    // so this member can never be the sole cause of a red. It is kept because
-    // it names the one module the GitHub write core imports, and this pinned
-    // pair is what records that the subsumption is known rather than assumed.
-    ['./github-client', ['./github-client', BASENAME_BAN_LABEL]],
-    ['../direct/github-client.ts', ['./github-client', BASENAME_BAN_LABEL]],
-    ['./legacy-github-transport', [BASENAME_BAN_LABEL]],
+    // Every named sibling ban is subsumed by the allowlist, which is what the
+    // second label on each of these rows records: a relative specifier naming
+    // any of them resolves outside the scanned set, so none of the three can
+    // be the sole cause of a red any more. They are kept because they name the
+    // modules the GitHub write core really imports, and a violation line that
+    // names the module is a better report than one that only says "outside the
+    // set". The exact-path ban on the client is subsumed twice over, by the
+    // basename ban as well — pinned here so the subsumptions stay known rather
+    // than assumed.
+    ['./write-decorator', ['./write-decorator', SCANNED_SET_BAN_LABEL]],
+    ['./command-runner', ['./command-runner', SCANNED_SET_BAN_LABEL]],
+    ['./github-client', ['./github-client', BASENAME_BAN_LABEL, SCANNED_SET_BAN_LABEL]],
+    [
+      '../direct/github-client.ts',
+      ['./github-client', BASENAME_BAN_LABEL, SCANNED_SET_BAN_LABEL],
+    ],
+    ['./legacy-github-transport', [BASENAME_BAN_LABEL, SCANNED_SET_BAN_LABEL]],
     ['@octokit/rest', [VOCABULARY_BAN_LABEL]],
     ['node:https', [VOCABULARY_BAN_LABEL]],
     ['@revu/app/mock', [VOCABULARY_BAN_LABEL]],
+    // A helper landed beside these files under every extension a runtime or a
+    // bundler will load, plus a directory with an index. None of them names a
+    // banned module and none has "github" in its basename, so the allowlist is
+    // the only rule that can see any of them — and it sees all of them for one
+    // reason rather than eight, because the rule is what a specifier may
+    // resolve TO and not what it may be spelled as.
+    ['./local-smuggle.ts', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.mts', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.cts', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.tsx', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.js', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.mjs', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.cjs', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle.json', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle/index.ts', [SCANNED_SET_BAN_LABEL]],
+    ['./local-smuggle', [SCANNED_SET_BAN_LABEL]],
+    // The same shapes wearing a scanned member's NAME, which is the case an
+    // extension-stripping comparison would wave through: neither of these is
+    // the file the scanned set pins, and both must still be violations.
+    ['./local-ids.mts', [SCANNED_SET_BAN_LABEL]],
+    ['./local-ids/index.ts', [SCANNED_SET_BAN_LABEL]],
     // The legitimate vocabulary, so the bans are shown to be specific rather
-    // than universally red.
+    // than universally red — including both spellings of a scanned member.
     ['@revu/shared', []],
     ['bun:test', []],
     ['./local-ids', []],
+    ['./local-ids.ts', []],
+    ['./local-writes', []],
+    ['./local-write-fakes', []],
   ]
 
   for (const [spec, labels] of SPECIFIER_FIXTURES) {
@@ -368,6 +468,48 @@ describe('the import-graph walk is proven to reach a client at depth', () => {
     // would then report nothing over the local path either.
     const visited = reachableModules(join(DIRECT_DIR, 'writes.ts'), readFromDisk)
     expect(githubModulesAmong(visited)).toEqual([join(DIRECT_DIR, 'github-client.ts')])
+  })
+})
+
+describe('a client reached through another extension is caught, and only by the allowlist', () => {
+  // The shape this pair exists for: a helper landed beside the write module
+  // under an extension the walk does not append, importing the client itself.
+  // Both halves are asserted, because the interesting fact is not that the
+  // violation is reported — it is that the walk reports NOTHING while a client
+  // really is reachable, so a suite holding only the walk would record a green
+  // over a live import. That makes the allowlist load-bearing rather than a
+  // second opinion, and it is why the two are measured separately here.
+  const SMUGGLING_ENTRY = [
+    "import { mintLocalEntityId } from './local-ids'",
+    "import './local-smuggle.mts'",
+    '',
+    'export const mint = mintLocalEntityId',
+    '',
+  ].join('\n')
+
+  const SMUGGLING_GRAPH: Record<string, string> = {
+    [join(DIRECT_DIR, 'local-writes.ts')]: SMUGGLING_ENTRY,
+    [join(DIRECT_DIR, 'local-ids.ts')]: 'export const mintLocalEntityId = () => 1\n',
+    [join(DIRECT_DIR, 'local-smuggle.mts')]:
+      "export { createGithubClient } from './github-client'\n",
+    [join(DIRECT_DIR, 'github-client.ts')]: 'export const createGithubClient = () => 1\n',
+  }
+  const readSmuggling: ReadModule = (path) => SMUGGLING_GRAPH[path] ?? null
+
+  test('the walk resolves one extension, so it reports no client at all here', () => {
+    const visited = reachableModules(join(DIRECT_DIR, 'local-writes.ts'), readSmuggling)
+    expect(githubModulesAmong(visited)).toEqual([])
+  })
+
+  test('the walk does not even visit the smuggling module, which is why it sees nothing', () => {
+    const visited = reachableModules(join(DIRECT_DIR, 'local-writes.ts'), readSmuggling)
+    expect(visited).not.toContain(join(DIRECT_DIR, 'local-smuggle.mts'))
+  })
+
+  test('the allowlist reports the specifier that reaches it', () => {
+    expect(specifierViolations('local-writes.ts', SMUGGLING_ENTRY)).toEqual([
+      `local-writes.ts imports './local-smuggle.mts' — banned: ${SCANNED_SET_BAN_LABEL}`,
+    ])
   })
 })
 

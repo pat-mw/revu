@@ -3353,3 +3353,251 @@ describe('no outcome short of a confirmed submit costs the reviewer a byte of th
     expect(deps.getLocalDraft(SESSION.human.id, LOCAL_ID)).toBeNull()
   })
 })
+
+/**
+ * Two writes overlapping on one local review, and the state neither may erase.
+ *
+ * Two of the four verbs read the review's snapshot, await the branch head, and
+ * only then write a whole envelope. That await is the one point at which either
+ * gives up control, and it sits between the read and the write — so a verb that
+ * resumes there is holding a description of the review that another write may
+ * already have replaced. An envelope built from the pre-await read republishes
+ * the old thread list and the old authorship map over whatever landed in
+ * between: a comment that fully persisted disappears, its authorship entry
+ * disappears with it — and a local comment with no entry can never be
+ * recognized as its writer's own again — while BOTH verbs answer success. That
+ * is confirmed reviewer text destroyed with nothing anywhere reporting it,
+ * which is the outcome this product exists to prevent.
+ *
+ * The window is closed by re-reading the snapshot after the last await. Every
+ * store method the port declares is synchronous, so once a verb resumes, its
+ * whole tail runs to completion with no further interleaving: a read taken at
+ * the top of that tail already carries everything that landed during the await,
+ * and nothing can land after it. The rule that keeps this true is stated in the
+ * write module's own header, because a verb added later that awaited anywhere
+ * between its read and its write would reopen the same window in silence.
+ *
+ * The two cases drive the two verbs against each other in both directions, and
+ * each asserts against the ENVELOPE that was written rather than against what
+ * reads back. The in-memory store keeps threads as rows and upserts them, so an
+ * envelope that dropped a thread still reads back complete — the loss that
+ * matters is in what the verb handed to storage, and a durable store is free to
+ * read that envelope as the whole truth about the review.
+ *
+ * NEITHER CASE CAN BE GREEN BECAUSE NOTHING OVERLAPPED. Each pins the order the
+ * two verbs completed in, and each checks that the blocked verb had written
+ * nothing at the moment the other one ran — so a run in which the interleaving
+ * did not happen is named rather than counted as a survival.
+ */
+describe('two writes overlapping on one local review, neither erasing the other', () => {
+  const OVERLAP_PATH = 'src/retry.ts'
+  const ROOT_COMMENT_ID = LOCAL_ENTITY_ID_BASE + 900
+  const ROOT_THREAD_ID = `local:${LOCAL_ID}:${ROOT_COMMENT_ID}`
+  const ROOT_AUTHOR_ID = 'wren.abbot@example.test'
+  const REPLY_BODY = 'This landed while the other write was resolving the head.'
+  const SUMMARY_BODY = 'One note before this goes anywhere.'
+
+  const PENDING: readonly PendingComment[] = [
+    {
+      key: 'one',
+      path: OVERLAP_PATH,
+      side: 'RIGHT',
+      start_side: null,
+      line: 12,
+      start_line: null,
+      body: 'This retries on a 4xx too, which will never succeed.',
+      createdAt: FIXED_NOW,
+      updatedAt: FIXED_NOW,
+      anchor: { lineText: 'line 12', contextBefore: [], contextAfter: [] },
+    },
+  ]
+
+  const submitInput = (): SubmitReviewInput => ({
+    prNumber: LOCAL_ID,
+    expectedHeadSha: HEAD_SHA,
+    event: 'COMMENT',
+    body: SUMMARY_BODY,
+    comments: [...PENDING],
+  })
+
+  /** A synced review carrying one thread written by somebody else, so both verbs have work to do. */
+  const overlappingStore = (): FakeLocalStore =>
+    makeLocalStore({
+      snapshots: [
+        localSnapshot({
+          localId: LOCAL_ID,
+          headSha: HEAD_SHA,
+          at: FIXED_NOW,
+          mergeBaseSha: BASE_SHA,
+          paths: [OVERLAP_PATH],
+          threads: [
+            { id: ROOT_THREAD_ID, path: OVERLAP_PATH, comments: [{ id: ROOT_COMMENT_ID }] },
+          ],
+          commentAuthors: { [ROOT_COMMENT_ID]: ROOT_AUTHOR_ID },
+        }),
+      ],
+    })
+
+  /**
+   * A head resolver that parks until it is released, and announces that it has
+   * been entered. Entry is what tells a case that the verb under test has taken
+   * its pre-await read and is now suspended; release is what lets it resume.
+   * Without the entry signal a case could run its second verb before the first
+   * had read anything, which is a different interleaving and not the one these
+   * cases are about.
+   */
+  const gatedHead = (): {
+    resolveHead: () => Promise<{ sha: string; commitCount: number }>
+    entered: Promise<void>
+    release: () => void
+  } => {
+    let announceEntry: () => void = () => {}
+    const entered = new Promise<void>((settle) => {
+      announceEntry = settle
+    })
+    let allow: () => void = () => {}
+    const released = new Promise<void>((settle) => {
+      allow = settle
+    })
+    return {
+      entered,
+      release: () => {
+        allow()
+      },
+      resolveHead: async () => {
+        announceEntry()
+        await released
+        return { sha: HEAD_SHA, commitCount: 3 }
+      },
+    }
+  }
+
+  /** Every comment id an envelope carries, across every thread it holds. */
+  const envelopeCommentIds = (envelope: Snapshot): number[] =>
+    envelope.mutable.threads.flatMap((thread) => thread.comments.map((comment) => comment.id))
+
+  /** The last envelope handed to storage, or a loud failure — no envelope makes a case vacuous. */
+  const lastEnvelope = (envelopes: readonly Snapshot[]): Snapshot => {
+    const held = envelopes.at(-1)
+    if (held === undefined) throw new Error('no snapshot envelope was written')
+    return held
+  }
+
+  /**
+   * Every comment id the submit created, read out of the thread ROWS rather
+   * than out of an envelope: the rows are written per thread and are the one
+   * record an envelope that dropped a thread cannot have erased.
+   */
+  const createdCommentIds = (store: FakeLocalStore): number[] =>
+    store
+      .listLocalThreads(LOCAL_ID)
+      .filter((thread) => thread.id !== ROOT_THREAD_ID)
+      .flatMap((thread) => thread.comments.map((comment) => comment.id))
+
+  test('a reply that lands while a submit is resolving the head survives the submit', async () => {
+    const store = overlappingStore()
+    const nextEntityId = countingEntityIds()
+    const gate = gatedHead()
+    const captured = capturing(store)
+    const submitDeps: LocalWriteDeps = {
+      ...captured.deps,
+      nextEntityId,
+      resolveHead: gate.resolveHead,
+    }
+    const replyDeps: LocalWriteDeps = { ...makeLocalDeps(store), nextEntityId }
+
+    const completed: string[] = []
+    const submitting = localWrites.submitLocalReview(submitDeps, submitInput()).then((result) => {
+      completed.push('submit')
+      return result
+    })
+    await gate.entered
+
+    // The submit is parked on its head resolution here, holding the read it
+    // took before that await. Everything the reply does lands inside that
+    // window.
+    const reply = await localWrites.replyToLocalThread(
+      replyDeps,
+      LOCAL_ID,
+      ROOT_THREAD_ID,
+      REPLY_BODY,
+    )
+    completed.push('reply')
+    // The interleaving, pinned: the submit had written nothing when the reply ran.
+    expect(store.listLocalSubmittedReviews(LOCAL_ID)).toEqual([])
+
+    gate.release()
+    const result = await submitting
+    expect(completed).toEqual(['reply', 'submit'])
+    expect(result.status).toBe('ok')
+
+    const envelope = lastEnvelope(captured.envelopes)
+    // The control, checked first and independent of the claim: the submit put
+    // its OWN comment in the envelope, so this is an envelope that really
+    // carried a new write rather than one nothing reached. It holds whether or
+    // not the reply survived, which is what stops it restating the claim.
+    const created = createdCommentIds(store)
+    expect(created.length).toBe(PENDING.length)
+    for (const id of created) expect(envelopeCommentIds(envelope)).toContain(id)
+
+    // The claim: the comment that landed inside the window is still in the
+    // envelope, and still attributable to the human who wrote it.
+    expect(envelopeCommentIds(envelope)).toContain(reply.id)
+    expect(envelope.mutable.commentAuthors?.[reply.id]).toBe(SESSION.human.id)
+
+    // And the loss the reviewer would see: the comment is still readable.
+    const held = store.getLocalSnapshot(LOCAL_ID)
+    expect(held).not.toBeNull()
+    expect(held?.mutable.threads.flatMap((thread) => thread.comments).map((c) => c.id)).toContain(
+      reply.id,
+    )
+  })
+
+  test('a submit that lands while a reply is resolving the head survives the reply', async () => {
+    const store = overlappingStore()
+    const nextEntityId = countingEntityIds()
+    const gate = gatedHead()
+    const captured = capturing(store)
+    const replyDeps: LocalWriteDeps = {
+      ...captured.deps,
+      nextEntityId,
+      resolveHead: gate.resolveHead,
+    }
+    const submitDeps: LocalWriteDeps = { ...makeLocalDeps(store), nextEntityId }
+
+    const completed: string[] = []
+    const replying = localWrites
+      .replyToLocalThread(replyDeps, LOCAL_ID, ROOT_THREAD_ID, REPLY_BODY)
+      .then((comment) => {
+        completed.push('reply')
+        return comment
+      })
+    await gate.entered
+
+    const result = await localWrites.submitLocalReview(submitDeps, submitInput())
+    completed.push('submit')
+    if (result.status !== 'ok') throw new Error(`the submit answered '${result.status}'`)
+    // The interleaving, pinned: the reply had written nothing when the submit ran.
+    expect(captured.envelopes).toEqual([])
+
+    gate.release()
+    const reply = await replying
+    expect(completed).toEqual(['submit', 'reply'])
+
+    const envelope = lastEnvelope(captured.envelopes)
+    // The control, checked first and independent of the claim: the reply put
+    // its own comment in the envelope, so this is an envelope a write really
+    // reached.
+    expect(envelopeCommentIds(envelope)).toContain(reply.id)
+
+    // The claim: the submit's own comment, and the entry that says who wrote
+    // it. An id present with no entry is a comment nobody can ever be shown as
+    // the author of, which is the half of this loss no later write can repair.
+    const created = createdCommentIds(store)
+    expect(created.length).toBe(PENDING.length)
+    for (const id of created) {
+      expect(envelopeCommentIds(envelope)).toContain(id)
+      expect(envelope.mutable.commentAuthors?.[id]).toBe(SESSION.human.id)
+    }
+  })
+})
