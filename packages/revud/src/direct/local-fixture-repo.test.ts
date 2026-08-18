@@ -92,6 +92,8 @@ describe('the seeded fixture repository', () => {
   let fixture: FixtureRepo
   let rawZ: string
   let records: RawRecord[]
+  /** Patch output for the type-changed path alone, so its sections can be counted. */
+  let patchStdout: string
 
   beforeAll(async () => {
     fixture = await createFixtureRepo()
@@ -111,6 +113,18 @@ describe('the seeded fixture repository', () => {
       fixture.headSha,
     ])
     records = parseRawZRecords(rawZ)
+    patchStdout = await stdoutOf(fixture.dir, [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '-M',
+      '--unified=3',
+      '--end-of-options',
+      fixture.mergeBaseSha,
+      fixture.headSha,
+      '--',
+      fixture.paths.typechanged,
+    ])
   })
 
   afterAll(() => {
@@ -217,6 +231,36 @@ describe('the seeded fixture repository', () => {
     // absent SHA rather than at the file mode must fail against this record.
     expect(record.dstSha).toBe(FIXTURE_GITLINK_SHA)
     expect(record.dstSha).not.toBe(ZERO_SHA)
+  })
+
+  test('the type change is recorded as T, from a symlink to a regular file', () => {
+    const record = recordFor(fixture.paths.typechanged)
+    expect([record.status, record.srcMode, record.dstMode]).toEqual(['T', '120000', '100644'])
+  })
+
+  test('and both of its object names are real ones, neither spelled as absent', () => {
+    // A path that merely appeared or vanished would carry the all-zero name on
+    // one side; a type change exists on both, which is what makes it a single
+    // record git nevertheless prints as two patch sections.
+    const record = recordFor(fixture.paths.typechanged)
+    expect([record.srcSha === ZERO_SHA, record.dstSha === ZERO_SHA]).toEqual([false, false])
+  })
+
+  test('git prints two patch sections for that one record', () => {
+    // The measurement the change-set join depends on, taken here so a git that
+    // stopped splitting a type change turns the harness red rather than leaving
+    // the join asserting a shape nothing produces any more.
+    const openings = patchStdout
+      .split('\n')
+      .filter((line) => line.startsWith('diff --git '))
+    expect(openings).toHaveLength(2)
+  })
+
+  test('and it spells them as a deletion of the old mode then a creation of the new', () => {
+    const introductions = patchStdout
+      .split('\n')
+      .filter((line) => line.startsWith('deleted file mode ') || line.startsWith('new file mode '))
+    expect(introductions).toEqual(['deleted file mode 120000', 'new file mode 100644'])
   })
 
   test("the gitlink's oid is not an object this repository holds", async () => {
@@ -343,6 +387,61 @@ describe('disposing a fixture repository', () => {
     fixture.dispose()
 
     expect(existsSync(fixture.dir)).toBe(false)
+    expect(process.env.GIT_CONFIG_GLOBAL).toBe(prior)
+  })
+
+  test('two overlapping fixtures unwind to the original whichever order they go in', async () => {
+    // The order nothing enforces. A pin that restores whatever it displaced
+    // restores the *second* fixture's value when the first is disposed first, and
+    // that value names a directory the second fixture will then delete — leaving
+    // the variable pointing at a path that does not exist for the rest of the
+    // process, suppressing ambient configuration for every unrelated suite after
+    // it. The terminal state has to be the original, not merely "not the first
+    // fixture's".
+    const prior = process.env.GIT_CONFIG_GLOBAL
+    const priorSystem = process.env.GIT_CONFIG_SYSTEM
+    const first = await createFixtureRepo()
+    const second = await createFixtureRepo()
+    expect(process.env.GIT_CONFIG_GLOBAL).toBe(second.env.GIT_CONFIG_GLOBAL)
+
+    first.dispose()
+
+    // The survivor keeps its isolation: the variable still names a path it
+    // chose, and never the one the disposed fixture has just deleted.
+    expect(process.env.GIT_CONFIG_GLOBAL).toBe(second.env.GIT_CONFIG_GLOBAL)
+    expect(existsSync(first.dir)).toBe(false)
+
+    second.dispose()
+
+    expect(process.env.GIT_CONFIG_GLOBAL).toBe(prior)
+    // Both variables, because they are pinned independently and a fix that only
+    // reached one of them would leave the other pointing at a deleted path.
+    expect(process.env.GIT_CONFIG_SYSTEM).toBe(priorSystem)
+    expect(existsSync(second.dir)).toBe(false)
+  })
+
+  test('the two fixtures really did pin different values, so the order matters', async () => {
+    // Without this the row above would hold for the trivial reason that both
+    // fixtures pinned the same string and no order could tell them apart.
+    const first = await createFixtureRepo()
+    const second = await createFixtureRepo()
+    try {
+      expect(first.env.GIT_CONFIG_GLOBAL).not.toBe(second.env.GIT_CONFIG_GLOBAL)
+    } finally {
+      first.dispose()
+      second.dispose()
+    }
+  })
+
+  test('disposing twice leaves the variable where the second disposal put it', async () => {
+    const prior = process.env.GIT_CONFIG_GLOBAL
+    const first = await createFixtureRepo()
+    const second = await createFixtureRepo()
+    first.dispose()
+    first.dispose()
+    // A second release must not count as releasing the survivor's pin.
+    expect(process.env.GIT_CONFIG_GLOBAL).toBe(second.env.GIT_CONFIG_GLOBAL)
+    second.dispose()
     expect(process.env.GIT_CONFIG_GLOBAL).toBe(prior)
   })
 })

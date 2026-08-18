@@ -60,6 +60,7 @@ import {
   parseNumstatZ,
   parseRawZ,
   patchHunks,
+  patchSectionCount,
   readLocalSnapshotImmutable,
   resolveLocalRange,
   splitPatchSections,
@@ -94,6 +95,10 @@ const FORGE_STATUS: Readonly<Partial<Record<RawDiffRecord['status'], PullFile['s
   D: 'removed',
   M: 'modified',
   R: 'renamed',
+  // A forge has no notion of a file's object class, so a path that stopped being
+  // a link and became a file is reported to it as what it looks like from the
+  // outside: the same path, holding different content.
+  T: 'modified',
 }
 
 /** A raw changed-file entry as the forge's files endpoint spells one. */
@@ -135,23 +140,36 @@ async function gitRaw(dir: string, args: readonly string[]): Promise<string> {
   return result.stdout
 }
 
-/** Turns git's records into the file list the forge's files endpoint would return. */
+/**
+ * Turns git's records into the file list the forge's files endpoint would return.
+ *
+ * The records and the counts are one entry per changed path; the patch sections
+ * are not, because a type change is emitted as a deletion followed by a creation.
+ * The section cursor therefore advances by each record's own span, read from the
+ * function that describes git's output format rather than from either producer's
+ * shape builder.
+ */
 function forgeFiles(
   records: readonly RawDiffRecord[],
   counts: readonly NumstatRecord[],
   sections: readonly string[],
 ): ForgeFileRaw[] {
-  if (counts.length !== records.length || sections.length !== records.length) {
+  const spans = records.map((record) => patchSectionCount(record.status))
+  const expectedSections = spans.reduce((total, span) => total + span, 0)
+  if (counts.length !== records.length || sections.length !== expectedSections) {
     throw new Error(
-      `the three reads of one range disagree: ${records.length} record(s), ${counts.length} count(s), ${sections.length} section(s)`,
+      `the three reads of one range disagree: ${records.length} record(s), ${counts.length} count(s), ${sections.length} section(s) where ${expectedSections} were expected`,
     )
   }
+  let cursor = 0
   return records.map((record, index) => {
     const status = FORGE_STATUS[record.status]
     if (status === undefined) {
       throw new Error(`no wire status for a ${record.status} record at ${record.path}`)
     }
     const count = counts[index]
+    const span = sections.slice(cursor, cursor + spans[index])
+    cursor += spans[index]
     const file: ForgeFileRaw = {
       // A removal has no head-side object, and the forge reports the pre-image
       // object name in this field — the only name that identifies the file.
@@ -167,11 +185,11 @@ function forgeFiles(
     // forge's own notation for a file it will not diff, and reproducing that
     // absence — rather than an empty string — is the whole of the convention.
     if (!count.binary) {
-      const hunks = patchHunks(sections[index])
-      if (hunks === undefined) {
+      const hunks = span.map(patchHunks)
+      if (hunks.some((text) => text === undefined)) {
         throw new Error(`${record.path} has line counts but no hunks to go with them`)
       }
-      file.patch = hunks
+      file.patch = hunks.join('\n')
     }
     return file
   })
@@ -183,9 +201,10 @@ function forgeTree(records: readonly RawDiffRecord[]): GhTreeEntry[] {
   for (const record of records) {
     // An addition has no base side, so the merge base's tree holds nothing for it.
     if (record.status === 'A') continue
-    // Every base-side entry in this range is a regular file. A submodule would be
-    // typed `commit` rather than `blob`; the range has none on that side, and a
-    // branch for a case the repository cannot produce is a branch nothing reaches.
+    // A tree lists both regular files and symlinks as `blob` — the mode tells
+    // them apart and a tree listing does not carry one. A submodule would be
+    // typed `commit`; the range has none on that side, and a branch for a case
+    // the repository cannot produce is a branch nothing reaches.
     entries.push({ path: record.previousPath ?? record.path, type: 'blob', sha: record.srcSha })
   }
   return entries
@@ -362,18 +381,34 @@ describe('the seeded range carries every case the comparisons depend on', () => 
     expect(binaries).toEqual([fixture.paths.binary])
   })
 
-  test('it contains two paths whose object is not file content', () => {
+  test('it contains three paths whose object is not file content', () => {
     // Read off the file modes rather than off the skip decision, so this stays
-    // standing when the code that makes that decision is wrong.
+    // standing when the code that makes that decision is wrong. Both sides are
+    // read: the type-changed path holds an ordinary blob on the head side and is
+    // unreadable only because of what it stopped being.
     const unreadable = records
-      .filter((record) => record.dstMode === '120000' || record.dstMode === '160000')
+      .filter((record) =>
+        [record.srcMode, record.dstMode].some((mode) => mode === '120000' || mode === '160000'),
+      )
       .map((record) => record.path)
-    expect(unreadable.sort()).toEqual([fixture.paths.symlink, fixture.paths.gitlink].sort())
+    expect(unreadable.sort()).toEqual(
+      [fixture.paths.symlink, fixture.paths.gitlink, fixture.paths.typechanged].sort(),
+    )
   })
 
-  test('it spans four distinct status letters, so a vocabulary claim over it is not trivial', () => {
+  test('it spans five distinct status letters, so a vocabulary claim over it is not trivial', () => {
     const letters = [...new Set(records.map((record) => record.status))].sort()
-    expect(letters).toEqual(['A', 'D', 'M', 'R'])
+    expect(letters).toEqual(['A', 'D', 'M', 'R', 'T'])
+  })
+
+  test('the letter that has no wire member of its own is one of them', () => {
+    // `T` is the case the two producers cannot both reach by the same route: git
+    // names it, and a forge has no vocabulary for it at all. Pinned separately so
+    // that removing it from the range breaks a named assertion rather than only
+    // shortening a list.
+    expect(records.filter((record) => record.status === 'T').map((record) => record.path)).toEqual([
+      fixture.paths.typechanged,
+    ])
   })
 
   test('the pair both producers read is the one the repository seeded', () => {
@@ -462,7 +497,7 @@ describe('the two producers key the blob index the same way', () => {
     // the trivial reason that nothing was ever filtered out of either.
     const { git, forge } = immutables()
     expect(Object.keys(local.skippedBlobPaths).sort()).toEqual(
-      [fixture.paths.symlink, fixture.paths.gitlink].sort(),
+      [fixture.paths.symlink, fixture.paths.gitlink, fixture.paths.typechanged].sort(),
     )
     expect(Object.keys(forge.blobIndex).length).toBeGreaterThan(Object.keys(git.blobIndex).length)
   })

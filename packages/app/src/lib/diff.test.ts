@@ -353,6 +353,57 @@ describe('a patch carrying a following file bleeds into the previous hunk', () =
   })
 })
 
+describe('a file whose object class changed arrives as two hunks in one patch', () => {
+  /**
+   * What a producer emits for a path that was a symlink and became a regular
+   * file: the removal of the link, then the creation of the file, with each
+   * side's own hunk and none of the lines that introduce either. Transcribed
+   * from git's output for that change, minus those introducing lines.
+   */
+  const TYPECHANGED = patch(
+    '@@ -1 +0,0 @@',
+    '-plain.txt',
+    '\\ No newline at end of file',
+    '@@ -0,0 +1,2 @@',
+    '+no longer a link',
+    '+plain content instead',
+  )
+
+  const model = parsePatch(makeFile({ filename: 'src/config', patch: TYPECHANGED }))
+
+  it('reads it as two hunks, one per side of the change', () => {
+    expect(model.hunks.map((hunk) => hunk.header)).toEqual([
+      '@@ -1 +0,0 @@',
+      '@@ -0,0 +1,2 @@',
+    ])
+  })
+
+  it('numbers the removed line on the base side and nothing on the head side', () => {
+    expect(model.hunks[0].lines).toEqual([
+      { kind: 'del', oldLine: 1, newLine: null, text: 'plain.txt' },
+    ])
+  })
+
+  it('numbers the added lines from the head file own first line', () => {
+    // The second hunk resets both cursors from its own header, so the lines the
+    // file now holds are numbered 1 and 2 — not continued from the hunk before
+    // them, which is what would happen if the two sides had been glued together
+    // without their headers.
+    expect(model.hunks[1].lines.map((line) => [line.kind, line.newLine])).toEqual([
+      ['add', 1],
+      ['add', 2],
+    ])
+  })
+
+  it('carries no row invented by the marker of a line that introduces a file', () => {
+    // The bleed check from the consumer side: joining the two *sections* rather
+    // than their hunks would put `--- /dev/null` and `+++ b/src/config` inside
+    // the first hunk as a deletion and an addition.
+    const texts = model.hunks.flatMap((hunk) => hunk.lines.map((line) => line.text))
+    expect(texts.filter((text) => text.startsWith('-- ') || text.startsWith('++ '))).toEqual([])
+  })
+})
+
 // ————————————————————————————————————————————————————————————————
 // intralineDiff
 // ————————————————————————————————————————————————————————————————

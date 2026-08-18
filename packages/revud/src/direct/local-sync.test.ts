@@ -58,6 +58,7 @@ import type {
   LocalRangeFailure,
   LocalRangeResult,
   LocalReviewIdentity,
+  LocalSnapshot,
   NumstatRecord,
   RawDiffRecord,
   WorktreeState,
@@ -71,6 +72,7 @@ import {
   parseNumstatZ,
   parseRawZ,
   patchHunks,
+  patchSectionCount,
   readLocalAuthorName,
   readLocalChangeSet,
   readLocalCommits,
@@ -593,6 +595,7 @@ describe('every command the resolver runs is hardened, and none is classified by
       'parseNumstatZ',
       'parseRawZ',
       'patchHunks',
+      'patchSectionCount',
       'readLocalAuthorName',
       'readLocalChangeSet',
       'readLocalCommits',
@@ -1620,6 +1623,10 @@ describe('against a real repository, every seeded case lands where it belongs', 
       [fixture.paths.binary]: 'added',
       [fixture.paths.symlink]: 'added',
       [fixture.paths.gitlink]: 'added',
+      // The wire vocabulary has no member for a type change, and the closest
+      // true statement about the head side is that the path exists on both
+      // sides holding different content.
+      [fixture.paths.typechanged]: 'modified',
     })
   })
 
@@ -1667,10 +1674,18 @@ describe('against a real repository, every seeded case lands where it belongs', 
     expect(Object.hasOwn(diff.blobIndex, fixture.paths.symlink)).toBe(false)
   })
 
-  test('both are still in the file list, with their skip reason recorded', () => {
+  test('the type-changed path is absent too, on the strength of its base side', () => {
+    // Its head side is an ordinary blob; only the side it stopped being makes it
+    // unreadable, so a skip decided on the head mode alone would index it and a
+    // comment written against the base side would resolve against a link target.
+    expect(Object.hasOwn(diff.blobIndex, fixture.paths.typechanged)).toBe(false)
+  })
+
+  test('all three are still in the file list, with their skip reason recorded', () => {
     expect(diff.skippedBlobPaths).toEqual({
       [fixture.paths.gitlink]: 'gitlink',
       [fixture.paths.symlink]: 'symlink',
+      [fixture.paths.typechanged]: 'symlink',
     })
   })
 
@@ -2153,6 +2168,9 @@ describe('against a real repository, every file is completed', () => {
       [fixture.paths.binary]: [0, 0],
       [fixture.paths.symlink]: [1, 0],
       [fixture.paths.gitlink]: [1, 0],
+      // One count record for a path git emits two patch sections for, holding
+      // the union of the two: the link's one line gone, the file's two arrived.
+      [fixture.paths.typechanged]: [2, 1],
     })
   })
 
@@ -2208,11 +2226,12 @@ describe('against a real repository, every file is completed', () => {
 
   test('the change set still carries the blob index the raw read produced', () => {
     // Completing the files must not disturb what the change-set read decided:
-    // the two paths with no readable object stay out of the index and keep
+    // the three paths with no readable object stay out of the index and keep
     // their reason.
     expect(changeSet.skippedBlobPaths).toEqual({
       [fixture.paths.gitlink]: 'gitlink',
       [fixture.paths.symlink]: 'symlink',
+      [fixture.paths.typechanged]: 'symlink',
     })
     expect(Object.hasOwn(changeSet.blobIndex, fixture.paths.modified)).toBe(true)
   })
@@ -2243,6 +2262,159 @@ describe('against a real repository, every file is completed', () => {
   test('the patch of the modified file is the hunk git printed for it', () => {
     expect(byPath[fixture.paths.modified].patch).toBe(
       '@@ -1,3 +1,3 @@\n alpha\n-bravo\n+BRAVO-CHANGED\n charlie',
+    )
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// Against real git: the one shape the three output formats do not agree on.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('a range containing a type change builds, and builds correctly', () => {
+  let fixture: FixtureRepo
+  let snapshot: LocalSnapshot
+  let file: PullFile
+  let rawZ: string
+  let numstatZ: string
+  let patchStdout: string
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    const runner = createBunCommandRunner()
+    const range = {
+      baseSha: fixture.baseSha,
+      headSha: fixture.headSha,
+      mergeBaseSha: fixture.mergeBaseSha,
+      compareKey: `${fixture.mergeBaseSha}...${fixture.headSha}`,
+    }
+    // The production entry point, not the join in isolation: the defect this
+    // guards was a refusal of the whole snapshot, so the assertion has to be
+    // that a snapshot comes back.
+    const read = await readLocalSnapshotImmutable(runner, fixture.dir, range)
+    if (!read.ok) throw new Error(`the fixture range must read, got ${read.reason}`)
+    snapshot = read.snapshot
+    const found = snapshot.immutable.files.find(
+      (entry) => entry.filename === fixture.paths.typechanged,
+    )
+    if (found === undefined) throw new Error('the type-changed path is missing from the file list')
+    file = found
+
+    const pair = [fixture.mergeBaseSha, fixture.headSha]
+    rawZ = await gitRaw(fixture.dir, [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--raw',
+      '--no-abbrev',
+      '-M',
+      '-z',
+      ...pair,
+      '--',
+      fixture.paths.typechanged,
+    ])
+    numstatZ = await gitRaw(fixture.dir, [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--numstat',
+      '-M',
+      '-z',
+      ...pair,
+      '--',
+      fixture.paths.typechanged,
+    ])
+    patchStdout = await gitRaw(fixture.dir, [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '-M',
+      '--unified=3',
+      ...pair,
+      '--',
+      fixture.paths.typechanged,
+    ])
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  test('git really does report one record, one count and two sections for it', () => {
+    // The measurement the join is built on, taken from the program rather than
+    // asserted from memory: if a future git stops splitting a type change in two,
+    // this is what says so, and the span rule can be retired deliberately.
+    const raw = parseRawZ(rawZ)
+    const counts = parseNumstatZ(numstatZ)
+    if (!raw.ok || !counts.ok) throw new Error('the seeded type change must parse')
+    expect([
+      raw.records.length,
+      counts.records.length,
+      splitPatchSections(patchStdout).length,
+    ]).toEqual([1, 1, 2])
+  })
+
+  test('and it reports it with the status letter that has no wire member', () => {
+    const raw = parseRawZ(rawZ)
+    if (!raw.ok) throw new Error('the seeded type change must parse')
+    expect([raw.records[0].status, raw.records[0].srcMode, raw.records[0].dstMode]).toEqual([
+      'T',
+      '120000',
+      '100644',
+    ])
+  })
+
+  test('the two sections are the deletion and the creation the join expects', () => {
+    const [first, second] = splitPatchSections(patchStdout)
+    expect([
+      first.includes('\ndeleted file mode 120000\n'),
+      second.includes('\nnew file mode 100644\n'),
+    ]).toEqual([true, true])
+  })
+
+  test('the file it becomes carries the counts git reported, as one file', () => {
+    expect([file.status, file.additions, file.deletions, file.changes]).toEqual([
+      'modified',
+      2,
+      1,
+      3,
+    ])
+  })
+
+  test('its patch is both of git own hunks, in the order git emitted them', () => {
+    expect(file.patch).toBe(
+      '@@ -1 +0,0 @@\n' +
+        '-plain.txt\n' +
+        '\\ No newline at end of file\n' +
+        '@@ -0,0 +1,2 @@\n' +
+        '+no longer a link\n' +
+        '+plain content instead',
+    )
+  })
+
+  test('and that patch introduces no file, so nothing bled across the boundary', () => {
+    expect((file.patch ?? '').slice(0, 2)).toBe('@@')
+    expect((file.patch ?? '').split('\n').filter((line) => FILE_HEADER_LINE.test(line))).toEqual([])
+  })
+
+  test('the path stays out of the blob index, on the strength of the side it left', () => {
+    expect(Object.hasOwn(snapshot.immutable.blobIndex, fixture.paths.typechanged)).toBe(false)
+    expect(snapshot.skippedBlobPaths[fixture.paths.typechanged]).toBe('symlink')
+  })
+
+  test('every other seeded path is still there beside it', () => {
+    // The control that keeps the rows above from holding over a snapshot that
+    // dropped everything else to make the type change fit.
+    expect(snapshot.immutable.files.map((entry) => entry.filename).sort()).toEqual(
+      [
+        fixture.paths.modified,
+        fixture.paths.added,
+        fixture.paths.removed,
+        fixture.paths.renamedTo,
+        fixture.paths.binary,
+        fixture.paths.symlink,
+        fixture.paths.gitlink,
+        fixture.paths.typechanged,
+      ].sort(),
     )
   })
 })
@@ -2334,7 +2506,7 @@ describe('the three reads agree, or the change set is refused', () => {
     const short = buildLocalChangeSet(build(ZIP_RAW), parseCounts(ZIP_COUNTS), sections.slice(1))
     expect(short.ok).toBe(false)
     if (short.ok) return
-    expect(short.detail).toContain('2 changed file(s) but 1 patch section(s)')
+    expect(short.detail).toContain('2 changed file(s) span 2 patch section(s), got 1')
   })
 
   test('one patch section too many is refused as well', () => {
@@ -2362,6 +2534,167 @@ describe('the three reads agree, or the change set is refused', () => {
       ok: true,
       changeSet: { files: [], blobIndex: {}, skippedBlobPaths: {}, binaryPaths: [] },
     })
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// One changed path, two patch sections: the shape the three streams disagree on.
+// ————————————————————————————————————————————————————————————————————————————
+
+const TYPECHANGE_ZIP_PATH = 'src/config'
+
+/** One `--raw -z` record for a symlink that became a regular file. */
+const TYPECHANGE_ZIP_RAW = rawRecord(
+  `:120000 100644 ${TYPECHANGE_BASE_OID} ${TYPECHANGE_HEAD_OID} T`,
+  TYPECHANGE_ZIP_PATH,
+)
+
+/** One `--numstat -z` record, holding the union of both sides' line counts. */
+const TYPECHANGE_ZIP_COUNTS = numstatRecord('2', '1', TYPECHANGE_ZIP_PATH)
+
+/** The section git emits first: the object the path stopped being, removed. */
+const TYPECHANGE_DELETE_SECTION =
+  `diff --git a/${TYPECHANGE_ZIP_PATH} b/${TYPECHANGE_ZIP_PATH}\n` +
+  'deleted file mode 120000\n' +
+  'index 9c9c9c9..0000000\n' +
+  `--- a/${TYPECHANGE_ZIP_PATH}\n` +
+  '+++ /dev/null\n' +
+  '@@ -1 +0,0 @@\n' +
+  '-plain.txt\n' +
+  '\\ No newline at end of file\n'
+
+/** The section git emits second: the object the path became, created. */
+const TYPECHANGE_CREATE_SECTION =
+  `diff --git a/${TYPECHANGE_ZIP_PATH} b/${TYPECHANGE_ZIP_PATH}\n` +
+  'new file mode 100644\n' +
+  'index 0000000..ababab0\n' +
+  '--- /dev/null\n' +
+  `+++ b/${TYPECHANGE_ZIP_PATH}\n` +
+  '@@ -0,0 +1,2 @@\n' +
+  '+no longer a link\n' +
+  '+plain content instead\n'
+
+/** The same path's creation side with no hunk, the way git spells a binary result. */
+const TYPECHANGE_BINARY_CREATE_SECTION =
+  `diff --git a/${TYPECHANGE_ZIP_PATH} b/${TYPECHANGE_ZIP_PATH}\n` +
+  'new file mode 100644\n' +
+  'index 0000000..ababab0\n' +
+  `Binary files /dev/null and b/${TYPECHANGE_ZIP_PATH} differ\n`
+
+function typechangeZip(
+  ...sections: readonly string[]
+): ReturnType<typeof buildLocalChangeSet> {
+  return buildLocalChangeSet(
+    build(TYPECHANGE_ZIP_RAW),
+    parseCounts(TYPECHANGE_ZIP_COUNTS),
+    sections,
+  )
+}
+
+describe('how many patch sections a change spans is decided by what changed', () => {
+  test('every status but a type change spans exactly one section', () => {
+    const spans = Object.fromEntries(
+      (['A', 'C', 'D', 'M', 'R', 'T'] as const).map((status) => [
+        status,
+        patchSectionCount(status),
+      ]),
+    )
+    expect(spans).toEqual({ A: 1, C: 1, D: 1, M: 1, R: 1, T: 2 })
+  })
+})
+
+describe('a type change is one record, one count and two sections', () => {
+  test('the two sections become one file carrying both sides of the change', () => {
+    const built = typechangeZip(TYPECHANGE_DELETE_SECTION, TYPECHANGE_CREATE_SECTION)
+    if (!built.ok) throw new Error(`the pair must build, got ${built.detail}`)
+    expect(built.changeSet.files).toEqual([
+      {
+        sha: TYPECHANGE_HEAD_OID,
+        filename: TYPECHANGE_ZIP_PATH,
+        status: 'modified',
+        additions: 2,
+        deletions: 1,
+        changes: 3,
+        patch:
+          '@@ -1 +0,0 @@\n' +
+          '-plain.txt\n' +
+          '\\ No newline at end of file\n' +
+          '@@ -0,0 +1,2 @@\n' +
+          '+no longer a link\n' +
+          '+plain content instead',
+      },
+    ])
+  })
+
+  test('the patch it carries accounts for both of the counts, not one of them', () => {
+    // The reason both sections are emitted rather than the interesting one: the
+    // counts stream reports a type change once, with the union of the two sides.
+    // A patch built from the creation side alone would leave the deletion count
+    // with no line behind it, and vice versa.
+    const built = typechangeZip(TYPECHANGE_DELETE_SECTION, TYPECHANGE_CREATE_SECTION)
+    if (!built.ok) throw new Error(`the pair must build, got ${built.detail}`)
+    const [file] = built.changeSet.files
+    const lines = (file.patch ?? '').split('\n')
+    expect([
+      lines.filter((line) => line.startsWith('+')).length,
+      lines.filter((line) => line.startsWith('-')).length,
+    ]).toEqual([file.additions, file.deletions])
+  })
+
+  test('and it still starts at a hunk header, carrying no line that introduces a file', () => {
+    // Joining the sections themselves would put the creation side's `diff --git`,
+    // `new file mode`, `---` and `+++` lines inside an already-open hunk, where a
+    // reader consumes them as content and every line number after them drifts.
+    const built = typechangeZip(TYPECHANGE_DELETE_SECTION, TYPECHANGE_CREATE_SECTION)
+    if (!built.ok) throw new Error(`the pair must build, got ${built.detail}`)
+    const patch = built.changeSet.files[0].patch ?? ''
+    expect(patch.slice(0, 2)).toBe('@@')
+    expect(patch.split('\n').filter((line) => FILE_HEADER_LINE.test(line))).toEqual([])
+  })
+
+  test('one section for a type change is refused, naming what was expected', () => {
+    const built = typechangeZip(TYPECHANGE_CREATE_SECTION)
+    expect(built.ok).toBe(false)
+    if (built.ok) return
+    expect(built.detail).toContain('1 changed file(s) span 2 patch section(s), got 1')
+  })
+
+  test('three sections for a type change is refused as well', () => {
+    const built = typechangeZip(
+      TYPECHANGE_DELETE_SECTION,
+      TYPECHANGE_CREATE_SECTION,
+      MODE_ONLY_SECTION,
+    )
+    expect(built.ok).toBe(false)
+  })
+
+  test('two sections that are not a deletion then a creation are refused', () => {
+    // The count on its own is a weak association: two sections in the right
+    // number can still be the wrong two. The pair git emits for a type change
+    // introduces the old object's removal and then the new object's creation, so
+    // anything else at those positions is a stream this cannot read.
+    const built = typechangeZip(TYPECHANGE_CREATE_SECTION, TYPECHANGE_DELETE_SECTION)
+    expect(built.ok).toBe(false)
+    if (built.ok) return
+    expect(built.detail).toContain(TYPECHANGE_ZIP_PATH)
+    expect(built.detail).toContain('not a deletion followed by a creation')
+  })
+
+  test('a pair whose creation side has no hunk carries no patch key at all', () => {
+    // git declines a text diff for a side it considers binary. Half a change is
+    // not a smaller truth than none: its line numbers would describe a file that
+    // never existed. The absent key already says there is no diff to show.
+    const built = typechangeZip(TYPECHANGE_DELETE_SECTION, TYPECHANGE_BINARY_CREATE_SECTION)
+    if (!built.ok) throw new Error(`the pair must build, got ${built.detail}`)
+    expect('patch' in built.changeSet.files[0]).toBe(false)
+  })
+
+  test('and the same pair with both sides diffable does carry one', () => {
+    // The control for the row above: without it, a builder that never assigned a
+    // patch to a two-section file would satisfy it.
+    const built = typechangeZip(TYPECHANGE_DELETE_SECTION, TYPECHANGE_CREATE_SECTION)
+    if (!built.ok) throw new Error(`the pair must build, got ${built.detail}`)
+    expect('patch' in built.changeSet.files[0]).toBe(true)
   })
 })
 
@@ -2424,12 +2757,24 @@ describe('completing a change set asks git for exactly three things', () => {
       '-c',
       'core.quotePath=false',
       'diff',
+      '--no-ext-diff',
+      '--no-color',
       '-M',
       '--unified=3',
       '--end-of-options',
       MERGE_BASE_SHA,
       HEAD_SHA,
     ])
+  })
+
+  test('the two reads that are not the patch read carry neither of its two flags', () => {
+    // Not decoration: both settings are properties of patch generation and reach
+    // neither `--raw` nor `--numstat`, so a flag written here would be a claim
+    // about those commands that no configuration could make false. The
+    // behavioural leg below is where the patch read's own two are falsified.
+    for (const args of [sink[0], sink[1]]) {
+      expect([args.includes('--no-ext-diff'), args.includes('--no-color')]).toEqual([false, false])
+    }
   })
 
   test('the counts read carries -M, so a rename is one record and not two', () => {
@@ -2535,6 +2880,173 @@ describe('rename detection is asked for, never inherited from the repository', (
     expect(result.changeSet.files.map((file) => file.filename)).not.toContain(
       fixture.paths.renamedFrom,
     )
+  })
+})
+
+describe('the patch read survives an ordinary contributor configuration', () => {
+  /** The argv of the patch read, with whichever flags a leg wants to give it. */
+  function patchArgs(fixture: FixtureRepo, flags: readonly string[]): string[] {
+    return [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      ...flags,
+      '-M',
+      '--unified=3',
+      fixture.mergeBaseSha,
+      fixture.headSha,
+    ]
+  }
+
+  const STATED_FLAGS = ['--no-ext-diff', '--no-color']
+
+  /**
+   * How a coloured line opens: the escape byte, then the bracket that begins a
+   * control sequence. Written as an escape rather than as the byte itself — a
+   * raw control character in a source file makes that file binary to `git diff`
+   * and to `grep`, which takes its contents out of every review and every scan.
+   */
+  const ANSI_SEQUENCE_START = '\u001b['
+
+  let fixture: FixtureRepo
+  let scratch: string
+  /** Section counts from the same command with and without the two stated flags. */
+  let externalSections: { stated: number; ambient: number }
+  let colorSections: { stated: number; ambient: number }
+  let colorAmbientStdout: string
+  let readWithBoth: Awaited<ReturnType<typeof readLocalChangeSet>>
+  let recordsBefore: string
+  let countsBefore: string
+  let recordsAfter: string
+  let countsAfter: string
+
+  const recordArgs = (f: FixtureRepo): string[] => [
+    '-c',
+    'core.quotePath=false',
+    'diff',
+    '--raw',
+    '--no-abbrev',
+    '-M',
+    '-z',
+    f.mergeBaseSha,
+    f.headSha,
+  ]
+  const countArgs = (f: FixtureRepo): string[] => [
+    '-c',
+    'core.quotePath=false',
+    'diff',
+    '--numstat',
+    '-M',
+    '-z',
+    f.mergeBaseSha,
+    f.headSha,
+  ]
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    recordsBefore = await gitRaw(fixture.dir, recordArgs(fixture))
+    countsBefore = await gitRaw(fixture.dir, countArgs(fixture))
+
+    // An external differ that exists on any machine the suite runs on, rather
+    // than a name that happens to be installed on the author's: the setting is
+    // what is under test, not the program it names.
+    scratch = mkdtempSync(join(tmpdir(), 'revu-external-differ-'))
+    const differ = join(scratch, 'differ.sh')
+    writeFileSync(differ, '#!/bin/sh\necho "an external differ replied instead"\n')
+    chmodSync(differ, 0o755)
+
+    await git(fixture.dir, ['config', 'diff.external', differ])
+    externalSections = {
+      stated: splitPatchSections(await gitRaw(fixture.dir, patchArgs(fixture, STATED_FLAGS))).length,
+      ambient: splitPatchSections(await gitRaw(fixture.dir, patchArgs(fixture, []))).length,
+    }
+
+    await git(fixture.dir, ['config', '--unset', 'diff.external'])
+    await git(fixture.dir, ['config', 'color.diff', 'always'])
+    colorAmbientStdout = await gitRaw(fixture.dir, patchArgs(fixture, []))
+    colorSections = {
+      stated: splitPatchSections(await gitRaw(fixture.dir, patchArgs(fixture, STATED_FLAGS))).length,
+      ambient: splitPatchSections(colorAmbientStdout).length,
+    }
+
+    // Both at once, which is the state a repository configured by a person who
+    // likes their diffs coloured and rendered by another program is actually in.
+    await git(fixture.dir, ['config', 'diff.external', differ])
+    readWithBoth = await readLocalChangeSet(createBunCommandRunner(), fixture.dir, {
+      mergeBaseSha: fixture.mergeBaseSha,
+      headSha: fixture.headSha,
+    })
+    recordsAfter = await gitRaw(fixture.dir, recordArgs(fixture))
+    countsAfter = await gitRaw(fixture.dir, countArgs(fixture))
+  })
+
+  afterAll(() => {
+    fixture.dispose()
+    rmSync(scratch, { recursive: true, force: true })
+  })
+
+  test('the repository really carries both settings', async () => {
+    // Without this every row below would also pass over a repository where
+    // neither setting took, which is the whole point of the leg.
+    await expect(git(fixture.dir, ['config', '--get', 'color.diff'])).resolves.toBe('always')
+    expect(await git(fixture.dir, ['config', '--get', 'diff.external'])).toContain('differ.sh')
+  })
+
+  test('an external differ really does take the patch away from a read that lets it', () => {
+    // The falsification `--no-ext-diff` needs. git's own default is to run no
+    // external differ, so the flag changes nothing until a repository says
+    // otherwise — and this is the measurement that says it does.
+    expect(externalSections.ambient).toBe(0)
+  })
+
+  test('and the read that states the flag still gets git own sections', () => {
+    expect(externalSections.stated).toBeGreaterThan(0)
+  })
+
+  test('colour really does hide the line every section is split on', () => {
+    // The same falsification for `--no-color`: git colours nothing when its
+    // output is not a terminal, so the flag is inert until a repository asks for
+    // colour always. The escape arrives ahead of the opening line, in the first
+    // column, which is exactly where the split looks for `diff --git `.
+    expect(colorAmbientStdout.startsWith(ANSI_SEQUENCE_START)).toBe(true)
+    expect(colorSections.ambient).toBe(0)
+  })
+
+  test('and the read that states the flag is uncoloured', () => {
+    expect(colorSections.stated).toBeGreaterThan(0)
+  })
+
+  test('a change set reads normally with both settings in force', () => {
+    if (!readWithBoth.ok) {
+      throw new Error(`the configured repository must still read, got ${readWithBoth.reason}`)
+    }
+    expect(readWithBoth.changeSet.files.length).toBeGreaterThan(0)
+  })
+
+  test('and the patches it carries are git own hunks, not another program output', () => {
+    if (!readWithBoth.ok) {
+      throw new Error(`the configured repository must still read, got ${readWithBoth.reason}`)
+    }
+    const modified = readWithBoth.changeSet.files.find(
+      (file) => file.filename === fixture.paths.modified,
+    )
+    expect(modified?.patch).toBe('@@ -1,3 +1,3 @@\n alpha\n-bravo\n+BRAVO-CHANGED\n charlie')
+  })
+
+  test('neither setting reaches the record stream, which is why it states no flag', () => {
+    // The measurement behind the decision not to write the two flags onto the
+    // other two reads. Both settings are properties of patch generation; a flag
+    // that changed nothing there would be a claim nothing could falsify.
+    expect(recordsAfter).toBe(recordsBefore)
+  })
+
+  test('nor the count stream', () => {
+    expect(countsAfter).toBe(countsBefore)
+  })
+
+  test('and the two streams really did carry something to compare', () => {
+    // Without this, two empty strings would satisfy both rows above.
+    expect([recordsBefore.length, countsBefore.length].every((size) => size > 0)).toBe(true)
   })
 })
 
@@ -2909,7 +3421,7 @@ describe('the commits of a range arrive oldest first', () => {
     expect(commits.map((commit) => commit.commit.message)).toEqual([
       'modify one file and add another',
       'delete one file and rename another',
-      'add a binary file, a symlink and a gitlink',
+      'add a binary file, a symlink and a gitlink, and unlink one path',
     ])
   })
 })
@@ -3365,6 +3877,7 @@ describe('the assembled snapshot has exactly the contract shape, at runtime', ()
     expect(read.snapshot.skippedBlobPaths).toEqual({
       [fixture.paths.symlink]: 'symlink',
       [fixture.paths.gitlink]: 'gitlink',
+      [fixture.paths.typechanged]: 'symlink',
     })
     expect(read.snapshot.binaryPaths).toEqual([fixture.paths.binary])
   })

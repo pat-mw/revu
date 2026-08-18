@@ -10,8 +10,9 @@
  * A base branch and a head branch of three commits, whose combined diff against
  * the merge base carries one instance of every case the builder must classify:
  * a plain modification, an addition, a deletion, a rename detected by similarity,
- * a binary file (its bytes contain a NUL), a symlink (mode `120000`) and a gitlink
- * (mode `160000`). The base branch also advances by one commit *after* the head
+ * a binary file (its bytes contain a NUL), a symlink (mode `120000`), a gitlink
+ * (mode `160000`) and a type change (a symlink on the base side, a regular file on
+ * the head side). The base branch also advances by one commit *after* the head
  * branch forks, so the merge base is strictly behind the base tip and a builder
  * that confuses the two cannot pass.
  *
@@ -19,9 +20,20 @@
  * no-op on a filesystem without symlink support and a gitlink entry is silently
  * dropped if the index write fails, and either would leave a classification test
  * asserting over a change set that never contained the case — passing forever
- * while the logic it names is completely unguarded. The two environment-dependent
+ * while the logic it names is completely unguarded. The three environment-dependent
  * steps are therefore verified here, at the point of seeding, and throw rather
  * than degrade. The remaining cases are asserted by this module's own self-test.
+ *
+ * ## Why a type change is one of the seeded cases
+ *
+ * Replacing a symlinked file with a real one is an ordinary thing to do to a
+ * repository, and it is the only change git reports with a different *number* of
+ * records in different output formats: one `--raw` record and one `--numstat`
+ * record, but two patch sections, because git spells the change as a deletion of
+ * the old object class followed by a creation of the new one. A change set read
+ * by joining those three streams is therefore wrong for this shape unless it was
+ * built knowing about it, and a fixture that seeds only a symlink *addition*
+ * cannot tell the difference.
  *
  * ## Why every commit carries explicit identity flags
  *
@@ -47,8 +59,9 @@
  * fixture's own spawns, because the production `CommandRunner` inherits the
  * process environment and takes no environment argument; pinning them here is the
  * only way the isolation reaches the git commands the code under test runs.
- * `dispose()` unwinds the pin, and unwinds only its own value, so an overlapping
- * fixture is not clobbered.
+ * `dispose()` releases this fixture's pin; the value the process carried before
+ * any fixture pinned it comes back when the last live pin is released, in
+ * whatever order the fixtures are disposed.
  *
  * ## Why the gitlink is written with `update-index --cacheinfo`
  *
@@ -108,6 +121,12 @@ export interface FixtureRepoPaths {
   readonly symlink: string
   /** Added on the head side as a gitlink — file mode `160000`. */
   readonly gitlink: string
+  /**
+   * A symlink on the base side and a regular file on the head side — file mode
+   * `120000` becoming `100644`, which git reports as a single `T` record and as
+   * two patch sections.
+   */
+  readonly typechanged: string
   /** Added on the base branch after the head branch forked. Not in the head range. */
   readonly baseOnly: string
 }
@@ -164,8 +183,17 @@ const PATHS: FixtureRepoPaths = {
   binary: 'assets/binary.bin',
   symlink: 'src/link',
   gitlink: 'vendor/sub',
+  typechanged: 'src/config',
   baseOnly: 'docs/base-only.md',
 }
+
+/**
+ * What the type-changed path holds once it is a regular file. Two lines, so the
+ * addition count it produces (2) differs from the deletion count the symlink it
+ * replaced produces (1) — a patch built from only one of git's two sections then
+ * disagrees with the line counts, visibly, rather than by a number nobody reads.
+ */
+const TYPECHANGED_BODY = 'no longer a link\nplain content instead\n'
 
 /**
  * The rename's shared body. Twelve identical lines against a single appended line
@@ -219,17 +247,57 @@ async function git(
 }
 
 /**
- * Sets one environment variable on this process and returns the undo. The undo is
- * a no-op unless the variable still holds the value it set, so two fixtures whose
- * lifetimes overlap unwind in either order without one erasing the other's pin.
+ * Every pin currently held on one environment variable, newest last, beside the
+ * value the process carried before the first of them was taken.
+ *
+ * Overlapping pins have to be tracked in one place rather than each remembering
+ * what it displaced. A pin that restores whatever it happened to displace
+ * restores a *later* fixture's value when it is released first, and that value
+ * names a directory that fixture has already deleted — so the variable is left
+ * pointing at a path that no longer exists, for the rest of the process, quietly
+ * suppressing ambient configuration for every unrelated suite that follows.
+ * Whether the last release restores the original therefore cannot be a property
+ * of the order they are released in.
+ */
+interface HeldPins {
+  readonly prior: string | undefined
+  /** One entry per live pin. Held as objects so two pins of the same value are two pins. */
+  readonly pins: { readonly value: string }[]
+}
+
+const heldPins = new Map<string, HeldPins>()
+
+/**
+ * Sets one environment variable on this process and returns the undo.
+ *
+ * Releasing the last pin on a variable restores exactly what the process carried
+ * before the first one was taken — deleting the variable where it carried
+ * nothing. Releasing a pin while others are still held reinstates the newest of
+ * those instead, so an overlapping fixture keeps its isolation whichever order
+ * the two are disposed in. A second release of the same pin does nothing.
  */
 function pinEnv(key: string, value: string): () => void {
-  const prior = process.env[key]
+  let held = heldPins.get(key)
+  if (held === undefined) {
+    held = { prior: process.env[key], pins: [] }
+    heldPins.set(key, held)
+  }
+  const state = held
+  const pin = { value }
+  state.pins.push(pin)
   process.env[key] = value
   return (): void => {
-    if (process.env[key] !== value) return
-    if (prior === undefined) delete process.env[key]
-    else process.env[key] = prior
+    const at = state.pins.indexOf(pin)
+    if (at === -1) return
+    state.pins.splice(at, 1)
+    const newest = state.pins[state.pins.length - 1]
+    if (newest !== undefined) {
+      process.env[key] = newest.value
+      return
+    }
+    heldPins.delete(key)
+    if (state.prior === undefined) delete process.env[key]
+    else process.env[key] = state.prior
   }
 }
 
@@ -262,6 +330,21 @@ export async function createFixtureRepo(): Promise<FixtureRepo> {
   const commit = (message: string): Promise<string> =>
     run([...COMMIT_CONFIG, 'commit', '-q', '-m', message])
   const head = async (): Promise<string> => (await run(['rev-parse', 'HEAD'])).trim()
+  /**
+   * Creates a symlink and refuses to continue unless it really is one. A
+   * filesystem without symlink support turns the call into a no-op or into an
+   * ordinary file, and either would leave the mode-`120000` cases asserting over
+   * a change set that never carried them.
+   */
+  const link = (target: string, path: string): void => {
+    mkdirSync(join(dir, path, '..'), { recursive: true })
+    symlinkSync(target, join(dir, path))
+    if (!lstatSync(join(dir, path)).isSymbolicLink()) {
+      throw new Error(
+        `fixture repo seeding failed: ${path} is not a symlink — this filesystem cannot carry the mode 120000 case`,
+      )
+    }
+  }
 
   try {
     const init = await spawnGit(['init', '-q', '-b', 'main', dir], env)
@@ -273,6 +356,10 @@ export async function createFixtureRepo(): Promise<FixtureRepo> {
     write(PATHS.modified, 'alpha\nbravo\ncharlie\n')
     write(PATHS.removed, 'gone-one\ngone-two\n')
     write(PATHS.renamedFrom, RENAME_BODY)
+    // The pre-image of the type change: a link, in the shape a repository that
+    // points a config path at a checked-in file has. The head branch replaces it
+    // with the file itself.
+    link('plain.txt', PATHS.typechanged)
     await run(['add', '-A'])
     await commit('seed the base branch')
     const rootSha = await head()
@@ -298,12 +385,11 @@ export async function createFixtureRepo(): Promise<FixtureRepo> {
     writeFileSync(join(dir, PATHS.binary), BINARY_BYTES)
     // A relative target inside the same directory, so the link resolves whatever
     // the repository's absolute location turns out to be.
-    symlinkSync('plain.txt', join(dir, PATHS.symlink))
-    if (!lstatSync(join(dir, PATHS.symlink)).isSymbolicLink()) {
-      throw new Error(
-        `fixture repo seeding failed: ${PATHS.symlink} is not a symlink — this filesystem cannot carry the mode 120000 case`,
-      )
-    }
+    link('plain.txt', PATHS.symlink)
+    // The link the base branch carries stops being a link and becomes the file.
+    // Removed first: writing through it would follow it and rewrite its target.
+    rmSync(join(dir, PATHS.typechanged))
+    write(PATHS.typechanged, TYPECHANGED_BODY)
     await run(['add', '-A'])
     // Written after `add -A`, which would otherwise stage the gitlink's absence
     // from the worktree and remove the entry that was just created.
@@ -314,7 +400,7 @@ export async function createFixtureRepo(): Promise<FixtureRepo> {
         `fixture repo seeding failed: ${PATHS.gitlink} was staged as ${JSON.stringify(staged)}, not as a mode 160000 gitlink`,
       )
     }
-    await commit('add a binary file, a symlink and a gitlink')
+    await commit('add a binary file, a symlink and a gitlink, and unlink one path')
     const headSha = await head()
 
     // ——— Advance the base branch after the fork, so the merge base is strictly
@@ -330,6 +416,25 @@ export async function createFixtureRepo(): Promise<FixtureRepo> {
     if (mergeBaseSha !== rootSha) {
       throw new Error(
         `fixture repo seeding failed: merge base is ${mergeBaseSha}, expected the root commit ${rootSha}`,
+      )
+    }
+
+    // A path can stop being a symlink without git calling it a type change: had
+    // the pre-image never been committed as a link, the same two commits would
+    // read as an ordinary modification and the case would be silently absent.
+    const typechange = await run([
+      'diff',
+      '--raw',
+      '--no-abbrev',
+      '-M',
+      mergeBaseSha,
+      headSha,
+      '--',
+      PATHS.typechanged,
+    ])
+    if (!/^:120000 100644 [0-9a-f]{40} [0-9a-f]{40} T\t/.test(typechange)) {
+      throw new Error(
+        `fixture repo seeding failed: ${PATHS.typechanged} is reported as ${JSON.stringify(typechange)}, not as a 120000 → 100644 type change`,
       )
     }
 

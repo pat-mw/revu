@@ -373,6 +373,13 @@ export type DiffFileEntry = Pick<PullFile, 'sha' | 'filename' | 'status' | 'prev
 export interface LocalDiffFiles {
   /** One entry per record, in the order git emitted them. */
   readonly files: readonly DiffFileEntry[]
+  /**
+   * The status letter git printed for each entry, in the same order — kept
+   * because the mapping onto the wire vocabulary is lossy in a way that matters
+   * later: two letters both become `modified`, and only one of them is emitted
+   * as two sections of patch output.
+   */
+  readonly rawStatuses: readonly RawDiffStatus[]
   /** Keyed by head-side path. A path whose object cannot be read is absent. */
   readonly blobIndex: SnapshotImmutable['blobIndex']
   /**
@@ -522,10 +529,12 @@ function objectNameOrNull(sha: string): string | null {
  */
 export function buildLocalDiffFiles(records: readonly RawDiffRecord[]): LocalDiffFiles {
   const files: DiffFileEntry[] = []
+  const rawStatuses: RawDiffStatus[] = []
   const blobIndex: SnapshotImmutable['blobIndex'] = {}
   const skippedBlobPaths: Record<string, BlobIndexSkipReason> = {}
 
   for (const record of records) {
+    rawStatuses.push(record.status)
     const status = STATUS[record.status]
     const base = objectNameOrNull(record.srcSha)
     const head = objectNameOrNull(record.dstSha)
@@ -557,7 +566,7 @@ export function buildLocalDiffFiles(records: readonly RawDiffRecord[]): LocalDif
     }
   }
 
-  return { files, blobIndex, skippedBlobPaths }
+  return { files, rawStatuses, blobIndex, skippedBlobPaths }
 }
 
 /** The two commits a change set is read between. */
@@ -750,6 +759,43 @@ export function patchHunks(section: string): string | undefined {
   return undefined
 }
 
+/**
+ * How many `diff --git ` sections one changed path occupies in patch output.
+ *
+ * Every status but one occupies a single section. A type change — a path whose
+ * object class changes, a symlink replaced by a regular file, a submodule
+ * replaced by either — occupies **two**: git has no single-section spelling for
+ * "this stopped being a link and became a file", so it emits the change as a
+ * deletion of the old class followed by a creation of the new one. The record
+ * stream and the count stream still report such a path once each, which is
+ * exactly why the three streams cannot be joined by index alone: they agree on
+ * the order of the paths, never on how many entries each path spans.
+ */
+export function patchSectionCount(status: RawDiffStatus): number {
+  return status === 'T' ? 2 : 1
+}
+
+/** How git introduces the removal of an object, and its creation. */
+const DELETED_FILE_INTRODUCTION = 'deleted file mode '
+const NEW_FILE_INTRODUCTION = 'new file mode '
+
+/**
+ * Whether a section's introduction — everything before its own first hunk header
+ * — carries a line beginning with `marker`.
+ *
+ * The scan stops at the first hunk deliberately. Inside a hunk every line carries
+ * a `+`, `-` or space marker in the first column, so a body line can never be
+ * mistaken for an introduction line; stopping early makes that structural rather
+ * than a property of the strings a repository happens to contain.
+ */
+function introduces(section: string, marker: string): boolean {
+  for (const [from] of lineRanges(section)) {
+    if (section.startsWith(HUNK_HEADER_START, from)) return false
+    if (section.startsWith(marker, from)) return true
+  }
+  return false
+}
+
 // ————————————————————————————————————————————————————————————————————————————
 // The three reads, joined.
 // ————————————————————————————————————————————————————————————————————————————
@@ -797,6 +843,34 @@ export type LocalChangeSetBuild =
  * The patch sections carry paths too, but only inside a header where a path
  * holding a quote or a newline arrives C-quoted, so they are matched by position
  * alone rather than through a second, weaker path parser.
+ *
+ * ## Why the patch sections are not counted one per file
+ *
+ * The three streams agree on the *order* of the paths, never on how many entries
+ * each path spans. A type change spans one record, one count record and **two**
+ * patch sections, so the expected number of sections is a sum over the statuses
+ * rather than the length of the file list. Position is still what associates a
+ * section with a file: the cursor advances by each file's own span, so the guard
+ * stays as loud as it was for anything that is not the shape git documents —
+ * a stream one section short, one section long, or carrying a pair whose two
+ * sections are not the deletion-then-creation git emits for a type change, is
+ * refused with what was expected and what arrived.
+ *
+ * ## Which of a pair's sections becomes the patch
+ *
+ * Both, reduced to their hunks and joined. The counts stream reports a type
+ * change once, with the *union* of the two sides — the lines the old object lost
+ * and the lines the new one gained — so a patch carrying one side would leave
+ * the other side's count with nothing behind it. Joining the hunks rather than
+ * the sections is what keeps the result a patch: a section carries the lines
+ * that introduce its file, and a reader that has already opened a hunk consumes
+ * those as content.
+ *
+ * A span whose sections do not all carry hunks produces no patch at all. git
+ * declines a text diff for a side it considers binary, and half a change is not
+ * a smaller truth than none — it is a patch whose line numbers describe a file
+ * that never existed. The absent key already means "there is no diff to show
+ * here", which is exactly the claim.
  */
 export function buildLocalChangeSet(
   diff: LocalDiffFiles,
@@ -808,17 +882,32 @@ export function buildLocalChangeSet(
       `${diff.files.length} changed file(s) but ${counts.length} line-count record(s)`,
     )
   }
-  if (sections.length !== diff.files.length) {
-    return malformed(`${diff.files.length} changed file(s) but ${sections.length} patch section(s)`)
+  const spans = diff.rawStatuses.map(patchSectionCount)
+  const expectedSections = spans.reduce((total, span) => total + span, 0)
+  if (sections.length !== expectedSections) {
+    return malformed(
+      `${diff.files.length} changed file(s) span ${expectedSections} patch section(s), got ${sections.length}`,
+    )
   }
 
   const files: PullFile[] = []
   const binaryPaths: string[] = []
+  let cursor = 0
   for (const [index, entry] of diff.files.entries()) {
     const count = counts[index]
     if (count.path !== entry.filename) {
       return malformed(
         `line counts at position ${index} name ${JSON.stringify(count.path)}, the change set names ${JSON.stringify(entry.filename)}`,
+      )
+    }
+    const span = sections.slice(cursor, cursor + spans[index])
+    cursor += spans[index]
+    if (
+      span.length === 2 &&
+      !(introduces(span[0], DELETED_FILE_INTRODUCTION) && introduces(span[1], NEW_FILE_INTRODUCTION))
+    ) {
+      return malformed(
+        `the two patch sections for ${JSON.stringify(entry.filename)} are not a deletion followed by a creation`,
       )
     }
     const file: PullFile = {
@@ -827,11 +916,12 @@ export function buildLocalChangeSet(
       deletions: count.deletions,
       changes: count.additions + count.deletions,
     }
-    const patch = patchHunks(sections[index])
-    // Assigned only when there is one, so a file with no text diff carries no
-    // `patch` key at all rather than a key holding undefined — the difference
-    // survives serialization, where an undefined value does not.
-    if (patch !== undefined) file.patch = patch
+    const hunks = span.map(patchHunks)
+    // Assigned only when every section of the span has one, so a file with no
+    // text diff carries no `patch` key at all rather than a key holding
+    // undefined — the difference survives serialization, where an undefined
+    // value does not.
+    if (hunks.every((text) => text !== undefined)) file.patch = hunks.join('\n')
     files.push(file)
     if (count.binary) binaryPaths.push(entry.filename)
   }
@@ -872,6 +962,24 @@ export async function readLocalNumstat(
  * default is configurable per repository, and a patch's context width decides
  * which lines a comment can be anchored to, so leaving it ambient would let one
  * contractor's configuration change what another contractor can review.
+ *
+ * ## Why the patch text is asked for in git's own format, explicitly
+ *
+ * This is the one read of the three that a person's ordinary configuration can
+ * take away. `diff.external` replaces the whole diff generator with another
+ * program — difftastic, delta, anything — and the output is then that program's,
+ * carrying no `diff --git` line at all. `color.diff = always` keeps git's format
+ * but prefixes every structural line with an escape sequence, so neither the
+ * line that opens a section nor the one that opens a hunk begins where it is
+ * looked for. Either setting turns every review in that repository into a
+ * refusal naming a malformed diff, and both are things people really set. The
+ * two flags cost nothing where neither is configured, which is where git's own
+ * defaults already produce this output.
+ *
+ * The record and count reads carry neither flag. Both settings are properties of
+ * patch generation, and neither reaches `--raw` or `--numstat` output; a flag
+ * that changes nothing about a command is a claim about that command nothing can
+ * check.
  */
 export async function readLocalPatchSections(
   runner: CommandRunner,
@@ -879,7 +987,15 @@ export async function readLocalPatchSections(
   range: LocalDiffRange,
 ): Promise<{ readonly ok: true; readonly sections: string[] } | DiffFailed> {
   const result = await runGit(runner, cwd, {
-    args: ['-c', 'core.quotePath=false', 'diff', '-M', '--unified=3'],
+    args: [
+      '-c',
+      'core.quotePath=false',
+      'diff',
+      '--no-ext-diff',
+      '--no-color',
+      '-M',
+      '--unified=3',
+    ],
     revs: [range.mergeBaseSha, range.headSha],
   })
   if (!result.ok) return { ok: false, reason: 'diff_failed', code: result.code }
@@ -958,8 +1074,7 @@ function malformedCommitLog(detail: string): MalformedCommitLog {
 }
 
 /**
- * The author date in the spelling the API-shaped producer emits: the instant,
- * in UTC.
+ * The author date as the same instant, spelled in UTC at millisecond precision.
  *
  * git prints a strict ISO timestamp carrying the author's own UTC offset. That
  * names the same instant but does not *compare* the same, and comparison is
@@ -971,9 +1086,16 @@ function malformedCommitLog(detail: string): MalformedCommitLog {
  * out of the range, which on a branch that is amended and rebased is the
  * ordinary case rather than the rare one.
  *
+ * The spelling is the draft timestamps' own, millisecond field included, which
+ * is what makes the comparison a comparison of instants rather than of two
+ * notations. It is not byte-identical to what the API-shaped producer emits:
+ * that one passes a service's timestamp through untouched, and the service
+ * spells the same instant to the second. Both are UTC, both compare correctly
+ * against a draft, and neither is derived from the other — so the shared
+ * property is the timezone, not the number of digits.
+ *
  * Nothing is lost by converting: the offset is not information any reader of
- * this structure has ever had, because the API-shaped producer discards it too,
- * and both producers' timestamps then compare against each other.
+ * this structure has ever had, because the API-shaped producer discards it too.
  *
  * A value that cannot be read as an instant is carried through unchanged. A
  * date this cannot parse is a fact about the repository, and replacing it with
