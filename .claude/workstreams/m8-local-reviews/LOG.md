@@ -444,3 +444,40 @@ must be settled before M8.10.6 wires a call site — it was deliberately not rai
 scoped to the four questions that blocked dispatch.
 
 **Next.** M8.8 is In Progress. M8.10 is in scope for the same session by ruling 4. M8.9 is independent.
+
+**update — 2026-08-19 (later the same session)**
+
+**Done.** **M8.8 is 6/8** on `m8.8/resync-and-pinning`, pushed, no PR. M8.8.1 (`9522087`), M8.8.2 (`4d73d69`),
+M8.8.3 (`7ed601d`), M8.8.4 (`048ea90`), M8.8.5 (`b52f181`), M8.8.8 (`cb2c5a0`). Gate at the tip
+**2702 pass · 1 skip · 0 fail · 98 files** under `TZ=UTC`, re-run in the main tree after every unit. Only the
+two app-side units remain, and they share `reconcile-dialog.tsx` so they run 6 then 7.
+
+**Six git facts were verified against real git 2.50.1 before the pin seam was written**, not taken on trust:
+the literal `<id>/<compareKey>` ref form is rejected; the substituted form is accepted; `update-ref --stdin`
+is atomic (one bad entry ⇒ zero refs); two separate invocations leave a **half-write**; a ref at
+`refs/revu/reviews/<id>` cannot exist while children do; `for-each-ref` accepts `--end-of-options`. The
+atomicity asymmetry is now a permanent test in both directions.
+
+**Decisions.**
+1. **`syncPull` stays contract-shaped.** The pin outcome cannot ride `Snapshot` (frozen, shared with the
+   hosted path), so `syncLocalReview` carries `{ snapshot, pin }` and `syncPull` delegates. Asserted: the
+   object `syncPull` returns has no `pin` key. M8.8 OQ3 should read from there when answered.
+2. **The pin outcome is not `partial`.** Held apart by comparing a pinned and a pin-blind run — same
+   `partial`, same `immutable`, different `pin.ok` — rather than by prose.
+3. **`CommandRunner` gained an optional `stdin`.** Additive; nothing broke. It is a security improvement:
+   **no object name occupies an argv slot**, asserted.
+4. **Validation is `isLocalReviewId`**, not "a positive integer" — a pull request number is one too.
+5. **The rewrite fix changes the hosted PR path as well**, deliberately: `reconcile.ts` is shared, and a
+   force-push on a pull request carries the identical defect.
+
+**Two findings.** (a) The author-date fallback did not under-report, it reported **zero** on a faithful
+rebase — author dates are preserved by a rebase, so every rewritten commit filters out. (b) M8.8.4's "re-sync
+to rebuild" message **could not be acted on**: the sync read the whole snapshot to carry the authorship map
+forward, which is the read that throws in that state. Caught only by an assertion the ticket did not ask for.
+Recorded as a durable memory.
+
+**Blockers.** None. **⚠️ This branch has never seen CI** — `ci.yml` triggers on `pull_request` and pushes to
+`main` only, so a PR-less branch gets no runner. Local `TZ=UTC` runs are the only evidence.
+
+**Next.** M8.8.6 → M8.8.7 → Verify → adversarial pass → PR. **M8.10 belongs to the same session as M8.8**
+(ruling 4); its OQ2 needs the owner first. M8.9 is independent and unblocked.
