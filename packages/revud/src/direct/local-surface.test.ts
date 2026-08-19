@@ -70,6 +70,7 @@ import { createBunCommandRunner } from './command-runner'
 import { createFixtureRepo, type FixtureRepo } from './local-fixture-repo'
 import { buildLocalWriteDeps, createLocalReviewSurface } from './local-surface'
 import type { LocalReviewSurface, LocalReviewSurfaceDeps } from './local-surface'
+import { listPins, pinRefsFor } from './local-pins'
 import { localSnapshot } from './local-write-fakes'
 import type { DirectStore } from './store'
 import { openDirectStore } from './store'
@@ -1162,6 +1163,11 @@ describe('a review answers only the repository that owns it', () => {
    */
   const FOREIGN_CALLS: Record<string, (surface: LocalReviewSurface, id: number) => unknown> = {
     syncPull: (surface, id) => surface.syncPull(id),
+    // The richer sync is swept in its own right rather than trusted to inherit
+    // the refusal from the verb that delegates to it: the delegation runs the
+    // other way round, so an ownership check placed only on `syncPull` would
+    // leave this one open.
+    syncLocalReview: (surface, id) => surface.syncLocalReview(id),
     getSnapshot: (surface, id) => surface.getSnapshot(id),
     getDraft: (surface, id) => surface.getDraft(id),
     saveDraft: (surface, id) =>
@@ -1572,5 +1578,157 @@ describe('reconcileDraft resolves ownership before the reconcile it delegates to
     // reads.
     expect(calls).toEqual(['getLocalReview'])
     store.close()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// Object pinning happens before the first object is read.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * A runner that fails every `update-ref` and delegates everything else.
+ *
+ * The pin is the one step of a sync whose failure must not become the sync's
+ * failure: a review whose objects are unpinned is completely readable today and
+ * merely has no retention guarantee. Standing that case up needs a git that
+ * refuses exactly the pin and answers every other read normally, so the
+ * resulting snapshot can be compared field for field against the pinned one.
+ */
+function pinBlindRunner(): CommandRunner {
+  const real = createBunCommandRunner()
+  return {
+    run(args: string[], opts?: { cwd?: string }): Promise<CommandResult> {
+      if (args.includes('update-ref')) {
+        return Promise.resolve({
+          ok: false,
+          code: 128,
+          stdout: '',
+          stderr: 'fatal: cannot lock ref',
+        })
+      }
+      return real.run(args, opts)
+    },
+  }
+}
+
+/** The index of the first recorded argv containing `token`, or -1. */
+function firstArgvWith(sink: string[][], token: string): number {
+  return sink.findIndex((argv) => argv.some((arg) => arg.includes(token)))
+}
+
+describe('a sync pins the objects it is about to read', () => {
+  test('the pin is written before the first object read', async () => {
+    // An ordering assertion, not a was-it-called assertion. A prune landing
+    // between the diff that produces the blob SHAs and the cat-file reads that
+    // fetch their bytes turns every one of those SHAs into a missing entry,
+    // with no hosted tier to recover them. Pinning first closes that window;
+    // pinning afterwards does not close it at all.
+    const sink: string[][] = []
+    const harness = makeSurface({ toplevel: fixture.dir, runner: recordingRunner(sink) })
+    const review = await harness.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    await harness.surface.syncPull(review.id)
+
+    const pin = firstArgvWith(sink, 'update-ref')
+    const diff = firstArgvWith(sink, 'diff')
+    const catFile = firstArgvWith(sink, 'cat-file')
+    // The `>= 0` guard is what stops two absent commands comparing equal: with
+    // it, "no pin was written at all" is red rather than vacuously ordered.
+    expect(pin).toBeGreaterThanOrEqual(0)
+    expect(diff).toBeGreaterThanOrEqual(0)
+    expect(catFile).toBeGreaterThanOrEqual(0)
+    expect(pin).toBeLessThan(diff)
+    expect(pin).toBeLessThan(catFile)
+    harness.store.close()
+  })
+
+  test('a successful pin is reported on the sync outcome', async () => {
+    const harness = makeSurface({ toplevel: fixture.dir })
+    const review = await harness.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    const outcome = await harness.surface.syncLocalReview(review.id)
+    expect(outcome.pin.ok).toBe(true)
+    harness.store.close()
+  })
+
+  test('a failed pin is not a failed sync, and is reported', async () => {
+    // Paired with the row above: without a success case on the same field, a
+    // failure assertion is satisfied by a field that is always falsy or absent.
+    const harness = makeSurface({ toplevel: fixture.dir, runner: pinBlindRunner() })
+    const review = await harness.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    const outcome = await harness.surface.syncLocalReview(review.id)
+    expect(outcome.pin.ok).toBe(false)
+    expect(outcome.pin.reason).toBe('git-failed')
+    // The snapshot is complete regardless: the pin buys retention, not content.
+    expect(outcome.snapshot.partial).toBeNull()
+    harness.store.close()
+  })
+
+  test('the pin outcome never leaks into partial', async () => {
+    // `partial` means content is missing. An unpinned-but-complete snapshot is
+    // not partial, and folding the pin outcome in would make a retention
+    // failure indistinguishable from an unreadable object — the exact confusion
+    // the separate field exists to prevent. Asserted by comparing the two runs
+    // rather than by restating the rule.
+    const pinned = makeSurface({ toplevel: fixture.dir })
+    const pinnedReview = await pinned.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    const pinnedOut = await pinned.surface.syncLocalReview(pinnedReview.id)
+
+    const unpinned = makeSurface({ toplevel: fixture.dir, runner: pinBlindRunner() })
+    const unpinnedReview = await unpinned.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    const unpinnedOut = await unpinned.surface.syncLocalReview(unpinnedReview.id)
+
+    expect(unpinnedOut.snapshot.partial).toEqual(pinnedOut.snapshot.partial)
+    expect(unpinnedOut.snapshot.immutable).toEqual(pinnedOut.snapshot.immutable)
+    // ...and the two runs genuinely differ on the field that should differ.
+    expect(unpinnedOut.pin.ok).not.toBe(pinnedOut.pin.ok)
+    pinned.store.close()
+    unpinned.store.close()
+  })
+
+  test('the pin names the compare the snapshot was built from', async () => {
+    const harness = makeSurface({ toplevel: fixture.dir })
+    const review = await harness.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    const outcome = await harness.surface.syncLocalReview(review.id)
+    const listed = await listPins(harness.deps.runner, fixture.dir, review.id)
+    expect(listed.ok).toBe(true)
+    if (!listed.ok) return
+    const expected = pinRefsFor(review.id, outcome.snapshot.immutable.compareKey)
+    expect([...listed.pins].map((p) => p.ref).sort()).toEqual(
+      [expected.base, expected.head].sort(),
+    )
+    expect(listed.pins.find((p) => p.ref === expected.head)?.objectName).toBe(
+      outcome.snapshot.immutable.headSha,
+    )
+    harness.store.close()
+  })
+
+  test('syncPull returns exactly the outcome snapshot', async () => {
+    // The contract-shaped method stays contract-shaped: the pin rides an
+    // internal seam, and nothing about it reaches the wire type.
+    const harness = makeSurface({ toplevel: fixture.dir })
+    const review = await harness.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    const viaSyncPull = await harness.surface.syncPull(review.id)
+    expect(Object.keys(viaSyncPull)).not.toContain('pin')
+    harness.store.close()
   })
 })

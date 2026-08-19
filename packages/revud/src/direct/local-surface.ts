@@ -25,6 +25,8 @@ import type {
   MalformedCommitLog,
   MalformedDiff,
 } from './local-sync'
+import type { PinFailureReason } from './local-pins'
+import { pinSnapshotObjects } from './local-pins'
 import {
   detectDirtyWorktree,
   readLocalAuthorName,
@@ -92,8 +94,26 @@ export interface LocalReviewSurface {
    */
   listBranches(): Promise<BranchRef[]>
 
-  /** Recompute the diff between the pair's current tips and persist a snapshot. */
+  /**
+   * Recompute the diff between the pair's current tips and persist a snapshot.
+   *
+   * The contract-shaped verb: it answers with exactly the wire type and nothing
+   * beside it. Anything a sync learns that the wire type has no field for is
+   * reached through `syncLocalReview`.
+   */
   syncPull(localId: number): Promise<Snapshot>
+
+  /**
+   * The same sync, plus what it learned that the snapshot shape cannot carry.
+   *
+   * The snapshot is a frozen wire type shared with the hosted path, so a local
+   * detail cannot be added to it — and the pin outcome is exactly such a detail.
+   * It is deliberately not folded into `partial`, which means content is
+   * missing: an unpinned snapshot is complete, it simply has no guarantee that
+   * it will still be readable after the branch moves. Collapsing the two would
+   * make a retention failure and an unreadable object indistinguishable.
+   */
+  syncLocalReview(localId: number): Promise<LocalSyncOutcome>
 
   /**
    * The stored snapshot, or `null` when this review has never been synced.
@@ -178,6 +198,28 @@ export interface LocalReviewSurface {
  * by name instead of being bought back over a network — and no code path below
  * has a client to mis-call even if one were wanted.
  */
+/**
+ * Whether a sync managed to pin the objects it read.
+ *
+ * A pin failure is not a sync failure. The objects are present right now — that
+ * is how the snapshot was built — and the pin only decides whether they survive
+ * the branch moving. So the sync completes, the snapshot is stored, and the
+ * outcome travels here for a caller that has somewhere to put it. Nothing
+ * renders it yet, which is why it is a record of what happened rather than a
+ * classification of what to do about it.
+ */
+export interface LocalPinOutcome {
+  readonly ok: boolean
+  /** Present only on failure, naming the class of failure rather than its text. */
+  readonly reason?: PinFailureReason
+}
+
+/** A completed local sync: the stored snapshot, and the pin it attempted. */
+export interface LocalSyncOutcome {
+  readonly snapshot: Snapshot
+  readonly pin: LocalPinOutcome
+}
+
 export interface LocalReviewSurfaceDeps {
   store: DirectStore
   runner: CommandRunner
@@ -592,6 +634,10 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     },
 
     async syncPull(localId: number): Promise<Snapshot> {
+      return (await this.syncLocalReview(localId)).snapshot
+    },
+
+    async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
       const review = requireReview(deps, localId)
 
       const resolved = await resolveLocalRange(deps.runner, deps.toplevel, {
@@ -600,6 +646,24 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       })
       if (!resolved.ok) throw rangeRefusal(localId, resolved)
       const { range } = resolved
+
+      // Pinned BEFORE the first object is read, and the ordering is the whole
+      // point. The diff produces the blob names and the cat-file reads fetch
+      // their bytes; a collection landing between the two turns every one of
+      // those names into a missing entry, with no hosted tier able to supply
+      // them. Pinning first closes that window. Pinning afterwards would leave
+      // it exactly as wide as it is now.
+      //
+      // The outcome is carried, never thrown: the objects are demonstrably
+      // present — the snapshot below is built from them — so a review whose pin
+      // failed is completely readable today and merely unguaranteed tomorrow.
+      const pinned = await pinSnapshotObjects(deps.runner, deps.toplevel, localId, {
+        mergeBaseSha: range.mergeBaseSha,
+        headSha: range.headSha,
+      })
+      const pin: LocalPinOutcome = pinned.ok
+        ? { ok: true }
+        : { ok: false, reason: pinned.reason }
 
       const built = await readLocalSnapshotImmutable(deps.runner, deps.toplevel, range)
       if (!built.ok) throw readRefusal(localId, built)
@@ -705,7 +769,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
         dirty: worktree === 'dirty',
         lastSyncedAt: syncedAt,
       })
-      return snapshot
+      return { snapshot, pin }
     },
 
     getSnapshot(localId: number): Snapshot | null {
