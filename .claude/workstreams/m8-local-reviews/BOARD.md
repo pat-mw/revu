@@ -53,8 +53,16 @@ that the author's model and the code disagree.
 daemon with no broker; and `--local-only` **without** `--direct` silently boots mock mode and serves the
 fixture app.
 
-**In flight — three disjoint fix units:** M1+M4+the mode/flag refusal (fable) · M2+the typed head error
-(fable) · M3 (opus).
+**Fix status:** **M3 landed** (`6b0b047`, 2606 · 1 · 0 · 95). M1+M4+the mode/flag refusal (fable) and
+M2+the typed head error (fable) are still running.
+
+**A new finding, from the M3 audit — recorded, deliberately NOT fixed here.** `setPreferences` performs a
+read-modify-write with the read taken **outside** its write block. It is not vulnerable to the
+stale-snapshot bug — there is no transaction, so there is no lock upgrade to refuse, and the lone write is
+covered by the busy timeout — but it is a **lost-update race**: two concurrent patches to *different*
+preference keys clobber one another, last writer winning the whole document. A different defect class, outside
+this ticket, and worth its own look.
+
 
 **The review also named coverage gaps worth keeping:** the 304 empty-body assertion cannot fail (the transport
 strips the body — the implementer had already flagged this independently); the "either half moves the etag"
