@@ -10,137 +10,57 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.5 is COMPLETE and in review on [#76](https://github.com/pat-mw/revu/pull/76).** All ten units landed,
-`Verify` green, two full adversarial reviews of the diff plus a focused third pass on the riskiest change, and
-every blocker they found fixed before the PR opened. **CI is green on all eight PRs.**
+**M8.8 — re-sync, rebase safety, and object pinning — is In Progress** on `m8.8/resync-and-pinning`, branched
+from the stack tip. Nothing else is running. The four questions that blocked this session's dispatch were put
+to the owner and **all four are answered** — recorded below and written into the tickets they bind.
 
-| ticket | units | gate at its tip | PR |
+| ticket | units | state | branch |
 | --- | --- | --- | --- |
-| **M8.5** daemon wiring | 10/10 | **2635 pass · 1 skip · 0 fail · 95 files** (under `TZ=UTC`) | [#76](https://github.com/pat-mw/revu/pull/76) base `m8.4` |
+| **M8.8** re-sync, rebase safety, pinning | 0/8 | **In Progress** | `m8.8/resync-and-pinning` |
 
-**The stack, bottom-up — eight PRs, none merged, all green:** `main` → #69 → #70 → #71 → #72 → #73 → #74 →
-#75 → **#76**. `main` is untouched at `177068a`.
+### The owner's rulings — 2026-08-19
 
-### What M8.5 actually delivers
+Each is recorded in full at the Open question it closes; the ticket file is authoritative, this is the index.
+
+| # | question | ruling | closes |
+| --- | --- | --- | --- |
+| 1 | Deleting a local review that holds an unsubmitted draft | **The server refuses** while a draft exists; the client discards explicitly, then deletes. **No contract change** — a `force` parameter on the frozen route was put as the §5.2 stop it is, and declined. | M8.10 OQ3 · M8.12 OQ1 |
+| 2 | What triggers archive detection in direct mode | **On each sync of that review.** No new timer, no GitHub work on an inbox poll. | M8.9 OQ2 |
+| 3 | Is the blob prune on by default | **Off, behind an explicit policy flag.** The immutable prune runs live; the blob walk ships dark. | M8.10 OQ1 |
+| 4 | What bounds the pin set before retention lands | **Keep every pin.** Unbounded but correct — on the condition that **M8.10 lands in the same session as M8.8**. | M8.8 OQ4 |
+
+**Two of these bind work beyond the ticket they were asked about, and neither is optional:**
+
+- **Ruling 4 couples M8.8 and M8.10.** The pin set is allowed to be unbounded *only* because the garbage
+  collector arrives right behind it. M8.8 shipping alone would leave a growth path with no eviction, which is
+  not what was sanctioned. M8.10 is therefore in this session's scope, not the next one's.
+- **Ruling 2 accepts a real gap and moves it to copy.** A branch nobody re-syncs stays un-archived
+  indefinitely, so a user can keep writing local comments while a PR is already open — the confusion D1 exists
+  to prevent, now bounded to the window before the next sync rather than eliminated. That is M8.9.6's banner
+  problem, and it is **not** a licence to add a background tick.
+
+**Still open and deliberately not asked** (the handover's second tier — each belongs to the session that needs
+it): M8.9 OQ1 (what GitHub call feeds detection) and OQ8 (a PR against a different base); M8.8 OQ5 (throw or
+report on missing objects); M8.9 OQ9. **M8.10 OQ2 — when the prune runs — is narrowed by ruling 3 but not
+answered by it**, and must be settled before M8.10.6 wires a call site.
+
+### The stack was re-linearized before M8.8 branched
+
+#77 had drifted: it forked at `0b32368` and never picked up `048638c`, so the chain was a fork, not a line.
+Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
+trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
+
+**The stack, bottom-up — nine PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+(M8.5) → #77 (a store fix, not M8) → `m8.8` (no PR yet). `main` is untouched at `177068a`.
+
+### What M8.5 delivered (in review on #76)
 
 `revud --direct --local-only` starts in a repository with **no remotes at all**, lists its branches, creates a
 review on the reserved id band, syncs it from local git, and serves the snapshot — while every GitHub-bound
 route answers a typed refusal naming the missing repository. That is the milestone's headline exit criterion,
-proven durably by a new HTTP suite under a network tripwire **and** observed by hand.
-
-### The unit ledger
-
-| unit | commit | gate |
-| --- | --- | --- |
-| M8.5.4 — boot relaxation | `5bfdf38` | 2453 · 1 · 0 · 91 |
-| M8.5.1 — band dispatch | `369af01` | 2458 · 1 · 0 · 92 |
-| M8.5.9 — two daemons on one data dir | `6a837ae` | 2460 · 1 · 0 · 92 |
-| M8.5.2 — create / list / branches routes | `4a281ba` | 2474 · 1 · 0 · 92 |
-| M8.5.10 — the local surface factory | `d239db6` | 2528 · 1 · 0 · 93 |
-| M8.5.5 — boot assembly | `eb1eb5c` | 2563 · 1 · 0 · 94 |
-| M8.5.3 — `listPulls`, local merged | `fd5aca1` | 2568 · 1 · 0 · 94 |
-| M8.5.8 — router band handling | `c462105` | 2571 · 1 · 0 · 94 |
-| M8.5.6 — honest degradation + the exit-criterion unblock | `5b7057c` | 2577 · 1 · 0 · 94 |
-| M8.5.7 — the offline HTTP proof | `6f52c96` | 2605 · 1 · 0 · 95 |
-| review fixes — snapshot lock · repo scoping · half + etag | `6b0b047` `e167923` `b605ac3` | 2625 · 1 · 0 · 95 |
-| the over-correction, and two guards made real | `96d0240` `ee91a6e` | **2635 · 1 · 0 · 95** |
-
-**Two units were appended, not absorbed:** M8.5.9 (the two-daemon mint, handed to this ticket as a finding)
-and M8.5.10 (the surface factory, which had **no owner** — the ticket's boot unit assembles the surface but
-all four of its checks test boot seams).
-
-### 🔴 CI was red on #74 and #75 — fixed at the root
-
-`check` was failing on both, which skipped `conformance-matrix` and `e2e`. **One test**, whose control asserted
-git prints a numeric offset for UTC. It prints `Z`. The fixture pinned commit **identity** because a runner has
-none, but never pinned the **timezone**, so a developer machine passed and a UTC runner failed — and the local
-gate could never have caught it. **`m8.5` would have failed CI identically the moment its PR opened.**
-
-Fixed on **`m8.3`** (`2044c62`) so the stack inherits it by rebase, then `m8.4` and `m8.5` rebased and
-**re-gated under `TZ=UTC`** rather than trusting a clean rebase. Relaxing the pattern to accept `Z` would have
-been the wrong repair — it makes the control vacuous on exactly the machine where it was failing.
-
-**Standing practice from this: run the gate with `TZ=UTC` before pushing anything that touches dates or git
-output.** The default local run reproduces CI only by accident.
-
-### ⚠️ The three blockers the pre-merge reviews found — none was visible to any suite
-
-Every one of these passed a green gate. **This is the argument for reviewing the full diff before the PR opens
-rather than after.**
-
-1. **M8.2 — a corrupt id high-water mark minted `id 1`.** SQLite casts a non-numeric string to `0` silently, so
-   the increment produced a value **inside the forge's pull-request range**, in the table whose entire purpose is
-   to stay out of it, and then **overwrote the corrupt value**. Fixed in the statement's `WHERE` clause, because
-   the entity allocator has no surrounding transaction and a check on the result would refuse only after the
-   overwrite committed.
-2. **M8.3 — a typechange made a review unbuildable.** Git reports it once in the raw and numstat reads but splits
-   it into **two** patch sections, so the index zip refused the whole change set — and it falsified this ticket's
-   own *verified* claim that the three reads agree. The fixture seeded only a symlink *addition*, so nothing
-   caught it. **Plus:** the patch read inherited the user's git config, so **any external differ emitted zero
-   sections** — every local review in that repository unbuildable.
-3. **M8.4 — the D7 structural guard was evadable, demonstrated end to end.** Its closure walk resolved a relative
-   import to a `.ts` sibling only, so a helper with any other extension was invisible at every depth. A real
-   client imported that way left **the guard green, the compiler happy and the whole suite passing** while
-   loading at runtime. Fixed with an **allowlist** — every relative specifier must resolve into the pinned set —
-   because teaching a walk more extensions is a ban list, and this workstream has measured sixteen and found a
-   dead member in twelve.
-
-**And one that was not a blocker only because dispatch is not wired yet:** both write verbs read the snapshot,
-awaited head resolution, then wrote an envelope built from the **stale pre-await read**, so a reply that fully
-persisted in that window was **erased** by a concurrent submit — comment and authorship entry gone — while both
-verbs answered success. Fixed by re-reading after the single await.
-
-### A cross-lane defect only the rebase could reveal
-
-Merging lane C onto lane B turned one test red: M8.3.1's `process.cwd()` coverage guard, which asserts its
-scanned list equals the modules **actually present** in the directory. Combining the branches put three
-write-path modules there. **The rebase was clean, every file was disjoint, and the defect was still real** — the
-single strongest argument for re-gating after a rebase rather than trusting it.
-
-| ticket | state | where |
-| --- | --- | --- |
-| M8.1 | `In Review` — 9 units | PR [#70](https://github.com/pat-mw/revu/pull/70), base `m8/local-reviews-design` |
-| M8.6 | `In Review` — 7 units, Verify green incl. the browser walk | PR [#71](https://github.com/pat-mw/revu/pull/71), base `m8.1` |
-| **M8.7** | `In Review` — 13 units, `Verify` green, fable review run | PR [#72](https://github.com/pat-mw/revu/pull/72), base `m8.6` |
-
-**M8.7's PR opened mid-session, in the order the protocol requires: `Verify` green (`3e7bfa6`) → the
-fable-tier adversarial review of the full diff → its fixes (`de30223`) → PR #72, one minute later.** Review
-before the PR opens is §8 of the protocol; the PR is not batched to session end. `main` is still untouched at
-`177068a`; nothing has merged.
-
-### M8.7 — exactly what has landed, and what has not
-
-| unit | commit | gate at that commit |
-| --- | --- | --- |
-| M8.7.10 — the static-render harness | `f2ba173` | 1365 pass · 1 skip · 0 fail · 77 files |
-| M8.7.1 — mode derivation + single-call-site guard | `ad0bd54` | 1373 pass · 1 skip · 0 fail · 78 files |
-| M8.7.2 — tab set: omit Checks and Description | `efd260d` | 1391 pass · 1 skip · 0 fail · 79 files |
-| M8.7.9 — the two optimistic-path bugs | `38b9bd3` | 1405 pass · 1 skip · 0 fail · 80 files |
-| M8.7.4 — Conversation: threads only | `548f8e5` | 1411 pass · 1 skip · 0 fail · 81 files |
-| M8.7.3 — header identity, state chip, 404, banner stack | `4a9cd44` | 1440 pass · 1 skip · 0 fail · 81 files |
-| M8.7.5 — review-bar: no lock, no API claim, no broker | `27453da` | 1472 pass · 1 skip · 0 fail · 81 files |
-| M8.7.6 — residual sweep, rate chip, org-member title | `71c71e0` | 1534 pass · 1 skip · 0 fail · 82 files |
-| M8.7.8 — the dirty-worktree banner | `6dc373b` | 1551 pass · 1 skip · 0 fail · 83 files |
-| M8.7.12 — the header draws the branch pair once | `c50787b` | 1558 pass · 1 skip · 0 fail · 83 files |
-| M8.7.11 — the optimistic reply's author | `dd1931c` | 1570 pass · 1 skip · 0 fail · 83 files |
-| M8.7.7 — the closing proof: GitHub path unchanged | `82c9d55` | 1589 pass · 1 skip · 0 fail · 83 files |
-| M8.7 `Verify` — unit set, control ledger, mock walk | `3e7bfa6` | 232 pass · 0 fail in the unit-check set |
-| M8.7.13 + review fixes — palette, and 7 guards made real | `de30223` | **1611 pass · 1 skip · 0 fail · 83 files** |
-
-**All thirteen units are landed and M8.7 is complete.** The unit count grew by one when the pre-merge review
-found the command palette still framing a local review as a pull request — appended as **M8.7.13** rather than
-absorbed, the same handling M8.7.11 and M8.7.12 got.
-
-### M8.6 and M8.1 — landed and pushed
-
-| unit | commit | branch |
-| --- | --- | --- |
-| M8.1.9 refuse submit before first sync · review fixes | `4fbc5fb` · `8b73a77` | `m8.1` → [#70](https://github.com/pat-mw/revu/pull/70) |
-| M8.6.7 harness · M8.6.1 · M8.6.2 · M8.6.3 | `440aa74` `8385bdf` `113aee8` `eb20f17` | `m8.6` → [#71](https://github.com/pat-mw/revu/pull/71) |
-| M8.6.4 · M8.6.5 · M8.6.6 · review fixes · Verify | `be9442a` `836b841` `59e3e75` `a637522` `de14043` | `m8.6` → #71 |
-
-**Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
-one. `main` is untouched at **`177068a`**; nothing merged.
+proven durably by an HTTP suite under a network tripwire **and** observed by hand. All ten units landed, two
+full adversarial reviews plus a focused third pass on the riskiest change, every blocker fixed before the PR
+opened. CI is green on all nine PRs.
 
 ## Tickets
 
@@ -158,7 +78,7 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Review** | 10 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | [#76](https://github.com/pat-mw/revu/pull/76) |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
-| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
+| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Progress** | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |

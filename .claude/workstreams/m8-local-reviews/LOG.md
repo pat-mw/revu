@@ -408,3 +408,39 @@ rebased and **re-gated under `TZ=UTC`**.
 session** and need the owner — see the handover's interview list.
 
 **Next.** M8.8, M8.9 and M8.10 are mutually independent and all unblocked by M8.5; M8.11 closes the milestone.
+
+**update — 2026-08-19**
+
+**Done.** The owner was interviewed on the four questions the previous handover flagged as blocking dispatch,
+and **all four are answered**. Each ruling is written into the Open question it closes — the ticket file is
+authoritative — and indexed on `BOARD.md`. Ruling 3 was re-asked with the schema in front of it after the
+owner said the first framing was unclear; the second framing named `blobs` as `(sha, data)` keyed by git blob
+SHA and shared between GitHub and local snapshots, which is the fact the question actually turns on.
+
+The stack was **re-linearized** before `m8.8` branched. #77 had forked at `0b32368` and never picked up
+`048638c`, so what the last handover called a chain was a fork. Rebased onto the `m8.5` tip, **re-gated under
+`TZ=UTC`** (2646 · 1 · 0 · 95) rather than trusting the clean rebase, force-pushed. `m8.8/resync-and-pinning`
+branches from it. Baseline on the `m8.5` tip re-confirmed first at **2645 · 1 · 0 · 95**, exactly as the
+handover predicted.
+
+**Decisions.**
+1. **Delete + draft: the server refuses.** Server-authoritative, no contract change. A `force` parameter on
+   the frozen `DELETE /api/local-reviews/:n` was put to the owner as the §5.2 stop condition it is, and
+   declined. M8.10.1's delete keeps a precondition, never a partial delete; M8.12 renders the two-step
+   discard-then-delete against that refusal instead of guessing.
+2. **Archive detection fires on each sync of that review.** No direct-mode timer, no GitHub work on an inbox
+   poll. The accepted cost — a branch nobody re-syncs stays un-archived, so the user can keep commenting while
+   a PR is open — is recorded as M8.9.6 copy, not hidden.
+3. **The blob prune is off by default, behind an explicit policy flag.** The immutable prune bounds the churn
+   and runs live; the blob walk ships dark. The decisive argument was recovery asymmetry, not size: a PR's
+   blob is re-fetchable, a local review's blob can be the only copy once its branch is rewritten and its pins
+   dropped. M8.10.5's on/off assertion pair is now load-bearing — it is what stops "off by default" decaying
+   into "never worked".
+4. **Every pin is kept** — unbounded but correct, explicitly conditional on **M8.10 landing in the same
+   session as M8.8**. That coupling is a scope fact for this session, not a preference.
+
+**Blockers.** None. **M8.10 OQ2 (when the prune runs) is narrowed by ruling 3 but not answered by it** and
+must be settled before M8.10.6 wires a call site — it was deliberately not raised in this interview, which was
+scoped to the four questions that blocked dispatch.
+
+**Next.** M8.8 is In Progress. M8.10 is in scope for the same session by ruling 4. M8.9 is independent.
