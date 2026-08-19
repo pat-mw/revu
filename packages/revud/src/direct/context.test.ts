@@ -60,6 +60,25 @@ function failingFetch(status: number): FetchLike {
   return async () => new Response(JSON.stringify({ message: 'nope' }), { status })
 }
 
+/**
+ * A fetch that refuses to be called: every invocation counts itself and throws.
+ * `failingFetch` above proves "no request" only indirectly — it answers, so a
+ * caller that did make a request simply sees an error status. This one makes the
+ * absence directly assertable: `calls()` is the number of requests attempted, and
+ * a request that slips through fails the test loudly wherever it is awaited
+ * rather than being swallowed as a bad response.
+ */
+function refusingFetch(): { impl: FetchLike; calls: () => number } {
+  let calls = 0
+  return {
+    impl: async (url: string) => {
+      calls += 1
+      throw new Error(`unexpected GitHub request: ${url}`)
+    },
+    calls: () => calls,
+  }
+}
+
 const GOOD_CONFIG = { 'user.name': 'Alice', 'user.email': 'alice@x.io' }
 
 describe('resolveDirectContext — success', () => {
@@ -265,5 +284,135 @@ describe('resolveDirectContext — broker boot never probes the viewer', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+/**
+ * Starting with no GitHub at all. A local-only review needs no origin, no token,
+ * and no viewer: `requireGithub: false` turns each of those refuse-to-start
+ * conditions into a typed absence, and the session is built from git config
+ * alone. The default is unchanged, and the case that proves the relaxation
+ * carries its own control that flips the flag back and asserts the refusal
+ * returns — otherwise a passing boot would say nothing about the flag.
+ */
+describe('resolveDirectContext — local-only boot needs no GitHub', () => {
+  test('no origin, no token, and not one GitHub request', async () => {
+    const fetch = refusingFetch()
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+      fetchImpl: fetch.impl,
+      env: {},
+      requireGithub: false,
+    })
+    // Identity is real and local: the git-config email is the key everything
+    // per-human is stored under, so it must survive a GitHub-less boot intact.
+    expect(ctx.session.human.id).toBe('alice@x.io')
+    expect(ctx.session.viewerLogin).toBeUndefined()
+    // Asserted directly rather than inferred: the fake throws on any call and
+    // counts, so zero here means no request was attempted, not that one was
+    // answered harmlessly.
+    expect(fetch.calls()).toBe(0)
+  })
+
+  test('the same setup under the default still refuses to start', async () => {
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+        fetchImpl: refusingFetch().impl,
+        env: {},
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+  })
+
+  test('the GitHub half is typed-absent, never a blank owner/name', async () => {
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      requireGithub: false,
+    })
+    // A blank `{ owner: '', repo: '' }` stand-in would build request paths like
+    // `/repos///pulls/204`, which GitHub answers 404 with a message that blames
+    // the pull request. Absence has to be absence.
+    expect(ctx.repo).toBeUndefined()
+  })
+
+  test('no repo means no GitHub client to mis-call either', async () => {
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      requireGithub: false,
+    })
+    expect(ctx.github).toBeUndefined()
+  })
+
+  test('the workspace is a defined, non-empty label', async () => {
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      requireGithub: false,
+    })
+    expect(ctx.session.workspace.length).toBeGreaterThan(0)
+  })
+
+  test('the workspace interpolates neither `undefined` nor an empty repo', async () => {
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      requireGithub: false,
+    })
+    // `direct-undefined-undefined` and `direct--` are exactly what a missing repo
+    // produces when the absence is papered over instead of handled.
+    expect(ctx.session.workspace).not.toContain('undefined')
+    expect(ctx.session.workspace).not.toContain('direct--')
+  })
+
+  test('an unset user.email still refuses to start', async () => {
+    // The git-config identity guard is NOT relaxed by this flag. The email keys
+    // drafts and viewed state, so starting without one would file every human's
+    // drafts under a single blank id the store cannot tell apart afterwards.
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({
+          origin: false,
+          config: { 'user.name': 'Alice' },
+          ghToken: false,
+        }),
+        fetchImpl: refusingFetch().impl,
+        env: {},
+        requireGithub: false,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+    expect((thrown as Error).message).toContain('git config')
+  })
+
+  test('a resolvable origin is still resolved, and still costs no request', async () => {
+    // Absence is driven by what git can resolve, not by the flag: a local-only
+    // review run inside a real GitHub clone keeps its repo. The viewer probe is
+    // skipped either way, so the boot is request-free regardless.
+    const fetch = refusingFetch()
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: false,
+      }),
+      fetchImpl: fetch.impl,
+      env: {},
+      requireGithub: false,
+    })
+    expect(ctx.repo).toEqual({ owner: 'acme', repo: 'revu' })
+    expect(fetch.calls()).toBe(0)
   })
 })

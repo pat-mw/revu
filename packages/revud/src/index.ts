@@ -3,7 +3,11 @@ import { installDiskStorage } from './storage'
 import { loadMock } from './mock-bridge'
 import { startLoopbackAlias, startServer } from './server'
 import type { RevuMode } from './api-router'
-import { DirectStartupError, resolveDirectContext } from './direct/context'
+import {
+  DirectStartupError,
+  requireGithubContext,
+  resolveDirectContext,
+} from './direct/context'
 import { createDirectApi } from './direct/direct-api'
 import { resolveBotLogin } from './direct/session'
 import { createGithubClient } from './direct/github-client'
@@ -159,10 +163,15 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   const distDir = resolveDistDir(env)
   const repoOverride = resolveRepoOverride(process.argv.slice(2), env)
 
-  const context = await resolveDirectContext({
-    env,
-    ...(repoOverride !== undefined ? { repoOverride } : {}),
-  })
+  // Direct mode is repo-scoped: it resolves with the GitHub requirement in
+  // force, so narrowing to the GitHub-backed shape is what makes the repo and
+  // the client available to the api without either being a blank stand-in.
+  const context = requireGithubContext(
+    await resolveDirectContext({
+      env,
+      ...(repoOverride !== undefined ? { repoOverride } : {}),
+    }),
+  )
 
   // Opening the store reads the store-version row once and migrates in place; a
   // present-but-unreadable row throws here, failing startup loudly rather than
@@ -250,14 +259,19 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
   const distDir = resolveDistDir(env)
   const repoOverride = resolveRepoOverride(process.argv.slice(2), env)
 
-  const context = await resolveDirectContext({
-    env,
-    // Read the ambient host-injected credential rather than shelling out to `gh`.
-    tokenSource: createFileCredentialTokenSource({ env }),
-    // The credential may not be present yet at boot; do not halt on its absence.
-    validateToken: false,
-    ...(repoOverride !== undefined ? { repoOverride } : {}),
-  })
+  // Broker mode mediates GitHub for a repo, so it too narrows to the
+  // GitHub-backed shape: the poll loop and the api both address a real
+  // owner/name, never a blank one.
+  const context = requireGithubContext(
+    await resolveDirectContext({
+      env,
+      // Read the ambient host-injected credential rather than shelling out to `gh`.
+      tokenSource: createFileCredentialTokenSource({ env }),
+      // The credential may not be present yet at boot; do not halt on its absence.
+      validateToken: false,
+      ...(repoOverride !== undefined ? { repoOverride } : {}),
+    }),
+  )
 
   const dataDir = resolveDirectDataDir(env)
   const store = openDirectStore({ dataDir, env })

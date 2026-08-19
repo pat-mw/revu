@@ -47,6 +47,26 @@ export class MissingGitIdentityError extends Error {
   }
 }
 
+/**
+ * The `workspace` label for a session that has no GitHub repository — a review
+ * of local branches, where there is no owner/name to fold in.
+ *
+ * It cannot collide with a repo-derived label: `direct-<owner>-<repo>` always
+ * carries a hyphen between two non-empty segments after the `direct-` prefix,
+ * and this literal has none.
+ */
+export const LOCAL_WORKSPACE = 'direct-local'
+
+/**
+ * The `workspace` label for a session, with or without a resolved repository.
+ * Always a defined, non-empty string: `workspace` is a stable label for the
+ * surface a session belongs to, so an absent repo resolves to `LOCAL_WORKSPACE`
+ * rather than interpolating into `direct-undefined-undefined` or `direct--`.
+ */
+export function directWorkspace(repo: RepoRef | undefined): string {
+  return repo === undefined ? LOCAL_WORKSPACE : `direct-${repo.owner}-${repo.repo}`
+}
+
 /** Read one `git config <key>`; returns the trimmed value, or `null` when unset/empty. */
 async function readGitConfig(
   runner: CommandRunner,
@@ -117,7 +137,7 @@ export async function buildDirectSession(args: {
     // own unstamped comments as the bot. Own-comment detection uses
     // `viewerLogin` below, never `brokerLogin`.
     brokerLogin: '',
-    workspace: `direct-${args.repo.owner}-${args.repo.repo}`,
+    workspace: directWorkspace(args.repo),
     viewerLogin: viewer.login,
   }
 }
@@ -168,10 +188,14 @@ export function resolveBotLogin(
  * `brokerLogin` stays the empty "no bot" sentinel: with no self-identity the
  * write guards cannot run safely, so the router keeps the broker's write routes
  * gated to `not_implemented` and the session is the reads-only shape.
+ *
+ * Because it reaches GitHub not at all, this is also the session a local-only
+ * boot builds — one that resolved no repository. `repo` is optional for exactly
+ * that case, and the workspace label falls back to `LOCAL_WORKSPACE`.
  */
 export async function buildBrokerSession(args: {
   runner: CommandRunner
-  repo: RepoRef
+  repo?: RepoRef
   cwd?: string
   env?: Record<string, string | undefined>
 }): Promise<Session> {
@@ -185,7 +209,7 @@ export async function buildBrokerSession(args: {
   return {
     human,
     brokerLogin: botLogin ?? '',
-    workspace: `direct-${args.repo.owner}-${args.repo.repo}`,
+    workspace: directWorkspace(args.repo),
     ...(botLogin !== null ? { viewerLogin: botLogin } : {}),
   }
 }
