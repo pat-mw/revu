@@ -1602,6 +1602,55 @@ describe('handleDirectApi: the pull list', () => {
     store.close()
   })
 
+  test('a resolved thread moves the etag while no sha moves — the count cannot sit behind a 304', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const world = localListWorld([localRow(LOCAL_ID_A)])
+    world.threads.set(LOCAL_ID_A, [localThread('t1', false)])
+    const api = listApi({ store, local: world })
+
+    const first = await getList(api)
+    expect(first.status).toBe(200)
+    const etag1 = first.headers.get('etag') as string
+    const body1 = validatePullListResponse(await first.json())
+    expect(body1.items[0].broker.unresolvedThreads).toBe(1)
+
+    // Resolve the one thread. `unresolvedThreads` moves and NOTHING else does:
+    // both shas stand still, so the compare key is byte-identical before and
+    // after — exactly the change an etag composed from compare keys alone
+    // would hide behind a 304 forever, leaving the inbox on a stale count.
+    world.threads.set(LOCAL_ID_A, [localThread('t1', true)])
+    const after = await getList(api, etag1)
+    expect(after.status).toBe(200)
+    const etag2 = after.headers.get('etag') as string
+    expect(etag2).not.toBe(etag1)
+    const body2 = validatePullListResponse(await after.json())
+    expect(body2.items[0].broker.unresolvedThreads).toBe(0)
+    expect(body2.items[0].broker.compareKey).toBe(body1.items[0].broker.compareKey)
+    // The moved etag is stable in its own turn: nothing else changed, so a
+    // replay of it is a genuine 304.
+    expect((await getList(api, etag2)).status).toBe(304)
+    store.close()
+  })
+
+  test('a rename moves the etag while no sha moves', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const world = localListWorld([localRow(LOCAL_ID_A)])
+    const api = listApi({ store, local: world })
+
+    const first = await getList(api)
+    const etag1 = first.headers.get('etag') as string
+    await first.body?.cancel()
+
+    // Retitle the review: the served row changes and no compare key does.
+    world.reviews[0] = localRow(LOCAL_ID_A, { title: 'renamed review' })
+    const after = await getList(api, etag1)
+    expect(after.status).toBe(200)
+    expect(after.headers.get('etag')).not.toBe(etag1)
+    const body = validatePullListResponse(await after.json())
+    expect(body.items[0].pull.title).toBe('renamed review')
+    store.close()
+  })
+
   test('the merged list carries both halves, and either half moves the etag', async () => {
     const store = openDirectStore({ dataDir: ':memory:' })
     const poll: PollWorld = { etag: 'W/"upstream-1"', items: [remoteItem(101), remoteItem(102)] }

@@ -288,10 +288,15 @@ describe('resolveDirectContext — broker boot never probes the viewer', () => {
 })
 
 /**
- * Starting with no GitHub at all. A local-only review needs no origin, no token,
- * and no viewer: `requireGithub: false` turns each of those refuse-to-start
- * conditions into a typed absence, and the session is built from git config
- * alone. The default is unchanged, and the case that proves the relaxation
+ * Starting with GitHub optional. A local-only review needs no origin, no token,
+ * and no viewer: `requireGithub: false` turns an unusable GitHub half into a
+ * typed absence instead of a refusal, and the session is then built from git
+ * config alone. The half is all-or-nothing: a clone whose origin resolves AND
+ * whose token is obtainable keeps repo, client, and viewer together (probed at
+ * boot exactly as a required boot probes them), while a clone that cannot
+ * produce a token drops all three — never a repo without a viewer, because the
+ * write guards compare against the viewer login and silently invert on a blank
+ * one. The default is unchanged, and the case that proves the relaxation
  * carries its own control that flips the flag back and asserts the refusal
  * returns — otherwise a passing boot would say nothing about the flag.
  */
@@ -397,10 +402,15 @@ describe('resolveDirectContext — local-only boot needs no GitHub', () => {
     expect((thrown as Error).message).toContain('git config')
   })
 
-  test('a resolvable origin is still resolved, and still costs no request', async () => {
-    // Absence is driven by what git can resolve, not by the flag: a local-only
-    // review run inside a real GitHub clone keeps its repo. The viewer probe is
-    // skipped either way, so the boot is request-free regardless.
+  test('a clone without a credential drops the GitHub half whole, and still costs no request', async () => {
+    // The origin resolves — this is a genuine GitHub clone — but no token is
+    // obtainable, so nothing could authenticate a request or identify the
+    // viewer the write guards compare against. Keeping the repo here would
+    // present a GitHub-capable daemon whose session carries no viewer: the
+    // self-review gate and the submit idempotency re-check compare against the
+    // viewer login and silently invert on a blank one. The half is therefore
+    // dropped WHOLE — repo, client, and viewer together — and the boot is a
+    // purely local one that issues no request.
     const fetch = refusingFetch()
     const ctx = await resolveDirectContext({
       runner: scriptRunner({
@@ -412,7 +422,29 @@ describe('resolveDirectContext — local-only boot needs no GitHub', () => {
       env: {},
       requireGithub: false,
     })
-    expect(ctx.repo).toEqual({ owner: 'acme', repo: 'revu' })
+    expect(ctx.repo).toBeUndefined()
+    expect(ctx.github).toBeUndefined()
+    expect(ctx.session.viewerLogin).toBeUndefined()
     expect(fetch.calls()).toBe(0)
+  })
+
+  test('a clone with a credential keeps the whole half — repo, client, and viewer together', async () => {
+    // With a token obtainable, the optional-GitHub boot proves it and probes
+    // the viewer exactly as a required boot does. The kept half is never
+    // viewer-less: either every GitHub precondition holds and the full
+    // GitHub-capable surface is wired, or none is kept at all.
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_valid',
+      }),
+      fetchImpl: viewerFetch('alice-gh'),
+      env: {},
+      requireGithub: false,
+    })
+    expect(ctx.repo).toEqual({ owner: 'acme', repo: 'revu' })
+    expect(ctx.github).not.toBeUndefined()
+    expect(ctx.session.viewerLogin).toBe('alice-gh')
   })
 })

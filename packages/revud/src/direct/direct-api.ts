@@ -340,14 +340,22 @@ function localCompareKey(review: LocalReviewSummary): string {
 
 /**
  * The ETag served for a review list, composed from the poll source's own ETag
- * and the local reviews' compare keys. BOTH halves are always in the
- * composition — the poll half as the empty string when no loop is wired — so a
- * local-only list and a merged one cannot grow two different rules for it. A
- * change in either half moves the result, which is what stops a client replaying
- * a matching ETag from never being shown the other half's change.
+ * and the local rows AS SERVED. BOTH halves are always in the composition — the
+ * poll half as the empty string when no loop is wired — so a local-only list
+ * and a merged one cannot grow two different rules for it. A change in either
+ * half moves the result, which is what stops a client replaying a matching
+ * ETag from never being shown the other half's change.
+ *
+ * The local half hashes the whole serialized row, never a projection of it. A
+ * projection invites exactly one failure: a field it omits changes — a thread
+ * resolves and `unresolvedThreads` drops, a review is retitled, an archive
+ * flips a row's state — while every projected field stands still, and the
+ * client 304s forever on a list that is no longer what it would be served.
+ * Hashing what is served makes "the ETag moved" and "the body changed"
+ * equivalent by construction.
  */
-function reviewListEtag(pollEtag: string, localCompareKeys: readonly string[]): string {
-  return `W/"pulls+local:${djb2Hex(pollEtag)}:${djb2Hex(localCompareKeys.join('\n'))}"`
+function reviewListEtag(pollEtag: string, localItems: readonly PullListItem[]): string {
+  return `W/"pulls+local:${djb2Hex(pollEtag)}:${djb2Hex(JSON.stringify(localItems))}"`
 }
 
 /**
@@ -555,6 +563,20 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
    * than once, so a daemon with no repository can be assembled at all: the
    * local band never reads it, and the GitHub band cannot be reached without
    * one.
+   *
+   * A viewer identity is a precondition here, alongside the repository and the
+   * client — for writes ONLY, never for reads. The self-review gate and the
+   * submit idempotency re-check both compare against `session.viewerLogin`,
+   * and both silently invert on an absent one: every verdict is refused with a
+   * reason that blames the author, and no prior review can ever match, so a
+   * retried submit double-posts. No supported assembly reaches this guard —
+   * direct mode probes the viewer whenever it keeps a repository, a
+   * write-enabled broker carries the bot login as its viewer, and a reads-only
+   * broker's GitHub-band writes are refused by the router before dispatch — so
+   * like the two guards above it throws a plain error rather than a typed
+   * `ApiError` that would dress an assembly hole up as a considered answer.
+   * Reads are deliberately exempt: a reads-only broker legitimately serves
+   * sync and snapshots over a GitHub half with no viewer at all.
    */
   const writeDeps = (): {
     github: GithubClient
@@ -563,13 +585,24 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     session: Session
     writeDecorator: WriteDecorator
     now?: () => string
-  } => ({
-    ...githubTarget(),
-    store: deps.store,
-    session: deps.session,
-    writeDecorator,
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-  })
+  } => {
+    const target = githubTarget()
+    if (deps.session.viewerLogin === undefined) {
+      throw new Error(
+        'This daemon holds a GitHub repository but no viewer identity; a ' +
+          'GitHub-bound write must not run, because the self-review gate and ' +
+          'the submit idempotency re-check compare against the viewer login ' +
+          'and silently invert on an absent one.',
+      )
+    }
+    return {
+      ...target,
+      store: deps.store,
+      session: deps.session,
+      writeDecorator,
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    }
+  }
 
   return {
     // The capability is read off the decorator actually injected, so it can be
@@ -609,14 +642,13 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
         return pollSource.listPulls(ifNoneMatch)
       }
 
+      // The ETag hashes these BUILT rows rather than anything recomputed from
+      // the store, so the value the ETag is composed from and the value the
+      // client renders are the same object by construction.
       const localItems = localPullListItems(local, deps.session)
-      // Read back off the built rows rather than recomputed from the store, so
-      // the key the ETag is composed from and the key the client renders are the
-      // same string by construction.
-      const localKeys = localItems.map((item) => item.broker.compareKey)
 
       if (pollSource === undefined) {
-        const etag = reviewListEtag('', localKeys)
+        const etag = reviewListEtag('', localItems)
         if (ifNoneMatch !== null && ifNoneMatch === etag) {
           return { items: [], etag, notModified: true, rateLimit: unspentRateLimit() }
         }
@@ -630,7 +662,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       // the only thing that stops a new pull request from sitting behind a 304
       // forever while the local half stands still.
       const poll = pollSource.listPulls(null)
-      const etag = reviewListEtag(poll.etag, localKeys)
+      const etag = reviewListEtag(poll.etag, localItems)
       if (ifNoneMatch !== null && ifNoneMatch === etag) {
         return { items: [], etag, notModified: true, rateLimit: poll.rateLimit }
       }

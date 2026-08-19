@@ -17,9 +17,12 @@ import { buildBrokerSession, buildDirectSession } from './session'
  * one actionable line and exit non-zero.
  *
  * A boot that reviews local branches needs none of that GitHub half, so the
- * requirement is an option rather than a fixture: with it lifted the repo and its
- * client are typed-absent instead of blank, the boot issues no request, and the
- * git-config identity guard still stands.
+ * requirement is an option rather than a fixture. With it lifted the half is
+ * kept ALL-OR-NOTHING: a clone whose origin resolves and whose token is
+ * obtainable keeps repo, client, and probed viewer together, exactly as a
+ * required boot does; anything less — no origin, or no credential — drops all
+ * three as typed absences rather than blanks, and the boot issues no request.
+ * The git-config identity guard still stands either way.
  *
  * Everything external is injected: the `CommandRunner` (git/gh), the GitHub
  * `fetch`, and the environment. Nothing here reaches a real subprocess or the
@@ -114,11 +117,14 @@ export interface DirectResolveOptions {
   tokenSource?: TokenSource
   /**
    * Whether to prove a token is obtainable at startup by fetching one once.
-   * Defaults to `requireGithub`, so an unauthenticated direct setup fails at boot
-   * rather than on the first request. Set `false` when the credential is injected
-   * asynchronously by an external host and may legitimately be absent for a short
-   * window at container start: boot then proceeds and the absent-credential state
-   * is surfaced per request instead of stopping the daemon.
+   * Defaults on whenever there is a GitHub half to stand behind it — GitHub is
+   * required, or a repository resolved anyway — so an unauthenticated direct
+   * setup fails at boot rather than on the first request, and an optional-GitHub
+   * boot never keeps a repository it could not authenticate to. Set `false` when
+   * the credential is injected asynchronously by an external host and may
+   * legitimately be absent for a short window at container start: boot then
+   * proceeds and the absent-credential state is surfaced per request instead of
+   * stopping the daemon.
    */
   validateToken?: boolean
   /**
@@ -126,11 +132,15 @@ export interface DirectResolveOptions {
    * to `true`: an unresolvable repo stops the daemon, exactly as before.
    *
    * Set `false` to boot for a review of local branches, which needs no origin,
-   * no token, and no viewer. An unresolvable repo is then recorded as the
-   * typed-absent GitHub half of `LocalDirectContext` instead of thrown, the token
-   * probe defaults off, and the session is built by the zero-GitHub-call path.
-   * The git-config identity guard is NOT relaxed: the email keys drafts and
-   * viewed state, so an unset `user.email` still refuses to start.
+   * no token, and no viewer. The GitHub half is then kept all-or-nothing: an
+   * unresolvable repo, or a resolvable one with no obtainable token, becomes the
+   * typed-absent half of `LocalDirectContext` instead of a thrown refusal, and
+   * the session is built by the zero-GitHub-call path. A repo whose token IS
+   * obtainable is kept whole — client built, viewer probed — never as a
+   * viewer-less GitHub surface, because the write guards compare against the
+   * viewer login and silently invert on a blank one. The git-config identity
+   * guard is NOT relaxed: the email keys drafts and viewed state, so an unset
+   * `user.email` still refuses to start.
    */
   requireGithub?: boolean
 }
@@ -152,13 +162,18 @@ export interface DirectResolveOptions {
  * A GitHub error while reading the viewer (a revoked or wrong-scoped token) is
  * also a hard start failure, surfaced with the HTTP status so the user can act.
  *
- * With `requireGithub: false` — a review of local branches — every one of those
- * GitHub preconditions relaxes: no origin is needed, the token probe defaults
- * off, and the session comes from the zero-GitHub-call path, so the boot makes
- * no request at all. The git-config identity guard is deliberately untouched:
- * `user.email` is the key drafts and viewed state are filed under, so an unset
- * one still refuses to start rather than collapsing every human onto one blank
- * id the store could not tell apart afterwards.
+ * With `requireGithub: false` — a review of local branches — those GitHub
+ * preconditions become droppable instead of fatal, and they drop TOGETHER: no
+ * origin means no GitHub half, and a resolvable origin whose token cannot be
+ * obtained sheds the repo too rather than keeping a surface no client can
+ * authenticate to and no viewer stands behind. Only when every precondition
+ * holds is the half kept, and then it is kept whole — token proven, viewer
+ * probed — exactly as a required boot keeps it. A boot that dropped the half
+ * builds its session from the zero-GitHub-call path and makes no request at
+ * all. The git-config identity guard is deliberately untouched: `user.email`
+ * is the key drafts and viewed state are filed under, so an unset one still
+ * refuses to start rather than collapsing every human onto one blank id the
+ * store could not tell apart afterwards.
  */
 export async function resolveDirectContext(
   opts: DirectResolveOptions = {},
@@ -177,27 +192,36 @@ export async function resolveDirectContext(
   if (!resolution.ok && requireGithub) {
     throw new DirectStartupError(repoErrorMessage(resolution.error))
   }
-  const repo = resolution.ok ? resolution.repo : undefined
+  let repo = resolution.ok ? resolution.repo : undefined
 
   // 2. Token custody — build (or accept) the source. The default is the
   //    `gh`-backed direct source; an injected source swaps the custody surface
   //    (e.g. a host-injected ambient credential) while every other assembly step
-  //    stays identical. By default a token is fetched once to prove the setup is
-  //    authenticated, so an unauthenticated direct setup fails at startup rather
-  //    than on the first call. Validation is skipped when the credential is
-  //    injected asynchronously and may be absent at boot for a short window, and
-  //    defaults off when GitHub is not required at all — a local-branch review
-  //    has nothing to authenticate to.
+  //    stays identical. By default a token is fetched once whenever a GitHub
+  //    half exists to stand behind it, so an unauthenticated direct setup fails
+  //    at startup rather than on the first call. Validation is skipped when the
+  //    credential is injected asynchronously and may be absent at boot for a
+  //    short window, and defaults off only when there is no repo at all —
+  //    nothing to authenticate to.
   const tokenSource = opts.tokenSource ?? createDirectTokenSource(runner, env)
-  const validateToken = opts.validateToken ?? requireGithub
+  const validateToken = opts.validateToken ?? (requireGithub || repo !== undefined)
   if (validateToken) {
     try {
       await tokenSource.getToken()
     } catch (err) {
-      if (err instanceof NoTokenError) {
+      if (!(err instanceof NoTokenError)) throw err
+      if (requireGithub) {
         throw new DirectStartupError(err.message)
       }
-      throw err
+      // GitHub is optional and no credential exists: drop the GitHub half
+      // WHOLE rather than keep a repo no client can authenticate to. A kept
+      // repo would report this daemon GitHub-capable while its session carries
+      // no viewer login, and the write guards keyed on that login — the
+      // self-review gate and the submit idempotency re-check — silently invert
+      // on a blank one: every verdict refused with a false reason, every
+      // retried submit double-posted. All-or-nothing: repo, client, and viewer
+      // together, or none of them.
+      repo = undefined
     }
   }
 
@@ -216,16 +240,18 @@ export async function resolveDirectContext(
 
   let session: Session
   try {
-    // Direct mode validates the token at boot, so the viewer fetch is proven to
-    // work and the full session (with `viewerLogin` from `GET /user`) is built.
-    // Broker mode (validation skipped) does NOT probe the viewer at all: its
-    // GitHub App installation token cannot resolve a login via `GET /user`
-    // (GitHub answers 403). Identity comes from git config, and the bot's own
-    // login — when the deployment configures one — from the environment, so
-    // boot never depends on a present credential. A local-branch review takes
-    // that same path for the same reason, one step further: with no repo there
-    // is nothing to be the viewer OF, so the GitHub-free assembly is the only
-    // one available and the boot issues no request.
+    // A kept GitHub half always proved its token above, so the viewer fetch is
+    // proven to work and the full session (with `viewerLogin` from `GET /user`)
+    // is built — including on an optional-GitHub boot that kept its half, whose
+    // writes need that viewer exactly as a required boot's do. Broker mode
+    // (validation skipped) does NOT probe the viewer at all: its GitHub App
+    // installation token cannot resolve a login via `GET /user` (GitHub answers
+    // 403). Identity comes from git config, and the bot's own login — when the
+    // deployment configures one — from the environment, so boot never depends
+    // on a present credential. A boot whose GitHub half dropped takes that same
+    // path for the same reason, one step further: with no repo there is nothing
+    // to be the viewer OF, so the GitHub-free assembly is the only one
+    // available and the boot issues no request.
     if (repo !== undefined && github !== undefined && validateToken) {
       session = await buildDirectSession({
         runner,

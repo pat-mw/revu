@@ -692,3 +692,102 @@ describe('direct api band dispatch', () => {
     store.close()
   })
 })
+
+// ————————————————————————————————————————————————————————————————————————————
+// The GitHub-band write path and the viewer identity.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * A session with a GitHub half wired but no viewer probed. No supported boot
+ * assembles this shape for GitHub-band WRITES — direct mode probes the viewer
+ * whenever it keeps a repository, a write-enabled broker carries the bot login
+ * as its viewer, and a reads-only broker's GitHub-band writes are refused by
+ * the router before dispatch — but the surface must hold the line on its own:
+ * the self-review gate and the submit idempotency re-check compare against the
+ * viewer login, and both silently invert on a blank one (every verdict refused
+ * with a false reason; every retried submit double-posted).
+ */
+const VIEWERLESS_SESSION: Session = {
+  human: SESSION.human,
+  brokerLogin: '',
+  workspace: SESSION.workspace,
+}
+
+/** The `build` harness over the viewer-less session, everything else equal. */
+function buildViewerless(): Harness {
+  const store = openDirectStore({ dataDir: ':memory:' })
+  const { client, calls } = recordingGithubClient()
+  const { surface, spy } = fakeLocalSurface()
+  const api = createDirectApi({
+    session: VIEWERLESS_SESSION,
+    github: client,
+    repo: REPO,
+    store,
+    now,
+    localReviews: surface,
+  })
+  return { api, store, githubCalls: calls, spy }
+}
+
+describe('a GitHub-band write refuses to run without a viewer identity', () => {
+  test('all four writes are refused before a single GitHub call', async () => {
+    const { api, store, githubCalls } = buildViewerless()
+
+    for (const call of [
+      (): Promise<unknown> => api.submitReview(submitInput(PR_ID)),
+      (): Promise<unknown> => api.replyToThread(PR_ID, 'PRRT_1', 'agreed'),
+      (): Promise<unknown> => api.resolveThread(PR_ID, 'PRRT_1', true),
+      (): Promise<unknown> => api.addReaction(PR_ID, 5001, '+1'),
+    ]) {
+      const outcome = await call().then(
+        () => ({ resolved: true, err: null as unknown }),
+        (e: unknown) => ({ resolved: false, err: e }),
+      )
+      expect(outcome.resolved).toBe(false)
+      // A plain error, not a typed contract answer: this is an assembly
+      // invariant no supported boot violates, and a typed envelope would let a
+      // hole in the boot's all-or-nothing GitHub half pass for a considered
+      // refusal.
+      expect(outcome.err).toBeInstanceOf(Error)
+      expect((outcome.err as Error).message).toContain('viewer')
+    }
+
+    // Refused BEFORE the write path: nothing was even attempted against
+    // GitHub, so nothing could have posted, and nothing could have been
+    // double-posted on a retry.
+    expect(githubCalls).toEqual([])
+    store.close()
+  })
+
+  test('the local band is untouched: a viewer-less session still writes local reviews', async () => {
+    // A review of a local branch pair posts as nobody and consults no viewer,
+    // so the guard must not close over it — local reviews are exactly the
+    // deployment a viewer-less daemon exists for.
+    const { api, store, githubCalls, spy } = buildViewerless()
+
+    expect(await api.submitReview(submitInput(LOCAL_ID))).toEqual(LOCAL_SUBMIT)
+    expect(await api.replyToThread(LOCAL_ID, 'LOCALTHREAD_1', 'agreed')).toEqual(LOCAL_COMMENT)
+    expect(await api.resolveThread(LOCAL_ID, 'LOCALTHREAD_1', true)).toEqual(LOCAL_THREAD)
+    expect(await api.addReaction(LOCAL_ID, LOCAL_ENTITY_ID_BASE + 3, '+1')).toEqual(LOCAL_ROLLUP)
+
+    expect(spy.calls).toEqual([
+      `submitReview:${LOCAL_ID}`,
+      `replyToThread:${LOCAL_ID}`,
+      `resolveThread:${LOCAL_ID}`,
+      `addReaction:${LOCAL_ID}`,
+    ])
+    expect(githubCalls).toEqual([])
+    store.close()
+  })
+
+  test('reads stay served viewer-less: the shape is a reads-only broker, not a broken one', async () => {
+    // A reads-only broker legitimately runs a GitHub half with no viewer — its
+    // writes are refused by the router, and its reads consult no viewer at
+    // all. The capability must therefore keep reporting the two halves, and a
+    // read that needs neither guard must answer.
+    const { api, store } = buildViewerless()
+    expect(api.githubEnabled).toBe(true)
+    expect(api.getSnapshot(PR_ID)).toBeNull()
+    store.close()
+  })
+})

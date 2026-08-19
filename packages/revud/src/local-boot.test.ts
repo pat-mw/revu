@@ -1,6 +1,6 @@
 /**
- * The three boot decisions the local review capability adds to direct mode, and
- * the one thing it must never add.
+ * The boot decisions the local review capability adds to direct mode, and the
+ * one thing it must never add.
  *
  * A `main*` function is assertable only by spawning a process, so each decision
  * is an exported pure function and boot is wiring over them. That is what makes
@@ -18,7 +18,9 @@
  *    GitHub clone would boot a daemon that can only do local reviews and shows
  *    an empty inbox, which reads to its user as data loss. With no flag and no
  *    environment variable the requirement stands, so the existing boot is
- *    unchanged.
+ *    unchanged. And a SET switch must never be silently ignored: with any mode
+ *    but direct resolved, boot refuses rather than serving a daemon the switch
+ *    never configured.
  * 3. **The repository root is DISCOVERED, never assumed.** The boot context
  *    carries a bare process working directory that nothing discovers. Handing
  *    that to the local surface would read blobs and write pin refs against
@@ -38,7 +40,10 @@ import type { CommandResult, CommandRunner } from './direct/command-runner'
 import { createDirectApi } from './direct/direct-api'
 import { throwingGithubClient } from './direct/github-write-stubs'
 import { openDirectStore } from './direct/store'
+import { resolveDirectContext } from './direct/context'
+import { handleDirectApi } from './direct-router'
 import {
+  assertLocalOnlySupported,
   directStartupLine,
   resolveGithubRequirement,
   resolveLocalSurfaceRoot,
@@ -176,6 +181,41 @@ describe('resolveGithubRequirement', () => {
     expect(message).toContain('REVU_LOCAL_ONLY')
     expect(message).toContain('1')
     expect(message).toContain('0')
+  })
+})
+
+describe('assertLocalOnlySupported', () => {
+  test('the switch with a non-direct mode refuses to boot rather than being ignored', () => {
+    // Only the direct boot path consults the GitHub requirement, so with any
+    // other mode resolved the daemon would boot as if the switch had never
+    // been given — a mock daemon serving fixtures to a user who asked for a
+    // local-only one. That is the same silent degradation the unrecognized
+    // REVU_LOCAL_ONLY value is refused for, one level up, and it is refused
+    // the same way: loudly, at boot.
+    expect(() => assertLocalOnlySupported('mock', false)).toThrow()
+    expect(() => assertLocalOnlySupported('broker', false)).toThrow()
+  })
+
+  test('the refusal names the mode that would ignore the switch, and the fix', () => {
+    let message = ''
+    try {
+      assertLocalOnlySupported('mock', false)
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err)
+    }
+    expect(message).toContain('mock')
+    expect(message).toContain('--local-only')
+    expect(message).toContain('--direct')
+  })
+
+  test('direct mode with the switch boots', () => {
+    expect(() => assertLocalOnlySupported('direct', false)).not.toThrow()
+  })
+
+  test('without the switch every mode boots unchanged', () => {
+    expect(() => assertLocalOnlySupported('mock', true)).not.toThrow()
+    expect(() => assertLocalOnlySupported('direct', true)).not.toThrow()
+    expect(() => assertLocalOnlySupported('broker', true)).not.toThrow()
   })
 })
 
@@ -364,6 +404,82 @@ const SESSION: Session = {
 }
 
 // ————————————————————————————————————————————————————————————————————————————
+// Block 3b — a local-only boot inside a GitHub clone.
+// ————————————————————————————————————————————————————————————————————————————
+
+describe('a local-only boot inside a GitHub clone without a credential', () => {
+  test('a GitHub-band write cannot reach the write path with an absent viewer', async () => {
+    // The runner answers as a genuine clone would — the origin parses — while
+    // `gh` is unauthenticated and no env token is set. The GitHub half must
+    // then drop WHOLE rather than keep a repo no client can authenticate to:
+    // a kept repo would make the daemon report itself GitHub-capable while its
+    // session carries no viewer, and the write guards keyed on the viewer
+    // login (the self-review gate, the submit idempotency re-check) silently
+    // invert on a blank one — refusing every verdict and double-posting
+    // retried submits.
+    const runner = fakeRunner({
+      [ORIGIN_ARGV]: OK('git@github.com:acme/revu.git\n'),
+      'git config user.name': OK('Dana Reeve\n'),
+      'git config user.email': OK('dana.reeve@example.test\n'),
+      'gh auth token': FAILED(1, 'gh: not logged in'),
+    })
+    let fetchCalls = 0
+    const context = await resolveDirectContext({
+      runner,
+      fetchImpl: async (url: string) => {
+        fetchCalls += 1
+        throw new Error(`unexpected GitHub request: ${url}`)
+      },
+      env: {},
+      requireGithub: false,
+    })
+
+    expect(context.repo).toBeUndefined()
+    expect(context.github).toBeUndefined()
+    expect(context.session.viewerLogin).toBeUndefined()
+
+    // Assembled exactly as boot assembles it: both halves together, or neither.
+    const store = openDirectStore({ dataDir: ':memory:' })
+    try {
+      const github = context.github
+      const repo = context.repo
+      const api = createDirectApi({
+        session: context.session,
+        ...(github !== undefined && repo !== undefined ? { github, repo } : {}),
+        store,
+      })
+      expect(api.githubEnabled).toBe(false)
+
+      // The router refuses the GitHub-band write before dispatch, naming the
+      // missing repository, so the write path never runs against the absent
+      // viewer — and nothing along the way issued a GitHub request.
+      const res = await handleDirectApi(
+        new Request('http://localhost/api/pulls/204/review', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            prNumber: 204,
+            expectedHeadSha: 'h'.repeat(40),
+            event: 'APPROVE',
+            body: 'ship it',
+            comments: [],
+          }),
+        }),
+        context.session,
+        api,
+      )
+      expect(res?.status).toBe(501)
+      const body = (await res?.json()) as { code: string; message: string }
+      expect(body.code).toBe('not_implemented')
+      expect(/no GitHub repository/i.test(body.message)).toBe(true)
+      expect(fetchCalls).toBe(0)
+    } finally {
+      store.close()
+    }
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
 // Block 4 — the startup line.
 // ————————————————————————————————————————————————————————————————————————————
 
@@ -429,19 +545,31 @@ describe('directStartupLine', () => {
     expect(line).toContain('data=/home/dana/.local/share/revu')
   })
 
-  test('a repo with no viewer keeps the repo and drops only the viewer', () => {
-    // The ordinary local-only boot inside a GitHub clone: the origin parses, but
-    // nothing probed a viewer, so there is no login to print.
-    const line = directStartupLine({
+  test('the GitHub facts travel together: both printed, or both omitted', () => {
+    // The GitHub half is all-or-nothing at resolve time: a boot that kept its
+    // repository proved a credential and probed its viewer, and a boot that
+    // could not produce one dropped both. The line renders the only two shapes
+    // a direct boot yields — never a repo without a viewer, which would print
+    // a daemon claiming GitHub capability its write guards cannot back.
+    const kept = directStartupLine({
       distDir: '/dist',
       port: 4780,
       repo: 'acme/revu',
+      viewer: 'dana',
+      dataDir: '/data',
+    })
+    expect(kept).toContain('repo=acme/revu')
+    expect(kept).toContain('viewer=dana')
+
+    const dropped = directStartupLine({
+      distDir: '/dist',
+      port: 4780,
+      repo: null,
       viewer: null,
       dataDir: '/data',
     })
-
-    expect(line).toContain('repo=acme/revu')
-    expect(line).not.toContain('viewer')
+    expect(dropped).not.toContain('repo=')
+    expect(dropped).not.toContain('viewer=')
   })
 
   test('the bound port is readable from the GitHub-capable line', () => {

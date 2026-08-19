@@ -148,6 +148,26 @@ export function resolveGithubRequirement(
 }
 
 /**
+ * Refuse a boot whose local-only switch would otherwise be silently ignored.
+ *
+ * Only the direct boot path consults the GitHub requirement, so with the
+ * switch set and any other mode resolved the daemon would come up as if the
+ * switch had never been given — by default a MOCK daemon serving fixture data
+ * to a user who asked for a local-only one, discoverable only at the first
+ * confusing answer. That is the same silent degradation the unrecognized
+ * `REVU_LOCAL_ONLY` value is refused for, one level up, and it is refused the
+ * same way: loudly, at boot, with the fix in the message.
+ */
+export function assertLocalOnlySupported(mode: BootMode, requireGithub: boolean): void {
+  if (requireGithub || mode === 'direct') return
+  throw new Error(
+    `${LOCAL_ONLY_FLAG} (or ${LOCAL_ONLY_ENV_VAR}) serves local reviews inside direct ` +
+      `mode, but the resolved mode is "${mode}", which would ignore it. Pass --direct ` +
+      `(or set REVU_MODE=direct) alongside the switch.`,
+  )
+}
+
+/**
  * The repository a local review surface would be built over: where its git
  * commands run, and the identity its rows are keyed under.
  */
@@ -224,12 +244,19 @@ export function directStartupLine(line: DirectStartupLine): string {
  * threaded explicitly from here down to the router: the router never reads the
  * environment, so the mock-only dev routes cannot be re-enabled after boot by a
  * changed env var. Direct mode and mock mode take different boot paths but the
- * default (mock) behavior is byte-for-byte unchanged.
+ * default (mock) behavior is byte-for-byte unchanged. The local-only switch is
+ * checked against the resolved mode up front, so setting it outside direct mode
+ * is a refusal rather than a no-op.
  */
 export async function main(
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
-  const mode = resolveMode(process.argv.slice(2), env)
+  const argv = process.argv.slice(2)
+  const mode = resolveMode(argv, env)
+  // The local-only switch is validated for EVERY mode, before any boot path
+  // runs: a set switch with a non-direct mode resolved refuses to start rather
+  // than booting a daemon the switch never configured.
+  assertLocalOnlySupported(mode, resolveGithubRequirement(argv, env))
   if (mode === 'direct') {
     await mainDirect(env)
     return
@@ -286,9 +313,10 @@ async function mainMock(env: Record<string, string | undefined>): Promise<void> 
  * never as a mode of their own: `resolveGithubRequirement` decides whether the
  * GitHub half is a precondition, and the local surface is assembled over the
  * repository this daemon actually sits in. With the requirement lifted the
- * GitHub half may be absent ENTIRELY — the boot then starts in a repository
- * with no `origin` remote, and the api reports no GitHub capability so the
- * router refuses the GitHub-only routes with a message naming what is missing.
+ * GitHub half may be absent ENTIRELY — a repository with no `origin` remote,
+ * or one whose credential could not be obtained — and the api then reports no
+ * GitHub capability, so the router refuses the GitHub-only routes with a
+ * message naming what is missing.
  * Nothing is narrowed to a repository here, because there may be none to narrow
  * to. The repository is DISCOVERED once —
  * the context's own working directory is a bare `process.cwd()` that nothing
@@ -311,12 +339,13 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   const requireGithub = resolveGithubRequirement(argv, env)
 
   // Resolved WITHOUT narrowing to the GitHub-backed shape: with the requirement
-  // lifted the repo and its client are typed-absent rather than blank, and the
+  // lifted an unusable GitHub half is typed-absent rather than blank, and the
   // boot carries that absence forward instead of refusing to start on it. That
   // refusal is what previously made a local-only daemon impossible in a
-  // repository with no `origin` — the one deployment it exists for. Lifting the
-  // requirement also relaxes the token probe and the viewer probe, which such a
-  // daemon issues neither of.
+  // repository with no `origin` — the one deployment it exists for. The half is
+  // all-or-nothing: a clone whose token is obtainable keeps repo, client, and
+  // probed viewer together, and anything less drops all three, so the boot
+  // never carries a repository its write guards have no viewer to stand behind.
   const context = await resolveDirectContext({
     env,
     requireGithub,
@@ -385,14 +414,17 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
     directStartupLine({
       distDir,
       port: server.port,
-      // Absent on a local-only boot, which resolved no repository at all.
-      // Printed as nothing rather than as a placeholder, for the same reason
-      // the viewer is: a blank `repo=/` describes a daemon pinned to a
-      // repository that does not exist, which is a different problem.
+      // Absent when the boot holds no GitHub half — no origin resolved, or
+      // the half was dropped whole for want of a credential. Printed as
+      // nothing rather than as a placeholder, for the same reason the viewer
+      // is: a blank `repo=/` describes a daemon pinned to a repository that
+      // does not exist, which is a different problem.
       repo: repo === undefined ? null : `${repo.owner}/${repo.repo}`,
-      // Absent on a local-only boot, which probes no viewer at all. Printed as
-      // nothing rather than as a placeholder: `viewer=?` describes a daemon
-      // whose viewer could not be read, which is a different problem.
+      // Absent exactly when the repo is: the GitHub half is all-or-nothing,
+      // so a kept repository always carries a probed viewer and a dropped one
+      // carries neither. Printed as nothing rather than as a placeholder:
+      // `viewer=?` describes a daemon whose viewer could not be read, which
+      // is a different problem.
       viewer: context.session.viewerLogin ?? null,
       dataDir,
     }),
