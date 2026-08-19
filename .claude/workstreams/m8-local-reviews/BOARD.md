@@ -24,24 +24,26 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 | **M8.5.5** — boot assembly | opus | ✅ `eb1eb5c` — 2563 · 1 · 0 · 94 |
 | **M8.5.3** — `listPulls`, local merged | opus | ✅ `fd5aca1` — **2568 · 1 · 0 · 94** |
 | **M8.5.8** — the write path's router band handling | opus | ✅ `c462105` — **2571 · 1 · 0 · 94** |
-| **M8.5.6** — honest degradation (+ the exit-criterion unblock) | opus | **dispatched** |
+| **M8.5.6** — honest degradation (+ the exit-criterion unblock) | opus | ✅ `5b7057c` — **2577 · 1 · 0 · 94** |
+| **M8.5.7** — the end-to-end HTTP proof, offline | opus | **dispatched** |
 
 Remaining after `.6`: **`.7`** (the offline HTTP proof), then `Verify` → the fable-tier adversarial review of
 the full diff → the PR. **Nine of ten units are landed.**
 
-### ⚠️ The headline exit criterion is NOT yet reachable, and M8.5.6 is what unblocks it
+### ✅ The headline exit criterion is reachable, and was observed directly
 
-Boot assembly delivered the token/viewer half of the local-only switch — inside a GitHub clone `--local-only`
-skips both probes and serves local reviews, verified live against a real daemon booted from a subdirectory with
-the tokens blanked (`GET /api/branches` answered 200 with the repository's real branches). **But a repository
-with no origin still refuses to start**: `DirectApiDeps` declares `github` and `repo` as **non-optional**, so
-boot must still funnel through the narrowing guard. The two ways to satisfy those types without a repo — a
-blank `{ owner: '', repo: '' }` stand-in, or a cast — are exactly what the typed-absent design exists to
-forbid, and the implementer correctly refused both rather than paper over it.
+`revud --direct --local-only` now **starts in a repository with no remotes at all**, with no token and no
+viewer probe, and serves the local flow. Run by the orchestrator in the main tree against a scratch repo:
+branches listed, review created at id `1000000000`, sync 200, snapshot 200, and the review present in
+`GET /api/pulls` — while `GET /api/rate-limit` and a pull-request-id snapshot answer a typed 501 naming the
+missing repository. The startup line omits the absent repo and viewer rather than placeholdering them.
 
-Making those two deps optional **is** "a GitHub-less api degrades honestly", so it was folded into M8.5.6
-rather than given a new unit. **M8.5.7 cannot pass until it lands** — its whole premise is a repository with no
-remote.
+Getting there needed `DirectApiDeps.github`/`repo` to become optional, which was folded into M8.5.6. The
+implementer of boot assembly hit that wall and **refused both escape hatches** — a blank `{ owner: '',
+repo: '' }` stand-in and a cast — which is why the gap surfaced as a clean blocker rather than as a mysterious
+failure later.
+
+M8.5.7 makes all of this durable; the drill is corroboration only.
 
 **Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
 one, and every number matched the worker's report.
