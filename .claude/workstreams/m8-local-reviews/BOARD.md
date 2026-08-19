@@ -15,17 +15,32 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 
 | unit | tier | state |
 | --- | --- | --- |
-| **OQ5 design pass** — the `LocalReviewSurface` seam + the five findings | fable | ✅ spec only, no code |
+| **OQ5 design pass** — the seam + the five findings | fable | ✅ spec only |
 | **M8.5.4** — boot relaxation | opus | ✅ `5bfdf38` — 2453 · 1 · 0 · 91 |
-| **M8.5.1** — band dispatch on the direct surface | opus | ✅ `369af01` — 2458 · 1 · 0 · 92 |
+| **M8.5.1** — band dispatch | opus | ✅ `369af01` — 2458 · 1 · 0 · 92 |
 | **M8.5.9** — two daemons on one data dir | opus | ✅ `6a837ae` — 2460 · 1 · 0 · 92 |
 | **M8.5.2** — create / list / branches routes | opus | ✅ `4a281ba` — 2474 · 1 · 0 · 92 |
-| **M8.5.10** — the local surface factory | opus | ✅ `d239db6` — **2528 · 1 · 0 · 93** |
-| **M8.5.5** — boot assembly (`index.ts`) | opus | **dispatched** |
-| **M8.5.3** — `listPulls` with local reviews merged | opus | **dispatched** |
+| **M8.5.10** — the local surface factory | opus | ✅ `d239db6` — 2528 · 1 · 0 · 93 |
+| **M8.5.5** — boot assembly | opus | ✅ `eb1eb5c` — 2563 · 1 · 0 · 94 |
+| **M8.5.3** — `listPulls`, local merged | opus | ✅ `fd5aca1` — **2568 · 1 · 0 · 94** |
+| **M8.5.8** — the write path's router band handling | opus | **dispatched** |
 
-Remaining after this pair: **`.8` → `.6`** on the router chain, then **`.7`** (the offline HTTP proof), then
-`Verify` → the fable-tier adversarial review of the full diff → the PR.
+Remaining: **`.6`** (honest degradation — scope widened, see below), then **`.7`** (the offline HTTP proof),
+then `Verify` → the fable-tier adversarial review of the full diff → the PR.
+
+### ⚠️ The headline exit criterion is NOT yet reachable, and M8.5.6 is what unblocks it
+
+Boot assembly delivered the token/viewer half of the local-only switch — inside a GitHub clone `--local-only`
+skips both probes and serves local reviews, verified live against a real daemon booted from a subdirectory with
+the tokens blanked (`GET /api/branches` answered 200 with the repository's real branches). **But a repository
+with no origin still refuses to start**: `DirectApiDeps` declares `github` and `repo` as **non-optional**, so
+boot must still funnel through the narrowing guard. The two ways to satisfy those types without a repo — a
+blank `{ owner: '', repo: '' }` stand-in, or a cast — are exactly what the typed-absent design exists to
+forbid, and the implementer correctly refused both rather than paper over it.
+
+Making those two deps optional **is** "a GitHub-less api degrades honestly", so it was folded into M8.5.6
+rather than given a new unit. **M8.5.7 cannot pass until it lands** — its whole premise is a repository with no
+remote.
 
 **Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
 one, and every number matched the worker's report.
