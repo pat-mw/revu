@@ -27,6 +27,7 @@
  * nothing is red rather than green.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { readFileSync } from 'node:fs'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -34,7 +35,7 @@ import { join } from 'node:path'
 import { ApiError } from '@revu/shared'
 import type { PendingComment, ReviewDraft, ReviewThread, Session } from '@revu/shared'
 import { createBunCommandRunner } from './command-runner'
-import type { CommandRunner } from './command-runner'
+import type { CommandResult, CommandRunner } from './command-runner'
 import { createFixtureRepo, type FixtureRepo } from './local-fixture-repo'
 import { createLocalReviewSurface } from './local-surface'
 import type { LocalReviewSurface } from './local-surface'
@@ -120,11 +121,11 @@ interface Harness {
  * A synced local review carrying a draft with three comments and one published
  * thread — the artifacts whose survival is the point of this file.
  */
-async function seed(): Promise<Harness> {
+async function seed(runnerOverride?: CommandRunner): Promise<Harness> {
   const fixture = await createFixtureRepo()
   const dataDir = mkdtempSync(join(tmpdir(), 'revu-resync-'))
   const real = openDirectStore({ dataDir })
-  const runner: CommandRunner = createBunCommandRunner()
+  const runner: CommandRunner = runnerOverride ?? createBunCommandRunner()
   const surfaceOver = (store: DirectStore): LocalReviewSurface =>
     createLocalReviewSurface({
       store,
@@ -328,5 +329,237 @@ describe('source corroboration, not the check', () => {
     expect(source).not.toMatch(/\.delete[A-Z]/)
     // The scanner proving itself: the pattern fires on the construct it bans.
     expect('store.deleteLocalDraft(who, id)').toMatch(/\.delete[A-Z]/)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The pin, proved against a real collection.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * A runner that swallows `update-ref` and delegates everything else.
+ *
+ * The control for the survival walk. It disables pinning without editing the
+ * module under test and without a break-and-revert dance, so both halves of the
+ * pair live permanently in the gate: one asserts the objects survive, the other
+ * asserts that without the pin they do not. A survival test with no such
+ * control passes just as happily when the feature is absent — which is exactly
+ * how this walk would fail to notice pinning being removed.
+ *
+ * It reports success rather than failure, because a failing pin is a different
+ * scenario (M8.8.2 covers it) and would let the sync take a visibly different
+ * path. Here the sync must believe it pinned.
+ */
+function unpinnedRunner(): CommandRunner {
+  const real = createBunCommandRunner()
+  return {
+    run(args: string[], opts?: { cwd?: string }): Promise<CommandResult> {
+      if (args.includes('update-ref')) {
+        return Promise.resolve({ ok: true, code: 0, stdout: '', stderr: '' })
+      }
+      return real.run(args, opts)
+    },
+  }
+}
+
+/**
+ * Rewrites the head branch so the previously synced head becomes unreachable,
+ * then collects hard.
+ *
+ * Both commands are mandatory and the order matters. `git gc --prune=now` on
+ * its own keeps unreachable objects for two weeks via the reflog, so a walk
+ * without the expiry collects nothing and passes whatever the pin does —
+ * verified against real git while writing this. `--expire-unreachable=now` is
+ * the half that actually drops the rewritten commit's entry.
+ */
+async function rewriteAndCollect(fixture: FixtureRepo): Promise<void> {
+  await git(fixture, ['checkout', '-q', fixture.headBranch])
+  await git(fixture, [
+    '-c',
+    'user.email=pin-fixture@revu.invalid',
+    '-c',
+    'user.name=Pin Fixture',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+    'commit',
+    '-q',
+    '--amend',
+    '--no-edit',
+  ])
+  await git(fixture, ['reflog', 'expire', '--expire=now', '--expire-unreachable=now', '--all'])
+  await git(fixture, ['gc', '--prune=now', '-q'])
+}
+
+/** `git cat-file -t <sha>` — the object's type, or null when it is gone. */
+async function objectType(fixture: FixtureRepo, sha: string): Promise<string | null> {
+  const runner = createBunCommandRunner()
+  const result = await runner.run(['git', 'cat-file', '-t', sha], { cwd: fixture.dir })
+  return result.ok ? result.stdout.trim() : null
+}
+
+describe('a pin keeps the reviewed objects through a collection', () => {
+  let h: Harness
+  let storedMergeBase = ''
+  let storedHead = ''
+  let storedBlobShas: string[] = []
+
+  beforeAll(async () => {
+    h = await seed()
+    const stored = h.surface.getSnapshot(h.localId)
+    if (stored === null) throw new Error('the seed did not store a snapshot')
+    storedMergeBase = stored.immutable.mergeBaseSha
+    storedHead = stored.immutable.headSha
+    storedBlobShas = Object.values(stored.immutable.blobIndex).flatMap((entry) =>
+      [entry.base, entry.head].filter((sha): sha is string => sha !== null),
+    )
+    await rewriteAndCollect(h.fixture)
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('the walk actually has objects to assert over', () => {
+    // Asserted before "every SHA survived", because an empty index satisfies
+    // that vacuously and would make the whole survival claim meaningless.
+    expect(storedBlobShas.length).toBeGreaterThan(0)
+  })
+
+  test('both ends of the stored range survive', async () => {
+    expect(await objectType(h.fixture, storedMergeBase)).toBe('commit')
+    expect(await objectType(h.fixture, storedHead)).toBe('commit')
+  }, 30_000)
+
+  test('every blob the stored snapshot indexes survives, on both sides', async () => {
+    for (const sha of storedBlobShas) {
+      expect(await objectType(h.fixture, sha)).not.toBeNull()
+    }
+  }, 60_000)
+})
+
+describe('without the pin, the same objects are collected — the control', () => {
+  let h: Harness
+  let storedHead = ''
+
+  beforeAll(async () => {
+    h = await seed(unpinnedRunner())
+    const stored = h.surface.getSnapshot(h.localId)
+    if (stored === null) throw new Error('the seed did not store a snapshot')
+    storedHead = stored.immutable.headSha
+    await rewriteAndCollect(h.fixture)
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('the previously synced head is gone', async () => {
+    // The SPECIFIC red, named rather than "at least one assertion fails". A
+    // reconcile-level check is not a reliable discriminator here: the freshly
+    // synced compare is reachable either way, and the blob cache is
+    // cache-forever, so a naive rebase-gc-reconcile walk passes with pinning
+    // entirely absent.
+    expect(await objectType(h.fixture, storedHead)).toBeNull()
+  }, 30_000)
+})
+
+/**
+ * A pending comment whose anchor text is read out of the blob the snapshot
+ * actually indexes, so the classification below is answering a real question.
+ *
+ * An anchor with empty text is fine for tests that never classify, but here it
+ * would make every comment unmatchable and the whole leg would assert that a
+ * broken fixture produces broken results.
+ */
+function anchoredOn(
+  store: DirectStore,
+  blobSha: string,
+  path: string,
+  line: number,
+): PendingComment | null {
+  const blob = store.getBlob(blobSha)
+  if (!blob || blob.binary) return null
+  const lines = blob.content.split('\n')
+  const text = lines[line - 1]
+  if (text === undefined || text.length === 0) return null
+  return {
+    key: `anchored-${path}-${line}`,
+    path,
+    side: 'RIGHT',
+    start_side: null,
+    line,
+    start_line: null,
+    body: 'A note that must survive the branch being rewritten.',
+    createdAt: NOW,
+    updatedAt: NOW,
+    anchor: {
+      lineText: text,
+      contextBefore: lines.slice(Math.max(0, line - 3), line - 1),
+      contextAfter: lines.slice(line, line + 2),
+    },
+  }
+}
+
+describe('the product-level claim: comments survive a rewrite plus a collection', () => {
+  let h: Harness
+  let results: string[] = []
+  let commentCount = 0
+
+  beforeAll(async () => {
+    h = await seed()
+    const stored = h.surface.getSnapshot(h.localId)
+    if (stored === null) throw new Error('the seed did not store a snapshot')
+
+    // Anchors taken from the indexed head blobs of as many files as carry one.
+    const comments: PendingComment[] = []
+    for (const [path, entry] of Object.entries(stored.immutable.blobIndex)) {
+      if (entry.head === null) continue
+      const comment = anchoredOn(h.store, entry.head, path, 1)
+      if (comment) comments.push(comment)
+      if (comments.length === 3) break
+    }
+    commentCount = comments.length
+    h.surface.saveDraft({
+      humanId: SESSION.human.id,
+      prNumber: h.localId,
+      headSha: stored.immutable.headSha,
+      compareKey: stored.immutable.compareKey,
+      body: 'Draft across three files.',
+      event: 'COMMENT',
+      comments,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+
+    await rewriteAndCollect(h.fixture)
+
+    // Emptying the blob cache forces the local git tier to be the ONLY producer
+    // of these bytes, the hosted tier being structurally absent from this path.
+    //
+    // Note what this leg is and is not. It is the PRODUCT claim — a reader's
+    // comments survive a rewrite plus a collection — and it is deliberately not
+    // the proof that pinning works: the freshly rewritten compare is reachable
+    // whether or not anything was pinned, so this walk would pass with the
+    // feature entirely absent. The pinned/unpinned object-survival pair above
+    // is what discriminates; this is what the discrimination is FOR.
+    const raw = new Database(join(h.dataDir, 'direct.sqlite'))
+    raw.run('DELETE FROM blobs')
+    raw.close()
+
+    const resynced = await h.surface.syncPull(h.localId)
+    expect(resynced.partial).toBeNull()
+    results = h.surface.reconcileDraft(h.localId).results.map((r) => r.kind)
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('the draft really carried comments to classify', () => {
+    expect(commentCount).toBeGreaterThan(0)
+    expect(results).toHaveLength(commentCount)
+  })
+
+  test('not one comment was reported lost', () => {
+    // The product claim. Every comment is either still where it was or moved,
+    // and none is reported gone — which is the answer a reader would have
+    // acted on by discarding text the rewrite never actually removed.
+    expect(results.filter((kind) => kind === 'lost')).toEqual([])
   })
 })
