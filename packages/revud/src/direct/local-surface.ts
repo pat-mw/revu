@@ -211,12 +211,22 @@ function clockOf(deps: LocalReviewSurfaceDeps): () => string {
 
 /**
  * The review row, or the typed not-found naming an id nothing carries. Every
- * operation that has to read the pair's refs goes through this, so an unknown id
+ * id-keyed operation on the surface goes through this FIRST, so an unknown id
  * answers identically wherever it arrives.
+ *
+ * OWNED BY THIS REPOSITORY, not merely present. The store read is keyed by the
+ * id alone, and ids are minted from one monotonic mark shared by every
+ * repository using the data directory, so the row that comes back can belong to
+ * a repository other than the one this surface serves. Such a row is refused
+ * with the SAME code and the SAME sentence an absent id answers: any
+ * distinguishable answer would confirm to one repository's caller that the id
+ * exists somewhere else, and a check that passed it would let every read and
+ * write behind it act on another repository's review with this repository's
+ * branches, worktree, clock and session.
  */
 function requireReview(deps: LocalReviewSurfaceDeps, localId: number): LocalReviewSummary {
   const review = deps.store.getLocalReview(localId)
-  if (review === null) {
+  if (review === null || review.repo !== deps.repo) {
     throw new ApiError('not_found', `No local review carries the id ${localId}.`)
   }
   return review
@@ -240,19 +250,28 @@ function requireReview(deps: LocalReviewSurfaceDeps, localId: number): LocalRevi
  * a clean exit whose output is not an object name would otherwise build a range
  * expression out of whatever git happened to print.
  *
- * A review with no recorded merge base is a WIRING failure, not a caller error,
- * and it throws a plain error rather than a typed one. Both verbs that await
- * this refuse a never-synced review before the await, so arriving here with a
- * null merge base means something called this outside those guards — and a typed
- * code would dress that up as an answer the caller could act on.
+ * FAILURES HERE SPLIT ON WHOSE FAULT THEY ARE, and the split decides the type.
+ * A missing row, a row another repository owns, and a null merge base are WIRING
+ * failures: every verb that awaits this first resolves its review through the
+ * ownership-checking guard and refuses a never-synced one, so arriving here in
+ * any of those states means something called this outside those guards — each
+ * throws a plain error, because a typed code would dress an internal miswiring
+ * up as an answer the caller could act on. A head ref that no longer resolves
+ * and a range that can no longer be counted are ORDINARY REPOSITORY STATES — a
+ * branch deleted after its review was created, a merge base rewritten or pruned
+ * away between two syncs — and each throws a typed `ApiError`, because a bare
+ * error escaping to the transport's terminal catch-all is answered as an
+ * unreachable broker on a daemon that has no broker at all.
  */
 async function resolveLocalHead(
   deps: LocalReviewSurfaceDeps,
   localId: number,
 ): Promise<{ sha: string; commitCount: number }> {
   const review = deps.store.getLocalReview(localId)
-  if (review === null) {
-    throw new Error(`local review ${localId} has no row to resolve a head against`)
+  if (review === null || review.repo !== deps.repo) {
+    throw new Error(
+      `local review ${localId} has no row in this surface's repository to resolve a head against`,
+    )
   }
   const { mergeBaseSha } = review
   if (mergeBaseSha === null) {
@@ -267,8 +286,11 @@ async function resolveLocalHead(
   })
   const sha = tip.stdout.trim()
   if (!tip.ok || !OBJECT_NAME.test(sha)) {
-    throw new Error(
-      `${review.headRef} did not resolve to a commit: git rev-parse exited ${tip.code}`,
+    throw new ApiError(
+      'not_found',
+      `The head ref ${review.headRef} of local review ${localId} did not resolve to a commit ` +
+        `(git rev-parse exited ${tip.code}). The branch has been deleted or renamed since the ` +
+        `review was created; fetch or recreate it, then try again.`,
     )
   }
 
@@ -278,8 +300,11 @@ async function resolveLocalHead(
   })
   const printed = counted.stdout.trim()
   if (!counted.ok || !DECIMAL_COUNT.test(printed)) {
-    throw new Error(
-      `the commits in ${mergeBaseSha}..${sha} could not be counted: git rev-list exited ${counted.code}`,
+    throw new ApiError(
+      'unprocessable',
+      `The commits in ${mergeBaseSha}..${sha} for local review ${localId} could not be counted ` +
+        `(git rev-list exited ${counted.code}). The recorded merge base may no longer be ` +
+        `reachable in this clone; sync the review again, then retry.`,
     )
   }
   return { sha, commitCount: Number.parseInt(printed, 10) }
@@ -476,6 +501,17 @@ async function qualifyRef(
  * resolved function, so the sink spawns nothing and cannot grow a code path that
  * does. The read half never sees a hosted client, because none exists in this
  * object to pass on.
+ *
+ * EVERY ID-KEYED VERB RESOLVES ITS REVIEW THROUGH THE SAME OWNERSHIP GUARD
+ * BEFORE TOUCHING ANYTHING ELSE. The store is shared by every repository using
+ * the data directory and every id-keyed store method reads by id alone, so a
+ * verb that went to the store directly would answer for a review some OTHER
+ * repository owns — resolve that review's refs against this repository's
+ * toplevel, stamp this repository's SHAs onto its row, and land durable threads
+ * under its id. The guard is one function and the rule is that nothing below
+ * bypasses it: reads and writes alike, including the verbs whose store read
+ * would happen to come back empty anyway, because "empty for the wrong
+ * repository" and "empty for this one" must not be distinguishable answers.
  */
 export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalReviewSurface {
   const { store } = deps
@@ -673,14 +709,20 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     },
 
     getSnapshot(localId: number): Snapshot | null {
+      // The null below is reserved for a review THIS repository owns that has
+      // never been synced; an id it does not own is refused before the read,
+      // exactly as an absent one is.
+      requireReview(deps, localId)
       return store.getLocalSnapshot(localId)
     },
 
     getDraft(localId: number): ReviewDraft | null {
+      requireReview(deps, localId)
       return store.getLocalDraft(humanId, localId)
     },
 
     saveDraft(draft: ReviewDraft): ReviewDraft {
+      requireReview(deps, draft.prNumber)
       // Rebuilt around the session's human rather than stored as it arrived.
       // Ownership never comes from the body: a draft is the single most private
       // thing this store holds, and a client-supplied id that survived to here
@@ -691,14 +733,20 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     },
 
     discardDraft(localId: number): void {
+      // Deleting an absent DRAFT stays a no-op; an absent or foreign REVIEW is
+      // still refused, so the id space this verb will touch at all is exactly
+      // the one every other verb answers for.
+      requireReview(deps, localId)
       store.deleteLocalDraft(humanId, localId)
     },
 
     reconcileDraft(localId: number): ReconcileReport {
+      requireReview(deps, localId)
       return runReconcileDraft({ store: reconcileStore, humanId }, localId)
     },
 
     getFileViewed(localId: number): FileViewedState {
+      requireReview(deps, localId)
       return store.getLocalViewed(humanId, localId)
     },
 
@@ -708,33 +756,48 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       viewed: boolean,
       blobSha: string | null,
     ): FileViewedState {
+      requireReview(deps, localId)
       const state = store.getLocalViewed(humanId, localId)
       state[path] = { viewed, blobSha, at: now() }
       store.setLocalViewed(humanId, localId, state)
       return state
     },
 
-    submitReview(input: SubmitReviewInput): Promise<SubmitResult> {
+    // The four write verbs check ownership HERE, before the sink runs: the
+    // write port deliberately carries no repository identity, so the sink
+    // cannot make this check and must never be handed an id that failed it.
+    // Each is `async` so the guard's refusal arrives as a rejection, the only
+    // failure shape a promise-returning method's callers are set up to catch.
+    async submitReview(input: SubmitReviewInput): Promise<SubmitResult> {
+      requireReview(deps, input.prNumber)
       return submitLocalReview(buildLocalWriteDeps(deps, input.prNumber), input)
     },
 
-    replyToThread(localId: number, threadId: string, body: string): Promise<ReviewComment> {
+    async replyToThread(localId: number, threadId: string, body: string): Promise<ReviewComment> {
+      requireReview(deps, localId)
       return replyToLocalThread(buildLocalWriteDeps(deps, localId), localId, threadId, body)
     },
 
-    resolveThread(localId: number, threadId: string, resolved: boolean): Promise<ReviewThread> {
+    async resolveThread(
+      localId: number,
+      threadId: string,
+      resolved: boolean,
+    ): Promise<ReviewThread> {
+      requireReview(deps, localId)
       return resolveLocalThread(buildLocalWriteDeps(deps, localId), localId, threadId, resolved)
     },
 
-    addReaction(
+    async addReaction(
       localId: number,
       commentId: number,
       reaction: ReactionKey,
     ): Promise<ReactionRollup> {
+      requireReview(deps, localId)
       return addLocalReaction(buildLocalWriteDeps(deps, localId), localId, commentId, reaction)
     },
 
     listThreads(localId: number): ReviewThread[] {
+      requireReview(deps, localId)
       return store.listLocalThreads(localId)
     },
   }

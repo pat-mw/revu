@@ -1,13 +1,13 @@
 /**
- * The assembled local review surface: what it wires together, and the four
- * wirings that are wrong in ways no type could notice.
+ * The assembled local review surface: what it wires together, and the wirings
+ * that are wrong in ways no type could notice.
  *
  * Every case here drives a REAL repository on disk through the real hardened git
- * seam and a real store, because three of the four claims below are about what
- * git was actually asked. A fake runner would let a wrongly scoped revision pass
- * as a string nobody compared against a repository.
+ * seam and a real store, because most of the claims below are about what git was
+ * actually asked. A fake runner would let a wrongly scoped revision pass as a
+ * string nobody compared against a repository.
  *
- * ## The four wirings
+ * ## The wirings
  *
  * **The write port is mapped, not spread.** Two of the port's members are named
  * differently on the durable store, so a spread of the store onto the port both
@@ -33,6 +33,21 @@
  * store and from the local clone, and from nowhere else: the provisioning call
  * omits the client entirely, so an object the clone can no longer produce is
  * REPORTED as missing rather than bought back over a network.
+ *
+ * **A review answers only the repository that owns it.** One data directory —
+ * and therefore one store — is shared by every repository, and review ids are
+ * minted from one monotonic mark across all of them, so an id-keyed verb that
+ * read the store by id alone would act on another repository's review with this
+ * repository's branches, worktree and session. Every id-keyed verb, reads and
+ * writes alike, must answer a foreign id with the same not-found an absent id
+ * answers.
+ *
+ * **Head resolution failures on ordinary repository states are typed.** A
+ * branch deleted after its review was created, and a recorded merge base the
+ * clone can no longer count from, are states a user can reach without touching
+ * this codebase. A bare error there escapes to the transport's terminal
+ * catch-all and is answered as an unreachable broker — on a daemon that has no
+ * broker at all — so both must refuse with a typed `ApiError` instead.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -1043,6 +1058,334 @@ describe('the remaining write verbs reach the local sink', () => {
     const rollup = await harness.surface.addReaction(localId, thread.comments[0].id, 'heart')
     expect(rollup.heart).toBe(1)
     expect(rollup.total_count).toBe(1)
+    harness.store.close()
+  })
+})
+
+describe('a review answers only the repository that owns it', () => {
+  /**
+   * Two surfaces over ONE store, exactly as two repositories pointing their
+   * daemons at one shared data directory produce. Both are given the SAME
+   * toplevel on purpose: branch names collide across repositories far more
+   * readily than pull-request numbers do, so the intruding repository really
+   * does carry branches spelled identically to the pair the review records —
+   * which is the state in which an unscoped store read does not merely leak a
+   * row, it resolves the other repository's refs, rewrites its SHAs, and lands
+   * durable threads under its id.
+   */
+  const OWNER_REPO = 'acme/api'
+  const INTRUDER_REPO = 'acme/web'
+  const INTRUDER_NOW = '2026-03-04T05:06:07.000Z'
+  const INTRUDER_SESSION: Session = {
+    human: {
+      id: 'mallory.finch@example.test',
+      name: 'Mallory Finch',
+      role: 'contractor',
+      email: 'mallory.finch@example.test',
+    },
+    brokerLogin: '',
+    workspace: 'local',
+  }
+
+  let store: DirectStore
+  let owner: Harness
+  let intruder: Harness
+  let victimId = 0
+  let victimSnapshot: Snapshot
+  let victimThreadId = ''
+  let victimCommentId = 0
+  /** The owning repository's durable rows, serialized before any sweep runs. */
+  let victimStateBefore = ''
+
+  /** Everything durable the owning review holds, in one comparable string. */
+  function victimStateNow(): string {
+    return JSON.stringify({
+      review: store.getLocalReview(victimId),
+      snapshot: store.getLocalSnapshot(victimId),
+      threads: store.listLocalThreads(victimId),
+    })
+  }
+
+  beforeAll(async () => {
+    store = openDirectStore({ dataDir: ':memory:' })
+    owner = makeSurface({ toplevel: fixture.dir, store, repo: OWNER_REPO })
+    intruder = makeSurface({
+      toplevel: fixture.dir,
+      store,
+      repo: INTRUDER_REPO,
+      session: INTRUDER_SESSION,
+      // A clock of its own, so any write that slipped through would stamp a
+      // timestamp the serialized-state comparison below cannot miss.
+      now: () => INTRUDER_NOW,
+    })
+    const review = await owner.surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    victimId = review.id
+    victimSnapshot = await owner.surface.syncPull(victimId)
+    await owner.surface.submitReview({
+      prNumber: victimId,
+      expectedHeadSha: victimSnapshot.immutable.headSha,
+      event: 'COMMENT',
+      body: 'One note.',
+      comments: [pendingComment(fixture.paths.modified, 2)],
+    })
+    const [thread] = owner.surface.listThreads(victimId)
+    victimThreadId = thread.id
+    victimCommentId = thread.comments[0].id
+    victimStateBefore = victimStateNow()
+  }, 30_000)
+
+  afterAll(() => {
+    store.close()
+  })
+
+  /**
+   * The verbs that carry no review id, exempt from the sweep by construction:
+   * creation has no id yet to be foreign, and the two listings are scoped at
+   * their source — the review listing by the repository key, the branch listing
+   * by reading git alone. Everything else the surface exports takes a review id
+   * somewhere in its arguments and must refuse a foreign one.
+   */
+  const ID_FREE_VERBS = ['createLocalReview', 'listBranches', 'listLocalReviews'] as const
+
+  /**
+   * One driver per id-keyed verb, each aimed at the given surface with the
+   * given review id. The thread and comment ids are the victim's REAL ones, so
+   * a verb that read the store before checking ownership would find its target
+   * and answer rather than refuse.
+   */
+  const FOREIGN_CALLS: Record<string, (surface: LocalReviewSurface, id: number) => unknown> = {
+    syncPull: (surface, id) => surface.syncPull(id),
+    getSnapshot: (surface, id) => surface.getSnapshot(id),
+    getDraft: (surface, id) => surface.getDraft(id),
+    saveDraft: (surface, id) =>
+      surface.saveDraft({
+        humanId: INTRUDER_SESSION.human.id,
+        prNumber: id,
+        headSha: victimSnapshot.immutable.headSha,
+        compareKey: victimSnapshot.immutable.compareKey,
+        body: 'Draft text aimed across repositories.',
+        event: 'COMMENT',
+        comments: [],
+        createdAt: INTRUDER_NOW,
+        updatedAt: INTRUDER_NOW,
+      }),
+    discardDraft: (surface, id) => surface.discardDraft(id),
+    reconcileDraft: (surface, id) => surface.reconcileDraft(id),
+    getFileViewed: (surface, id) => surface.getFileViewed(id),
+    setFileViewed: (surface, id) => surface.setFileViewed(id, fixture.paths.modified, true, null),
+    submitReview: (surface, id) =>
+      surface.submitReview({
+        prNumber: id,
+        expectedHeadSha: victimSnapshot.immutable.headSha,
+        event: 'COMMENT',
+        body: 'A verdict aimed across repositories.',
+        comments: [pendingComment(fixture.paths.modified, 2)],
+      }),
+    replyToThread: (surface, id) =>
+      surface.replyToThread(id, victimThreadId, 'A reply aimed across repositories.'),
+    resolveThread: (surface, id) => surface.resolveThread(id, victimThreadId, true),
+    addReaction: (surface, id) => surface.addReaction(id, victimCommentId, '+1'),
+    listThreads: (surface, id) => surface.listThreads(id),
+  }
+
+  /** How a driven verb answered, whether it threw synchronously or rejected. */
+  const refusal = (run: () => unknown): Promise<string> =>
+    Promise.resolve()
+      .then(run)
+      .then(
+        () => 'answered',
+        (error: unknown) =>
+          error instanceof ApiError ? `threw ${error.code}` : 'threw an untyped error',
+      )
+
+  /**
+   * The refusal with its code AND its sentence, the id normalized out so a
+   * foreign id's answer can be compared byte for byte against an absent one's.
+   */
+  const normalizedRefusal = (run: () => unknown, id: number): Promise<string> =>
+    Promise.resolve()
+      .then(run)
+      .then(
+        () => 'answered',
+        (error: unknown) => {
+          if (!(error instanceof ApiError)) return 'threw an untyped error'
+          return `${error.code}: ${error.message.split(String(id)).join('<id>')}`
+        },
+      )
+
+  test('every verb the surface exports is classified: swept as id-keyed, or exempt by name', () => {
+    // The sweep's coverage is derived from the surface's own key set rather
+    // than hand-listed: a verb added later lands in neither list and fails
+    // here, so it cannot ship unswept. The exemption list is deliberately
+    // short and written out — moving a verb onto it is a reviewed decision,
+    // never a default.
+    expect([...ID_FREE_VERBS, ...Object.keys(FOREIGN_CALLS)].sort()).toEqual(
+      Object.keys(owner.surface).sort(),
+    )
+  })
+
+  test('the owning repository still answers its own id', () => {
+    // The control that stops the sweep from being satisfied by a surface that
+    // refuses everything: the same id, asked through the owner, answers.
+    expect(owner.surface.getSnapshot(victimId)).not.toBeNull()
+    expect(owner.surface.listThreads(victimId)).toHaveLength(1)
+  })
+
+  test('the listing never offers another repository review', () => {
+    expect(intruder.surface.listLocalReviews()).toEqual([])
+    expect(owner.surface.listLocalReviews().map((row) => row.id)).toEqual([victimId])
+  })
+
+  test('every id-keyed verb answers a foreign id with not_found — reads and writes alike', async () => {
+    // Collected and compared in one shot rather than asserted per verb, so a
+    // verb that started answering is NAMED instead of aborting the sweep
+    // before the verbs after it are driven.
+    const outcomes: (readonly [string, string])[] = []
+    for (const [verb, call] of Object.entries(FOREIGN_CALLS)) {
+      outcomes.push([verb, await refusal(() => call(intruder.surface, victimId))])
+    }
+    expect(outcomes).toEqual(
+      Object.keys(FOREIGN_CALLS).map((verb) => [verb, 'threw not_found'] as const),
+    )
+  })
+
+  test('a foreign id is indistinguishable from an absent one, verb by verb', async () => {
+    // Any distinguishable answer — a different code, a different sentence —
+    // confirms to one repository's caller that the id exists somewhere else.
+    // Both refusals are captured with the id normalized out and compared byte
+    // for byte. The absent id sits in the review band above anything this
+    // store has minted.
+    const absentId = victimId + 5000
+    const contrasts: (readonly [string, string, string])[] = []
+    for (const [verb, call] of Object.entries(FOREIGN_CALLS)) {
+      const foreign = await normalizedRefusal(() => call(intruder.surface, victimId), victimId)
+      const absent = await normalizedRefusal(() => call(intruder.surface, absentId), absentId)
+      contrasts.push([verb, foreign, absent])
+    }
+    expect(contrasts).toEqual(contrasts.map(([verb, foreign]) => [verb, foreign, foreign]))
+    // The shared answer really is the typed not-found, not some other string
+    // both halves happen to agree on.
+    expect(contrasts.every(([, foreign]) => foreign.startsWith('not_found: '))).toBe(true)
+  })
+
+  test('the sweeps above left the owning repository review byte-identical', () => {
+    // The durable half of the claim. A refusal that answered not_found AFTER
+    // reading git and writing the store would pass every sweep above and still
+    // corrupt: the row's SHAs restamped, a thread landed under the owner's id.
+    expect(victimStateNow()).toBe(victimStateBefore)
+    // Nothing landed under the intruder's own keys either.
+    expect(store.getLocalDraft(INTRUDER_SESSION.human.id, victimId)).toBeNull()
+  })
+})
+
+describe('head resolution failures on ordinary repository states are typed', () => {
+  /**
+   * A runner that refuses only the commit count and delegates everything else,
+   * standing in for a recorded merge base the clone can no longer count from —
+   * a history rewrite or an aggressive prune between two syncs. Everything up
+   * to the count, the sync included, runs against the real repository.
+   */
+  function countBlindRunner(): CommandRunner {
+    const real = createBunCommandRunner()
+    return {
+      run(args: string[], opts?: { cwd?: string }): Promise<CommandResult> {
+        if (args.includes('rev-list') && args.includes('--count')) {
+          return Promise.resolve({ ok: false, code: 128, stdout: '', stderr: 'bad revision' })
+        }
+        return real.run(args, opts)
+      },
+    }
+  }
+
+  test('a head branch deleted after the review was created answers a typed not-found naming the ref', async () => {
+    // The transport maps any bare error to `broker_unreachable` at 500, so an
+    // untyped throw here tells the reviewer a broker is down on a daemon that
+    // has never had one. A deleted branch is an ordinary state — the review
+    // outlives the ref pair it records — and the honest answer names the ref
+    // that is gone.
+    const doomed = await createFixtureRepo()
+    const harness = makeSurface({ toplevel: doomed.dir })
+    try {
+      const review = await harness.surface.createLocalReview({
+        baseRef: doomed.baseBranch,
+        headRef: doomed.headBranch,
+      })
+      const snapshot = await harness.surface.syncPull(review.id)
+      await harness.surface.submitReview({
+        prNumber: review.id,
+        expectedHeadSha: snapshot.immutable.headSha,
+        event: 'COMMENT',
+        body: 'One note.',
+        comments: [pendingComment(doomed.paths.modified, 2)],
+      })
+      const [thread] = harness.surface.listThreads(review.id)
+      const draft = harness.surface.saveDraft({
+        humanId: SESSION.human.id,
+        prNumber: review.id,
+        headSha: snapshot.immutable.headSha,
+        compareKey: snapshot.immutable.compareKey,
+        body: 'Unsent text that must survive the failure.',
+        event: 'COMMENT',
+        comments: [],
+        createdAt: FIXED_NOW,
+        updatedAt: FIXED_NOW,
+      })
+
+      // The fixture leaves its worktree on the base branch, so the head branch
+      // deletes cleanly — the state a reviewer reaches by tidying branches
+      // after the work merged elsewhere.
+      await seedGit(doomed.dir, doomed.env, ['branch', '-q', '-D', doomed.headBranch])
+
+      const submitFailure = await harness.surface
+        .submitReview({
+          prNumber: review.id,
+          expectedHeadSha: snapshot.immutable.headSha,
+          event: 'COMMENT',
+          body: 'A verdict on a branch that is gone.',
+          comments: [],
+        })
+        .catch((cause: unknown) => cause)
+      expect(submitFailure).toBeInstanceOf(ApiError)
+      expect((submitFailure as ApiError).code).toBe('not_found')
+      expect((submitFailure as ApiError).message).toContain(`refs/heads/${doomed.headBranch}`)
+
+      const replyFailure = await harness.surface
+        .replyToThread(review.id, thread.id, 'A reply on a branch that is gone.')
+        .catch((cause: unknown) => cause)
+      expect(replyFailure).toBeInstanceOf(ApiError)
+      expect((replyFailure as ApiError).code).toBe('not_found')
+      expect((replyFailure as ApiError).message).toContain(`refs/heads/${doomed.headBranch}`)
+
+      // The failed submit cost the reviewer none of their unsent text.
+      const kept = harness.surface.getDraft(review.id)
+      expect(JSON.stringify(kept)).toBe(JSON.stringify(draft))
+    } finally {
+      harness.store.close()
+      doomed.dispose()
+    }
+  }, 30_000)
+
+  test('a compare whose commits cannot be counted answers a typed unprocessable', async () => {
+    // The other head-resolution read: `rev-parse` still answers — the branch
+    // exists — but the range from the recorded merge base cannot be counted.
+    // The sync path never asks for a count, so the same blind runner carries
+    // the whole flow up to the one read this case is about.
+    const harness = makeSurface({ toplevel: fixture.dir, runner: countBlindRunner() })
+    const { localId, snapshot } = await createdAndSynced(harness)
+    const failure = await harness.surface
+      .submitReview({
+        prNumber: localId,
+        expectedHeadSha: snapshot.immutable.headSha,
+        event: 'COMMENT',
+        body: 'A verdict over an uncountable range.',
+        comments: [],
+      })
+      .catch((cause: unknown) => cause)
+    expect(failure).toBeInstanceOf(ApiError)
+    expect((failure as ApiError).code).toBe('unprocessable')
     harness.store.close()
   })
 })
