@@ -15,14 +15,27 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 
 | unit | tier | state |
 | --- | --- | --- |
-| **OQ5 design pass** — the `LocalReviewSurface` seam + the five findings | fable | ✅ landed (spec only, no code) |
-| **M8.5.4** — boot relaxation: no origin, no token, no `GET /user` | opus | ✅ landed `5bfdf38` — 2453 pass · 1 skip · 0 fail · 91 files |
-| **M8.5.1** — band dispatch on the direct surface | opus | **dispatched** (isolated worktree) |
-| **M8.5.9** — two daemons on one data dir: the mint must wait | opus | **dispatched** (isolated worktree, disjoint files) |
+| **OQ5 design pass** — the `LocalReviewSurface` seam + the five findings | fable | ✅ spec only, no code |
+| **M8.5.4** — boot relaxation | opus | ✅ `5bfdf38` — 2453 · 1 · 0 · 91 |
+| **M8.5.1** — band dispatch on the direct surface | opus | ✅ `369af01` — 2458 · 1 · 0 · 92 |
+| **M8.5.9** — two daemons on one data dir | opus | ✅ `6a837ae` — **2460 · 1 · 0 · 92** |
+| **M8.5.10** — the local surface factory | opus | **dispatched** |
+| **M8.5.2** — create / list / branches routes | opus | **dispatched** |
 
-`.1` writes `direct-api.ts` + a new `local-surface.ts` + a new `direct-api.test.ts`; `.9` writes `store.ts` +
-`store.test.ts`. Disjoint, so they run together. Everything after them is the **router chain**, which is
-serialized — see below.
+`.10` writes `local-surface.ts` (+ its new test); `.2` writes `direct-router.ts`, `direct-router.test.ts`,
+`direct-api.ts`, `direct-api.test.ts`. Disjoint, so they run together. Remaining after them:
+**`.3` → `.8` → `.6`** on the router chain, `.5` (boot assembly, `index.ts`) once `.10` lands, then `.7`.
+
+**Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
+one, and every number matched the worker's report.
+
+### M8.5.10 was appended because the factory had no owner
+
+The ticket's M8.5.5 assembles "the local surface" and its four Check blocks all test **boot seams** — the mode
+tripwire, the requirement switch, root discovery, the startup line. None of them touches the wiring itself, so
+the factory that maps the store onto the write port, computes the head, and sources the default branch was
+assumed rather than assigned. Appended as its own unit rather than absorbed into boot wiring, where its three
+traps would have been invisible to M8.5.5's Check.
 
 ### ⚠️ The router chain is serialized, correcting the roadmap
 
