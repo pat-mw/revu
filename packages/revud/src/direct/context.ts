@@ -149,6 +149,55 @@ export interface DirectResolveOptions {
    * `user.email` still refuses to start.
    */
   requireGithub?: boolean
+  /**
+   * Where the one diagnostic this function emits goes: the line announcing that
+   * the GitHub half was shed. Defaults to `console.warn`; tests inject a capture
+   * so the line is asserted directly instead of scraped from process output.
+   */
+  log?: (message: string) => void
+}
+
+/**
+ * The safe description of a failure that shed the GitHub half: enough to tell
+ * the causes apart in a log, built ONLY from fields the code itself authored.
+ *
+ * Nothing from the error's message reaches the caller. A credential can ride in
+ * an error's free text — a credential-store reader quoting the line it read, a
+ * proxy echoing the presented token back in a response body that an HTTP error
+ * excerpts, a URL carrying the token in its userinfo. Redacting that text would
+ * be a denylist against an unbounded space of token shapes, so it is not
+ * attempted; these three admitted fields are an allowlist instead.
+ *
+ *   - The class name, and only when it is a bare identifier of bounded length.
+ *     Class names are literals in this repository's source, never built from
+ *     credential material.
+ *   - The HTTP status, and only an integer in the real response range. This is
+ *     what separates "GitHub refused the credential" from "GitHub never
+ *     answered at all".
+ *   - The errno mnemonic, and only in the SCREAMING_SNAKE shape libuv and the C
+ *     library produce. No GitHub token matches it: every issued prefix
+ *     (`ghp_`, `gho_`, `ghs_`, `github_pat_`) is lowercase.
+ *
+ * Anything outside those shapes degrades to a generic word rather than being
+ * passed through.
+ */
+function describeShedCause(err: unknown): string {
+  const parts: string[] = []
+
+  const name = err instanceof Error ? err.name : ''
+  parts.push(/^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : 'unknown error')
+
+  const status = (err as { status?: unknown }).status
+  if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) {
+    parts.push(`HTTP ${status}`)
+  }
+
+  const code = (err as { code?: unknown }).code
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9]{1,15}(_[A-Z0-9]{1,15}){0,3}$/.test(code)) {
+    parts.push(code)
+  }
+
+  return parts.join(', ')
 }
 
 /**
@@ -190,6 +239,15 @@ export async function resolveDirectContext(
   const env = opts.env ?? process.env
   const runner = opts.runner ?? createBunCommandRunner()
   const requireGithub = opts.requireGithub ?? true
+  const log = opts.log ?? console.warn
+
+  // The step whose failure shed the GitHub half, recorded rather than logged on
+  // the spot: the warning promises the daemon is continuing without GitHub, and
+  // that promise is only true once the GitHub-free session has actually been
+  // built. A shed followed by a fatal git-identity failure must not leave a
+  // "continuing" line in front of an operator whose daemon did not start.
+  let shedStep: string | undefined
+  let shedCause = ''
 
   // 1. Repo resolution. Required by default; when it is not required, an
   //    unresolvable repo is the absent GitHub half rather than a start failure.
@@ -232,6 +290,14 @@ export async function resolveDirectContext(
       // verdict refused with a false reason, every retried submit
       // double-posted. All-or-nothing: repo, client, and viewer together, or
       // none of them.
+      //
+      // Recorded only when a repo had actually resolved: with no origin there
+      // was no half to lose, and that boot is the designed local-only case
+      // rather than a degradation worth a warning.
+      if (repo !== undefined) {
+        shedStep = 'obtaining a GitHub credential'
+        shedCause = describeShedCause(err)
+      }
       repo = undefined
     }
   }
@@ -282,7 +348,12 @@ export async function resolveDirectContext(
         // Deliberately no error classification: `buildBrokerSession` re-reads
         // the identity through the same builder, so a missing git identity —
         // the one failure that must stay fatal, because the email keys drafts
-        // and viewed state — surfaces from the retry unchanged.
+        // and viewed state — surfaces from the retry unchanged. That same lack
+        // of classification is why the shed is only RECORDED here: an identity
+        // failure caught at this point is about to be raised again by the
+        // retry, and must not be announced as a daemon that carried on.
+        shedStep = 'probing the GitHub viewer'
+        shedCause = describeShedCause(err)
         repo = undefined
         github = undefined
         session = await buildBrokerSession({
@@ -310,6 +381,23 @@ export async function resolveDirectContext(
   // clone; carry it (and the runner) so the local-first blob path uses the same
   // seam startup validated against.
   const cwd = opts.cwd ?? process.cwd()
+
+  // The half was shed and the GitHub-free session stood up, so the daemon is
+  // genuinely continuing: say so once, naming the step that failed and the
+  // sanitized cause. Without this the startup line shows only the ABSENCE of a
+  // repo, which cannot tell a missing credential from a rejected one from a
+  // network that was down for the length of one probe — and reading the reason
+  // otherwise means re-running with GitHub required. The consequence is spelled
+  // out because the cause alone does not tell an operator what they now have.
+  if (shedStep !== undefined) {
+    log(
+      `revud: dropped the GitHub half while ${shedStep} (${shedCause}); continuing ` +
+        `without GitHub — this daemon serves local reviews only, and pull requests ` +
+        `stay unavailable until it is restarted against a reachable GitHub with a ` +
+        `credential it accepts.`,
+    )
+  }
+
   if (repo === undefined || github === undefined) {
     return { session, tokenSource, runner, cwd }
   }

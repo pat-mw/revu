@@ -587,3 +587,256 @@ describe('resolveDirectContext — local-only boot needs no GitHub', () => {
     expect((thrown as Error).message).toContain('git config')
   })
 })
+
+/**
+ * The shed is announced. Dropping the GitHub half turns a GitHub-capable
+ * daemon into a local-only one, and the causes an operator has to tell apart —
+ * no credential at all, a credential GitHub rejects, a GitHub that cannot be
+ * reached, an injected source failing in its own way — are invisible in the
+ * startup line, which shows only the ABSENCE of a repo. One warning names the
+ * cause and the consequence at the moment the daemon commits to continuing
+ * without GitHub.
+ *
+ * The line is built from the failure's STRUCTURE — class name, HTTP status,
+ * errno mnemonic — and never from its free text, because a credential can ride
+ * in an error message, a URL, or a header. The leak assertion below is the one
+ * that matters, so it is written to be able to fail: it first proves the
+ * token-shaped string really is in the source error.
+ */
+describe('resolveDirectContext — the shed announces itself', () => {
+  /** A diagnostics sink plus the lines it received, so nothing is read from process output. */
+  function captureLog(): { log: (message: string) => void; lines: () => string[] } {
+    const lines: string[] = []
+    return {
+      log: (message: string) => {
+        lines.push(message)
+      },
+      lines: () => lines,
+    }
+  }
+
+  /** Shaped like a real GitHub personal access token, so a leak is unmistakable. */
+  const TOKEN_SHAPED = 'ghp_0123456789abcdefghijklmnopqrstuvwxyzA'
+
+  test('a rejected credential names the rejection and the consequence', async () => {
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_stale',
+      }),
+      fetchImpl: failingFetch(401),
+      env: {},
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toHaveLength(1)
+    const line = captured.lines()[0] ?? ''
+    // The cause: which step failed, and how GitHub answered.
+    expect(line).toContain('GithubRequestError')
+    expect(line).toContain('401')
+    // The consequence: the reason alone does not tell an operator what they now have.
+    expect(line).toContain('local reviews only')
+  })
+
+  test('an unreachable GitHub reads differently from a rejected credential', async () => {
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_valid',
+      }),
+      fetchImpl: async () => {
+        throw Object.assign(new Error('fetch failed: getaddrinfo ENOTFOUND api.github.com'), {
+          code: 'ENOTFOUND',
+        })
+      },
+      env: {},
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toHaveLength(1)
+    const line = captured.lines()[0] ?? ''
+    expect(line).toContain('ENOTFOUND')
+    expect(line).toContain('local reviews only')
+    // Distinguishable from the rejected-credential line: no HTTP answer came back.
+    expect(line).not.toContain('GithubRequestError')
+  })
+
+  test('an absent credential names the absent credential, not a GitHub answer', async () => {
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: false,
+      }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toHaveLength(1)
+    const line = captured.lines()[0] ?? ''
+    expect(line).toContain('NoTokenError')
+    expect(line).toContain('local reviews only')
+  })
+
+  test('an injected source failing in its own way is a fourth, distinct line', async () => {
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({ origin: 'git@github.com:acme/revu.git', config: GOOD_CONFIG }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      tokenSource: {
+        getToken: async () => {
+          throw Object.assign(new Error('credential store unreadable'), { code: 'EACCES' })
+        },
+      },
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toHaveLength(1)
+    const line = captured.lines()[0] ?? ''
+    expect(line).toContain('EACCES')
+    // Not the typed no-token absence: an operator must not read this as "log in".
+    expect(line).not.toContain('NoTokenError')
+  })
+
+  test('a plain no-origin local-only boot says nothing', async () => {
+    // A repository with no GitHub remote is the DESIGNED case, not a
+    // degradation. Warning here would train the reader to ignore the line.
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({ origin: false, config: GOOD_CONFIG, ghToken: false }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toEqual([])
+  })
+
+  test('a boot that keeps the whole GitHub half says nothing', async () => {
+    const captured = captureLog()
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_valid',
+      }),
+      fetchImpl: viewerFetch('alice-gh'),
+      env: {},
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(ctx.repo).toEqual({ owner: 'acme', repo: 'revu' })
+    expect(captured.lines()).toEqual([])
+  })
+
+  test('the required path throws instead of warning', async () => {
+    // The operator already gets the failure as a refusal to start; a warning
+    // beside it would be a second, weaker copy of the same news.
+    const captured = captureLog()
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({
+          origin: 'git@github.com:acme/revu.git',
+          config: GOOD_CONFIG,
+          ghToken: 'gho_stale',
+        }),
+        fetchImpl: failingFetch(401),
+        env: {},
+        requireGithub: true,
+        log: captured.log,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+    expect(captured.lines()).toEqual([])
+  })
+
+  test('a token-bearing credential-source error reaches the log token-free', async () => {
+    const sourceError = Object.assign(
+      new Error(`credential store returned https://x-access-token:${TOKEN_SHAPED}@github.com`),
+      { code: 'EACCES' },
+    )
+    // Falsification: if the token-shaped string were not actually in the source
+    // error, the absence assertion below would pass for the wrong reason.
+    expect(sourceError.message).toContain(TOKEN_SHAPED)
+
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({ origin: 'git@github.com:acme/revu.git', config: GOOD_CONFIG }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      tokenSource: {
+        getToken: async () => {
+          throw sourceError
+        },
+      },
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toHaveLength(1)
+    const line = captured.lines()[0] ?? ''
+    expect(line).not.toContain(TOKEN_SHAPED)
+    // Not merely absent verbatim: no recognizable fragment of it either.
+    expect(line).not.toContain('ghp_')
+    expect(line).not.toContain('x-access-token')
+  })
+
+  test("a token echoed in GitHub's own response body never reaches the log", async () => {
+    // The viewer-probe shed's error carries a bounded excerpt of the response
+    // body, and a proxy or a misconfigured endpoint can echo the presented
+    // credential back inside it.
+    const captured = captureLog()
+    await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_stale',
+      }),
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ message: `Bad credentials: ${TOKEN_SHAPED}` }), {
+          status: 401,
+        }),
+      env: {},
+      requireGithub: false,
+      log: captured.log,
+    })
+    expect(captured.lines()).toHaveLength(1)
+    const line = captured.lines()[0] ?? ''
+    expect(line).toContain('401')
+    expect(line).not.toContain(TOKEN_SHAPED)
+    expect(line).not.toContain('ghp_')
+  })
+
+  test('an identity failure that reaches the shed is not softened into a warning', async () => {
+    // The local rebuild raises the unset `user.email` again and the daemon does
+    // NOT continue, so the "continuing without GitHub" line would be a lie.
+    const captured = captureLog()
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({
+          origin: 'git@github.com:acme/revu.git',
+          config: { 'user.name': 'Alice' },
+          ghToken: 'gho_stale',
+        }),
+        fetchImpl: failingFetch(401),
+        env: {},
+        requireGithub: false,
+        log: captured.log,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+    expect(captured.lines()).toEqual([])
+  })
+})
