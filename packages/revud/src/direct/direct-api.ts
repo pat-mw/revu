@@ -3,8 +3,10 @@ import type {
   CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
+  GhRef,
   HumanPreferences,
   LocalReviewSummary,
+  PullListItem,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -22,6 +24,7 @@ import { ApiError, isLocalReviewId } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import type { GithubClient } from './github-client'
 import type { LocalReviewSurface } from './local-surface'
+import { shortRefName, synthesizeLocalUser } from './local-sync'
 import { reconcileDraft as runReconcileDraft } from './reconcile'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
@@ -81,16 +84,41 @@ export interface DirectApi {
   readonly brokerWritesEnabled: boolean
 
   /**
-   * The conditional open-pulls list, served LIVE from the broker's ~30s poll
-   * cache (never a per-request GitHub call). `ifNoneMatch` is the client's
-   * `If-None-Match`; when it matches the cache's broker-level ETag the result is
-   * `notModified: true` with empty items (the caller replays its last-known
-   * list per the frozen 304 rule), else the full list. Present only when a poll
-   * loop is wired (broker mode): direct and mock surfaces have no poll loop, so
-   * their implementation throws a typed `not_implemented`, and the router keeps
-   * gating the route to 501 there. Throws `broker_unreachable` when the poll has
-   * no live list yet — a retriable "live data unavailable", never a fabricated
-   * empty list.
+   * Whether this api serves a review list at all: true when a broker poll loop
+   * is wired, when a local review surface is wired, or both. The router gates
+   * `GET /api/pulls` on THIS capability rather than on the deployment mode,
+   * mirroring how the broker write routes gate on `brokerWritesEnabled`.
+   *
+   * The gate is load-bearing rather than decorative, and the reason is worth
+   * stating where it can be read: `listPulls` throws a typed `not_found` when
+   * neither source is wired, and a route that dispatched into it unconditionally
+   * would serialize that as a 404 — telling a client the list does not exist,
+   * when the truth is that this daemon does not serve one. Keyed on the
+   * capability, a daemon with no list to offer keeps answering the honest
+   * `not_implemented` (501) it answers today.
+   */
+  readonly pullListEnabled: boolean
+
+  /**
+   * The conditional review list, assembled from up to two sources and never
+   * from a per-request GitHub call: the broker's ~30s poll cache, and the local
+   * reviews this daemon records for branch pairs that have no pull request.
+   * Either may be absent. When both are present the halves are MERGED — poll
+   * items in their existing order, then local reviews by id descending — and the
+   * ETag is derived from both, so a change in either invalidates a client's
+   * cached list. An ETag over one half alone would leave an inbox 304-ing
+   * forever against a change in the other.
+   *
+   * `ifNoneMatch` is the client's `If-None-Match`; when it matches the served
+   * ETag the result is `notModified: true` with empty items (the caller replays
+   * its last-known list per the frozen 304 rule), else the full list.
+   *
+   * Throws a typed `not_found` when NEITHER source is wired: this instance
+   * serves no list, which is not a promise to serve one later. The router never
+   * reaches that throw — it gates on `pullListEnabled` and answers 501 — so it
+   * is the fail-closed backstop for a direct caller. `broker_unreachable`
+   * propagates from the poll source when it has no live list yet, a retriable
+   * "live data unavailable" and never a fabricated empty list.
    */
   listPulls(ifNoneMatch: string | null): PullListResponse
 
@@ -227,9 +255,9 @@ export interface DirectApiDeps {
 
   /**
    * The broker's live pulls-list source, served from the ~30s poll cache. Wired
-   * in broker mode; ABSENT in direct and mock, where `listPulls` has no live
-   * cache and answers `not_implemented`. The api only reads from it — the loop's
-   * lifecycle (start/stop) is owned by broker boot, not by the api.
+   * in broker mode; ABSENT in direct and mock, where the review list is built
+   * from local reviews alone, or not served at all. The api only reads from it —
+   * the loop's lifecycle (start/stop) is owned by broker boot, not by the api.
    */
   pullList?: PullListSource
 
@@ -254,6 +282,148 @@ export interface DirectApiDeps {
  */
 export interface PullListSource {
   listPulls(ifNoneMatch: string | null): PullListResponse
+}
+
+/** djb2 string hash, rendered lowercase hex — the family every list ETag here uses. */
+function djb2Hex(input: string): string {
+  let hash = 5381
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash + input.charCodeAt(i)) | 0
+  }
+  return (hash >>> 0).toString(16)
+}
+
+/**
+ * The compare key a local review row currently claims: the three-dot join of its
+ * merge base and its head, the same key a snapshot is content-addressed by. A
+ * review that has never been synced holds null on both sides and so joins to
+ * `...` — a key no snapshot can match, which is exactly right, because there is
+ * no snapshot for it to match.
+ */
+function localCompareKey(review: LocalReviewSummary): string {
+  return `${review.mergeBaseSha ?? ''}...${review.headSha ?? ''}`
+}
+
+/**
+ * The ETag served for a review list, composed from the poll source's own ETag
+ * and the local reviews' compare keys. BOTH halves are always in the
+ * composition — the poll half as the empty string when no loop is wired — so a
+ * local-only list and a merged one cannot grow two different rules for it. A
+ * change in either half moves the result, which is what stops a client replaying
+ * a matching ETag from never being shown the other half's change.
+ */
+function reviewListEtag(pollEtag: string, localCompareKeys: readonly string[]): string {
+  return `W/"pulls+local:${djb2Hex(pollEtag)}:${djb2Hex(localCompareKeys.join('\n'))}"`
+}
+
+/**
+ * The allowance a list assembled without touching GitHub reports. Local reviews
+ * are read from the store and the workspace's own refs, so `used` is zero as a
+ * measured fact rather than a field nobody filled in — the shape that makes
+ * honest-error copy read "not rate limited" instead of naming an exhausted
+ * bucket. The limit is deliberately NOT GitHub's own figure, which would be a
+ * fabricated reading of an allowance this list never spent from, and the reset
+ * instant is meaningless for a bucket that never empties.
+ */
+function unspentRateLimit(): RateLimitInfo {
+  return {
+    limit: Number.MAX_SAFE_INTEGER,
+    remaining: Number.MAX_SAFE_INTEGER,
+    used: 0,
+    reset: new Date(0).toISOString(),
+  }
+}
+
+/**
+ * One local review projected into a list row: a synthesized pull summary, and
+ * the meta a row carries.
+ *
+ * The meta half is DERIVED here rather than stored:
+ *   - `authorHumanId` is null. It names the human who drove the shared App
+ *     identity when a pull request was opened, and none was opened here, so no
+ *     surface may claim one was.
+ *   - `canApprove` is true. GitHub's refusal to let an account approve its own
+ *     pull request has no local analogue, so every verdict stays available.
+ *   - `unresolvedThreads` is counted from the durable thread table, the same
+ *     source the snapshot's mutable half is rebuilt from, so the row and the
+ *     opened review cannot disagree about how much is outstanding.
+ *   - No reviewers can be assigned where there is no pull request to assign
+ *     them to.
+ *   - `checks` is ABSENT rather than empty. Nothing has reported on a branch
+ *     that was never pushed, which is neither a pass nor a failure, and the
+ *     field's absence already means precisely that.
+ *
+ * The two local-only annotations, `dirty` and `archivedPr`, are deliberately not
+ * smuggled in: the meta shape carries no field for either, and both ride the
+ * local-review summary on its own route, so no surface renders one row from two
+ * sources of truth.
+ */
+function localPullListItem(
+  surface: LocalReviewSurface,
+  session: Session,
+  review: LocalReviewSummary,
+): PullListItem {
+  const side = (ref: string, sha: string | null): GhRef => ({
+    ref: shortRefName(ref),
+    sha: sha ?? '',
+    label: shortRefName(ref),
+    // The default branch is a git read this synchronous list cannot make, and
+    // the review row records none. Empty is the same "not known" a local
+    // snapshot's own synthesized pull carries for a clone whose origin has no
+    // symbolic HEAD — a marker nobody has, rather than one invented here.
+    repo: { full_name: review.repo, default_branch: '' },
+  })
+  const snapshot = surface.getSnapshot(review.id)
+  return {
+    pull: {
+      id: review.id,
+      node_id: `local:${review.id}`,
+      number: review.id,
+      // A review superseded by a pull request has gone read-only, which is what
+      // `closed` means to every surface reading this list.
+      state: review.archivedPr === null ? 'open' : 'closed',
+      draft: false,
+      merged_at: null,
+      title: review.title,
+      body: null,
+      // The session's human: no hosted account stands behind a local review, and
+      // a display name is the only honest thing to put in the author slot.
+      user: synthesizeLocalUser(session.human.name),
+      labels: [],
+      requested_reviewers: [],
+      head: side(review.headRef, review.headSha),
+      base: side(review.baseRef, review.baseSha),
+      created_at: review.createdAt,
+      updated_at: review.updatedAt,
+    },
+    broker: {
+      authorHumanId: null,
+      canApprove: true,
+      unresolvedThreads: surface.listThreads(review.id).filter((t) => !t.isResolved).length,
+      assignedReviewerHumanIds: [],
+      compareKey: localCompareKey(review),
+      // Zero before the first sync, when no snapshot has been assembled. That is
+      // true rather than unknown: nothing has been brought under review yet.
+      commitCount: snapshot?.immutable.commits.length ?? 0,
+    },
+  }
+}
+
+/**
+ * Every local review as a list row, newest id first. The order is fixed here
+ * rather than left to the store, because the served ETag is a function of this
+ * sequence: an order that varied between two calls would move the ETag with
+ * nothing having changed, and a client would re-fetch a list it already holds.
+ */
+function localPullListItems(
+  surface: LocalReviewSurface,
+  session: Session,
+): PullListItem[] {
+  return surface
+    .listLocalReviews()
+    .slice()
+    .sort((a, b) => b.id - a.id)
+    .map((review) => localPullListItem(surface, session, review))
 }
 
 /** Build the direct-mode API surface over an injected client + durable store. */
@@ -326,21 +496,66 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     // never by default, and never from session or env shape.
     brokerWritesEnabled: writeDecorator.brokerWritesEnabled === true,
 
+    // The list capability is read off the sources actually injected, so a daemon
+    // wired with neither keeps the honest 501 the router answers for it instead
+    // of the misleading 404 the throw below would become.
+    pullListEnabled: deps.pullList !== undefined || deps.localReviews !== undefined,
+
     listPulls(ifNoneMatch: string | null): PullListResponse {
-      if (deps.pullList === undefined) {
-        // No poll loop wired: the live list is a broker-only capability. In
-        // direct mode the router never routes GET /api/pulls here at all — it
-        // falls through to the router's own `not_implemented` (501) placeholder —
-        // so this throw is reached ONLY when a broker was assembled without a
-        // pull loop (a misconfiguration). It is a typed `not_found` (404): the
-        // resource is not being served by this instance, not a promise to serve
-        // it later.
-        throw new ApiError(
-          'not_found',
-          'A live pull list is served only in broker mode.',
-        )
+      const local = deps.localReviews
+      const pollSource = deps.pullList
+      if (local === undefined) {
+        if (pollSource === undefined) {
+          // Neither source: this instance serves no list. A typed `not_found`
+          // (404) rather than `not_implemented`, which would promise the
+          // capability is coming — a daemon assembled without either source is
+          // not going to grow one mid-run. The router gates the route on
+          // `pullListEnabled` and never reaches here.
+          throw new ApiError(
+            'not_found',
+            'This daemon serves no review list: it has neither a broker poll ' +
+              'loop nor a local review surface.',
+          )
+        }
+        // The poll cache IS the served view, its ETag included, so the
+        // conditional read is delegated whole rather than re-derived around it.
+        return pollSource.listPulls(ifNoneMatch)
       }
-      return deps.pullList.listPulls(ifNoneMatch)
+
+      const localItems = localPullListItems(local, deps.session)
+      // Read back off the built rows rather than recomputed from the store, so
+      // the key the ETag is composed from and the key the client renders are the
+      // same string by construction.
+      const localKeys = localItems.map((item) => item.broker.compareKey)
+
+      if (pollSource === undefined) {
+        const etag = reviewListEtag('', localKeys)
+        if (ifNoneMatch !== null && ifNoneMatch === etag) {
+          return { items: [], etag, notModified: true, rateLimit: unspentRateLimit() }
+        }
+        return { items: localItems, etag, notModified: false, rateLimit: unspentRateLimit() }
+      }
+
+      // The client's `If-None-Match` is deliberately NOT forwarded: it conditions
+      // on the MERGED ETag, a value the poll source has never issued and could
+      // only fail to match. Asking unconditionally is what makes the poll half
+      // available to compose the merged ETag from — and composing it from both is
+      // the only thing that stops a new pull request from sitting behind a 304
+      // forever while the local half stands still.
+      const poll = pollSource.listPulls(null)
+      const etag = reviewListEtag(poll.etag, localKeys)
+      if (ifNoneMatch !== null && ifNoneMatch === etag) {
+        return { items: [], etag, notModified: true, rateLimit: poll.rateLimit }
+      }
+      return {
+        items: [...poll.items, ...localItems],
+        etag,
+        notModified: false,
+        // The live allowance, not the unspent one: the poll half really did
+        // spend from the shared bucket, and only a purely local list may claim
+        // otherwise.
+        rateLimit: poll.rateLimit,
+      }
     },
 
     // `listBranches` and `createLocalReview` are `async` so that an unwired

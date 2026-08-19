@@ -14,11 +14,15 @@
 import { describe, expect, test } from 'bun:test'
 import type {
   BranchRef,
+  CommitInfo,
   CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
+  GhRef,
   HumanPreferences,
   LocalReviewSummary,
+  PullListItem,
+  PullListResponse,
   RateLimitInfo,
   ReactionRollup,
   ReconcileReport,
@@ -35,9 +39,10 @@ import {
   LOCAL_REVIEW_ID_BASE,
   ROUTES,
   validateLocalReviewSummaries,
+  validatePullListResponse,
 } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './direct/command-runner'
-import type { DirectApi } from './direct/direct-api'
+import type { DirectApi, PullListSource } from './direct/direct-api'
 import { createDirectApi } from './direct/direct-api'
 import { throwingGithubClient } from './direct/github-write-stubs'
 import { listBranches as readGitBranches } from './direct/local-git'
@@ -57,6 +62,18 @@ const SESSION: Session = {
   viewerLogin: 'alice-gh',
 }
 
+/**
+ * A conditional-list answer with nothing in it. The items a real list carries
+ * are pinned against the REAL api further down; what this stands in for is only
+ * the transport — a 200 with an ETag header, and the 304 that replays it.
+ */
+const EMPTY_LIST: PullListResponse = {
+  items: [],
+  etag: 'W/"pulls+local:none"',
+  notModified: false,
+  rateLimit: { limit: 5000, remaining: 5000, used: 0, reset: '2026-01-01T00:00:00.000Z' },
+}
+
 /** A fake read/persist surface: no network, no disk — just enough to route against. */
 function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
   const snapshots = new Map<number, Snapshot>()
@@ -68,6 +85,10 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     // These router tests run in direct mode, where writes are gated by mode,
     // not by the broker write capability — so the fake honestly reports false.
     brokerWritesEnabled: false,
+    // No poll loop and no local surface stand behind this fake, so it serves no
+    // list at all and the route must keep answering its honest 501. A test that
+    // wants the list served overrides this alongside `listPulls`.
+    pullListEnabled: false,
     getRateLimit: async () => ({
       limit: 5000,
       remaining: 4999,
@@ -395,16 +416,28 @@ describe('handleDirectApi', () => {
     expect(body.code).toBe('persist_failed')
   })
 
-  test('a not-yet-built route (list, threads) is a 501 not_implemented', async () => {
-    for (const [method, path] of [
-      ['GET', '/api/pulls'],
-      ['GET', '/api/pulls/204/threads'],
-    ] as const) {
-      const res = await handleDirectApi(req(method, path), SESSION, fakeApi())
-      expect(res?.status).toBe(501)
-      const body = (await res?.json()) as { code: string }
-      expect(body.code).toBe('not_implemented')
-    }
+  test('the thread read stays a 501 while a list-capable api serves the pull list', async () => {
+    // The GraphQL thread read is genuinely unbuilt, and stays an honest 501.
+    const threads = await handleDirectApi(
+      req('GET', '/api/pulls/204/threads'),
+      SESSION,
+      fakeApi(),
+    )
+    expect(threads?.status).toBe(501)
+    const threadsBody = (await threads?.json()) as { code: string }
+    expect(threadsBody.code).toBe('not_implemented')
+
+    // The pull list is no longer among them: an api that declares the list
+    // capability serves it, in direct mode, with the conditional-list ETag on
+    // the response. The two live in one test because the route the capability
+    // opens and the route it must NOT open are the same shape of path.
+    const list = await handleDirectApi(
+      req('GET', '/api/pulls'),
+      SESSION,
+      fakeApi({ pullListEnabled: true, listPulls: () => EMPTY_LIST }),
+    )
+    expect(list?.status).toBe(200)
+    expect(list?.headers.get('etag')).toBe(EMPTY_LIST.etag)
   })
 
   // The allowance is GitHub's to report, not this daemon's to accumulate: every
@@ -1222,5 +1255,401 @@ describe('handleDirectApi: local reviews', () => {
     expect(body.code).toBe('not_implemented')
     expect(h.store.getLocalReview(created.id)).not.toBeNull()
     h.close()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The pull list — the capability gate, and local reviews as list rows
+// ————————————————————————————————————————————————————————————————
+
+const LOCAL_ID_A = LOCAL_REVIEW_ID_BASE
+const LOCAL_ID_B = LOCAL_REVIEW_ID_BASE + 1
+
+/** A stored local review row, with every field the list reads spelled out. */
+function localRow(id: number, over: Partial<LocalReviewSummary> = {}): LocalReviewSummary {
+  return {
+    id,
+    repo: LOCAL_REPO,
+    baseRef: MAIN_REF,
+    headRef: FEATURE_REF,
+    title: `review ${id}`,
+    baseSha: MAIN_SHA,
+    mergeBaseSha: MERGE_BASE_SHA,
+    headSha: FEATURE_SHA,
+    dirty: false,
+    archivedPr: null,
+    createdAt: LOCAL_NOW,
+    updatedAt: LOCAL_NOW,
+    lastSyncedAt: LOCAL_NOW,
+    ...over,
+  }
+}
+
+function localThread(id: string, isResolved: boolean): ReviewThread {
+  return {
+    id,
+    isResolved,
+    isOutdated: false,
+    path: 'a.ts',
+    line: 1,
+    originalLine: 1,
+    startLine: null,
+    originalStartLine: null,
+    diffSide: 'RIGHT',
+    startDiffSide: null,
+    subjectType: 'LINE',
+    resolvedBy: null,
+    comments: [],
+  }
+}
+
+function commit(index: number): CommitInfo {
+  return {
+    sha: `${index}`.padStart(40, '0'),
+    commit: {
+      message: `commit ${index}`,
+      author: { name: 'Alice', email: 'alice@x.io', date: LOCAL_NOW },
+    },
+    author: null,
+    parents: [],
+  }
+}
+
+/** A stored local snapshot whose only interesting property is its commit count. */
+function localSnapshotOf(localId: number, commits: number): Snapshot {
+  return {
+    prNumber: localId,
+    syncedAt: LOCAL_NOW,
+    partial: null,
+    syncStats: { blobsFetched: 0, blobsReused: 0, requests: 0 },
+    immutable: {
+      compareKey: `${MERGE_BASE_SHA}...${FEATURE_SHA}`,
+      mergeBaseSha: MERGE_BASE_SHA,
+      headSha: FEATURE_SHA,
+      files: [],
+      blobIndex: {},
+      commits: Array.from({ length: commits }, (_, i) => commit(i)),
+    },
+    mutable: {
+      fetchedAt: LOCAL_NOW,
+      pull: { number: localId } as Snapshot['mutable']['pull'],
+      threads: [],
+      issueComments: [],
+      reviews: [],
+      checks: [],
+    },
+  }
+}
+
+/**
+ * The three reads the pull list makes of a local surface, over state a test can
+ * move BETWEEN two requests — which is what makes "the etag followed the local
+ * half" an observation rather than a restatement of how it was built.
+ */
+interface LocalListWorld {
+  reviews: LocalReviewSummary[]
+  threads: Map<number, ReviewThread[]>
+  snapshots: Map<number, Snapshot>
+}
+
+function localListWorld(reviews: LocalReviewSummary[]): LocalListWorld {
+  return { reviews, threads: new Map(), snapshots: new Map() }
+}
+
+/**
+ * A local surface serving only what a list row is built from. Every other
+ * method throws, so a list assembled through one of them fails loudly rather
+ * than quietly returning a plausible value.
+ */
+function listOnlyLocalSurface(world: LocalListWorld): LocalReviewSurface {
+  const unused = (name: string): never => {
+    throw new Error(`the pull-list tests do not exercise ${name}`)
+  }
+  return {
+    listLocalReviews: (): LocalReviewSummary[] => world.reviews.map((r) => ({ ...r })),
+    listThreads: (localId: number): ReviewThread[] => world.threads.get(localId) ?? [],
+    getSnapshot: (localId: number): Snapshot | null => world.snapshots.get(localId) ?? null,
+    createLocalReview: () => unused('createLocalReview'),
+    listBranches: () => unused('listBranches'),
+    syncPull: () => unused('syncPull'),
+    getDraft: () => unused('getDraft'),
+    saveDraft: () => unused('saveDraft'),
+    discardDraft: () => unused('discardDraft'),
+    reconcileDraft: () => unused('reconcileDraft'),
+    getFileViewed: () => unused('getFileViewed'),
+    setFileViewed: () => unused('setFileViewed'),
+    submitReview: () => unused('submitReview'),
+    replyToThread: () => unused('replyToThread'),
+    resolveThread: () => unused('resolveThread'),
+    addReaction: () => unused('addReaction'),
+  }
+}
+
+/** The poll loop's served view, over an etag a test can move between requests. */
+interface PollWorld {
+  etag: string
+  items: PullListItem[]
+}
+
+const POLL_RATE_LIMIT: RateLimitInfo = {
+  limit: 5000,
+  remaining: 4321,
+  used: 679,
+  reset: '2026-03-01T00:00:00.000Z',
+}
+
+function pollSourceOver(world: PollWorld): PullListSource {
+  return {
+    listPulls(ifNoneMatch: string | null): PullListResponse {
+      if (ifNoneMatch !== null && ifNoneMatch === world.etag) {
+        return { items: [], etag: world.etag, notModified: true, rateLimit: POLL_RATE_LIMIT }
+      }
+      return {
+        items: world.items,
+        etag: world.etag,
+        notModified: false,
+        rateLimit: POLL_RATE_LIMIT,
+      }
+    },
+  }
+}
+
+function remoteRef(ref: string, sha: string): GhRef {
+  return { ref, sha, label: `o:${ref}`, repo: { full_name: LOCAL_REPO, default_branch: 'main' } }
+}
+
+/** A pull-request row of the kind the poll loop serves. */
+function remoteItem(number: number): PullListItem {
+  return {
+    pull: {
+      id: number,
+      node_id: `PR_${number}`,
+      number,
+      state: 'open',
+      draft: false,
+      merged_at: null,
+      title: `pull ${number}`,
+      body: null,
+      user: {
+        login: 'carol',
+        id: 9,
+        node_id: '',
+        avatar_url: '',
+        html_url: '',
+        type: 'User',
+      },
+      labels: [],
+      requested_reviewers: [],
+      head: remoteRef('feature', 'e'.repeat(40)),
+      base: remoteRef('main', MAIN_SHA),
+      created_at: LOCAL_NOW,
+      updated_at: LOCAL_NOW,
+    },
+    broker: {
+      authorHumanId: 'bob@x.io',
+      canApprove: true,
+      unresolvedThreads: 1,
+      assignedReviewerHumanIds: ['alice@x.io'],
+      compareKey: `${MERGE_BASE_SHA}...${'e'.repeat(40)}`,
+      commitCount: 3,
+    },
+  }
+}
+
+/** The api under test, assembled with whichever list sources a case needs. */
+function listApi(sources: {
+  store: DirectStore
+  local?: LocalListWorld
+  poll?: PollWorld
+}): DirectApi {
+  return createDirectApi({
+    session: SESSION,
+    github: throwingGithubClient(),
+    repo: LOCAL_REPO_REF,
+    store: sources.store,
+    ...(sources.local ? { localReviews: listOnlyLocalSurface(sources.local) } : {}),
+    ...(sources.poll ? { pullList: pollSourceOver(sources.poll) } : {}),
+  })
+}
+
+async function getList(
+  api: DirectApi,
+  etag?: string,
+  mode?: 'direct' | 'broker',
+): Promise<Response> {
+  const request = new Request('http://localhost/api/pulls', {
+    method: 'GET',
+    ...(etag === undefined ? {} : { headers: { 'if-none-match': etag } }),
+  })
+  const res = await handleDirectApi(request, SESSION, api, mode)
+  expect(res).not.toBeNull()
+  return res as Response
+}
+
+describe('handleDirectApi: the pull list', () => {
+  test('an api with neither a poll loop nor a local surface still answers 501', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const api = listApi({ store })
+    const res = await getList(api)
+    expect(res.status).toBe(501)
+    expect(((await res.json()) as { code: string }).code).toBe('not_implemented')
+
+    // The landmine this guards, pinned as an independent observation rather
+    // than inferred from the status above: the api underneath throws a typed
+    // `not_found`, which the error envelope renders as a 404. Only the
+    // capability gate keeps the route from reaching it, so a naive removal of
+    // the gate turns today's honest 501 into a misleading "no such resource".
+    expect(api.pullListEnabled).toBe(false)
+    let thrown: unknown = null
+    try {
+      api.listPulls(null)
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(ApiError)
+    expect((thrown as ApiError).code).toBe('not_found')
+    store.close()
+  })
+
+  test('a local review becomes a list row with a complete broker meta', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const world = localListWorld([localRow(LOCAL_ID_A)])
+    world.threads.set(LOCAL_ID_A, [
+      localThread('t1', false),
+      localThread('t2', true),
+      localThread('t3', false),
+    ])
+    world.snapshots.set(LOCAL_ID_A, localSnapshotOf(LOCAL_ID_A, 4))
+    const api = listApi({ store, local: world })
+
+    const res = await getList(api)
+    expect(res.status).toBe(200)
+    // Validated against the frozen contract shape, so a meta missing a required
+    // field is caught here rather than by whatever renders it.
+    const body = validatePullListResponse(await res.json())
+    expect(body.items.length).toBe(1)
+    const item = body.items[0]
+
+    expect(item.pull.number).toBe(LOCAL_ID_A)
+    expect(item.pull.title).toBe(`review ${LOCAL_ID_A}`)
+    expect(item.pull.state).toBe('open')
+
+    expect(item.broker.authorHumanId).toBeNull()
+    // No self-review rule applies to a review of a local branch pair.
+    expect(item.broker.canApprove).toBe(true)
+    // Counted from the local threads, not carried on the row.
+    expect(item.broker.unresolvedThreads).toBe(2)
+    expect(item.broker.compareKey).toBe(`${MERGE_BASE_SHA}...${FEATURE_SHA}`)
+    expect(item.broker.commitCount).toBe(4)
+    // ABSENT, not empty: nothing has reported on a branch that was never
+    // pushed, which is neither a pass nor a failure.
+    expect(item.broker.checks).toBeUndefined()
+    expect('checks' in item.broker).toBe(false)
+    // The two local-only annotations ride the local-review summary instead, so
+    // no surface renders a row from two sources of truth.
+    expect('dirty' in item.broker).toBe(false)
+    expect('archivedPr' in item.broker).toBe(false)
+
+    // Nothing was spent to assemble this, so the honest-error copy reads "not
+    // rate limited" rather than borrowing a GitHub reading this never took.
+    expect(body.rateLimit.used).toBe(0)
+    expect(body.rateLimit.remaining).toBeGreaterThan(0)
+    expect(body.notModified).toBe(false)
+    store.close()
+  })
+
+  test('replaying the list etag is a BODILESS 304 with the etag echoed', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const world = localListWorld([localRow(LOCAL_ID_A)])
+    const api = listApi({ store, local: world })
+
+    const first = await getList(api)
+    expect(first.status).toBe(200)
+    const etag = first.headers.get('etag') as string
+    expect(etag).toBeTruthy()
+    await first.body?.cancel()
+
+    const replay = await getList(api, etag)
+    expect(replay.status).toBe(304)
+    expect(replay.headers.get('etag')).toBe(etag)
+    // A 304 carries NO body — a status assertion alone would pass on a 304 that
+    // shipped the whole list anyway.
+    expect(await replay.text()).toBe('')
+    store.close()
+  })
+
+  test('GET /api/pulls/<localId>/threads is a 501 even on a list-capable api', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const api = listApi({ store, local: localListWorld([localRow(LOCAL_ID_A)]) })
+    const res = await handleDirectApi(
+      req('GET', `/api/pulls/${LOCAL_ID_A}/threads`),
+      SESSION,
+      api,
+    )
+    // Local threads ride the snapshot's mutable half. A second thread read that
+    // could disagree with the snapshot the client is already rendering is two
+    // sources of truth for one set of threads, so the route stays unserved.
+    expect(res?.status).toBe(501)
+    const body = (await res?.json()) as { code: string }
+    expect(body.code).toBe('not_implemented')
+    store.close()
+  })
+
+  test('the merged list carries both halves, and either half moves the etag', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const poll: PollWorld = { etag: 'W/"upstream-1"', items: [remoteItem(101), remoteItem(102)] }
+    const world = localListWorld([localRow(LOCAL_ID_A), localRow(LOCAL_ID_B)])
+    const api = listApi({ store, local: world, poll })
+
+    const first = await getList(api, undefined, 'broker')
+    expect(first.status).toBe(200)
+    const etag1 = first.headers.get('etag') as string
+    const body1 = validatePullListResponse(await first.json())
+    // Poll-loop items in their existing order, then local reviews by id
+    // descending — one deterministic order, so the etag is a function of the
+    // list rather than of the order two sources happened to answer in.
+    expect(body1.items.map((it) => it.pull.number)).toEqual([
+      101,
+      102,
+      LOCAL_ID_B,
+      LOCAL_ID_A,
+    ])
+    // The broker half keeps the live allowance; only a purely local list can
+    // honestly claim nothing was spent.
+    expect(body1.rateLimit.used).toBe(POLL_RATE_LIMIT.used)
+
+    const idle = await getList(api, etag1, 'broker')
+    expect(idle.status).toBe(304)
+    await idle.body?.cancel()
+
+    // Move ONLY the local half.
+    world.reviews[1] = localRow(LOCAL_ID_B, { headSha: 'f'.repeat(40) })
+    const afterLocal = await getList(api, etag1, 'broker')
+    expect(afterLocal.status).toBe(200)
+    const etag2 = afterLocal.headers.get('etag') as string
+    expect(etag2).not.toBe(etag1)
+    await afterLocal.body?.cancel()
+    expect((await getList(api, etag2, 'broker')).status).toBe(304)
+
+    // Move ONLY the poll half. An inbox that 304s forever and never shows a new
+    // pull request is exactly what an etag derived from the local half alone
+    // would produce here.
+    poll.etag = 'W/"upstream-2"'
+    poll.items = [...poll.items, remoteItem(103)]
+    const afterPoll = await getList(api, etag2, 'broker')
+    expect(afterPoll.status).toBe(200)
+    const etag3 = afterPoll.headers.get('etag') as string
+    expect(etag3).not.toBe(etag2)
+    expect(etag3).not.toBe(etag1)
+    const body3 = validatePullListResponse(await afterPoll.json())
+    expect(body3.items.map((it) => it.pull.number)).toEqual([
+      101,
+      102,
+      103,
+      LOCAL_ID_B,
+      LOCAL_ID_A,
+    ])
+    expect((await getList(api, etag3, 'broker')).status).toBe(304)
+    store.close()
   })
 })

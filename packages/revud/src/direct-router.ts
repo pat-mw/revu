@@ -83,10 +83,17 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  * rejection is what makes the value safe, and it happens before the value is
  * passed on at all.
  *
- * Routes that belong to the not-yet-built GraphQL thread read and rate-limit
- * still answer a typed `not_implemented` (501). Unknown API paths 404; non-API
- * paths return `null` so the caller serves static assets. There is no mock and
- * no dev panel in direct mode.
+ * `GET /api/pulls` is served whenever the api declares the list capability
+ * (`api.pullListEnabled`) — a broker poll cache, a local review surface, or both
+ * merged into one conditional list. The gate is the capability rather than the
+ * deployment mode, so a direct daemon that records local reviews can list them,
+ * while an api carrying no list source at all keeps the honest
+ * `not_implemented` (501) instead of the 404 its `listPulls` would throw.
+ *
+ * Routes that belong to the not-yet-built GraphQL thread read still answer a
+ * typed `not_implemented` (501). Unknown API paths 404; non-API paths return
+ * `null` so the caller serves static assets. There is no mock and no dev panel
+ * in direct mode.
  *
  * The session is captured at startup and never re-derived per request: identity
  * is fixed for the daemon's life and no request can influence it.
@@ -107,12 +114,18 @@ function errorJson(code: string, message: string, status: number): Response {
 
 /**
  * The routes the not-yet-built parts of the surface own. They stay `501` until
- * the GraphQL thread read (`listReviewThreads`) and the rate-limit read
- * (`getRateLimit`) land. The write path (submitReview, replyToThread,
- * resolveThread, addReaction), `getBlob` (a content-addressed store read), and
- * `reconcileDraft` (a pure read of snapshot + draft state) are all served below.
- * `listPulls` is served LIVE from the poll cache in broker mode; in direct mode
- * it has no poll loop and falls through to the honest 501 placeholder below.
+ * the GraphQL thread read (`listReviewThreads`) lands. The write path
+ * (submitReview, replyToThread, resolveThread, addReaction), `getBlob` (a
+ * content-addressed store read), the rate-limit read and `reconcileDraft` (a
+ * pure read of snapshot + draft state) are all served below.
+ *
+ * `listReviewThreads` stays here for local reviews too, and not merely for want
+ * of an implementation: local threads ride the mutable half of the snapshot, so
+ * a second, separately served read of them could disagree with the snapshot the
+ * client is already rendering — two sources of truth for one set of threads.
+ *
+ * `listPulls` is NOT here. It is served below whenever the api carries a list
+ * source, and falls through to the honest 501 only when it carries none.
  */
 const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
   ROUTES.listReviewThreads.path,
@@ -356,13 +369,20 @@ export async function handleDirectApi(
   }
 
   try {
-    // ——— listPulls: GET /api/pulls, conditional, served from the broker poll
-    // cache. Honors CONDITIONAL_LIST_304_RULE: the client sends If-None-Match,
-    // the server emits an ETag on the 200 and replies a bodiless 304 when the
-    // ETag matches. Served ONLY in broker mode (direct mode has no poll loop, so
-    // the route falls through to the 501 placeholder below). ———
+    // ——— listPulls: GET /api/pulls, conditional, served from whichever list
+    // sources the api carries — the broker poll cache, the local reviews, or
+    // both merged. Honors CONDITIONAL_LIST_304_RULE: the client sends
+    // If-None-Match, the server emits an ETag on the 200 and replies a bodiless
+    // 304 when the ETag matches.
+    //
+    // Gated on the api's CAPABILITY, never on the deployment mode. Keyed on mode,
+    // a direct daemon that does serve local reviews could not list them; keyed on
+    // nothing, an api with no list source at all would be handed the request and
+    // answer the typed `not_found` its `listPulls` throws — a 404 claiming the
+    // resource does not exist, where the honest answer is that this daemon does
+    // not serve one. The flag keeps the 501 below for exactly that case. ———
     if (
-      mode === 'broker' &&
+      api.pullListEnabled &&
       method === ROUTES.listPulls.method &&
       path === ROUTES.listPulls.path
     ) {

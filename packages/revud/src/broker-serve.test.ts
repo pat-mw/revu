@@ -60,6 +60,9 @@ function stubApi(): DirectApi {
     // No broker write decorator behind this stub, so it honestly lacks the
     // broker write capability; these serve tests exercise reads only.
     brokerWritesEnabled: false,
+    // No poll loop and no local reviews behind it either, so it serves no
+    // review list and `GET /api/pulls` keeps its honest 501.
+    pullListEnabled: false,
     getRateLimit: async () => ({
       limit: 5000,
       remaining: 4999,
