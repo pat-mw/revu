@@ -100,6 +100,27 @@ export interface DirectApi {
   readonly pullListEnabled: boolean
 
   /**
+   * Whether this api has a GitHub repository to address: true only when a repo
+   * and a client for it were BOTH injected. A daemon that resolved no
+   * repository — a boot for reviews of local branch pairs, which needs no
+   * origin, no token and no viewer — reports false.
+   *
+   * The router gates the GitHub-only surfaces on THIS capability, the same way
+   * it gates the pull list and the broker writes on theirs. The gate is the
+   * only thing standing between such a daemon and the methods below that need a
+   * repository: they narrow their dependencies and throw when the half is
+   * missing, which the router's terminal catch-all would render as
+   * `broker_unreachable` (500) — a broker outage reported to a deployment whose
+   * premise is that it has no broker.
+   *
+   * The capability is NOT a statement about the local band. The `:n` routes and
+   * the snapshot read serve a review of a local branch pair with no GitHub
+   * involved at all, so the router's refusal is decided per REVIEW rather than
+   * per route.
+   */
+  readonly githubEnabled: boolean
+
+  /**
    * The conditional review list, assembled from up to two sources and never
    * from a per-request GitHub call: the broker's ~30s poll cache, and the local
    * reviews this daemon records for branch pairs that have no pull request.
@@ -237,8 +258,21 @@ export interface DirectApi {
 
 export interface DirectApiDeps {
   session: Session
-  github: GithubClient
-  repo: RepoRef
+  /**
+   * The GitHub half: the repository every request path is built from, and the
+   * client that addresses it. Both are present together or absent together —
+   * a daemon that resolved no repository has no client to build one for.
+   *
+   * ABSENT when this daemon reviews local branch pairs and nothing else: such a
+   * boot has no origin, no token and no viewer. The absence is a TYPE, never a
+   * blank `{ owner: '', repo: '' }` stand-in — a stand-in builds request paths
+   * like `/repos///pulls/204`, which GitHub answers 404 with a message blaming
+   * the pull request rather than the missing repository. Every GitHub-backed
+   * surface narrows instead of interpolating, and the router refuses the routes
+   * that would need one before they are reached.
+   */
+  github?: GithubClient
+  repo?: RepoRef
   store: DirectStore
   /** Runs `git cat-file` for the local-first blob provider. Omit to skip local git. */
   runner?: CommandRunner
@@ -480,15 +514,62 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     return deps.localReviews
   }
 
-  /** The invariant bundle every write operation shares. */
-  const writeDeps = {
-    github: deps.github,
-    repo: deps.repo,
+  /**
+   * The GitHub client, or a refusal. A rate-limit read is scoped to the
+   * CREDENTIAL and names no repository, so it needs this half alone.
+   *
+   * Unreachable by construction: the router refuses every route that lands here
+   * before dispatching, keyed on `githubEnabled`. It is therefore an invariant
+   * guard rather than a contract answer, and it throws a plain error on purpose
+   * — a typed `ApiError` would serialize into a plausible-looking contract
+   * response and let a hole in the router's gate pass for a considered answer.
+   */
+  const githubClient = (): GithubClient => {
+    if (deps.github === undefined) {
+      throw new Error(
+        'This daemon was assembled without a GitHub client; the router must ' +
+          'refuse every GitHub-backed route before it reaches this surface.',
+      )
+    }
+    return deps.github
+  }
+
+  /**
+   * The repository and the client together — what every request path against
+   * GitHub is built from. Guarded for the same reason, and in the same way, as
+   * the client alone.
+   */
+  const githubTarget = (): { github: GithubClient; repo: RepoRef } => {
+    const repo = deps.repo
+    if (repo === undefined) {
+      throw new Error(
+        'This daemon resolved no GitHub repository; the router must refuse ' +
+          'every GitHub-backed route before it reaches this surface.',
+      )
+    }
+    return { github: githubClient(), repo }
+  }
+
+  /**
+   * The invariant bundle every write operation shares. Built per call rather
+   * than once, so a daemon with no repository can be assembled at all: the
+   * local band never reads it, and the GitHub band cannot be reached without
+   * one.
+   */
+  const writeDeps = (): {
+    github: GithubClient
+    repo: RepoRef
+    store: DirectStore
+    session: Session
+    writeDecorator: WriteDecorator
+    now?: () => string
+  } => ({
+    ...githubTarget(),
     store: deps.store,
     session: deps.session,
     writeDecorator,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
-  }
+  })
 
   return {
     // The capability is read off the decorator actually injected, so it can be
@@ -500,6 +581,12 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     // wired with neither keeps the honest 501 the router answers for it instead
     // of the misleading 404 the throw below would become.
     pullListEnabled: deps.pullList !== undefined || deps.localReviews !== undefined,
+
+    // Read off the halves actually injected, and off BOTH of them: a client
+    // with no repository can address nothing, and a repository with no client
+    // cannot be asked about. Either alone would let the router dispatch into a
+    // surface that then fails on the other.
+    githubEnabled: deps.github !== undefined && deps.repo !== undefined,
 
     listPulls(ifNoneMatch: string | null): PullListResponse {
       const local = deps.localReviews
@@ -581,8 +668,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       if (local !== null) return local.syncPull(prNumber)
       return runSyncPull(
         {
-          github: deps.github,
-          repo: deps.repo,
+          ...githubTarget(),
           store: deps.store,
           ...(deps.runner !== undefined ? { runner: deps.runner } : {}),
           ...(deps.cwd !== undefined ? { cwd: deps.cwd } : {}),
@@ -593,7 +679,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     },
 
     async getRateLimit(): Promise<RateLimitInfo> {
-      return deps.github.getRateLimit()
+      return githubClient().getRateLimit()
     },
 
     getSnapshot(prNumber: number): Snapshot | null {
@@ -685,7 +771,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     async submitReview(input: SubmitReviewInput): Promise<SubmitResult> {
       const local = localFor(input.prNumber)
       if (local !== null) return local.submitReview(input)
-      return runSubmitReview(writeDeps, input)
+      return runSubmitReview(writeDeps(), input)
     },
 
     async replyToThread(
@@ -695,7 +781,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     ): Promise<ReviewComment> {
       const local = localFor(prNumber)
       if (local !== null) return local.replyToThread(prNumber, threadId, body)
-      return runReplyToThread(writeDeps, prNumber, threadId, body)
+      return runReplyToThread(writeDeps(), prNumber, threadId, body)
     },
 
     async resolveThread(
@@ -705,7 +791,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     ): Promise<ReviewThread> {
       const local = localFor(prNumber)
       if (local !== null) return local.resolveThread(prNumber, threadId, resolved)
-      return runResolveThread(writeDeps, prNumber, threadId, resolved)
+      return runResolveThread(writeDeps(), prNumber, threadId, resolved)
     },
 
     // The band branch is on the REVIEW id only. `commentId` is never classified:
@@ -719,7 +805,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     ): Promise<ReactionRollup> {
       const local = localFor(prNumber)
       if (local !== null) return local.addReaction(prNumber, commentId, reaction)
-      return runAddReaction(writeDeps, prNumber, commentId, reaction)
+      return runAddReaction(writeDeps(), prNumber, commentId, reaction)
     },
   }
 }

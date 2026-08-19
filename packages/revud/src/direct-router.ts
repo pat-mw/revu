@@ -98,6 +98,17 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  * while an api carrying no list source at all keeps the honest
  * `not_implemented` (501) instead of the 404 its `listPulls` would throw.
  *
+ * A daemon may hold no GitHub repository at all — a boot for reviews of local
+ * branch pairs needs no origin, no token and no viewer — and every route only
+ * GitHub can answer is then refused with `not_implemented` (501) and a message
+ * naming the missing repository: `getRateLimit`, and `syncPull`, `getSnapshot`
+ * and the four writes for a PULL REQUEST id. The gate reads `api.githubEnabled`
+ * and is decided per REVIEW, so a local id passes through untouched and the
+ * feature the deployment exists for keeps working. Without the gate these land
+ * in the terminal catch-all as `broker_unreachable` (500) — a broker outage
+ * reported to a deployment that has no broker — or, worse, as a 200 `null`
+ * snapshot inviting a sync that can never succeed.
+ *
  * Routes that belong to the not-yet-built GraphQL thread read still answer a
  * typed `not_implemented` (501). Unknown API paths 404; non-API paths return
  * `null` so the caller serves static assets. There is no mock and no dev panel
@@ -177,6 +188,45 @@ const BROKER_GATED_PULL_WRITE_ROUTES: readonly {
 }[] = [ROUTES.submitReview, ROUTES.replyToThread, ROUTES.resolveThread]
 
 /**
+ * The routes whose owning review is a PATH parameter and that only GitHub can
+ * answer, refused — before the request body is read — whenever the api carries
+ * no GitHub repository AND the request names a pull request.
+ *
+ * A daemon may be assembled with no repository at all: reviewing two local
+ * branches needs no origin, no token and no viewer, so a boot in a repository
+ * without an `origin` remote resolves the GitHub half as typed-absent. Every
+ * route here would then reach a surface that cannot build a request path, and
+ * the failure would arrive as the router's terminal catch-all —
+ * `broker_unreachable` (500), which reports a broker outage to a deployment
+ * whose entire premise is that it has no broker. Worse answers hide behind the
+ * same fall-through: a snapshot read for a pull request that can never be
+ * synced returns a JSON `null` (200) meaning "not synced yet, sync it", and a
+ * thread reply 404s blaming the thread.
+ *
+ * Every one of these serves a review of a local branch pair with no GitHub
+ * involved, so the refusal is decided per REVIEW exactly as the reads-only
+ * broker gate is: a local id passes straight through. An id that fails to parse
+ * is not local and is refused here, so an unreadable id cannot open a gate a
+ * readable one would close.
+ *
+ * `getRateLimit` is absent because it carries no review id to band — the
+ * allowance belongs to the credential — and is refused unconditionally below.
+ * `addReaction` is absent for the same structural reason it is absent from the
+ * broker table: its route carries only a comment id, so it is refused inside
+ * its own handler against the one review binding resolved there.
+ */
+const GITHUB_ONLY_PULL_ROUTES: readonly {
+  method: string
+  path: string
+}[] = [
+  ROUTES.syncPull,
+  ROUTES.getSnapshot,
+  ROUTES.submitReview,
+  ROUTES.replyToThread,
+  ROUTES.resolveThread,
+]
+
+/**
  * Match a request path against a route template, returning captured `:param`
  * values, or `null` when the template does not match. `/api/pulls/204/sync`
  * against `/api/pulls/:n/sync` yields `{ n: '204' }`.
@@ -236,6 +286,30 @@ function readsOnlyBrokerRefusal(method: string, path: string): Response {
       message:
         `${method} ${path} is not available: this broker has no bot identity ` +
         '(REVU_BOT_LOGIN) configured, so it is reads-only.',
+    },
+    501,
+  )
+}
+
+/**
+ * The refusal a daemon with no GitHub repository answers a GitHub-bound route
+ * with: an honest `not_implemented` (501) naming the missing repository, so the
+ * reader learns what this daemon is rather than hunting for an outage.
+ *
+ * It shares `readsOnlyBrokerRefusal`'s raw-envelope shape for the same reason:
+ * `not_implemented` is not a member of the contract's `ApiErrorCode` union and
+ * has no entry in the status map, so it is emitted directly rather than thrown
+ * as a typed `ApiError`.
+ *
+ * `path` is the URL pathname; a query string is deliberately not echoed.
+ */
+function noGithubRepositoryRefusal(method: string, path: string): Response {
+  return json(
+    {
+      code: 'not_implemented',
+      message:
+        `${method} ${path} is not available: this daemon has no GitHub repository ` +
+        'configured, so it serves reviews of local branches only.',
     },
     501,
   )
@@ -418,6 +492,30 @@ export async function handleDirectApi(
       const params = matchRoute(route.path, path)
       if (params !== null && !namesLocalReview(prNumberOf(params))) {
         return readsOnlyBrokerRefusal(method, path)
+      }
+    }
+  }
+
+  // A daemon with no GitHub repository refuses the routes only GitHub can
+  // answer, before any of them reaches a surface that cannot build a request
+  // path. Keyed on the api's CAPABILITY rather than on the deployment mode: the
+  // repository is what is missing, and a mode says nothing about whether one was
+  // resolved.
+  //
+  // Decided against the REVIEW each request names, never against the route it
+  // arrived on, so the local reviews this deployment exists to serve are
+  // untouched. `addReaction` is refused inside its own handler, where the review
+  // it lands on is resolved. Broker mode never reaches any of this — a broker
+  // without a repository is not a supported deployment and refuses to start.
+  if (!api.githubEnabled) {
+    if (method === ROUTES.getRateLimit.method && matchRoute(ROUTES.getRateLimit.path, path)) {
+      return noGithubRepositoryRefusal(method, path)
+    }
+    for (const route of GITHUB_ONLY_PULL_ROUTES) {
+      if (method !== route.method) continue
+      const params = matchRoute(route.path, path)
+      if (params !== null && !namesLocalReview(prNumberOf(params))) {
+        return noGithubRepositoryRefusal(method, path)
       }
     }
   }
@@ -663,6 +761,14 @@ export async function handleDirectApi(
         // broker's refusal is unaffected by the body's shape.
         if (mode === 'broker' && !api.brokerWritesEnabled && !namesLocalReview(prNumber)) {
           return readsOnlyBrokerRefusal(method, path)
+        }
+        // The no-repository refusal for this route, decided against the SAME
+        // resolved review and for the same reason the reads-only gate is: a
+        // reaction on a pull request's comment reaches GitHub, and a reaction on
+        // a local review's comment reaches nothing but the store. `params.id` is
+        // a COMMENT id and must never stand in for the review here either.
+        if (!api.githubEnabled && !namesLocalReview(prNumber)) {
+          return noGithubRepositoryRefusal(method, path)
         }
         const commentId = Number(params.id)
         if (!Number.isInteger(commentId) || commentId <= 0) {

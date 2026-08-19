@@ -285,7 +285,12 @@ async function mainMock(env: Record<string, string | undefined>): Promise<void> 
  * Reviews of local branches are wired here as a CAPABILITY of this same boot,
  * never as a mode of their own: `resolveGithubRequirement` decides whether the
  * GitHub half is a precondition, and the local surface is assembled over the
- * repository this daemon actually sits in. The repository is DISCOVERED once —
+ * repository this daemon actually sits in. With the requirement lifted the
+ * GitHub half may be absent ENTIRELY — the boot then starts in a repository
+ * with no `origin` remote, and the api reports no GitHub capability so the
+ * router refuses the GitHub-only routes with a message naming what is missing.
+ * Nothing is narrowed to a repository here, because there may be none to narrow
+ * to. The repository is DISCOVERED once —
  * the context's own working directory is a bare `process.cwd()` that nothing
  * resolved, so threading it would read blobs and write refs against whichever
  * directory the daemon was started in rather than against the repository that
@@ -305,18 +310,18 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   const repoOverride = resolveRepoOverride(argv, env)
   const requireGithub = resolveGithubRequirement(argv, env)
 
-  // Narrowing to the GitHub-backed shape is what makes the repo and the client
-  // available to the api without either being a blank stand-in. Lifting the
-  // requirement relaxes the token probe and the viewer probe — a local-only
-  // daemon issues neither — while the repository itself is still resolved from
-  // the origin remote here.
-  const context = requireGithubContext(
-    await resolveDirectContext({
-      env,
-      requireGithub,
-      ...(repoOverride !== undefined ? { repoOverride } : {}),
-    }),
-  )
+  // Resolved WITHOUT narrowing to the GitHub-backed shape: with the requirement
+  // lifted the repo and its client are typed-absent rather than blank, and the
+  // boot carries that absence forward instead of refusing to start on it. That
+  // refusal is what previously made a local-only daemon impossible in a
+  // repository with no `origin` — the one deployment it exists for. Lifting the
+  // requirement also relaxes the token probe and the viewer probe, which such a
+  // daemon issues neither of.
+  const context = await resolveDirectContext({
+    env,
+    requireGithub,
+    ...(repoOverride !== undefined ? { repoOverride } : {}),
+  })
 
   // Opening the store reads the store-version row once and migrates in place; a
   // present-but-unreadable row throws here, failing startup loudly rather than
@@ -338,10 +343,16 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
           session: context.session,
         })
 
+  // The GitHub half is passed on exactly as the context holds it: both halves
+  // together, or neither. The api reports the result as its `githubEnabled`
+  // capability and the router refuses the GitHub-only routes on it, so nothing
+  // downstream needs a stand-in repository to interpolate into a request path.
+  const github = context.github
+  const repo = context.repo
+
   const directApi = createDirectApi({
     session: context.session,
-    github: context.github,
-    repo: context.repo,
+    ...(github !== undefined && repo !== undefined ? { github, repo } : {}),
     store,
     // The local-first blob provider reads the git clone via the same runner and
     // directory startup validated, so blob bytes come free from local git.
@@ -374,7 +385,11 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
     directStartupLine({
       distDir,
       port: server.port,
-      repo: `${context.repo.owner}/${context.repo.repo}`,
+      // Absent on a local-only boot, which resolved no repository at all.
+      // Printed as nothing rather than as a placeholder, for the same reason
+      // the viewer is: a blank `repo=/` describes a daemon pinned to a
+      // repository that does not exist, which is a different problem.
+      repo: repo === undefined ? null : `${repo.owner}/${repo.repo}`,
       // Absent on a local-only boot, which probes no viewer at all. Printed as
       // nothing rather than as a placeholder: `viewer=?` describes a daemon
       // whose viewer could not be read, which is a different problem.

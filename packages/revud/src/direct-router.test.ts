@@ -29,6 +29,7 @@ import type {
   ReviewComment,
   ReviewDraft,
   ReviewThread,
+  RouteName,
   Session,
   Snapshot,
   SubmitResult,
@@ -36,6 +37,7 @@ import type {
 import {
   ApiError,
   DEFAULT_PREFERENCES,
+  fillPath,
   LOCAL_ENTITY_ID_BASE,
   LOCAL_REVIEW_ID_BASE,
   ROUTES,
@@ -90,6 +92,10 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     // list at all and the route must keep answering its honest 501. A test that
     // wants the list served overrides this alongside `listPulls`.
     pullListEnabled: false,
+    // This fake answers a live rate limit and serves the write path, so it
+    // stands for a daemon that DOES hold a repository: the no-repository
+    // degradation is exercised against a real api further down, never here.
+    githubEnabled: true,
     getRateLimit: async () => ({
       limit: 5000,
       remaining: 4999,
@@ -1920,5 +1926,427 @@ describe('handleDirectApi: the write path across the id bands', () => {
     expect(api.writes.addReaction).toEqual([
       { prNumber: WRITE_LOCAL_REVIEW, commentId: topOfBand },
     ])
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// A daemon assembled with no GitHub repository.
+//
+// Reviewing two local branches needs no origin, no token and no viewer, so the
+// api may be assembled with its GitHub half absent by TYPE. The routes only
+// GitHub can answer must then degrade to a typed contract answer that names the
+// missing repository — never to the router's terminal catch-all, which emits
+// `broker_unreachable` (500) and so reports a broker outage to a deployment
+// whose whole premise is that it has no broker.
+//
+// Degradation is decided per REVIEW, never per route template: the five `:n`
+// write/sync routes and the snapshot read serve a review of a local branch pair
+// perfectly well, and only a pull request id makes them GitHub-bound.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** The review ids one GitHub-less daemon is driven with, and a comment on each. */
+const NO_GH_LOCAL_REVIEW = LOCAL_REVIEW_ID_BASE + 3
+const NO_GH_LOCAL_COMMENT = LOCAL_ENTITY_ID_BASE + 5
+const NO_GH_PULL = 511
+const NO_GH_PULL_COMMENT = 9001
+
+/** A well-formed draft for one review — the body the draft PUT is driven with. */
+function noGithubDraft(reviewId: number): ReviewDraft {
+  return {
+    humanId: SESSION.human.id,
+    prNumber: reviewId,
+    headSha: FEATURE_SHA,
+    compareKey: `${MERGE_BASE_SHA}...${FEATURE_SHA}`,
+    body: 'a draft that needs no repository',
+    event: 'COMMENT',
+    comments: [],
+    createdAt: LOCAL_NOW,
+    updatedAt: LOCAL_NOW,
+  }
+}
+
+/**
+ * A local surface that serves EVERY method, recording which one it entered.
+ *
+ * The recording is what turns "the local band still reaches the local surface"
+ * into an observation: a degraded route and a served one can both answer with a
+ * plausible body, and only the entered method tells them apart.
+ *
+ * The write path's response shapes are borrowed from the hand-rolled fake above
+ * rather than restated, so this surface carries no second opinion about what a
+ * reply or a reaction rollup looks like.
+ */
+function servingLocalSurface(calls: string[]): LocalReviewSurface {
+  const shapes = fakeApi()
+  return {
+    async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
+      calls.push('createLocalReview')
+      return localRow(NO_GH_LOCAL_REVIEW, {
+        baseRef: input.baseRef,
+        headRef: input.headRef,
+        title: input.title ?? input.headRef,
+      })
+    },
+    listLocalReviews(): LocalReviewSummary[] {
+      calls.push('listLocalReviews')
+      return [localRow(NO_GH_LOCAL_REVIEW)]
+    },
+    async listBranches(): Promise<BranchRef[]> {
+      calls.push('listBranches')
+      return [
+        { ref: MAIN_REF, name: 'main', kind: 'local', isDefault: true },
+        { ref: FEATURE_REF, name: 'feature/x', kind: 'local', isDefault: false },
+      ]
+    },
+    async syncPull(localId: number): Promise<Snapshot> {
+      calls.push('syncPull')
+      return localSnapshotOf(localId, 1)
+    },
+    getSnapshot(localId: number): Snapshot | null {
+      calls.push('getSnapshot')
+      return localSnapshotOf(localId, 1)
+    },
+    getDraft(): ReviewDraft | null {
+      calls.push('getDraft')
+      return null
+    },
+    saveDraft(draft: ReviewDraft): ReviewDraft {
+      calls.push('saveDraft')
+      return draft
+    },
+    discardDraft(): void {
+      calls.push('discardDraft')
+    },
+    reconcileDraft(localId: number): ReconcileReport {
+      calls.push('reconcileDraft')
+      return {
+        prNumber: localId,
+        draftHeadSha: FEATURE_SHA,
+        currentHeadSha: FEATURE_SHA,
+        newCommits: [],
+        results: [],
+      }
+    },
+    getFileViewed(): FileViewedState {
+      calls.push('getFileViewed')
+      return {}
+    },
+    setFileViewed(): FileViewedState {
+      calls.push('setFileViewed')
+      return {}
+    },
+    async submitReview(input): Promise<SubmitResult> {
+      calls.push('submitReview')
+      return shapes.submitReview(input)
+    },
+    async replyToThread(localId, threadId, body): Promise<ReviewComment> {
+      calls.push('replyToThread')
+      return shapes.replyToThread(localId, threadId, body)
+    },
+    async resolveThread(_localId, threadId, resolved): Promise<ReviewThread> {
+      calls.push('resolveThread')
+      return localThread(threadId, resolved)
+    },
+    async addReaction(localId, commentId, reaction): Promise<ReactionRollup> {
+      calls.push('addReaction')
+      return shapes.addReaction(localId, commentId, reaction)
+    },
+    listThreads(): ReviewThread[] {
+      calls.push('listThreads')
+      return []
+    },
+  }
+}
+
+interface NoGithubHarness {
+  api: DirectApi
+  store: DirectStore
+  /** Which local-surface methods were entered, in order. */
+  calls: string[]
+  close(): void
+}
+
+/**
+ * The router over a REAL api assembled WITHOUT a repository — the shape a boot
+ * inside a git repository that has no `origin` remote produces.
+ *
+ * A GitHub client is wired even so, and every one of its methods throws: the
+ * absence under test is the repository, and a route that leaked past the
+ * degradation must fail by naming the client method it reached rather than
+ * quietly answering something plausible.
+ */
+function noGithubHarness(): NoGithubHarness {
+  const store = openDirectStore({ dataDir: ':memory:' })
+  const calls: string[] = []
+  const api = createDirectApi({
+    session: SESSION,
+    github: throwingGithubClient(),
+    store,
+    localReviews: servingLocalSurface(calls),
+  })
+  return { api, store, calls, close: () => store.close() }
+}
+
+/**
+ * One row of the route-table classification: the contract route, the request
+ * that exercises it against a GitHub-less daemon, and the exact answer expected.
+ *
+ * The path is always built from the route TEMPLATE, so a row cannot drift onto a
+ * path the contract does not declare. `query` rides separately because a query
+ * string belongs to no template.
+ */
+interface NoGithubRow {
+  readonly name: RouteName
+  readonly query?: string
+  readonly body?: unknown
+  readonly status: number
+  /** The `code` of an error envelope; absent when the answer is a success body. */
+  readonly code?: string
+}
+
+function requestFor(row: NoGithubRow, params: Record<string, string | number>): Request {
+  const route = ROUTES[row.name]
+  const path = fillPath(route.path, params) + (row.query ?? '')
+  return req(route.method, path, row.body)
+}
+
+/** The pull-request-band params every GitHub-bound row is filled with. */
+const NO_GH_PULL_PARAMS = {
+  n: NO_GH_PULL,
+  threadId: 'T1',
+  id: NO_GH_PULL_COMMENT,
+  sha: 'f'.repeat(40),
+}
+
+/** The same params in the local band, for the routes that are band-shared. */
+const NO_GH_LOCAL_PARAMS = {
+  n: NO_GH_LOCAL_REVIEW,
+  threadId: 'T1',
+  id: NO_GH_LOCAL_COMMENT,
+  sha: 'f'.repeat(40),
+}
+
+/**
+ * The routes a daemon with no repository DEGRADES: each answers
+ * `not_implemented` (501) with a message naming the missing repository.
+ *
+ * Six of the seven are GitHub-bound only for a PULL REQUEST id, so each is
+ * driven with one. `getRateLimit` carries no review id at all — the allowance
+ * belongs to the credential, and there is no credential.
+ */
+const NO_GITHUB_DEGRADED: readonly NoGithubRow[] = [
+  { name: 'syncPull', status: 501, code: 'not_implemented' },
+  { name: 'getSnapshot', status: 501, code: 'not_implemented' },
+  {
+    name: 'submitReview',
+    body: {
+      prNumber: NO_GH_PULL,
+      expectedHeadSha: 'h'.repeat(40),
+      event: 'COMMENT',
+      body: 'looks good',
+      comments: [],
+    },
+    status: 501,
+    code: 'not_implemented',
+  },
+  { name: 'replyToThread', body: { body: 'agreed' }, status: 501, code: 'not_implemented' },
+  { name: 'resolveThread', body: { resolved: true }, status: 501, code: 'not_implemented' },
+  {
+    name: 'addReaction',
+    query: `?pr=${NO_GH_PULL}`,
+    body: { reaction: '+1' },
+    status: 501,
+    code: 'not_implemented',
+  },
+  { name: 'getRateLimit', status: 501, code: 'not_implemented' },
+]
+
+/**
+ * The routes a daemon with no repository SERVES in full. Drafts, viewed marks
+ * and preferences are per-human store state no repository is involved in, so
+ * they are driven with a PULL REQUEST id deliberately: their answer does not
+ * depend on the band either.
+ *
+ * Two rows answer a typed `not_found` (404) rather than a 200, and both are the
+ * route's ordinary contract answer for the state this daemon is in — an absent
+ * blob, and a reconcile of a review that has no draft — never a refusal.
+ */
+const NO_GITHUB_SERVED: readonly NoGithubRow[] = [
+  { name: 'getSession', status: 200 },
+  { name: 'listPulls', status: 200 },
+  { name: 'getBlob', status: 404, code: 'not_found' },
+  { name: 'getDraft', status: 200 },
+  { name: 'saveDraft', body: noGithubDraft(NO_GH_PULL), status: 200 },
+  { name: 'discardDraft', status: 200 },
+  { name: 'reconcileDraft', status: 404, code: 'not_found' },
+  { name: 'getFileViewed', status: 200 },
+  { name: 'setFileViewed', body: { path: 'a.ts', viewed: true, blobSha: null }, status: 200 },
+  { name: 'getPreferences', status: 200 },
+  { name: 'setPreferences', body: { diffMode: 'split' }, status: 200 },
+  { name: 'listBranches', status: 200 },
+  { name: 'createLocalReview', body: { baseRef: MAIN_REF, headRef: FEATURE_REF }, status: 200 },
+  { name: 'listLocalReviews', status: 200 },
+]
+
+/**
+ * The routes nobody has implemented, whether or not a repository is configured.
+ * Their 501 predates this degradation and says something different: the GraphQL
+ * thread read has not landed, and deleting a local review is a retention policy
+ * nobody has written. Neither message may claim a missing repository.
+ */
+const NO_GITHUB_NOT_IMPLEMENTED: readonly NoGithubRow[] = [
+  { name: 'listReviewThreads', status: 501, code: 'not_implemented' },
+  { name: 'deleteLocalReview', status: 501, code: 'not_implemented' },
+]
+
+/** The band-shared routes with a LOCAL review id, and the method each must enter. */
+const NO_GITHUB_LOCAL_BAND: readonly { row: NoGithubRow; surfaceCall: string }[] = [
+  { row: { name: 'syncPull', status: 200 }, surfaceCall: 'syncPull' },
+  { row: { name: 'getSnapshot', status: 200 }, surfaceCall: 'getSnapshot' },
+  {
+    row: {
+      name: 'submitReview',
+      body: {
+        prNumber: NO_GH_LOCAL_REVIEW,
+        expectedHeadSha: 'h'.repeat(40),
+        event: 'COMMENT',
+        body: 'looks good',
+        comments: [],
+      },
+      status: 200,
+    },
+    surfaceCall: 'submitReview',
+  },
+  {
+    row: { name: 'replyToThread', body: { body: 'agreed' }, status: 200 },
+    surfaceCall: 'replyToThread',
+  },
+  {
+    row: { name: 'resolveThread', body: { resolved: true }, status: 200 },
+    surfaceCall: 'resolveThread',
+  },
+  {
+    row: {
+      name: 'addReaction',
+      query: `?pr=${NO_GH_LOCAL_REVIEW}`,
+      body: { reaction: '+1' },
+      status: 200,
+    },
+    surfaceCall: 'addReaction',
+  },
+]
+
+describe('handleDirectApi: a daemon with no GitHub repository', () => {
+  test('every GitHub-bound route degrades to a typed answer naming the missing repository', async () => {
+    for (const row of NO_GITHUB_DEGRADED) {
+      const h = noGithubHarness()
+      // The precondition, pinned rather than assumed: this api reports no
+      // GitHub half, so the degradation under test is armed.
+      expect(h.api.githubEnabled).toBe(false)
+      const res = await handleDirectApi(requestFor(row, NO_GH_PULL_PARAMS), SESSION, h.api)
+      expect(res).not.toBeNull()
+      const body = (await res?.json()) as { code: string; message: string }
+      expect([row.name, res?.status, body.code]).toEqual([row.name, row.status, row.code])
+      // The message is the whole point of the degradation, so it is asserted
+      // rather than described: the reader must learn that this daemon has no
+      // repository, not that a broker they do not run is unreachable.
+      expect([row.name, /no GitHub repository/i.test(body.message)]).toEqual([row.name, true])
+      // Nothing reached the local surface: these ids name pull requests.
+      expect([row.name, h.calls]).toEqual([row.name, []])
+      h.close()
+    }
+  })
+
+  test('every other route is served in full, with no repository configured', async () => {
+    for (const row of NO_GITHUB_SERVED) {
+      const h = noGithubHarness()
+      const res = await handleDirectApi(requestFor(row, NO_GH_PULL_PARAMS), SESSION, h.api)
+      expect([row.name, res?.status]).toEqual([row.name, row.status])
+      const body = (await res?.json()) as { code?: string; message?: string } | null
+      const envelope = body !== null && typeof body === 'object' ? body : {}
+      expect([row.name, envelope.code]).toEqual([row.name, row.code])
+      // No served route may borrow the degradation's message — that would make
+      // a working route read as a refusal.
+      expect([row.name, /no GitHub repository/i.test(envelope.message ?? '')]).toEqual([
+        row.name,
+        false,
+      ])
+      h.close()
+    }
+  })
+
+  test('the unimplemented routes keep their own 501 and never claim a missing repository', async () => {
+    for (const row of NO_GITHUB_NOT_IMPLEMENTED) {
+      const h = noGithubHarness()
+      const res = await handleDirectApi(requestFor(row, NO_GH_LOCAL_PARAMS), SESSION, h.api)
+      const body = (await res?.json()) as { code: string; message: string }
+      expect([row.name, res?.status, body.code]).toEqual([row.name, row.status, row.code])
+      expect([row.name, /no GitHub repository/i.test(body.message)]).toEqual([row.name, false])
+      h.close()
+    }
+  })
+
+  test('the three buckets partition the whole route table exactly', () => {
+    const classified = [
+      ...NO_GITHUB_DEGRADED,
+      ...NO_GITHUB_SERVED,
+      ...NO_GITHUB_NOT_IMPLEMENTED,
+    ].map((row) => row.name)
+
+    // No route may be classified twice — two buckets claiming one route would
+    // otherwise mask a route that sits in none of them.
+    expect(new Set(classified).size).toBe(classified.length)
+
+    // Every route the contract declares is classified, and nothing outside it
+    // is. A route added later therefore fails HERE, rather than falling quietly
+    // into the router's `broker_unreachable` (500) catch-all on a daemon that
+    // has no repository.
+    const classifiedRoutes = classified
+      .map((name) => `${ROUTES[name].method} ${ROUTES[name].path}`)
+      .sort()
+    const everyRoute = Object.values(ROUTES)
+      .map((route) => `${route.method} ${route.path}`)
+      .sort()
+    expect(classifiedRoutes).toEqual(everyRoute)
+  })
+
+  test('a local review id still reaches the local surface on every band-shared route', async () => {
+    for (const { row, surfaceCall } of NO_GITHUB_LOCAL_BAND) {
+      const h = noGithubHarness()
+      const res = await handleDirectApi(requestFor(row, NO_GH_LOCAL_PARAMS), SESSION, h.api)
+      expect([row.name, res?.status]).toEqual([row.name, row.status])
+      // The status alone cannot say the feature survived: a degradation that
+      // answered 200 with a plausible body would pass it. The entered method can.
+      expect([row.name, h.calls]).toEqual([row.name, [surfaceCall]])
+      h.close()
+    }
+  })
+
+  test('the capability reports the two halves together, and an api holding neither', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    // The shape a `--local-only` boot in a repository with no origin produces:
+    // the repo and the client are both typed-absent, never blank stand-ins.
+    const bare = createDirectApi({ session: SESSION, store })
+    expect(bare.githubEnabled).toBe(false)
+
+    // The control: a repository and a client TOGETHER are what the capability
+    // reports, so the degradation cannot fire on a configured daemon.
+    const configured = createDirectApi({
+      session: SESSION,
+      store,
+      github: throwingGithubClient(),
+      repo: LOCAL_REPO_REF,
+    })
+    expect(configured.githubEnabled).toBe(true)
+
+    // And the bare api degrades exactly as the client-only harness above does,
+    // so the degradation keys on the capability rather than on which half of it
+    // a test happened to omit.
+    const res = await handleDirectApi(req('GET', ROUTES.getRateLimit.path), SESSION, bare)
+    expect(res?.status).toBe(501)
+    const body = (await res?.json()) as { code: string; message: string }
+    expect(body.code).toBe('not_implemented')
+    expect(/no GitHub repository/i.test(body.message)).toBe(true)
+    store.close()
   })
 })

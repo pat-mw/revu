@@ -63,6 +63,9 @@ function stubApi(): DirectApi {
     // No poll loop and no local reviews behind it either, so it serves no
     // review list and `GET /api/pulls` keeps its honest 501.
     pullListEnabled: false,
+    // A broker always mediates a repository, so this stub reports one: the
+    // no-repository degradation is not what these serve tests exercise.
+    githubEnabled: true,
     getRateLimit: async () => ({
       limit: 5000,
       remaining: 4999,
