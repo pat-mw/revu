@@ -31,26 +31,36 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 the four that must be untouched (and `git diff` confirms all four byte-unchanged), the mode axis held, and the
 frozen contract unedited. Full diff: **26 files, 7792 insertions**.
 
-**In flight: the fable-tier adversarial review of the full diff**, six independent lenses (structural
-isolation · id-band containment · contract semantics · guards-that-assert-nothing · durability · boot and
-degradation), each finding then put to two verifiers — one reasoning to refute, one attempting an actual
-reproduction — and only findings both agree on are treated as real. The PR opens after it, per §8. Every
-previous ticket's review found a blocker that had passed a green gate.
+### ⚠️ The pre-merge review found FOUR blockers, all reproduced. The PR is held.
 
-### ✅ The headline exit criterion is reachable, and was observed directly
+Six lenses over the full diff, each finding put to two independent verifiers — one reasoning to refute, one
+attempting an actual reproduction — with only findings **both** agreed on treated as real. 27 raw findings,
+4 confirmed, 3 contested, and a dismissal list so the next session does not re-raise them.
 
-`revud --direct --local-only` now **starts in a repository with no remotes at all**, with no token and no
-viewer probe, and serves the local flow. Run by the orchestrator in the main tree against a scratch repo:
-branches listed, review created at id `1000000000`, sync 200, snapshot 200, and the review present in
-`GET /api/pulls` — while `GET /api/rate-limit` and a pull-request-id snapshot answer a typed 501 naming the
-missing repository. The startup line omits the absent repo and viewer rather than placeholdering them.
+**This is the fourth ticket running whose pre-merge review caught something a green gate did not.**
 
-Getting there needed `DirectApiDeps.github`/`repo` to become optional, which was folded into M8.5.6. The
-implementer of boot assembly hit that wall and **refused both escape hatches** — a blank `{ owner: '',
-repo: '' }` stand-in and a cast — which is why the gap surfaced as a clean blocker rather than as a mysterious
-failure later.
+| # | defect | why it matters |
+| --- | --- | --- |
+| **M1** | `--local-only` inside a **GitHub clone** still resolves the repo and builds a client, but skips the token probe — so `viewerLogin` is `undefined` while `githubEnabled` is `true` | The approve gate inverts to always-false with a **factually untrue** message, and the submit idempotency re-check compares against `''` and can never match. Both reproductions **posted duplicate reviews with duplicate inline comments to a real pull request.** |
+| **M2** | Local review lookup is **never scoped by repository** — `deps.repo` is a listing filter and nothing else | A daemon in one repo accepted `syncPull` on another's review, resolved refs against the wrong toplevel, stamped the wrong SHAs onto the row, and landed a durable thread anchored to a file that exists only in the other repo. The payload still reported the original repo, so the corruption is invisible. **The thread is the part that does not heal.** |
+| **M3** | `writeSnapshotRows` is still a **deferred** read-then-write transaction, so the new busy timeout does not cover the snapshot persist | Measured: deferred threw `database is locked` in 1.3ms; immediate succeeded after 395.8ms. A peer taking the lock mid-sequence leaves threads and summary written with **no envelope** — the only durable home for the authorship map. |
+| **M4** | The list ETag hashes **compare keys alone** | A submit or resolve moves `unresolvedThreads` and **no** SHA, so the inbox 304s forever on a stale count. The docstring directly above asserts the opposite property. Four independent reviewers found it. |
 
-M8.5.7 makes all of this durable; the drill is corroboration only.
+Three of the four are contradicted by docstrings this branch also introduces — the strongest available signal
+that the author's model and the code disagree.
+
+**Two SHOULD-FIX, both being fixed with them:** a deleted head branch answers "the broker is unreachable" on a
+daemon with no broker; and `--local-only` **without** `--direct` silently boots mock mode and serves the
+fixture app.
+
+**In flight — three disjoint fix units:** M1+M4+the mode/flag refusal (fable) · M2+the typed head error
+(fable) · M3 (opus).
+
+**The review also named coverage gaps worth keeping:** the 304 empty-body assertion cannot fail (the transport
+strips the body — the implementer had already flagged this independently); the "either half moves the etag"
+case moves only the field that *is* in the composition, so it would still pass with M4 present; nothing
+verifies the network tripwire is actually installed in the child; and there is **no cross-repository test
+anywhere in the codebase**.
 
 **Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
 one, and every number matched the worker's report.
