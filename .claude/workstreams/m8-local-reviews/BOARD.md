@@ -23,10 +23,11 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 | **M8.5.10** — the local surface factory | opus | ✅ `d239db6` — 2528 · 1 · 0 · 93 |
 | **M8.5.5** — boot assembly | opus | ✅ `eb1eb5c` — 2563 · 1 · 0 · 94 |
 | **M8.5.3** — `listPulls`, local merged | opus | ✅ `fd5aca1` — **2568 · 1 · 0 · 94** |
-| **M8.5.8** — the write path's router band handling | opus | **dispatched** |
+| **M8.5.8** — the write path's router band handling | opus | ✅ `c462105` — **2571 · 1 · 0 · 94** |
+| **M8.5.6** — honest degradation (+ the exit-criterion unblock) | opus | **dispatched** |
 
-Remaining: **`.6`** (honest degradation — scope widened, see below), then **`.7`** (the offline HTTP proof),
-then `Verify` → the fable-tier adversarial review of the full diff → the PR.
+Remaining after `.6`: **`.7`** (the offline HTTP proof), then `Verify` → the fable-tier adversarial review of
+the full diff → the PR. **Nine of ten units are landed.**
 
 ### ⚠️ The headline exit criterion is NOT yet reachable, and M8.5.6 is what unblocks it
 
