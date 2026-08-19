@@ -1,10 +1,18 @@
-import type { ReactionKey, Session, SubmitReviewInput } from '@revu/shared'
+import type {
+  CreateLocalReviewInput,
+  ReactionKey,
+  Session,
+  SubmitReviewInput,
+} from '@revu/shared'
 import {
   ApiError,
   errorBodyFromApiError,
+  isValidRefName,
+  normalizeRefName,
   ROUTES,
   statusForApiError,
   ValidationError,
+  validateCreateLocalReviewInput,
   validateReactionBody,
   validateReplyBody,
   validateResolveBody,
@@ -57,6 +65,23 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  *   - `addReaction`'s route carries only the comment id, so the owning PR rides
  *     as a `?pr=<n>` query param (or a `prNumber` body field), mirroring the mock
  *     router; it is shared-and-honest (one GitHub user, one reaction).
+ *
+ * Three of the four local-review routes are served here — `GET /api/branches`,
+ * `POST /api/local-reviews` and `GET /api/local-reviews` — against the local
+ * surface the api was assembled with, and a typed `not_found` (404) when it was
+ * assembled without one. `DELETE /api/local-reviews/:n` is deliberately NOT
+ * served and keeps its honest `not_implemented` (501): deleting a local review
+ * means deciding what becomes of its snapshot, its cached blobs, and every
+ * human's draft and viewed marks on it, which is a retention policy rather than
+ * a row delete.
+ *
+ * Both refs of a creation request are validated and fully qualified HERE, before
+ * the request reaches anything that can run git. The shared body validator
+ * checks shape only — two strings — and a string is not yet a ref name: a value
+ * beginning with `-` is read by git as an option, and `git check-ref-format` is
+ * no defense against it (it exits 0 on `refs/heads/--upload-pack=x`). The
+ * rejection is what makes the value safe, and it happens before the value is
+ * passed on at all.
  *
  * Routes that belong to the not-yet-built GraphQL thread read and rate-limit
  * still answer a typed `not_implemented` (501). Unknown API paths 404; non-API
@@ -231,6 +256,50 @@ function envelopeForError(err: unknown): Response {
   }
   const message = err instanceof Error ? err.message : String(err)
   return errorJson('broker_unreachable', message, 500)
+}
+
+/**
+ * Validate and fully qualify the two refs of a local-review creation request.
+ *
+ * Runs BEFORE the request reaches the local surface, so no unvalidated string
+ * can become a git argument by any path. `isValidRefName` is the load-bearing
+ * screen: it rejects a leading `-` (the option-injection shape), `..`, a
+ * trailing `/`, control characters and git's forbidden charset — and it is run
+ * on the ref AS GIVEN, because `normalizeRefName` is purely mechanical and
+ * would happily qualify a hostile name into a legal-looking one.
+ *
+ * Both sides are then compared in their qualified form, so the same branch
+ * spelled bare and spelled in full is recognised as one side rather than two.
+ * A pair naming one ref is `unprocessable` — the request is well-formed but
+ * there is nothing to review between a ref and itself. A pair of two different
+ * names that happen to sit on the same COMMIT is a different check entirely and
+ * belongs where the commits are resolved.
+ */
+function qualifiedCreateInput(input: CreateLocalReviewInput): CreateLocalReviewInput {
+  for (const [side, ref] of [
+    ['base', input.baseRef],
+    ['head', input.headRef],
+  ] as const) {
+    if (!isValidRefName(ref)) {
+      throw new ApiError(
+        'unprocessable',
+        `The ${side} ref ${JSON.stringify(ref)} is not a valid git ref name.`,
+      )
+    }
+  }
+  const baseRef = normalizeRefName(input.baseRef)
+  const headRef = normalizeRefName(input.headRef)
+  if (baseRef === headRef) {
+    throw new ApiError(
+      'unprocessable',
+      `Base and head name the same ref (${baseRef}) — a review needs two different sides.`,
+    )
+  }
+  return {
+    baseRef,
+    headRef,
+    ...(input.title !== undefined ? { title: input.title } : {}),
+  }
 }
 
 async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
@@ -416,6 +485,34 @@ export async function handleDirectApi(
         const patch = validateSetPreferencesBody(await readJsonBody(req))
         return json(api.setPreferences(patch))
       }
+    }
+
+    // ——— listBranches: GET /api/branches ———
+    // A git read of the repository this daemon serves, never a store read: no
+    // table holds anything about branches, and the listing must offer refs no
+    // recorded review has ever named — a remote-tracking base that was never
+    // checked out is the ordinary case.
+    if (method === ROUTES.listBranches.method && path === ROUTES.listBranches.path) {
+      return json(await api.listBranches())
+    }
+
+    // ——— listLocalReviews: GET /api/local-reviews ———
+    // The only wire path for the two local-only annotations, `dirty` and
+    // `archivedPr`; they ride the summary and no other route carries them.
+    if (method === ROUTES.listLocalReviews.method && path === ROUTES.listLocalReviews.path) {
+      return json(api.listLocalReviews())
+    }
+
+    // ——— createLocalReview: POST /api/local-reviews ———
+    // Shape first (two strings), then ref validation and qualification, and only
+    // then the surface — so a hostile ref is refused before anything downstream
+    // could turn it into a git argument. A duplicate branch pair comes back as
+    // the review that already exists, at 200: creation is idempotent per pair,
+    // and a retry whose first answer was lost must not mint a second review or
+    // fail as a conflict.
+    if (method === ROUTES.createLocalReview.method && path === ROUTES.createLocalReview.path) {
+      const input = validateCreateLocalReviewInput(await readJsonBody(req))
+      return json(await api.createLocalReview(qualifiedCreateInput(input)))
     }
 
     // ——— submitReview: POST /api/pulls/:n/review ———

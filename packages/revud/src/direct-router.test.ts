@@ -4,12 +4,21 @@
  * surface; every not-yet-built contract route answers a typed `not_implemented`
  * (501); unknown paths 404; non-API paths return null so the caller serves
  * static assets. No mock, no dev panel, no network — the surface here is a fake.
+ *
+ * The local-review routes at the bottom of this file are driven differently, and
+ * deliberately: they run against the REAL api surface, the REAL store and the
+ * REAL local-git readers over a scripted command runner, because what they pin
+ * is the seam between an untrusted request body and a git argv. A hand-rolled
+ * api fake would sit exactly where the validation under test belongs.
  */
 import { describe, expect, test } from 'bun:test'
 import type {
+  BranchRef,
+  CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  LocalReviewSummary,
   RateLimitInfo,
   ReactionRollup,
   ReconcileReport,
@@ -20,9 +29,24 @@ import type {
   Snapshot,
   SubmitResult,
 } from '@revu/shared'
-import { ApiError, DEFAULT_PREFERENCES } from '@revu/shared'
+import {
+  ApiError,
+  DEFAULT_PREFERENCES,
+  LOCAL_REVIEW_ID_BASE,
+  ROUTES,
+  validateLocalReviewSummaries,
+} from '@revu/shared'
+import type { CommandResult, CommandRunner } from './direct/command-runner'
 import type { DirectApi } from './direct/direct-api'
-import { StoreWriteError } from './direct/store'
+import { createDirectApi } from './direct/direct-api'
+import { throwingGithubClient } from './direct/github-write-stubs'
+import { listBranches as readGitBranches } from './direct/local-git'
+import type { LocalRange, LocalRangeFailure } from './direct/local-sync'
+import { detectDirtyWorktree, resolveLocalRange } from './direct/local-sync'
+import type { LocalReviewSurface } from './direct/local-surface'
+import type { RepoRef } from './direct/repo'
+import type { DirectStore } from './direct/store'
+import { openDirectStore, StoreWriteError } from './direct/store'
 import { handleDirectApi } from './direct-router'
 
 const SESSION: Session = {
@@ -177,6 +201,19 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
       }
       rollup[reaction] = 1
       return rollup
+    },
+    // No local-review surface stands behind this fake, so the three local
+    // routes answer the same typed `not_found` a daemon assembled without one
+    // does. That is the honest answer for "this instance does not serve that",
+    // and it is deliberately NOT a 501, which would promise it later.
+    async listBranches(): Promise<BranchRef[]> {
+      throw new ApiError('not_found', 'This daemon does not serve local reviews.')
+    },
+    async createLocalReview(): Promise<LocalReviewSummary> {
+      throw new ApiError('not_found', 'This daemon does not serve local reviews.')
+    },
+    listLocalReviews(): LocalReviewSummary[] {
+      throw new ApiError('not_found', 'This daemon does not serve local reviews.')
     },
     ...overrides,
   }
@@ -578,5 +615,612 @@ describe('handleDirectApi', () => {
     // /api/dev is never a contract route, so it is an ordinary unknown API 404.
     const res = await handleDirectApi(req('GET', '/api/dev'), SESSION, fakeApi())
     expect(res?.status).toBe(404)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// Local reviews — three served routes over a real store and a scripted git
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The repository identity every local row in these tests is keyed under, and
+ * the directory the scripted git is asked about. Neither is discovered here:
+ * discovery belongs to whoever assembles the local surface, and pinning both to
+ * literals keeps the store's repository scoping visible in the assertions.
+ */
+const LOCAL_REPO = 'o/r'
+const LOCAL_CWD = '/repo'
+const LOCAL_REPO_REF: RepoRef = { owner: 'o', repo: 'r' }
+const LOCAL_NOW = '2026-02-02T00:00:00.000Z'
+
+const MAIN_REF = 'refs/heads/main'
+const FEATURE_REF = 'refs/heads/feature/x'
+/** A second NAME sitting on the feature branch's commit — a degenerate pair. */
+const TWIN_REF = 'refs/heads/feature/twin'
+/** A branch with no common ancestor, used for both no-merge-base outcomes. */
+const ORPHAN_REF = 'refs/heads/orphan'
+const ABSENT_REF = 'refs/heads/no-such-branch'
+/** A remote-tracking ref no stored review names — only git knows about it. */
+const REMOTE_MAIN_REF = 'refs/remotes/origin/main'
+
+const MAIN_SHA = 'a'.repeat(40)
+const FEATURE_SHA = 'b'.repeat(40)
+const ORPHAN_SHA = 'c'.repeat(40)
+const MERGE_BASE_SHA = 'd'.repeat(40)
+
+/** What `git rev-parse --verify` answers for each ref this repository holds. */
+const TIPS: Record<string, string> = {
+  [MAIN_REF]: MAIN_SHA,
+  [FEATURE_REF]: FEATURE_SHA,
+  // Deliberately the SAME commit as the feature branch: two different names at
+  // one commit is the degenerate pair that only a comparison of the resolved
+  // commits can see, and that a comparison of the names never will.
+  [TWIN_REF]: FEATURE_SHA,
+  [ORPHAN_REF]: ORPHAN_SHA,
+}
+
+/** The repository the scripted git describes for one test. */
+interface GitWorld {
+  /** What `git rev-parse --is-shallow-repository` reports. */
+  shallow: boolean
+  /**
+   * What `git status --porcelain=v1 -uno` reports. `unreadable` is a non-zero
+   * exit — the degraded probe whose worktree state is `unknown`.
+   */
+  worktree: 'clean' | 'dirty' | 'unreadable'
+}
+
+/** A command runner that records every argv it is handed before answering. */
+interface RecordingRunner extends CommandRunner {
+  /** Every argv the runner was actually asked to spawn, in order. */
+  readonly argvs: string[][]
+}
+
+function exited(code: number, stdout = ''): CommandResult {
+  return { ok: code === 0, code, stdout, stderr: '' }
+}
+
+/** The NUL byte `for-each-ref` separates its fields with. */
+const NUL = String.fromCharCode(0)
+
+/**
+ * A git that never spawns anything, answering from `world` and recording what
+ * it was asked. Recording is what turns "no git command ran" into an assertion
+ * over evidence: a ref rejected before the surface is entered leaves this list
+ * empty, and the happy path leaves it non-empty in the same test.
+ */
+function fakeGit(world: GitWorld): RecordingRunner {
+  const argvs: string[][] = []
+  return {
+    argvs,
+    async run(args: string[]): Promise<CommandResult> {
+      argvs.push([...args])
+      const sub = args[1]
+      const operands = args.slice(args.indexOf('--end-of-options') + 1)
+      if (sub === 'rev-parse' && args[2] === '--verify') {
+        const tip = TIPS[operands[0]]
+        return tip === undefined ? exited(128) : exited(0, `${tip}\n`)
+      }
+      if (sub === 'rev-parse' && args[2] === '--is-shallow-repository') {
+        return exited(0, world.shallow ? 'true\n' : 'false\n')
+      }
+      if (sub === 'merge-base') {
+        // Exit 1 with no output is git's "no common ancestor", the outcome a
+        // shallow clone counterfeits exactly.
+        if (operands.includes(ORPHAN_SHA)) return exited(1)
+        return exited(0, `${MERGE_BASE_SHA}\n`)
+      }
+      if (sub === 'for-each-ref') {
+        return exited(
+          0,
+          [
+            `${MAIN_REF}${NUL}${MAIN_SHA}${NUL}*`,
+            `${FEATURE_REF}${NUL}${FEATURE_SHA}${NUL}`,
+            `${REMOTE_MAIN_REF}${NUL}${MAIN_SHA}${NUL}`,
+            '',
+          ].join('\n'),
+        )
+      }
+      if (sub === 'symbolic-ref') return exited(0, `${REMOTE_MAIN_REF}\n`)
+      if (sub === 'status') {
+        if (world.worktree === 'unreadable') return exited(128)
+        return exited(0, world.worktree === 'dirty' ? ' M a.ts\n' : '')
+      }
+      return exited(1)
+    },
+  }
+}
+
+/**
+ * The contract code each way of resolving a branch pair can fail maps onto.
+ *
+ * A missing ref is `not_found` — the resource named does not exist. The other
+ * three are `unprocessable`: the request is well-formed and the refs are real,
+ * but the pair cannot be reviewed as given. None of them may reach the router's
+ * terminal catch-all, which would answer `broker_unreachable` (500) and tell a
+ * reader of a purely local daemon that a broker they do not have is down.
+ */
+function apiErrorForRange(failure: LocalRangeFailure): ApiError {
+  switch (failure.reason) {
+    case 'ref_not_found':
+      return new ApiError(
+        'not_found',
+        `No such ref: ${failure.refs.join(', ')} (git exited ${failure.code}).`,
+      )
+    case 'same_ref':
+      return new ApiError(
+        'unprocessable',
+        `${failure.baseRef} and ${failure.headRef} are both at ${failure.sha}.`,
+      )
+    case 'unrelated_histories':
+      return new ApiError(
+        'unprocessable',
+        `${failure.baseRef} and ${failure.headRef} share no common ancestor.`,
+      )
+    case 'shallow_clone':
+      return new ApiError(
+        'unprocessable',
+        `This clone is shallow, so the common ancestor of ${failure.baseRef} and ` +
+          `${failure.headRef} may simply not be present.`,
+      )
+  }
+}
+
+function localSnapshot(localId: number, range: LocalRange): Snapshot {
+  return {
+    prNumber: localId,
+    syncedAt: LOCAL_NOW,
+    partial: null,
+    syncStats: { blobsFetched: 0, blobsReused: 0, requests: 0 },
+    immutable: {
+      compareKey: range.compareKey,
+      mergeBaseSha: range.mergeBaseSha,
+      headSha: range.headSha,
+      files: [],
+      blobIndex: {},
+      commits: [],
+    },
+    mutable: {
+      fetchedAt: LOCAL_NOW,
+      pull: { number: localId } as Snapshot['mutable']['pull'],
+      threads: [],
+      issueComments: [],
+      reviews: [],
+      checks: [],
+    },
+  }
+}
+
+/**
+ * A stand-in for the assembled local-review surface, built from the REAL store
+ * and the REAL local-git readers over a scripted runner. Only the assembly is
+ * fake: `resolveLocalRange`, `detectDirtyWorktree` and the branch listing are
+ * the production functions, so a ref that reaches this surface reaches git's
+ * argv seam exactly as it would in a live daemon.
+ *
+ * Every method not needed to serve the three routes under test throws, so a
+ * route accidentally answered through one of them fails loudly rather than
+ * quietly returning a plausible empty value.
+ */
+function localSurfaceOver(
+  store: DirectStore,
+  runner: CommandRunner,
+  calls: string[],
+): LocalReviewSurface {
+  const unused = (name: string): never => {
+    throw new Error(`the local-review route tests do not exercise ${name}`)
+  }
+  return {
+    async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
+      calls.push('createLocalReview')
+      const resolved = await resolveLocalRange(runner, LOCAL_CWD, {
+        baseRef: input.baseRef,
+        headRef: input.headRef,
+      })
+      if (!resolved.ok) throw apiErrorForRange(resolved)
+      return store.createLocalReview({
+        repo: LOCAL_REPO,
+        baseRef: input.baseRef,
+        headRef: input.headRef,
+        title: input.title ?? input.headRef,
+      })
+    },
+    listLocalReviews(): LocalReviewSummary[] {
+      calls.push('listLocalReviews')
+      return store.listLocalReviews(LOCAL_REPO)
+    },
+    async listBranches(): Promise<BranchRef[]> {
+      calls.push('listBranches')
+      return readGitBranches(runner, LOCAL_CWD)
+    },
+    async syncPull(localId: number): Promise<Snapshot> {
+      calls.push('syncPull')
+      const review = store.getLocalReview(localId)
+      if (review === null) {
+        throw new ApiError('not_found', `No local review #${localId}.`)
+      }
+      const resolved = await resolveLocalRange(runner, LOCAL_CWD, {
+        baseRef: review.baseRef,
+        headRef: review.headRef,
+      })
+      if (!resolved.ok) throw apiErrorForRange(resolved)
+      const worktree = await detectDirtyWorktree(runner, LOCAL_CWD)
+      store.patchLocalReviewSync(localId, {
+        baseSha: resolved.range.baseSha,
+        mergeBaseSha: resolved.range.mergeBaseSha,
+        headSha: resolved.range.headSha,
+        // The tri-state squash. `unknown` — a worktree that could not be read
+        // at all — becomes `false`, so the wire meaning of `dirty: false` is
+        // "clean, or unknowable". Under-warning is the deliberate choice: a
+        // banner raised by every degraded probe is a banner nobody reads, which
+        // costs exactly the case it exists for.
+        dirty: worktree === 'dirty',
+        lastSyncedAt: LOCAL_NOW,
+      })
+      return localSnapshot(localId, resolved.range)
+    },
+    getSnapshot: () => unused('getSnapshot'),
+    getDraft: () => unused('getDraft'),
+    saveDraft: () => unused('saveDraft'),
+    discardDraft: () => unused('discardDraft'),
+    reconcileDraft: () => unused('reconcileDraft'),
+    getFileViewed: () => unused('getFileViewed'),
+    setFileViewed: () => unused('setFileViewed'),
+    submitReview: () => unused('submitReview'),
+    replyToThread: () => unused('replyToThread'),
+    resolveThread: () => unused('resolveThread'),
+    addReaction: () => unused('addReaction'),
+    listThreads: () => unused('listThreads'),
+  }
+}
+
+interface LocalHarness {
+  api: DirectApi
+  store: DirectStore
+  runner: RecordingRunner
+  /** Which local-surface methods were entered, in order. */
+  surfaceCalls: string[]
+  close(): void
+}
+
+/**
+ * The router under a REAL `DirectApi` — not the hand-rolled fake the rest of
+ * this file routes against — so the band dispatch, the new local methods and
+ * the store all sit between the request and the answer. The GitHub client
+ * throws on any call, which is what makes "nothing about a local review reaches
+ * GitHub" hold without a separate assertion.
+ */
+function localHarness(world: Partial<GitWorld> = {}): LocalHarness {
+  const store = openDirectStore({ dataDir: ':memory:' })
+  const runner = fakeGit({ shallow: false, worktree: 'clean', ...world })
+  const surfaceCalls: string[] = []
+  const api = createDirectApi({
+    session: SESSION,
+    github: throwingGithubClient(),
+    repo: LOCAL_REPO_REF,
+    store,
+    localReviews: localSurfaceOver(store, runner, surfaceCalls),
+  })
+  return { api, store, runner, surfaceCalls, close: () => store.close() }
+}
+
+/**
+ * The routes this router serves for local reviews. `deleteLocalReview` is NOT
+ * one of them — it keeps its honest known-route 501, pinned separately below —
+ * so it is deliberately absent from this table rather than listed and skipped.
+ */
+const SERVED_LOCAL_ROUTES = [
+  {
+    name: 'listBranches',
+    method: ROUTES.listBranches.method,
+    path: ROUTES.listBranches.path,
+    body: undefined as unknown,
+  },
+  {
+    name: 'createLocalReview',
+    method: ROUTES.createLocalReview.method,
+    path: ROUTES.createLocalReview.path,
+    body: { baseRef: MAIN_REF, headRef: FEATURE_REF } as unknown,
+  },
+  {
+    name: 'listLocalReviews',
+    method: ROUTES.listLocalReviews.method,
+    path: ROUTES.listLocalReviews.path,
+    body: undefined as unknown,
+  },
+] as const
+
+/**
+ * Ref shapes that must never become a git argument. A table rather than a
+ * single case, because the failure being guarded against is a handler that
+ * strips a leading dash and calls that validation: only the other four rows
+ * distinguish stripping from validating.
+ */
+const HOSTILE_REFS = [
+  { label: 'an option-injection flag', ref: '--upload-pack=/bin/sh' },
+  { label: 'a bare leading dash', ref: '-' },
+  { label: 'a range expression', ref: 'refs/heads/a..b' },
+  { label: 'a trailing slash', ref: 'refs/heads/feature/' },
+  { label: 'a control character', ref: `refs/heads/feature${String.fromCharCode(1)}x` },
+] as const
+
+async function createLocal(api: DirectApi, body: unknown): Promise<Response> {
+  const res = await handleDirectApi(req('POST', '/api/local-reviews', body), SESSION, api)
+  expect(res).not.toBeNull()
+  return res as Response
+}
+
+describe('handleDirectApi: local reviews', () => {
+  test('every served local route answers a 200, never the known-route 501', async () => {
+    for (const route of SERVED_LOCAL_ROUTES) {
+      const h = localHarness()
+      const res = await handleDirectApi(req(route.method, route.path, route.body), SESSION, h.api)
+      expect([route.name, res?.status]).toEqual([route.name, 200])
+      h.close()
+    }
+  })
+
+  test('every served local route is a typed not_found when no local surface is wired', async () => {
+    // The hand-rolled fake stands in for a daemon assembled without local
+    // reviews: the route exists, the request is well-formed, and the answer is
+    // an honest "this instance does not serve that" rather than a 501 promise.
+    for (const route of SERVED_LOCAL_ROUTES) {
+      const res = await handleDirectApi(
+        req(route.method, route.path, route.body),
+        SESSION,
+        fakeApi(),
+      )
+      expect([route.name, res?.status]).toEqual([route.name, 404])
+      const body = (await res?.json()) as { code: string }
+      expect(body.code).toBe('not_found')
+    }
+  })
+
+  test('POST creates a review and answers the stored summary (200)', async () => {
+    const h = localHarness()
+    const res = await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as LocalReviewSummary
+    expect(body.id).toBeGreaterThanOrEqual(LOCAL_REVIEW_ID_BASE)
+    expect(body.baseRef).toBe(MAIN_REF)
+    expect(body.headRef).toBe(FEATURE_REF)
+    expect(h.store.getLocalReview(body.id)?.headRef).toBe(FEATURE_REF)
+    h.close()
+  })
+
+  test('a bare branch name is qualified before it is stored', async () => {
+    const h = localHarness()
+    const res = await createLocal(h.api, { baseRef: 'main', headRef: 'feature/x' })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as LocalReviewSummary
+    // Qualified on the way in, so the same branch spelled bare and spelled in
+    // full lands on ONE record rather than forking the pair's identity.
+    expect([body.baseRef, body.headRef]).toEqual([MAIN_REF, FEATURE_REF])
+    h.close()
+  })
+
+  test('a hostile ref is refused on either side, and no git command runs', async () => {
+    for (const hostile of HOSTILE_REFS) {
+      for (const side of ['base', 'head'] as const) {
+        const h = localHarness()
+        const body =
+          side === 'base'
+            ? { baseRef: hostile.ref, headRef: FEATURE_REF }
+            : { baseRef: MAIN_REF, headRef: hostile.ref }
+        const res = await createLocal(h.api, body)
+        const envelope = (await res.json()) as { code: string }
+        expect([hostile.label, side, res.status, envelope.code]).toEqual([
+          hostile.label,
+          side,
+          422,
+          'unprocessable',
+        ])
+        // Nothing was spawned...
+        expect([hostile.label, side, h.runner.argvs]).toEqual([hostile.label, side, []])
+        // ...and the surface was not entered either, so the refusal is the
+        // router's own validation rather than the argv seam blocking a value
+        // that had already been handed onward.
+        expect([hostile.label, side, h.surfaceCalls]).toEqual([hostile.label, side, []])
+        expect(h.store.listLocalReviews(LOCAL_REPO)).toEqual([])
+        h.close()
+      }
+    }
+
+    // The positive control for the two emptiness claims above, on the same
+    // runner and the same surface: a well-formed pair DOES reach git. Without
+    // it, "zero invocations" would pass just as well on a runner nothing was
+    // ever wired to.
+    const h = localHarness()
+    const ok = await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    expect(ok.status).toBe(200)
+    expect(h.runner.argvs.length).toBeGreaterThanOrEqual(1)
+    expect(h.runner.argvs[0][0]).toBe('git')
+    expect(h.surfaceCalls).toEqual(['createLocalReview'])
+    h.close()
+  })
+
+  test('each typed creation failure lands on its contract code and status', async () => {
+    const cases = [
+      {
+        label: 'base and head name the same ref',
+        world: {},
+        body: { baseRef: MAIN_REF, headRef: MAIN_REF },
+        code: 'unprocessable',
+        status: 422,
+      },
+      {
+        label: 'two names resolving to one commit',
+        world: {},
+        body: { baseRef: FEATURE_REF, headRef: TWIN_REF },
+        code: 'unprocessable',
+        status: 422,
+      },
+      {
+        label: 'unrelated histories',
+        world: { shallow: false },
+        body: { baseRef: MAIN_REF, headRef: ORPHAN_REF },
+        code: 'unprocessable',
+        status: 422,
+      },
+      {
+        label: 'a shallow clone that cannot answer merge-base',
+        world: { shallow: true },
+        body: { baseRef: MAIN_REF, headRef: ORPHAN_REF },
+        code: 'unprocessable',
+        status: 422,
+      },
+      {
+        label: 'a ref that does not exist',
+        world: {},
+        body: { baseRef: MAIN_REF, headRef: ABSENT_REF },
+        code: 'not_found',
+        status: 404,
+      },
+      {
+        label: 'a ref name that fails validation',
+        world: {},
+        body: { baseRef: MAIN_REF, headRef: '-x' },
+        code: 'unprocessable',
+        status: 422,
+      },
+      {
+        label: 'a body that is not a creation input at all',
+        world: {},
+        body: { baseRef: MAIN_REF },
+        code: 'not_found',
+        status: 400,
+      },
+    ] as const
+
+    for (const c of cases) {
+      const h = localHarness(c.world)
+      const res = await createLocal(h.api, c.body)
+      const envelope = (await res.json()) as { code: string }
+      expect([c.label, res.status, envelope.code]).toEqual([c.label, c.status, c.code])
+      // Nothing was recorded for a request that could not be satisfied.
+      expect([c.label, h.store.listLocalReviews(LOCAL_REPO)]).toEqual([c.label, []])
+      h.close()
+    }
+  })
+
+  test('creating the same triple twice returns one id, 200 both times', async () => {
+    const h = localHarness()
+    const body = { baseRef: MAIN_REF, headRef: FEATURE_REF }
+    const first = await createLocal(h.api, body)
+    const second = await createLocal(h.api, body)
+    expect([first.status, second.status]).toEqual([200, 200])
+    const a = (await first.json()) as LocalReviewSummary
+    const b = (await second.json()) as LocalReviewSummary
+    // A duplicate pair is the review that already exists, not a conflict: the
+    // retry of a request whose answer was lost must be safe.
+    expect(b.id).toBe(a.id)
+    expect(h.store.listLocalReviews(LOCAL_REPO).map((r) => r.id)).toEqual([a.id])
+    h.close()
+  })
+
+  test('GET /api/local-reviews carries dirty and archivedPr on every item', async () => {
+    const h = localHarness()
+    await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    await createLocal(h.api, { baseRef: MAIN_REF, headRef: TWIN_REF })
+    const res = await handleDirectApi(req('GET', '/api/local-reviews'), SESSION, h.api)
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as LocalReviewSummary[]
+    expect(body.map((r) => r.headRef)).toEqual([FEATURE_REF, TWIN_REF])
+    for (const item of body) {
+      // This route is the ONLY wire path for the two local-only annotations, so
+      // a key merely absent here is a key no client can ever read. Presence is
+      // asserted structurally, then the whole shape against the contract's own
+      // validator, which requires every column.
+      expect(Object.hasOwn(item, 'dirty')).toBe(true)
+      expect(Object.hasOwn(item, 'archivedPr')).toBe(true)
+    }
+    expect(() => validateLocalReviewSummaries(body)).not.toThrow()
+    h.close()
+  })
+
+  test('a dirty worktree at sync time is served as dirty: true', async () => {
+    const h = localHarness({ worktree: 'dirty' })
+    const created = (await (
+      await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    ).json()) as LocalReviewSummary
+    const sync = await handleDirectApi(
+      req('POST', `/api/pulls/${created.id}/sync`),
+      SESSION,
+      h.api,
+    )
+    expect(sync?.status).toBe(200)
+    const list = (await (
+      await handleDirectApi(req('GET', '/api/local-reviews'), SESSION, h.api)
+    )?.json()) as LocalReviewSummary[]
+    expect(list[0].dirty).toBe(true)
+    h.close()
+  })
+
+  test('a worktree probe that cannot answer is served as dirty: false, never true', async () => {
+    const h = localHarness({ worktree: 'unreadable' })
+    const created = (await (
+      await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    ).json()) as LocalReviewSummary
+
+    // The probe genuinely fails, so the production detector answers `unknown` —
+    // the third state, not one synthesized for this test.
+    expect(await detectDirtyWorktree(h.runner, LOCAL_CWD)).toBe('unknown')
+
+    const sync = await handleDirectApi(
+      req('POST', `/api/pulls/${created.id}/sync`),
+      SESSION,
+      h.api,
+    )
+    expect(sync?.status).toBe(200)
+    const list = (await (
+      await handleDirectApi(req('GET', '/api/local-reviews'), SESSION, h.api)
+    )?.json()) as LocalReviewSummary[]
+    // Either answer would be defensible; this one is chosen and asserted, so
+    // the wire meaning of `dirty: false` is "clean, or unknowable" by decision
+    // rather than by a coercion nobody wrote down. The dirty case above is what
+    // keeps this from passing on a `dirty` that is simply always false.
+    expect(list[0].dirty).toBe(false)
+    h.close()
+  })
+
+  test('GET /api/branches is a git read, and surfaces refs no stored review names', async () => {
+    const h = localHarness()
+    await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    const res = await handleDirectApi(req('GET', '/api/branches'), SESSION, h.api)
+    expect(res?.status).toBe(200)
+    const body = (await res?.json()) as BranchRef[]
+    expect(body.map((b) => b.ref)).toEqual([MAIN_REF, FEATURE_REF, REMOTE_MAIN_REF])
+    // The remote-tracking ref is in no local-review row and in no store table —
+    // a branch listing answered from stored reviews could not produce it, and a
+    // base is frequently tracked and never checked out.
+    expect(body.some((b) => b.ref === REMOTE_MAIN_REF && b.kind === 'remote')).toBe(true)
+    expect(
+      h.store.listLocalReviews(LOCAL_REPO).flatMap((r) => [r.baseRef, r.headRef]),
+    ).not.toContain(REMOTE_MAIN_REF)
+    // Exactly one entry is the default, and it is the local branch rather than
+    // its remote-tracking copy.
+    expect(body.filter((b) => b.isDefault).map((b) => b.ref)).toEqual([MAIN_REF])
+    h.close()
+  })
+
+  test('DELETE /api/local-reviews/:n is a known route that answers 501', async () => {
+    const h = localHarness()
+    const created = (await (
+      await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    ).json()) as LocalReviewSummary
+    const res = await handleDirectApi(
+      req('DELETE', `/api/local-reviews/${created.id}`),
+      SESSION,
+      h.api,
+    )
+    // Deliberately unserved: removing a local review means deciding what becomes
+    // of its snapshot, its cached blobs, and every human's draft and viewed
+    // marks on it — a retention policy, not a row delete. An honest 501 is the
+    // interim answer, and the review is still there afterwards.
+    expect(res?.status).toBe(501)
+    const body = (await res?.json()) as { code: string }
+    expect(body.code).toBe('not_implemented')
+    expect(h.store.getLocalReview(created.id)).not.toBeNull()
+    h.close()
   })
 })

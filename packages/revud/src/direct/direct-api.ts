@@ -1,7 +1,10 @@
 import type {
+  BranchRef,
+  CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  LocalReviewSummary,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -105,6 +108,40 @@ export interface DirectApi {
    * The endpoint behind this is free — reading the allowance does not spend it.
    */
   getRateLimit(): Promise<RateLimitInfo>
+
+  // ——— reviews of a local branch pair, with no pull request behind them ———
+
+  /**
+   * The branches this repository can offer as either side of a new review:
+   * local branches AND remote-tracking refs, since a base is frequently tracked
+   * and never checked out.
+   *
+   * A GIT read, never a store read. Nothing about branches is recorded in any
+   * table, and the listing has to include refs no stored review has ever named
+   * — so there is no row set this could be answered from, and answering it from
+   * one would offer only the branches already under review.
+   */
+  listBranches(): Promise<BranchRef[]>
+
+  /**
+   * Record a review of `headRef` against `baseRef`, or return the review that
+   * already exists for that branch pair. The refs arrive already validated and
+   * fully qualified: syntax is settled at the request boundary, BEFORE any
+   * value could become a git argument.
+   *
+   * Idempotent per branch pair, and that idempotence is a 200 carrying the
+   * existing review rather than a conflict — a retried creation whose first
+   * answer was lost must be safe, and a pair's identity must not depend on how
+   * many times it was asked for.
+   */
+  createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary>
+
+  /**
+   * Every local review recorded for this repository, carrying the two
+   * annotations that exist only locally — `dirty` and `archivedPr`. Sync,
+   * because it is a single store read.
+   */
+  listLocalReviews(): LocalReviewSummary[]
 
   /** Run the burst sync and persist; may resolve a `partial` snapshot. */
   syncPull(prNumber: number): Promise<Snapshot>
@@ -254,6 +291,25 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     return deps.localReviews
   }
 
+  /**
+   * The local surface for the three operations that belong to local reviews
+   * ALONE — the branch listing, creation, and the local listing. They carry no
+   * review id, so there is no band to read and nothing to dispatch on: they are
+   * local by construction and have no GitHub-backed twin to fall through to.
+   *
+   * Unwired, they answer the same typed `not_found` `listPulls` gives for the
+   * broker-only live list: this instance does not serve that resource. It is
+   * deliberately not `not_implemented`, which would promise the capability is
+   * coming — a daemon assembled without a local surface is not going to grow
+   * one mid-run.
+   */
+  const localSurface = (): LocalReviewSurface => {
+    if (deps.localReviews === undefined) {
+      throw new ApiError('not_found', 'This daemon does not serve local reviews.')
+    }
+    return deps.localReviews
+  }
+
   /** The invariant bundle every write operation shares. */
   const writeDeps = {
     github: deps.github,
@@ -285,6 +341,24 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
         )
       }
       return deps.pullList.listPulls(ifNoneMatch)
+    },
+
+    // `listBranches` and `createLocalReview` are `async` so that an unwired
+    // local surface surfaces as a REJECTED promise rather than a synchronous
+    // throw — every caller awaits them, and a synchronous throw would escape
+    // the try/catch that awaiting establishes. `listLocalReviews` is sync on
+    // both sides of the seam, so its throw is synchronous too and the router
+    // calls it inside its own try.
+    async listBranches(): Promise<BranchRef[]> {
+      return localSurface().listBranches()
+    },
+
+    async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
+      return localSurface().createLocalReview(input)
+    },
+
+    listLocalReviews(): LocalReviewSummary[] {
+      return localSurface().listLocalReviews()
     },
 
     async syncPull(prNumber: number): Promise<Snapshot> {

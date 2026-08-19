@@ -17,6 +17,11 @@
  *   - a local id with no local surface wired is a typed `not_found`, never a
  *     fall-through to GitHub.
  *
+ * Alongside them sit the three operations that belong to local reviews alone —
+ * the branch listing, creation, and the local listing. They carry no review id,
+ * so there is no band to read: they always reach the local surface, and answer
+ * the same typed `not_found` when none is wired.
+ *
  * The last test derives its case table from the surface itself: every
  * function-valued key of the built api must appear in exactly one of two
  * literal name lists — those that dispatch on the band, and those that must
@@ -235,6 +240,33 @@ const LOCAL_VIEWED: FileViewedState = {
   'a.ts': { viewed: true, blobSha: 'localblob', at: NOW_ISO },
 }
 const LOCAL_SUBMIT: SubmitResult = { status: 'ok', review: reviewSummary(7001) }
+/** The row the fake local surface records and lists back. */
+const LOCAL_SUMMARY: LocalReviewSummary = {
+  id: LOCAL_ID,
+  repo: 'o/r',
+  baseRef: 'refs/heads/main',
+  headRef: 'refs/heads/feature/x',
+  title: 'feature/x',
+  baseSha: null,
+  mergeBaseSha: null,
+  headSha: null,
+  dirty: false,
+  archivedPr: null,
+  createdAt: NOW_ISO,
+  updatedAt: NOW_ISO,
+  lastSyncedAt: null,
+}
+/**
+ * The branch the fake listing answers with. Remote-tracking on purpose: no
+ * store row names it, so an answer carrying it can only have come from the
+ * local surface's git read.
+ */
+const LOCAL_BRANCH: BranchRef = {
+  ref: 'refs/remotes/origin/main',
+  name: 'origin/main',
+  kind: 'remote',
+  isDefault: false,
+}
 const LOCAL_COMMENT = reviewComment(LOCAL_ENTITY_ID_BASE + 3)
 const LOCAL_THREAD = reviewThread('LOCALTHREAD_1', LOCAL_ENTITY_ID_BASE + 3)
 const LOCAL_ROLLUP = rollup()
@@ -284,28 +316,19 @@ function fakeLocalSurface(): { surface: LocalReviewSurface; spy: SurfaceSpy } {
     async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
       spy.calls.push('createLocalReview')
       return {
-        id: LOCAL_ID,
-        repo: 'o/r',
+        ...LOCAL_SUMMARY,
         baseRef: input.baseRef,
         headRef: input.headRef,
         title: input.title ?? input.headRef,
-        baseSha: null,
-        mergeBaseSha: null,
-        headSha: null,
-        dirty: false,
-        archivedPr: null,
-        createdAt: NOW_ISO,
-        updatedAt: NOW_ISO,
-        lastSyncedAt: null,
       }
     },
     listLocalReviews(): LocalReviewSummary[] {
       spy.calls.push('listLocalReviews')
-      return []
+      return [LOCAL_SUMMARY]
     },
     async listBranches(): Promise<BranchRef[]> {
       spy.calls.push('listBranches')
-      return []
+      return [LOCAL_BRANCH]
     },
     async syncPull(localId: number): Promise<Snapshot> {
       spy.calls.push(`syncPull:${localId}`)
@@ -427,9 +450,20 @@ const DISPATCHING = [
 ]
 
 /**
- * The methods that take no review id and must NOT dispatch: `getBlob` is
- * content-addressed and the local store reuses the one blob table, preferences
- * are keyed by the human, and the two list/allowance reads take no id at all.
+ * The methods that take no review id and so must NOT branch on the band.
+ * `getBlob` is content-addressed and both kinds of review store their bytes in
+ * the one blob table, so a SHA means the same thing on either side;
+ * preferences are keyed by the human and belong to no review; the pull list and
+ * the allowance read take no id at all.
+ *
+ * The three local-review operations sit here for a further reason worth stating
+ * separately, because "does not dispatch" understates it: they are local BY
+ * CONSTRUCTION. A branch listing, a creation and the local listing have no
+ * GitHub-backed twin to choose between — no id to read a band off, and no
+ * pull-request path they could fall through to — so they always reach the local
+ * surface, or answer a typed `not_found` when none is wired. They belong in
+ * this list because the property it guards is "no band branch happens here",
+ * not "the local surface is never reached".
  */
 const NON_DISPATCHING = [
   'listPulls',
@@ -437,6 +471,9 @@ const NON_DISPATCHING = [
   'getBlob',
   'getPreferences',
   'setPreferences',
+  'listBranches',
+  'createLocalReview',
+  'listLocalReviews',
 ]
 
 describe('direct api band dispatch', () => {
@@ -572,6 +609,59 @@ describe('direct api band dispatch', () => {
       (): Promise<unknown> => api.replyToThread(LOCAL_ID, 'LOCALTHREAD_1', 'hi'),
       (): Promise<unknown> => api.resolveThread(LOCAL_ID, 'LOCALTHREAD_1', true),
       (): Promise<unknown> => api.addReaction(LOCAL_ID, LOCAL_ENTITY_ID_BASE + 3, 'heart'),
+    ]) {
+      const outcome = await call().then(
+        () => ({ resolved: true, err: null as unknown }),
+        (e: unknown) => ({ resolved: false, err: e }),
+      )
+      expect(outcome.resolved).toBe(false)
+      expect(outcome.err).toBeInstanceOf(ApiError)
+      expect((outcome.err as ApiError).code).toBe('not_found')
+    }
+
+    expect(githubCalls).toEqual([])
+    store.close()
+  })
+
+  test('the local-only operations reach the local surface, and GitHub is never entered', async () => {
+    const { api, store, githubCalls, spy } = build({ local: true })
+
+    expect(await api.listBranches()).toEqual([LOCAL_BRANCH])
+    const created = await api.createLocalReview({
+      baseRef: 'refs/heads/main',
+      headRef: 'refs/heads/feature/x',
+    })
+    expect(created.id).toBe(LOCAL_ID)
+    expect(api.listLocalReviews()).toEqual([LOCAL_SUMMARY])
+
+    expect(spy.calls).toEqual(['listBranches', 'createLocalReview', 'listLocalReviews'])
+    // A branch pair with no pull request behind it has nothing to ask GitHub
+    // about, and the recorder is the evidence rather than the absence of a
+    // thrown stub error.
+    expect(githubCalls).toEqual([])
+    store.close()
+  })
+
+  test('the local-only operations are a typed not_found with no local surface wired', async () => {
+    const { api, githubCalls, store } = build({ local: false })
+
+    // Sync on the surface, so its refusal is a synchronous throw...
+    let threw: unknown = null
+    try {
+      api.listLocalReviews()
+    } catch (err) {
+      threw = err
+    }
+    expect(threw).toBeInstanceOf(ApiError)
+    expect((threw as ApiError).code).toBe('not_found')
+
+    // ...while the two async ones must REJECT rather than throw synchronously:
+    // every caller awaits them, and a synchronous throw would escape the
+    // try/catch that awaiting establishes.
+    for (const call of [
+      (): Promise<unknown> => api.listBranches(),
+      (): Promise<unknown> =>
+        api.createLocalReview({ baseRef: 'refs/heads/main', headRef: 'refs/heads/x' }),
     ]) {
       const outcome = await call().then(
         () => ({ resolved: true, err: null as unknown }),
