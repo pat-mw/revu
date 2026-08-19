@@ -108,18 +108,24 @@ export function reconcileDraft(deps: ReconcileDeps, prNumber: number): Reconcile
     }),
   )
 
-  // Commits that landed after the draft was written — the ones the force-push /
-  // base-advance added. Preferred: find the draft's head in the fresh snapshot's
-  // base→head commit list and slice everything after it. When the draft's head
-  // predates the whole list (it fell out of the rewritten compare entirely),
-  // approximate by author date newer than the draft's creation. Matches the mock
-  // oracle's semantics exactly (`src/api/mock/adapter.ts` reconcileDraft); the
-  // count is what the UI communicates as "N new commits".
+  // Commits that landed after the draft was written — the ones a force-push or a
+  // base advance added.
+  //
+  // When the draft's head is still in the fresh base→head list, the answer is
+  // exact: slice everything after it.
+  //
+  // When it is absent, the branch was rewritten and the head this draft was
+  // written against exists nowhere in the compare any more. Every commit now in
+  // the range is new relative to a head that is gone, so the whole list is the
+  // answer. The alternative — keeping commits whose author date postdates the
+  // draft — under-reports by construction, because a rebase rewrites committer
+  // dates and PRESERVES author dates: every rewritten commit keeps a date older
+  // than the draft, and the filter yields nothing on precisely the rewrite that
+  // moved the most work. The count is what the UI communicates as "N new
+  // commits", and zero is the one answer a rewrite must never produce.
   const draftHeadIndex = commits.findIndex((c) => c.sha === draft.headSha)
   const newCommits: CommitInfo[] =
-    draftHeadIndex >= 0
-      ? commits.slice(draftHeadIndex + 1)
-      : commits.filter((c) => c.commit.author.date > draft.createdAt)
+    draftHeadIndex >= 0 ? commits.slice(draftHeadIndex + 1) : [...commits]
 
   return {
     prNumber,

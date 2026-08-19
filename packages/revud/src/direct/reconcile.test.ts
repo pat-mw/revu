@@ -442,18 +442,34 @@ describe('reconcileDraft — newCommits from the snapshot delta', () => {
     expect(report.currentHeadSha).toBe('NEW-HEAD')
   })
 
-  test('falls back to author-date when the draft head fell out of the rewritten compare', () => {
+  test('reports every commit when the draft head fell out of the rewritten compare', () => {
     const { draft, snapshot, blobs } = forcePushFixture()
     // A hard force-push that dropped OLD-HEAD entirely from the fresh list.
+    // Every author date here PREDATES the draft, which is what a rebase
+    // actually produces: it rewrites committer dates and preserves author
+    // dates. The head the draft was written against exists nowhere in this
+    // list, so every commit in it is new relative to a head that is gone.
     snapshot.immutable.commits = [
-      commit('X0', '2026-01-10T00:00:00.000Z'), // before the draft was written
-      commit('X1', '2026-01-16T00:00:00.000Z'), // after → counts as new
-      commit('X2', '2026-01-17T00:00:00.000Z'), // after → counts as new
+      commit('X0', '2026-01-10T00:00:00.000Z'),
+      commit('X1', '2026-01-11T00:00:00.000Z'),
+      commit('X2', '2026-01-12T00:00:00.000Z'),
     ]
     const store = fakeStore({ draft, snapshot, blobs })
     const report = reconcileDraft({ store, humanId: HUMAN }, 5)
-    // draft.createdAt is 2026-01-15; only X1 and X2 postdate it.
-    expect(report.newCommits.map((c) => c.sha)).toEqual(['X1', 'X2'])
+    expect(report.newCommits.map((c) => c.sha)).toEqual(['X0', 'X1', 'X2'])
+    // The property rather than the literal, so a fixture change cannot satisfy
+    // it: with the draft head absent, the count IS the list length.
+    expect(report.newCommits).toHaveLength(snapshot.immutable.commits.length)
+
+    // The old heuristic, computed inline and asserted strictly worse. This is
+    // the regression guard: restoring the author-date fallback makes it red,
+    // and on this fixture that fallback reports ZERO — the under-report at its
+    // worst, on exactly the rewrite that moved the most work.
+    const byAuthorDate = snapshot.immutable.commits.filter(
+      (c) => c.commit.author.date > draft.createdAt,
+    )
+    expect(byAuthorDate).toHaveLength(0)
+    expect(byAuthorDate.length).toBeLessThan(report.newCommits.length)
   })
 })
 
