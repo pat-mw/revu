@@ -293,10 +293,11 @@ describe('resolveDirectContext — broker boot never probes the viewer', () => {
  * typed absence instead of a refusal, and the session is then built from git
  * config alone. The half is all-or-nothing: a clone whose origin resolves AND
  * whose token is obtainable keeps repo, client, and viewer together (probed at
- * boot exactly as a required boot probes them), while a clone that cannot
- * produce a token drops all three — never a repo without a viewer, because the
- * write guards compare against the viewer login and silently invert on a blank
- * one. The default is unchanged, and the case that proves the relaxation
+ * boot exactly as a required boot probes them), while a clone with no usable
+ * half — no token obtainable, a credential GitHub rejects, or a GitHub that
+ * cannot be reached — drops all three — never a repo without a viewer, because
+ * the write guards compare against the viewer login and silently invert on a
+ * blank one. The default is unchanged, and the case that proves the relaxation
  * carries its own control that flips the flag back and asserts the refusal
  * returns — otherwise a passing boot would say nothing about the flag.
  */
@@ -446,5 +447,140 @@ describe('resolveDirectContext — local-only boot needs no GitHub', () => {
     expect(ctx.repo).toEqual({ owner: 'acme', repo: 'revu' })
     expect(ctx.github).not.toBeUndefined()
     expect(ctx.session.viewerLogin).toBe('alice-gh')
+  })
+
+  test('a stale credential (GET /user answers 401) drops the GitHub half whole', async () => {
+    // The token EXISTS locally — `gh auth token` produces one — but GitHub
+    // rejects it, so no viewer can stand behind the half. A local-only boot
+    // needs no token, so a credential GitHub refuses must shed the half
+    // exactly as an absent credential does — repo, client, and viewer
+    // together — and the boot proceeds as a purely local one.
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_stale',
+      }),
+      fetchImpl: failingFetch(401),
+      env: {},
+      requireGithub: false,
+    })
+    expect(ctx.repo).toBeUndefined()
+    expect(ctx.github).toBeUndefined()
+    expect(ctx.session.viewerLogin).toBeUndefined()
+  })
+
+  test('an unreachable GitHub (fetch throws) drops the GitHub half whole', async () => {
+    // The offline shape: the viewer probe cannot even connect. A local-only
+    // boot in an ordinary GitHub clone must survive exactly this — needing no
+    // network is the point of the mode — so the connection failure sheds the
+    // half rather than stopping the daemon.
+    const offlineFetch: FetchLike = async () => {
+      throw new Error('fetch failed: getaddrinfo ENOTFOUND api.github.com')
+    }
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({
+        origin: 'git@github.com:acme/revu.git',
+        config: GOOD_CONFIG,
+        ghToken: 'gho_valid',
+      }),
+      fetchImpl: offlineFetch,
+      env: {},
+      requireGithub: false,
+    })
+    expect(ctx.repo).toBeUndefined()
+    expect(ctx.github).toBeUndefined()
+    expect(ctx.session.viewerLogin).toBeUndefined()
+  })
+
+  test('a token source that fails in its own way sheds the half instead of aborting', async () => {
+    // The shed is not conditioned on the failure being the typed no-token
+    // shape: an injected source that fails differently (an unreadable
+    // credential store, say) equally leaves no usable credential, so an
+    // optional boot drops the half whole rather than crashing on the error.
+    const ctx = await resolveDirectContext({
+      runner: scriptRunner({ origin: 'git@github.com:acme/revu.git', config: GOOD_CONFIG }),
+      fetchImpl: refusingFetch().impl,
+      env: {},
+      tokenSource: {
+        getToken: async () => {
+          throw new Error('credential store unreadable')
+        },
+      },
+      requireGithub: false,
+    })
+    expect(ctx.repo).toBeUndefined()
+    expect(ctx.github).toBeUndefined()
+    expect(ctx.session.viewerLogin).toBeUndefined()
+  })
+
+  test('the same stale credential under the requirement still refuses to start', async () => {
+    // The control that keeps the relaxation honest: a required boot treats a
+    // rejected credential as the hard start failure it always was, with the
+    // HTTP status in the message so the user can act.
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({
+          origin: 'git@github.com:acme/revu.git',
+          config: GOOD_CONFIG,
+          ghToken: 'gho_stale',
+        }),
+        fetchImpl: failingFetch(401),
+        env: {},
+        requireGithub: true,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+    expect((thrown as Error).message).toContain('401')
+  })
+
+  test('the same unreachable GitHub under the requirement still refuses to start', async () => {
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({
+          origin: 'git@github.com:acme/revu.git',
+          config: GOOD_CONFIG,
+          ghToken: 'gho_valid',
+        }),
+        fetchImpl: async () => {
+          throw new Error('fetch failed: getaddrinfo ENOTFOUND api.github.com')
+        },
+        env: {},
+        requireGithub: true,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+    expect((thrown as Error).message).toContain('ENOTFOUND')
+  })
+
+  test('an unset user.email still refuses to start when the shed retries locally', async () => {
+    // A GitHub clone whose credential GitHub rejects sheds the half and
+    // rebuilds the session from git config alone — and the rebuild keeps the
+    // identity guard hard. The email keys drafts and viewed state, so the
+    // local retry must refuse an unset identity exactly as a first-attempt
+    // local boot does, never soften it into a blank id.
+    let thrown: unknown
+    try {
+      await resolveDirectContext({
+        runner: scriptRunner({
+          origin: 'git@github.com:acme/revu.git',
+          config: { 'user.name': 'Alice' },
+          ghToken: 'gho_stale',
+        }),
+        fetchImpl: failingFetch(401),
+        env: {},
+        requireGithub: false,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(DirectStartupError)
+    expect((thrown as Error).message).toContain('git config')
   })
 })

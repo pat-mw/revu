@@ -343,9 +343,11 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   // boot carries that absence forward instead of refusing to start on it. That
   // refusal is what previously made a local-only daemon impossible in a
   // repository with no `origin` — the one deployment it exists for. The half is
-  // all-or-nothing: a clone whose token is obtainable keeps repo, client, and
-  // probed viewer together, and anything less drops all three, so the boot
-  // never carries a repository its write guards have no viewer to stand behind.
+  // all-or-nothing: a clone whose GitHub half stands up end to end — token
+  // obtained, viewer probed — keeps repo, client, and viewer together, and
+  // anything less (no origin, no usable credential, an unreachable GitHub, or
+  // a probe it refuses) drops all three, so the boot never carries a
+  // repository its write guards have no viewer to stand behind.
   const context = await resolveDirectContext({
     env,
     requireGithub,
