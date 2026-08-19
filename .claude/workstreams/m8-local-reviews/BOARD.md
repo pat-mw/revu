@@ -10,13 +10,27 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.8 — re-sync, rebase safety, and object pinning — is In Progress** on `m8.8/resync-and-pinning`, branched
-from the stack tip. Nothing else is running. The four questions that blocked this session's dispatch were put
-to the owner and **all four are answered** — recorded below and written into the tickets they bind.
+**M8.8 — re-sync, rebase safety, and object pinning — is In Progress at 6/8** on
+`m8.8/resync-and-pinning`, pushed, **no PR yet**. Nothing is running. The four questions that blocked this
+session's dispatch were put to the owner and **all four are answered** — recorded below and written into the
+tickets they bind.
 
-| ticket | units | state | branch |
-| --- | --- | --- | --- |
-| **M8.8** re-sync, rebase safety, pinning | 0/8 | **In Progress** | `m8.8/resync-and-pinning` |
+| unit | what landed | commit |
+| --- | --- | --- |
+| **M8.8.1** the pin seam | `local-pins.ts`, one atomic `update-ref --stdin` batch | `9522087` |
+| **M8.8.2** pin before the first read | `syncLocalReview` carries the outcome; `syncPull` unchanged on the wire | `4d73d69` |
+| **M8.8.3** rewrite detection | the author-date fallback reported **zero** on a rebase; mock moved first | `7ed601d` |
+| **M8.8.4** missing objects | the `line-deleted` lie closed, **and the re-sync advice made to actually work** | `048ea90` |
+| **M8.8.5** deleted/renamed branch | survival walk + runtime deletion tripwire; **no production change needed** | `b52f181` |
+| **M8.8.8** prune survival | the pinned/unpinned pair — the control fails when the pin is removed | `cb2c5a0` |
+
+**Gate at the tip: 2702 pass · 1 skip · 0 fail · 98 files**, under `TZ=UTC`, re-run by the orchestrator in the
+main tree after every unit.
+
+**Remaining: M8.8.6 and M8.8.7 — both app-side, and they share `reconcile-dialog.tsx`, so they run in
+sequence, 6 then 7.** M8.8.6's staleness half wants M8.5.3's `listPulls` merge (a soft dependency — until then
+`useStaleness` returns `null` and the banner degrades rather than blocking). **No PR opens for M8.8 until 8/8
+and an adversarial pass** — §8 is review-before-PR, and the ticket is not complete.
 
 ### The owner's rulings — 2026-08-19
 
