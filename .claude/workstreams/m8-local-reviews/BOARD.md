@@ -15,10 +15,39 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 
 | unit | tier | state |
 | --- | --- | --- |
-| **OQ5 design pass** — the `LocalReviewSurface` seam, and the five findings addressed to M8.5 | fable | **dispatched** (read-only, no worktree) |
-| **M8.5.4** — boot relaxation: no origin, no token, no `GET /user` | opus | **dispatched** (isolated worktree) |
+| **OQ5 design pass** — the `LocalReviewSurface` seam + the five findings | fable | ✅ landed (spec only, no code) |
+| **M8.5.4** — boot relaxation: no origin, no token, no `GET /user` | opus | ✅ landed `5bfdf38` — 2453 pass · 1 skip · 0 fail · 91 files |
+| **M8.5.1** — band dispatch on the direct surface | opus | **dispatched** (isolated worktree) |
+| **M8.5.9** — two daemons on one data dir: the mint must wait | opus | **dispatched** (isolated worktree, disjoint files) |
 
-Everything else in M8.5 waits on one of those two. M8.5.1 needs the design pass; M8.5.5 needs M8.5.1 + M8.5.4.
+`.1` writes `direct-api.ts` + a new `local-surface.ts` + a new `direct-api.test.ts`; `.9` writes `store.ts` +
+`store.test.ts`. Disjoint, so they run together. Everything after them is the **router chain**, which is
+serialized — see below.
+
+### ⚠️ The router chain is serialized, correcting the roadmap
+
+`ROADMAP.md`'s S4 plans **M8.5.2 ∥ M8.5.3** with a "sanctioned trivial merge" on `direct-router.ts`. That
+repeats the exact assumption that already cost the app track and the daemon track a re-plan: **integration is
+by copying whole files out of an isolated worktree, so two workers on one file means one is silently
+discarded.** `.2`, `.3`, `.8` and `.6` all write `direct-router.ts` **and** `direct-router.test.ts`. Honest
+order: **`.1` → `.2` → `.3` → `.8` → `.6` → `.7`**, with `.5` (which owns `index.ts`) running beside the chain
+once `.1` lands, and `.9` beside it throughout.
+
+`.6` must land **after** `.2`, not before: its route-partition assertion classifies every route as
+served / degraded / not-implemented, and until `.2` serves them the four local-review routes sit in **none** of
+those buckets — they answer 501 through the *generic* fall-through while not being in `NOT_IMPLEMENTED_ROUTES`.
+Asserting a three-way partition today would either fail or require calling them "not implemented", which is
+false.
+
+### ⚠️ The ticket contradicts itself on M8.5.4's blast radius — resolved by measurement
+
+The Units preamble calls M8.5.4 "fully independent of M8.5.1–M8.5.3 — it touches `direct/context.ts` +
+`direct/session.ts`". Its own **Landmines** section says the opposite: making `DirectContext.repo` typed-absent
+"ripples" into `createDirectApi({repo})`, `runSyncPull`, `provisionBlobs` and the poll loop. M8.5.1 was held
+until M8.5.4 reported what it actually touched. **It touched `index.ts`, not `direct-api.ts`** — five reads of
+`context.repo` and two of `context.github` across `mainDirect` and `mainBroker`, folded behind one exported
+total narrowing function. So the collision did not materialise, but it was real enough to be worth the wait.
+
 
 **Gate at the branch point (`90d3876`), re-run in the main tree:** 2445 pass · 1 skip · 0 fail · 91 files.
 
