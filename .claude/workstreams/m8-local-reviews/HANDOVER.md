@@ -6,9 +6,8 @@ act from it alone.
 ## 2026-08-19 — Session 5 (the join) — **M8.5 COMPLETE and in review on #76**
 
 > Every branch is pushed, `main` is untouched at `177068a`, and no §5 stop condition was hit. **CI is green on
-> all nine PRs in the stack** — two of them were red when this session started. One small, non-blocking
-> observability fix was still in flight when this was written; see *One thing still in flight* below and check
-> `git log` before assuming either way. Everything else is landed.
+> all nine PRs in the stack** — two of them were red when this session started. Nothing is in flight and no
+> worktree is in use.
 >
 > ⚠️ **FIRST ACTION: interview the owner.** Four questions block what you are about to dispatch. They are
 > written out at the bottom of this entry with options and a recommendation for each. Ask them **before**
@@ -19,25 +18,25 @@ act from it alone.
 ### Start here
 
 1. `git checkout m8.5/daemon-wiring` — the tip, and where the board lives.
-2. `bun run check` — expect **2635 pass · 1 skip · 0 fail · 95 files**. The 1 skip is pre-existing.
+2. `bun run check` — expect **2645 pass · 1 skip · 0 fail · 95 files**. The 1 skip is pre-existing.
 3. **Run the gate with `TZ=UTC` before pushing anything that touches dates or git output.** A default local run
    reproduces CI only by accident; that is exactly how two PRs shipped red this week.
 4. Interview the owner (below), then dispatch. **M8.8, M8.9 and M8.10 are mutually independent** and all
    unblocked by M8.5 — the widest genuine parallelism left in this milestone.
 
 
-### One thing still in flight when this was written
+### Both follow-up fixes landed after the handover was first written
 
-A small **observability** fix is being written in an isolated worktree: the boot path can shed the GitHub half
-(drop the repo and client and continue local-only) for four different reasons — no credential, a rejected
-credential, an unreachable network, or an injected token source failing — and the shed is currently **silent**.
-The startup line shows the absence but never the cause, so an operator debugging "why is my daemon local-only
-when `gh auth status` is fine?" has to re-run with GitHub required just to see the error. A pre-merge review
-named it as the one residual worth closing and explicitly **not** a blocker.
-
-Worktree, if it needs recovering: `.claude/worktrees/agent-a4b3c0f447dd816e5`, based on `94f73c7`, touching
-`direct/context.ts` and `direct/context.test.ts` only. **If it is not in `git log`, it never landed** — either
-re-dispatch it or drop it; #76 is complete and correct without it.
+- **The silent shed is closed** (`0b32368`, on `m8.5`). Boot could drop the GitHub half for four different
+  reasons and say nothing; it now emits one line naming the cause and the consequence. **The cause is built
+  from an allowlist** — a pattern-checked class name, a bounded HTTP status, an uppercase errno mnemonic — and
+  the error's `message`, the one field a hostile or careless source controls, is **never read**. Redacting the
+  message instead would have been a denylist over every shape a credential can take. The line is emitted once
+  before the context returns rather than at the drop, because it promises the daemon is continuing, and an
+  identity failure on that same path refuses to start.
+- **The preferences lost-update race is fixed** on its own branch, [#77](https://github.com/pat-mw/revu/pull/77),
+  rebased onto the final `m8.5` tip. Kept out of #76 deliberately: it is a pre-existing store defect, not
+  daemon wiring.
 
 ### ⚠️ INTERVIEW THE OWNER FIRST — four questions, and they change the shape of the work
 
