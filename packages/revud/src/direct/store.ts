@@ -803,9 +803,28 @@ export function openDirectStore(
    * from the statement that caused it.
    *
    * All three statements — the preservation read and the two upserts — run inside
-   * ONE transaction, so a stored envelope never references an immutable half that
-   * is not on disk and no concurrent writer can change the immutable row between
-   * the read of its `partial` and the write that carries that value forward.
+   * ONE transaction, and it is opened with `BEGIN IMMEDIATE` rather than the
+   * deferred `BEGIN` that calling the transaction directly would open. Both halves
+   * of that carry weight. One transaction is what keeps a stored envelope from
+   * referencing an immutable half that is not on disk. Taking the write lock UP
+   * FRONT is what keeps a concurrent writer from changing the immutable row
+   * between the read of its `partial` and the write that carries that value
+   * forward — and it is also the only thing that lets this call WAIT for such a
+   * writer. A deferred transaction takes its read snapshot at the preservation
+   * read and asks for the write lock only at the first upsert, so a commit landing
+   * in between makes that snapshot stale and SQLite refuses the upgrade WITHOUT
+   * consulting the busy handler: waiting cannot refresh a snapshot that is already
+   * stale, so the connection's busy timeout is no help in that shape. Opening
+   * immediate moves the waiting to `BEGIN`, which is a plain busy wait the timeout
+   * does cover.
+   *
+   * That difference is not theoretical here. This is the longest write the store
+   * performs, and it is the last step of a sequence that has already persisted
+   * threads and a summary. Deferred, an ordinary few-millisecond overlap with
+   * another daemon on the same data directory surfaces as `database is locked` for
+   * a write that would have succeeded a moment later, leaving those rows on disk
+   * with no envelope — and the envelope is the only durable home for the map from
+   * a comment to its author.
    *
    * The whole unit sits inside the durability wrapper, so a database that cannot
    * be read or written surfaces as a `StoreWriteError` and the caller learns the
@@ -848,7 +867,7 @@ export function openDirectStore(
           [snapshot.prNumber, JSON.stringify(envelope)],
         )
       })
-      tx()
+      tx.immediate()
     })
   }
 

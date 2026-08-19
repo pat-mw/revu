@@ -1608,6 +1608,56 @@ describe('two connections writing at once: the loser waits and yields, never fai
       store.close()
     }
   })
+
+  test('a snapshot persisted against a held write lock waits for the holder rather than failing', async () => {
+    const store = open()
+    const compareKey = 'contended...snapshot'
+    // Both minted and seeded before the lock is taken, so the ONE call made under
+    // contention is the snapshot persist itself and nothing else can account for
+    // a failure. The seeded row is what makes the persist's read do work: with an
+    // immutable half already on disk carrying a `partial`, the transaction reads
+    // a value it must carry forward rather than reading an absent row.
+    const localId = store.createLocalReview(newLocalReview({})).id
+    store.putImmutable(immutable(compareKey), {
+      missingBlobShas: [],
+      reason: 'capped at N files',
+    })
+    const holder = await holdWriteLock('entity', newLocalReview({}))
+    try {
+      // The transaction behind this call READS the immutable row and only then
+      // WRITES its two upserts, which is the shape a busy timeout alone does not
+      // rescue: a deferred transaction takes its read snapshot at that SELECT and
+      // asks for the write lock afterwards, so the holder's commit lands in
+      // between and SQLite refuses the upgrade without ever consulting the busy
+      // handler. Taking the write lock at `BEGIN` moves the waiting somewhere the
+      // timeout applies, so this returns after the holder commits instead of
+      // failing in a millisecond.
+      //
+      // Succeeding IS the assertion. The defect this covers is a thrown
+      // `StoreWriteError` for a write that was in fact fine, and the caller's
+      // cost is not a slow persist but a review left with threads and a summary
+      // and no envelope to name their authors.
+      store.putLocalSnapshot(snapshot(localId, compareKey))
+      await holder.commit()
+
+      // The envelope is on disk and re-reads whole, so the persist committed
+      // rather than half-landing: `getLocalSnapshot` throws if the envelope
+      // references an immutable half that is not there.
+      expect(store.getLocalSnapshot(localId)?.immutable.compareKey).toBe(compareKey)
+
+      // The contended read did its work. A snapshot whose own `partial` is null
+      // must not erase the one the immutable row already carried, and that value
+      // only survives if the SELECT inside the transaction ran and was carried
+      // into the upsert.
+      expect(store.getImmutable(compareKey)?.partial).toEqual({
+        missingBlobShas: [],
+        reason: 'capped at N files',
+      })
+    } finally {
+      await holder.release()
+      store.close()
+    }
+  })
 })
 
 /**
