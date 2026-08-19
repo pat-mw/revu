@@ -560,11 +560,14 @@ describe('resolveDirectContext — local-only boot needs no GitHub', () => {
   })
 
   test('an unset user.email still refuses to start when the shed retries locally', async () => {
-    // A GitHub clone whose credential GitHub rejects sheds the half and
-    // rebuilds the session from git config alone — and the rebuild keeps the
-    // identity guard hard. The email keys drafts and viewed state, so the
-    // local retry must refuse an unset identity exactly as a first-attempt
-    // local boot does, never soften it into a blank id.
+    // The session builder reads git identity BEFORE it probes the viewer, so
+    // on this setup it is the unset email — not the rejected credential —
+    // that reaches the shed, and the local rebuild then raises it again from
+    // the same reader. That is the stronger version of the guarantee: the
+    // identity guard holds even when the identity failure is itself what
+    // triggered the shed. The email keys drafts and viewed state, so the
+    // retry must refuse an unset one exactly as a first-attempt local boot
+    // does, never soften it into a blank id shared by every human.
     let thrown: unknown
     try {
       await resolveDirectContext({
