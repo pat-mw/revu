@@ -23,13 +23,14 @@ import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
 import type {
   FileBlob,
+  HumanPreferences,
   ReviewDraft,
   ReviewSummary,
   ReviewThread,
   Snapshot,
   SnapshotImmutable,
 } from '@revu/shared'
-import { LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
+import { DEFAULT_PREFERENCES, LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
 import {
   openDirectStore,
   resolveDirectDataDir,
@@ -1387,6 +1388,25 @@ const LOCK_READY_POLL_MS = 5
 /** The title the lock holder inserts, so a row it wrote is distinguishable. */
 const LOCK_HOLDER_TITLE = 'from the lock holder'
 
+/** The human whose preferences the lock holder and this process both patch. */
+const LOCK_HOLDER_HUMAN = 'prefs-racer@x.io'
+
+/**
+ * The preferences document the lock holder commits. A WHOLE document, because
+ * that is what this store's setter writes — it merges a partial patch and then
+ * upserts the merged result — so the holder's row is exactly what a second daemon
+ * calling `setPreferences({ theme: 'light' })` would leave behind.
+ *
+ * `theme` is the field that carries the claim: it differs from the default, so a
+ * setter that dropped the holder's document reads back as the default rather than
+ * as this value.
+ */
+const LOCK_HOLDER_PREFS: HumanPreferences = {
+  diffMode: 'unified',
+  theme: 'light',
+  inboxView: 'list',
+}
+
 /**
  * The lock-holding child, written into the temp data dir and run as its own
  * process.
@@ -1409,7 +1429,8 @@ const LOCK_HOLDER_SOURCE = `
 import { Database } from 'bun:sqlite'
 import { writeFileSync } from 'node:fs'
 
-const [dbPath, readyPath, resultPath, holdMs, mode, repo, baseRef, headRef] = process.argv.slice(2)
+const [dbPath, readyPath, resultPath, holdMs, mode, repo, baseRef, headRef, humanId, prefsJson] =
+  process.argv.slice(2)
 
 const bump = (db, key) =>
   Number(
@@ -1439,6 +1460,13 @@ if (mode === 'review') {
     'INSERT INTO local_reviews (id, repo, base_ref, head_ref, generation, title, created_at, updated_at) ' +
       'VALUES (?, ?, ?, ?, 0, ?, ?, ?)',
     [reviewId, repo, baseRef, headRef, ${JSON.stringify(LOCK_HOLDER_TITLE)}, at, at],
+  )
+}
+if (mode === 'prefs') {
+  db.run(
+    'INSERT INTO prefs (human_id, data) VALUES (?, ?) ' +
+      'ON CONFLICT(human_id) DO UPDATE SET data = excluded.data',
+    [humanId, prefsJson],
   )
 }
 db.run('COMMIT')
@@ -1471,10 +1499,11 @@ interface HeldWriteLock {
  * `BEGIN IMMEDIATE` has returned says the thing the test actually depends on.
  *
  * `mode` selects what the holder commits: `'entity'` bumps the entity mark alone,
- * `'review'` also mints a review id and inserts the row for `key`.
+ * `'review'` also mints a review id and inserts the row for `key`, and `'prefs'`
+ * also upserts `LOCK_HOLDER_PREFS` for `LOCK_HOLDER_HUMAN`.
  */
 async function holdWriteLock(
-  mode: 'entity' | 'review',
+  mode: 'entity' | 'review' | 'prefs',
   key: NewLocalReview,
 ): Promise<HeldWriteLock> {
   const scriptPath = join(dir, 'lock-holder.mjs')
@@ -1495,6 +1524,8 @@ async function holdWriteLock(
       key.repo,
       key.baseRef,
       key.headRef,
+      LOCK_HOLDER_HUMAN,
+      JSON.stringify(LOCK_HOLDER_PREFS),
     ],
     { stdout: 'ignore', stderr: 'inherit' },
   )
@@ -1653,6 +1684,60 @@ describe('two connections writing at once: the loser waits and yields, never fai
         missingBlobShas: [],
         reason: 'capped at N files',
       })
+    } finally {
+      await holder.release()
+      store.close()
+    }
+  })
+
+  test('a preference patch made against a held write lock keeps the key it never set', async () => {
+    const store = open()
+
+    // The two keys are DISJOINT, and that is the entire claim. The holder sets
+    // `theme`, this process sets `diffMode`, and the setter's contract is that a
+    // caller changing one field never overwrites the others. A merge computed
+    // from a read taken before the holder committed still writes a whole
+    // document, so it carries `diffMode` and silently reverts `theme` — and
+    // NOTHING about that write fails, which is why no error-shaped assertion
+    // could ever catch it.
+    //
+    // The guard below keeps the discrimination honest. `light` is evidence that
+    // the holder's document survived only while it is NOT also what an unmerged
+    // write would have produced; were the default ever to become `light`, this
+    // test would start passing for the wrong reason, and this line is what says
+    // so instead of quietly going vacuous.
+    expect(DEFAULT_PREFERENCES.theme).not.toBe('light')
+
+    const holder = await holdWriteLock('prefs', newLocalReview({}))
+    try {
+      // Synchronous, and entered while the holder's transaction is still open.
+      // Every store call is synchronous, so no other JavaScript can run between
+      // this setter's read and its write — the competing writer HAS to be another
+      // process, and the interleave is arranged rather than raced for: the holder
+      // is known to hold the lock before this line runs, and known to commit
+      // while it is still inside SQLite.
+      //
+      // With the read outside the transaction there is nothing to wait on: a WAL
+      // reader never blocks on a writer, so the SELECT returns the last committed
+      // state — which does not yet contain the holder's document — and only the
+      // upsert waits, on the connection's busy timeout. By the time it lands, the
+      // value it merged onto is already out of date. Taking the write lock at
+      // `BEGIN` is what moves the waiting AHEAD of the read, so the merge is
+      // computed from state the holder has already committed.
+      const returned = store.setPreferences(LOCK_HOLDER_HUMAN, { diffMode: 'split' })
+      // Throws if the holder exited without committing, so a pass cannot come
+      // from a child that never wrote anything to lose.
+      await holder.commit()
+
+      // Both keys: the one this call set, and the one it never touched.
+      expect(returned.diffMode).toBe('split')
+      expect(returned.theme).toBe('light')
+
+      // And the same document is on disk, not merely in the return value — a
+      // setter could compute the right merge and still upsert a stale one.
+      const persisted = store.getPreferences(LOCK_HOLDER_HUMAN)
+      expect(persisted.diffMode).toBe('split')
+      expect(persisted.theme).toBe('light')
     } finally {
       await holder.release()
       store.close()
