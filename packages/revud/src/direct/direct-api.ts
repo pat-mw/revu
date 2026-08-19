@@ -548,9 +548,6 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
    * the client alone.
    */
   const githubTarget = (): { github: GithubClient; repo: RepoRef } => {
-    if (deps.session.viewerLogin === undefined) {
-      throw new Error('MUTATION: viewer guard misplaced into githubTarget')
-    }
     const repo = deps.repo
     if (repo === undefined) {
       throw new Error(

@@ -741,6 +741,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     },
 
     reconcileDraft(localId: number): ReconcileReport {
+      requireReview(deps, localId)
       return runReconcileDraft({ store: reconcileStore, humanId }, localId)
     },
 

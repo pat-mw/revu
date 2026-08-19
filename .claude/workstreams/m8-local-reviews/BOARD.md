@@ -82,6 +82,60 @@ One gate run during the fix round went red with six ~5000ms hook timeouts and **
 2615**. The count discriminator classified it as the known load artifact rather than a failed Check; a re-run
 on a quiet tree was green. No spurious tier escalation, no test weakened.
 
+### 🔴 CI IS RED ON #74 AND #75 — one test, and `m8.5` would have failed the same way
+
+Raised by the owner. `check` fails on **#74** and **#75** (which skips `conformance-matrix` and `e2e` on both);
+#69–#73 are fully green. **One test, the same on both:**
+
+```
+(fail) the commits of a range arrive oldest first
+       > the dates come back in UTC, whatever offset the machine authored under
+```
+
+**It is a control with a false premise, and it is environment-dependent.** The control asserts git's raw
+`%aI` output carries a numeric offset, with a comment claiming *"It holds on a machine running in UTC too,
+where git prints `+00:00`."* **Git does not.** `%aI` is strict ISO 8601, which prints **`Z`** for a zero
+offset — measured on git 2.50.1, so not even a version difference:
+
+| authored at | `git log -1 --format=%aI` |
+| --- | --- |
+| `+01:00` | `2026-08-19T15:40:03+01:00` |
+| **`+00:00`** | **`2026-08-18T10:00:00Z`** |
+| `+05:30` | `2026-08-18T10:00:00+05:30` |
+
+The fixture pins commit **identity** — explicitly because a CI runner has none — but never pins the commit
+**timezone**, so every fixture commit inherits the machine's offset. A developer machine passes; a UTC runner
+fails. **The local gate could never have caught this**, and `m8.5` would have failed CI identically the moment
+its PR opened.
+
+**Relaxing the regex to also accept `Z` would be the wrong fix** — it would make the control *vacuous on CI*,
+where git's output would then be byte-identical to the converted output and prove nothing exactly where it
+currently fails. That converts a red into a guard that asserts nothing, this project's most-measured defect
+class. The fixture is pinned to a **non-UTC** offset instead, so the conversion genuinely does work everywhere.
+
+The conversion logic itself is sound and already has a deterministic guard (`local-sync.test.ts:3185` pins
+`+01:00` → `.000Z` through a fake runner). Only the real-git integration control was environment-dependent.
+
+**Fixed at the root, not on the tip:** it lands on **`m8.3`**, so `m8.4` and `m8.5` inherit it by rebase.
+Fixing only on `m8.5` would leave #74 and #75 red — the divergence the owner flagged. Rebase order:
+`m8.3` → `m8.4` → `m8.5`, **re-gating in the main tree after each**, because a clean rebase is not a proof and
+one turned a guard red in a previous session.
+
+### The `setPreferences` lost-update race — fixed, held for landing
+
+Owner-requested, **out of M8 scope**, so it rides its **own branch stacked on the rebased `m8.5`** rather than
+widening the daemon-wiring PR. Gate in its worktree: 2626 · 1 · 0 · 95. The red was deterministic across three
+runs — the child committed one key, the parent patched a different one and put back a document carrying the
+default for the first. **Neither side threw; both writes "succeeded".**
+*Its negative control was stronger than the one asked for:* it held the transaction constant and varied only
+the **read's position**, proving the test measures where the read happens rather than merely that a
+transaction exists. And it sharpened the diagnosis — a WAL reader never blocks, so the untransacted `SELECT`
+returns immediately and the busy timeout then makes the *upsert* wait, which means the timeout **widens** the
+staleness window rather than merely failing to close it.
+*New finding, no owner:* `setViewed` / `setLocalViewed` take a **whole** state object, so that
+read-modify-write lives in the **caller**, outside the store — the same lost-update class may exist there and
+the store's API shape cannot prevent it. Callers not investigated.
+
 **In flight:** a **second-pass adversarial review of the fix diff only** — four lenses hunting the two failure
 modes specific to reviewing a fix (the original defect not actually closed, and the fix breaking something that
 worked). And, at the owner's direct request, the **`setPreferences` lost-update race** (out of M8 scope, in an
