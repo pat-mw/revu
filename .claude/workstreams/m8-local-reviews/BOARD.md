@@ -53,15 +53,40 @@ that the author's model and the code disagree.
 daemon with no broker; and `--local-only` **without** `--direct` silently boots mock mode and serves the
 fixture app.
 
-**Fix status:** **M3 landed** (`6b0b047`, 2606 · 1 · 0 · 95). M1+M4+the mode/flag refusal (fable) and
-M2+the typed head error (fable) are still running.
+**All four blocker fixes landed**, each re-gated by the orchestrator in the main tree:
 
-**A new finding, from the M3 audit — recorded, deliberately NOT fixed here.** `setPreferences` performs a
-read-modify-write with the read taken **outside** its write block. It is not vulnerable to the
-stale-snapshot bug — there is no transaction, so there is no lock upgrade to refuse, and the lone write is
-covered by the busy timeout — but it is a **lost-update race**: two concurrent patches to *different*
-preference keys clobber one another, last writer winning the whole document. A different defect class, outside
-this ticket, and worth its own look.
+| fix | commit | gate |
+| --- | --- | --- |
+| **M3** — the snapshot persist takes the write lock at `BEGIN` | `6b0b047` | 2606 · 1 · 0 · 95 |
+| **M2** — repo-scoped review lookup + typed head errors | `e167923` | 2614 · 1 · 0 · 95 |
+| **M1 + M4 + the mode/flag refusal** | `b605ac3` | **2625 · 1 · 0 · 95** |
+
+`Verify` re-run after the fixes and still green: 182 pass across the seven suites, 92 across the four that
+must be untouched, all four still byte-identical, mode axis and frozen contract intact.
+
+### ⚠️ The review's own prescription was wrong, and the implementer caught it
+
+The review prescribed adding `session.viewerLogin !== undefined` to the api's `githubEnabled` capability, and
+the orchestrator relayed it. **That would have introduced a new regression.** `GITHUB_ONLY_PULL_ROUTES`
+contains `syncPull` and `getSnapshot` — both **reads** — and a broker booted without a bot login legitimately
+carries no `viewerLogin` while still being required to serve them. The guard would have answered those reads
+with a 501 about a missing repository, and **no existing test would have caught it** (broker-serve uses a
+hand-built fake api, and the reads-only conformance write cases are refused by an earlier gate). The invariant
+was placed at the write bundle instead, which is exactly the surface where the two guards invert, and the
+deviation is pinned by its own test. Verified independently by the orchestrator before accepting it.
+**A reviewer's prescription is not automatically right either.**
+
+### The flake rule paid for itself
+
+One gate run during the fix round went red with six ~5000ms hook timeouts and **2591 tests registered against
+2615**. The count discriminator classified it as the known load artifact rather than a failed Check; a re-run
+on a quiet tree was green. No spurious tier escalation, no test weakened.
+
+**In flight:** a **second-pass adversarial review of the fix diff only** — four lenses hunting the two failure
+modes specific to reviewing a fix (the original defect not actually closed, and the fix breaking something that
+worked). And, at the owner's direct request, the **`setPreferences` lost-update race** (out of M8 scope, in an
+isolated worktree so it cannot disturb the tree the review is reading; it will ride its **own branch stacked on
+`m8.5`**, not this PR, since it is not daemon wiring).
 
 
 **The review also named coverage gaps worth keeping:** the 304 empty-body assertion cannot fail (the transport
