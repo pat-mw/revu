@@ -10,25 +10,45 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing. The daemon track is COMPLETE.** All three tickets landed their full unit sets, ran `Verify` green,
-took a fable-tier adversarial review of the full diff, fixed what it found, and opened a PR. No unit is
-dispatched, no agent is running, no worktree is in use, every branch is pushed, and `main` is untouched at
-`177068a`.
+**M8.5 (daemon wiring) is IN PROGRESS on `m8.5/daemon-wiring`, branched off the `m8.4` tip at `90d3876`.**
+The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / #74 / #75.
 
-| ticket | units | gate at its tip | PR |
-| --- | --- | --- | --- |
-| **M8.2** store v4 | 7/7 | 1702 pass · 1 skip · 0 fail | [#73](https://github.com/pat-mw/revu/pull/73) base `m8.7` |
-| **M8.3** git builder | 9/9 | 2209 pass · 1 skip · 0 fail | [#74](https://github.com/pat-mw/revu/pull/74) base `m8.2` |
-| **M8.4** write sink | 9/9 | **2445 pass · 1 skip · 0 fail · 91 files** | [#75](https://github.com/pat-mw/revu/pull/75) base `m8.3` |
+| unit | tier | state |
+| --- | --- | --- |
+| **OQ5 design pass** — the `LocalReviewSurface` seam, and the five findings addressed to M8.5 | fable | **dispatched** (read-only, no worktree) |
+| **M8.5.4** — boot relaxation: no origin, no token, no `GET /user` | opus | **dispatched** (isolated worktree) |
 
-**The stack, bottom-up — seven PRs, none merged:** `main` → [#69](https://github.com/pat-mw/revu/pull/69) →
-[#70](https://github.com/pat-mw/revu/pull/70) → [#71](https://github.com/pat-mw/revu/pull/71) →
-[#72](https://github.com/pat-mw/revu/pull/72) → [#73](https://github.com/pat-mw/revu/pull/73) →
-[#74](https://github.com/pat-mw/revu/pull/74) → [#75](https://github.com/pat-mw/revu/pull/75).
+Everything else in M8.5 waits on one of those two. M8.5.1 needs the design pass; M8.5.5 needs M8.5.1 + M8.5.4.
 
-**This file now lives at the chain tip**, not on `m8.2`. It was maintained on the base while three lanes ran
-concurrently, because one file on three branches conflicts at every rebase; the lanes have converged, so a cold
-session reads it from `m8.4/local-write-sink`.
+**Gate at the branch point (`90d3876`), re-run in the main tree:** 2445 pass · 1 skip · 0 fail · 91 files.
+
+⚠️ **The gate is not perfectly deterministic.** One run in six went red with **9 fail** and *three fewer tests
+registered* (2443 vs 2446) — the signature of a fixture-driven suite blowing the default 5-second hook budget
+under load, which is already on record as an unowned finding. Four subsequent runs were green, including two
+run concurrently. **Rule for this session: tee every gate run to a log, and treat a red as a failed Check only
+when it reproduces on a quiet tree with the same `(fail)` lines.** The first red was lost by not teeing it.
+
+### Decisions taken this session on M8.5's open questions
+
+The ticket delegates these; they are settled so no unit re-decides them mid-flight.
+
+- **OQ1 — how the local-only capability is switched on: an EXPLICIT switch**, never automatic. Automatic
+  relaxation on a failed repo/token probe means a transient `gh` failure inside a genuine GitHub clone boots a
+  daemon that silently shows an empty inbox — which reads as data loss. Pinned by M8.5.5's
+  `resolveGithubRequirement` table.
+- **OQ3 — `GET /api/rate-limit` on a GitHub-less daemon answers a typed `not_implemented` (501)**, not the
+  synthetic rate shape. The synthetic shape stays *inside* `PullListResponse` per §4.1, which is a different
+  surface. M8.7's rate chip is already three-valued (`null` loading · `false` unavailable · `true` available)
+  and omits on unavailable, so 501 lands on a designed path rather than a new one.
+- **OQ4 — merged ETag composition** follows the M4 broker precedent: a hash over both halves, so a change in
+  either moves it. Ordering is deterministic — broker items in poll-loop order, then local items by id
+  descending.
+- **OQ6 — `bin/revu` does NOT gain a local-only path in this ticket.** The milestone's headline exit criterion
+  is proven against `revud` directly (M8.5.7 durably, plus the manual drill). The CLI path is a follow-up, not
+  a silent absorption into M8.5.
+- **Finding 5 — the untyped storage failure on the local write path is NOT touched.** Whether it should be
+  `persist_failed` is the owner's call and is reserved. Any envelope work in M8.5.2/M8.5.6 must leave that
+  path's observable code unchanged.
 
 ### ⚠️ The three blockers the pre-merge reviews found — none was visible to any suite
 
@@ -120,9 +140,9 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
 | [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | **In Review** | 7 | revud | M8.1 | `m8.2/store-v4` | [#73](https://github.com/pat-mw/revu/pull/73) |
-| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Progress** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
-| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Progress** | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
-| [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
+| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Review** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | [#74](https://github.com/pat-mw/revu/pull/74) |
+| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Review** | 9 | revud | M8.1 | `m8.4/local-write-sink` | [#75](https://github.com/pat-mw/revu/pull/75) |
+| [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Progress** | 9 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
