@@ -54,6 +54,7 @@ import type {
   SubmitReviewInput,
 } from '@revu/shared'
 import { ApiError, LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
+import { MOVING_BASE_PR, movingBaseClient } from './conformance-fakes'
 import type { DirectApi } from './direct-api'
 import { createDirectApi } from './direct-api'
 import type { GithubClient } from './github-client'
@@ -788,6 +789,43 @@ describe('a GitHub-band write refuses to run without a viewer identity', () => {
     const { api, store } = buildViewerless()
     expect(api.githubEnabled).toBe(true)
     expect(api.getSnapshot(PR_ID)).toBeNull()
+    store.close()
+  })
+
+  test('sync and the snapshot behind it are served over a viewer-less GitHub half', async () => {
+    // The exemption the write guard is written around, driven rather than
+    // described. A broker booted with no bot login carries no viewer BY
+    // DESIGN, and sync — plus the snapshot read that answers from what sync
+    // cached — is precisely what such a deployment exists to serve. Hoisting
+    // the viewer check up into the narrowing that every GitHub-backed path
+    // shares would compile, leave every write refusal above green, and take
+    // both of these away from the one shape they were carved out for; the
+    // drive below is what refuses to compile that mistake into a passing run.
+    //
+    // The client is the fully answering read fake rather than the throwing
+    // recorder the rest of this file uses, so "served" means a complete
+    // snapshot came back — not merely that some other error arrived first.
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const api = createDirectApi({
+      session: VIEWERLESS_SESSION,
+      github: movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 2 }),
+      repo: REPO,
+      store,
+      now,
+    })
+
+    const synced = await api.syncPull(MOVING_BASE_PR)
+    expect(synced.prNumber).toBe(MOVING_BASE_PR)
+    expect(synced.partial).toBeNull()
+    expect(synced.immutable.compareKey).toBe('MB1...HEAD-FIXED')
+    expect(synced.mutable.issueComments).toHaveLength(2)
+
+    // The snapshot read is asserted on its own evidence — the compare the sync
+    // just cached — and against a pull request nothing synced, so a surface
+    // that answered null for everything could not satisfy both lines.
+    expect(api.getSnapshot(MOVING_BASE_PR)?.immutable.compareKey).toBe('MB1...HEAD-FIXED')
+    expect(api.getSnapshot(MOVING_BASE_PR + 1)).toBeNull()
+
     store.close()
   })
 })

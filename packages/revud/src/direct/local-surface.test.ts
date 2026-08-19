@@ -40,7 +40,10 @@
  * read the store by id alone would act on another repository's review with this
  * repository's branches, worktree and session. Every id-keyed verb, reads and
  * writes alike, must answer a foreign id with the same not-found an absent id
- * answers.
+ * answers. One of them — the draft reconcile — needs a case of its own, because
+ * the reconcile it delegates to answers that same not-found by itself whenever
+ * the caller holds no draft: only a foreign review the caller DOES hold a draft
+ * on can tell the guard apart from the delegate's own refusal.
  *
  * **Head resolution failures on ordinary repository states are typed.** A
  * branch deleted after its review was created, and a recorded merge base the
@@ -67,6 +70,7 @@ import { createBunCommandRunner } from './command-runner'
 import { createFixtureRepo, type FixtureRepo } from './local-fixture-repo'
 import { buildLocalWriteDeps, createLocalReviewSurface } from './local-surface'
 import type { LocalReviewSurface, LocalReviewSurfaceDeps } from './local-surface'
+import { localSnapshot } from './local-write-fakes'
 import type { DirectStore } from './store'
 import { openDirectStore } from './store'
 
@@ -1387,5 +1391,186 @@ describe('head resolution failures on ordinary repository states are typed', () 
     expect(failure).toBeInstanceOf(ApiError)
     expect((failure as ApiError).code).toBe('unprocessable')
     harness.store.close()
+  })
+})
+
+describe('reconcileDraft resolves ownership before the reconcile it delegates to', () => {
+  /**
+   * The one verb whose ownership guard a sweep over foreign ids cannot see.
+   *
+   * Every other id-keyed verb reaches a store read that would visibly answer
+   * for a review this repository does not own. `reconcileDraft` reaches one
+   * that USUALLY refuses on its own: the delegate's first act is to look for a
+   * draft under `(this human, that id)`, and a caller from another repository
+   * normally has none, so the delegate answers the same typed not-found the
+   * guard would have — and a sweep comparing the two learns nothing about
+   * whether the guard is there at all.
+   *
+   * That coincidence has a gap in it, and the gap is what this block drives.
+   * The draft is keyed by human and id, the snapshot by id alone, and NEITHER
+   * key carries a repository. One human whose daemons serve two repositories
+   * out of a single data directory — the arrangement the whole ownership rule
+   * exists for — really can hold a draft on a review the other repository
+   * owns. With both rows present the delegate has everything it needs and
+   * answers in full: the owning repository's head SHA, its files, its commits.
+   * Only the guard above it refuses.
+   *
+   * Two surfaces are built over one store, differing in their repository
+   * identity and in NOTHING else — same store, same session, same human, same
+   * review id — so the refusal can be attributed to the repository scope
+   * rather than to any other difference between them.
+   */
+  const OWNING_REPO = 'acme/api'
+  const NEIGHBOUR_REPO = 'acme/web'
+
+  /**
+   * The head the owning repository's snapshot records. Distinct from every
+   * other SHA in this file, so a report carrying it can only have been built
+   * from that repository's review.
+   */
+  const OWNED_HEAD_SHA = 'ab'.repeat(20)
+
+  /**
+   * A directory no case here reads. Reconcile is three store reads and a
+   * classification; it spawns nothing, and the runner below refuses every
+   * command, so a path that grew a git read would fail loudly rather than
+   * quietly succeed against whatever this happens to name.
+   */
+  const UNREAD_TOPLEVEL = join(tmpdir(), 'revu-local-surface-reconcile-scope')
+
+  /**
+   * The store with the name of every method called on it recorded, in order.
+   * The name is pushed BEFORE the call runs, so an attempted read is recorded
+   * even when it throws — which is what makes "nothing after the ownership
+   * read happened" an assertion over evidence rather than over an absence.
+   */
+  function recordingStore(): { store: DirectStore; calls: string[] } {
+    const base = openDirectStore({ dataDir: ':memory:' })
+    const calls: string[] = []
+    const source = base as unknown as Record<string, unknown>
+    const wrapped: Record<string, unknown> = {}
+    for (const name of Object.keys(base)) {
+      const member = source[name]
+      wrapped[name] =
+        typeof member === 'function'
+          ? (...args: unknown[]): unknown => {
+              calls.push(name)
+              return (member as (...rest: unknown[]) => unknown).apply(base, args)
+            }
+          : member
+    }
+    return { store: wrapped as unknown as DirectStore, calls }
+  }
+
+  interface ScopeFixture {
+    store: DirectStore
+    /** Store method names, in call order, since the two surfaces were built. */
+    calls: string[]
+    /** The review `OWNING_REPO` holds, and that `NEIGHBOUR_REPO` must not reach. */
+    reviewId: number
+    owner: LocalReviewSurface
+    neighbour: LocalReviewSurface
+  }
+
+  /**
+   * One review owned by `OWNING_REPO`, carrying both rows the delegate reads: a
+   * snapshot, and a draft under the human BOTH surfaces are keyed by.
+   */
+  function seedSharedStore(): ScopeFixture {
+    const { store, calls } = recordingStore()
+    const review = store.createLocalReview({
+      repo: OWNING_REPO,
+      baseRef: 'refs/heads/main',
+      headRef: 'refs/heads/feature/x',
+      title: 'feature/x',
+    })
+    const snapshot = localSnapshot({
+      localId: review.id,
+      headSha: OWNED_HEAD_SHA,
+      at: FIXED_NOW,
+    })
+    store.putLocalSnapshot(snapshot)
+    const draft: ReviewDraft = {
+      humanId: SESSION.human.id,
+      prNumber: review.id,
+      headSha: OWNED_HEAD_SHA,
+      compareKey: snapshot.immutable.compareKey,
+      body: 'Notes not sent yet.',
+      event: 'COMMENT',
+      comments: [],
+      createdAt: FIXED_NOW,
+      updatedAt: FIXED_NOW,
+    }
+    store.putLocalDraft(draft)
+
+    const runner: CommandRunner = {
+      run: (): Promise<CommandResult> =>
+        Promise.reject(new Error('reconcileDraft must spawn no command')),
+    }
+    const surfaceFor = (repo: string): LocalReviewSurface =>
+      makeSurface({ toplevel: UNREAD_TOPLEVEL, store, runner, repo }).surface
+    const owner = surfaceFor(OWNING_REPO)
+    const neighbour = surfaceFor(NEIGHBOUR_REPO)
+
+    // The seeding writes belong to no claim below; only what the driven verb
+    // does is measured.
+    calls.length = 0
+    return { store, calls, reviewId: review.id, owner, neighbour }
+  }
+
+  test('the owning repository gets the full report — the delegate behind the guard is reachable', () => {
+    // The control, and the load-bearing half of the pair: it establishes that
+    // with these exact rows in place the delegate DOES answer, so the refusal
+    // below is a decision rather than the delegate failing for its own reasons.
+    const { store, reviewId, owner, calls } = seedSharedStore()
+    const report = owner.reconcileDraft(reviewId)
+    expect(report.prNumber).toBe(reviewId)
+    expect(report.draftHeadSha).toBe(OWNED_HEAD_SHA)
+    expect(report.currentHeadSha).toBe(OWNED_HEAD_SHA)
+    // The ownership read ran first here too, and the delegate's two reads
+    // followed it rather than replacing it.
+    expect(calls).toEqual(['getLocalReview', 'getLocalDraft', 'getLocalSnapshot'])
+    store.close()
+  })
+
+  test('the neighbouring repository is refused, though the delegate would have answered', () => {
+    const { store, reviewId, neighbour } = seedSharedStore()
+    let refused = false
+    let answered: unknown = null
+    try {
+      answered = neighbour.reconcileDraft(reviewId)
+    } catch (error) {
+      refused = true
+      expect(error).toBeInstanceOf(ApiError)
+      expect((error as ApiError).code).toBe('not_found')
+      // The ownership sentence, not the delegate's missing-draft one: the
+      // draft is right there, so the delegate had no reason to say otherwise.
+      expect((error as ApiError).message).toBe(`No local review carries the id ${reviewId}.`)
+    }
+    expect(refused).toBe(true)
+    // Asserted separately because it is the claim the delegate cannot satisfy:
+    // a report here would carry the owning repository's head SHA out to a
+    // repository with no right to know the review exists.
+    expect(answered).toBeNull()
+    store.close()
+  })
+
+  test('the refusal precedes every store read the delegate would make', () => {
+    const { store, reviewId, neighbour, calls } = seedSharedStore()
+    const outcome = ((): string => {
+      try {
+        neighbour.reconcileDraft(reviewId)
+        return 'answered'
+      } catch {
+        return 'refused'
+      }
+    })()
+    expect(outcome).toBe('refused')
+    // The ownership read, and nothing after it. The draft and the snapshot are
+    // both present and both reachable by keys that carry no repository, so a
+    // guard that ran second — or not at all — shows up here as the two extra
+    // reads.
+    expect(calls).toEqual(['getLocalReview'])
+    store.close()
   })
 })
