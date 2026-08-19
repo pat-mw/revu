@@ -1065,6 +1065,7 @@ const CWD_SCANNED_MODULES = [
   'local-git-argv.ts',
   'local-git.ts',
   'local-ids.ts',
+  'local-surface.ts',
   'local-sync.ts',
   'local-write-fakes.ts',
   'local-writes.ts',
