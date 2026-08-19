@@ -3407,7 +3407,10 @@ describe('the commits of a range arrive oldest first', () => {
     }
     // The control: git's own stream carries an offset rather than that
     // spelling, so the conversion above is doing something. It holds on a
-    // machine running in UTC too, where git prints `+00:00`.
+    // machine running in UTC because the fixture stamps its commits at a fixed
+    // non-zero offset rather than inheriting the machine's — git prints `%aI`
+    // as strict ISO 8601, which spells a zero offset `Z` and never `+00:00`,
+    // so a commit authored in UTC would print nothing for this to convert.
     const printed = await gitRaw(fixture.dir, [
       'log',
       '-1',

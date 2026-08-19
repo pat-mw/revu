@@ -43,6 +43,27 @@
  * on a developer machine. `commit.gpgsign=false` and `core.hooksPath=/dev/null`
  * suppress a developer's signing key and hooks for the same reason in reverse.
  *
+ * ## Why every commit carries an explicit date, at a non-zero UTC offset
+ *
+ * Identity is pinned but the timezone is not, so without this every fixture
+ * commit would be stamped with whatever offset the machine happens to run at.
+ * That is not merely non-deterministic, it is unevenly informative: git prints
+ * an author date in strict ISO 8601 (`%aI`), and strict ISO 8601 spells a zero
+ * offset `Z`, never `+00:00`. A machine running in UTC therefore produces
+ * commits whose printed date carries no offset at all, and a consumer asserting
+ * that converting git's spelling to UTC *changes* it would be comparing a value
+ * against itself — green, and asserting nothing, on exactly the machines where
+ * the timezone handling is least exercised. Pinning a distinctive non-zero
+ * offset puts a real offset in git's own stream everywhere, so such a
+ * conversion is doing visible work on a developer's laptop and on a runner
+ * alike, and a later change that let the machine's clock back in shows up as a
+ * changed offset rather than as a silently weakened test.
+ *
+ * The instants are distinct and increasing, one commit to the next, because
+ * consumers read the commits of a range as an ordered list and compare an
+ * author date against other timestamps; commits sharing one instant would leave
+ * that order resting on nothing.
+ *
  * ## Why `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` are pinned at absent paths
  *
  * Identity flags are not isolation. Ambient configuration reaches every git
@@ -173,6 +194,36 @@ const COMMIT_CONFIG: readonly string[] = [
   '-c',
   'core.hooksPath=/dev/null',
 ]
+
+/**
+ * The UTC offset every fixture commit is authored and committed at. Neither zero
+ * — which git would print as `Z`, carrying no offset for a reader to convert —
+ * nor a whole number of hours, so a machine-local offset accidentally taking its
+ * place is recognisable on sight rather than plausible.
+ */
+const FIXTURE_COMMIT_OFFSET = '+05:45'
+
+/**
+ * The clock reading the first fixture commit is stamped with, held as epoch
+ * milliseconds so the readings that follow it are plain arithmetic. Only the
+ * date and time digits are used; the instant each commit names is that reading
+ * at `FIXTURE_COMMIT_OFFSET`, not this one.
+ */
+const FIXTURE_FIRST_COMMIT_MS = Date.parse('2026-08-17T09:11:12Z')
+
+/** How far apart consecutive fixture commits are stamped. */
+const FIXTURE_COMMIT_SPACING_MS = 60_000
+
+/**
+ * The date the nth fixture commit is stamped with, counting from zero: a fixed
+ * starting reading advanced by one spacing per commit, spelled at the fixture's
+ * pinned offset. Strictly increasing in n, so the commits carry an order in time
+ * that matches the order they are made in.
+ */
+function fixtureCommitDate(nth: number): string {
+  const reading = new Date(FIXTURE_FIRST_COMMIT_MS + nth * FIXTURE_COMMIT_SPACING_MS)
+  return `${reading.toISOString().slice(0, 19)}${FIXTURE_COMMIT_OFFSET}`
+}
 
 const PATHS: FixtureRepoPaths = {
   modified: 'src/plain.txt',
@@ -327,8 +378,23 @@ export async function createFixtureRepo(): Promise<FixtureRepo> {
     writeFileSync(join(dir, path), body)
   }
   const run = (args: readonly string[]): Promise<string> => git(dir, env, args)
-  const commit = (message: string): Promise<string> =>
-    run([...COMMIT_CONFIG, 'commit', '-q', '-m', message])
+  let commitsMade = 0
+  /**
+   * Commits the index, stamping the author and the committer with the same
+   * pinned instant. Both are set, and by environment variable, because
+   * `--date` reaches only the author date and git would fall back to the
+   * machine's clock for the committer.
+   */
+  const commit = (message: string): Promise<string> => {
+    const stamped = fixtureCommitDate(commitsMade++)
+    return git(dir, { ...env, GIT_AUTHOR_DATE: stamped, GIT_COMMITTER_DATE: stamped }, [
+      ...COMMIT_CONFIG,
+      'commit',
+      '-q',
+      '-m',
+      message,
+    ])
+  }
   const head = async (): Promise<string> => (await run(['rev-parse', 'HEAD'])).trim()
   /**
    * Creates a symlink and refuses to continue unless it really is one. A
