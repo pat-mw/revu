@@ -25,10 +25,17 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 | **M8.5.3** — `listPulls`, local merged | opus | ✅ `fd5aca1` — **2568 · 1 · 0 · 94** |
 | **M8.5.8** — the write path's router band handling | opus | ✅ `c462105` — **2571 · 1 · 0 · 94** |
 | **M8.5.6** — honest degradation (+ the exit-criterion unblock) | opus | ✅ `5b7057c` — **2577 · 1 · 0 · 94** |
-| **M8.5.7** — the end-to-end HTTP proof, offline | opus | **dispatched** |
+| **M8.5.7** — the end-to-end HTTP proof, offline | opus | ✅ `6f52c96` — **2605 · 1 · 0 · 95** |
 
-Remaining after `.6`: **`.7`** (the offline HTTP proof), then `Verify` → the fable-tier adversarial review of
-the full diff → the PR. **Nine of ten units are landed.**
+**All ten units are landed and `Verify` is GREEN** — 171 pass across the seven Verify suites, 92 pass across
+the four that must be untouched (and `git diff` confirms all four byte-unchanged), the mode axis held, and the
+frozen contract unedited. Full diff: **26 files, 7792 insertions**.
+
+**In flight: the fable-tier adversarial review of the full diff**, six independent lenses (structural
+isolation · id-band containment · contract semantics · guards-that-assert-nothing · durability · boot and
+degradation), each finding then put to two verifiers — one reasoning to refute, one attempting an actual
+reproduction — and only findings both agree on are treated as real. The PR opens after it, per §8. Every
+previous ticket's review found a blocker that had passed a green gate.
 
 ### ✅ The headline exit criterion is reachable, and was observed directly
 
