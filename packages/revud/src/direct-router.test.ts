@@ -36,6 +36,7 @@ import type {
 import {
   ApiError,
   DEFAULT_PREFERENCES,
+  LOCAL_ENTITY_ID_BASE,
   LOCAL_REVIEW_ID_BASE,
   ROUTES,
   validateLocalReviewSummaries,
@@ -1651,5 +1652,273 @@ describe('handleDirectApi: the pull list', () => {
     ])
     expect((await getList(api, etag3, 'broker')).status).toBe(304)
     store.close()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The write path across the id bands.
+//
+// Two places above the api read or gate a review id, and both belong to the
+// router alone: the broker's reads-only write gate, and the reaction handler's
+// resolution of the review its route does not carry. Everything below drives
+// `handleDirectApi` directly and records what the api was HANDED, because a
+// write to the wrong sink answers 200 exactly like a write to the right one.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * A local review id, and a locally minted entity (comment) id.
+ *
+ * The comment id comes from the ENTITY band, which sits ABOVE the review band —
+ * so `isLocalReviewId` answers true of it while it names no review at all. A
+ * band check aimed at a route's comment id instead of at the owning review
+ * would therefore call EVERY reaction write local, including one on a pull
+ * request. That is the shape these ids are chosen to expose.
+ */
+const WRITE_LOCAL_REVIEW = LOCAL_REVIEW_ID_BASE + 7
+const WRITE_LOCAL_COMMENT = LOCAL_ENTITY_ID_BASE + 11
+
+/** A pull request and one of its GitHub comment ids — the other side of the band. */
+const WRITE_GITHUB_PR = 204
+const WRITE_GITHUB_COMMENT = 7788
+
+/**
+ * The review id each of the four write methods was handed, in call order —
+ * plus the comment id for the reaction, whose route carries the two separately
+ * and can therefore mix them up.
+ */
+interface RecordedWrites {
+  submitReview: number[]
+  replyToThread: number[]
+  resolveThread: number[]
+  addReaction: { prNumber: number; commentId: number }[]
+}
+
+/**
+ * The fake surface, wrapped so every write records the arguments it received
+ * before delegating. The recording is the assertion target: a response body
+ * cannot distinguish a write that reached the intended review from one that
+ * reached another, since both ids are ordinary positive integers.
+ */
+function recordingApi(): { api: DirectApi; writes: RecordedWrites } {
+  const writes: RecordedWrites = {
+    submitReview: [],
+    replyToThread: [],
+    resolveThread: [],
+    addReaction: [],
+  }
+  const base = fakeApi()
+  const api: DirectApi = {
+    ...base,
+    async submitReview(input) {
+      writes.submitReview.push(input.prNumber)
+      return base.submitReview(input)
+    },
+    async replyToThread(prNumber, threadId, body) {
+      writes.replyToThread.push(prNumber)
+      return base.replyToThread(prNumber, threadId, body)
+    },
+    async resolveThread(prNumber, threadId, resolved) {
+      writes.resolveThread.push(prNumber)
+      return base.resolveThread(prNumber, threadId, resolved)
+    },
+    async addReaction(prNumber, commentId, reaction) {
+      writes.addReaction.push({ prNumber, commentId })
+      return base.addReaction(prNumber, commentId, reaction)
+    },
+  }
+  return { api, writes }
+}
+
+/** No write of any kind reached the api. */
+const NO_WRITES: RecordedWrites = {
+  submitReview: [],
+  replyToThread: [],
+  resolveThread: [],
+  addReaction: [],
+}
+
+/**
+ * The four write routes aimed at one review, each as a fresh `Request` — a
+ * request body is consumable once, so the same case cannot be replayed across
+ * modes without rebuilding it.
+ *
+ * `path` is the URL PATHNAME, which is what the refusal message quotes: the
+ * reaction's `?pr=` never appears in it.
+ */
+function writeRequests(
+  reviewId: number,
+  commentId: number,
+): { endpoint: string; path: string; request: () => Request }[] {
+  return [
+    {
+      endpoint: 'submitReview',
+      path: `/api/pulls/${reviewId}/review`,
+      request: () =>
+        req('POST', `/api/pulls/${reviewId}/review`, {
+          prNumber: reviewId,
+          expectedHeadSha: 'h'.repeat(40),
+          event: 'COMMENT',
+          body: 'looks good',
+          comments: [],
+        }),
+    },
+    {
+      endpoint: 'replyToThread',
+      path: `/api/pulls/${reviewId}/threads/T1/reply`,
+      request: () => req('POST', `/api/pulls/${reviewId}/threads/T1/reply`, { body: 'agreed' }),
+    },
+    {
+      endpoint: 'resolveThread',
+      path: `/api/pulls/${reviewId}/threads/T1/resolve`,
+      request: () => req('POST', `/api/pulls/${reviewId}/threads/T1/resolve`, { resolved: true }),
+    },
+    {
+      endpoint: 'addReaction',
+      path: `/api/comments/${commentId}/reactions`,
+      request: () =>
+        req('POST', `/api/comments/${commentId}/reactions?pr=${reviewId}`, { reaction: '+1' }),
+    },
+  ]
+}
+
+/**
+ * The refusal a reads-only broker answers a gated write with, spelled out here
+ * rather than derived from the router — a message compared against the code
+ * that produced it asserts nothing about the message.
+ */
+function readsOnlyRefusalMessage(path: string): string {
+  return (
+    `POST ${path} is not available: this broker has no bot identity ` +
+    '(REVU_BOT_LOGIN) configured, so it is reads-only.'
+  )
+}
+
+describe('handleDirectApi: the write path across the id bands', () => {
+  test('a reads-only broker serves the four writes on a local review and still refuses them on a pull request', async () => {
+    // The gate's precondition, pinned rather than assumed: this api carries no
+    // broker write capability, so the gate under test is armed.
+    const local = recordingApi()
+    expect(local.api.brokerWritesEnabled).toBe(false)
+
+    // A local review touches no GitHub and needs no bot identity, so every one
+    // of the four is served — and reaches the surface carrying the local id.
+    for (const route of writeRequests(WRITE_LOCAL_REVIEW, WRITE_LOCAL_COMMENT)) {
+      const res = await handleDirectApi(route.request(), SESSION, local.api, 'broker')
+      expect(res).not.toBeNull()
+      expect(res?.status).toBe(200)
+    }
+    expect(local.writes).toEqual({
+      submitReview: [WRITE_LOCAL_REVIEW],
+      replyToThread: [WRITE_LOCAL_REVIEW],
+      resolveThread: [WRITE_LOCAL_REVIEW],
+      addReaction: [{ prNumber: WRITE_LOCAL_REVIEW, commentId: WRITE_LOCAL_COMMENT }],
+    })
+
+    // The same four on a pull request are unchanged: 501, the typed code, and
+    // the bot-identity message byte for byte.
+    const pull = recordingApi()
+    for (const route of writeRequests(WRITE_GITHUB_PR, WRITE_GITHUB_COMMENT)) {
+      const res = await handleDirectApi(route.request(), SESSION, pull.api, 'broker')
+      expect(res?.status).toBe(501)
+      const body = (await res?.json()) as { code: string; message: string }
+      expect(body.code).toBe('not_implemented')
+      expect(body.message).toBe(readsOnlyRefusalMessage(route.path))
+    }
+    expect(pull.writes).toEqual(NO_WRITES)
+
+    // Direct mode is untouched on both ids: its writes are gated by mode, and
+    // this gate never applied to it.
+    for (const [reviewId, commentId] of [
+      [WRITE_LOCAL_REVIEW, WRITE_LOCAL_COMMENT],
+      [WRITE_GITHUB_PR, WRITE_GITHUB_COMMENT],
+    ] as const) {
+      const direct = recordingApi()
+      for (const route of writeRequests(reviewId, commentId)) {
+        const res = await handleDirectApi(route.request(), SESSION, direct.api, 'direct')
+        expect(res?.status).toBe(200)
+      }
+      expect(direct.writes).toEqual({
+        submitReview: [reviewId],
+        replyToThread: [reviewId],
+        resolveThread: [reviewId],
+        addReaction: [{ prNumber: reviewId, commentId }],
+      })
+    }
+  })
+
+  test("the reaction's band decision reads the review the router resolved, never a second parse", async () => {
+    // The comment id satisfies the review-band predicate on its own — the
+    // entity band sits above the review band — so a decision that read the
+    // route's `:id` would classify a reaction on ANY comment as local.
+    expect(WRITE_LOCAL_COMMENT).toBeGreaterThan(LOCAL_REVIEW_ID_BASE)
+
+    const served = recordingApi()
+    const ok = await handleDirectApi(
+      req('POST', `/api/comments/${WRITE_LOCAL_COMMENT}/reactions?pr=${WRITE_LOCAL_REVIEW}`, {
+        reaction: '+1',
+      }),
+      SESSION,
+      served.api,
+      'broker',
+    )
+    expect(ok?.status).toBe(200)
+    expect(served.writes.addReaction).toEqual([
+      { prNumber: WRITE_LOCAL_REVIEW, commentId: WRITE_LOCAL_COMMENT },
+    ])
+
+    // The contradictory pairing: the query names a local review, the body names
+    // a pull request. Whichever the router picks, the value it BANDED and the
+    // value it PASSED ON must be the same one — and only the recorded argument
+    // can say so, because either choice answers an indistinguishable 200.
+    const contradictory = recordingApi()
+    const res = await handleDirectApi(
+      req('POST', `/api/comments/${WRITE_LOCAL_COMMENT}/reactions?pr=${WRITE_LOCAL_REVIEW}`, {
+        reaction: '+1',
+        prNumber: WRITE_GITHUB_PR,
+      }),
+      SESSION,
+      contradictory.api,
+      'broker',
+    )
+    expect(res?.status).toBe(200)
+    expect(contradictory.writes.addReaction).toEqual([
+      { prNumber: WRITE_LOCAL_REVIEW, commentId: WRITE_LOCAL_COMMENT },
+    ])
+    expect(contradictory.writes.addReaction[0]?.prNumber).not.toBe(WRITE_GITHUB_PR)
+  })
+
+  test('an id at the top of the entity band survives the router parse exactly', async () => {
+    // Every id the router reads arrives as a decimal string and becomes a
+    // double through `Number()`. Below the exact-integer ceiling that round
+    // trips; at or above it, adjacent integers collapse onto one value and a
+    // write silently lands on a neighbouring entity.
+    //
+    // The ceiling is ASSERTED, not assumed: `MAX_SAFE_INTEGER` is where the
+    // collapse begins, and the entity band's base sits a hundredfold below it,
+    // so the band has room to grow before the parse stops being lossless.
+    expect(LOCAL_ENTITY_ID_BASE * 100).toBeLessThan(Number.MAX_SAFE_INTEGER)
+
+    // The falsification, so the round-trip below is a real boundary rather than
+    // a property of every decimal string: two past the ceiling does NOT survive.
+    const pastCeiling = (BigInt(Number.MAX_SAFE_INTEGER) + 2n).toString()
+    expect(String(Number(pastCeiling))).not.toBe(pastCeiling)
+
+    // The largest id any band may mint and still be read back unchanged.
+    const topOfBand = Number.MAX_SAFE_INTEGER
+    expect(Number(String(topOfBand))).toBe(topOfBand)
+
+    const api = recordingApi()
+    const res = await handleDirectApi(
+      req('POST', `/api/comments/${topOfBand}/reactions?pr=${WRITE_LOCAL_REVIEW}`, {
+        reaction: '+1',
+      }),
+      SESSION,
+      api.api,
+      'broker',
+    )
+    expect(res?.status).toBe(200)
+    expect(api.writes.addReaction).toEqual([
+      { prNumber: WRITE_LOCAL_REVIEW, commentId: topOfBand },
+    ])
   })
 })

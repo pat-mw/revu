@@ -7,6 +7,7 @@ import type {
 import {
   ApiError,
   errorBodyFromApiError,
+  isLocalReviewId,
   isValidRefName,
   normalizeRefName,
   ROUTES,
@@ -56,15 +57,22 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  * conferred solely by the stamping + journaling write decorator, which boot
  * injects exactly when the bot self-identity is configured); a broker api
  * without it is reads-only and gates all four to `not_implemented` (501)
- * before any write runs. Contract semantics enforced on the served write path:
+ * before any write runs. That gate is decided against the REVIEW each write
+ * names rather than against the route it arrived on: a write to a review of a
+ * local branch pair reaches no GitHub, posts as nobody and has no bot login to
+ * resolve, so it is served on a reads-only broker exactly as it is in direct
+ * mode. Contract semantics enforced on the served write path:
  *   - `submitReview` returns `head_moved`/`forbidden` as a 200-level VALUE, never
  *     an error status — it is an ordinary JSON body.
  *   - A submit that hits a 422 (a comment failed validation despite the guard)
  *     surfaces as `conflict` (409); the store draft is retained by the surface,
  *     never discarded on failure.
- *   - `addReaction`'s route carries only the comment id, so the owning PR rides
- *     as a `?pr=<n>` query param (or a `prNumber` body field), mirroring the mock
- *     router; it is shared-and-honest (one GitHub user, one reaction).
+ *   - `addReaction`'s route carries only the comment id, so the owning review
+ *     rides as a `?pr=<n>` query param (or a `prNumber` body field), mirroring
+ *     the mock router; it is shared-and-honest (one GitHub user, one reaction).
+ *     Its owning review is resolved ONCE and every later decision — the band
+ *     check included — reads that one binding, never the comment id and never a
+ *     second parse of the request.
  *
  * Three of the four local-review routes are served here — `GET /api/branches`,
  * `POST /api/local-reviews` and `GET /api/local-reviews` — against the local
@@ -132,32 +140,41 @@ const NOT_IMPLEMENTED_ROUTES: ReadonlySet<string> = new Set<string>([
 ])
 
 /**
- * The four write endpoints, gated to `not_implemented` in BROKER mode whenever
- * the api lacks the broker write capability. Correct broker writes need two
- * things at once: identity-dependent behavior (the self-approval guard, submit
- * idempotency-by-self, own-comment detection) that reads a resolved bot login
- * — a GitHub App installation token cannot resolve its own login from GitHub
- * (`GET /user` answers 403), so it exists only when the deployment configures
- * `REVU_BOT_LOGIN` — AND the stamping + journaling `WriteDecorator`, without
- * which a mediated write would post unstamped as the bare shared bot and leave
- * no audit row. The gate therefore keys on `api.brokerWritesEnabled`, the
- * capability only the broker decorator confers (boot injects it exactly when
- * the bot login is configured): the api structurally cannot be write-enabled
- * without stamping + journaling, so a session-shape/assembly mismatch fails
- * CLOSED to an honest 501, exactly as `listPulls` does. A capable broker
- * serves all four through the same shared write path direct mode uses. Direct
- * mode serves all four unchanged — its writes are gated by mode, not by this
- * capability.
+ * The write endpoints whose owning review is a PATH parameter, gated to
+ * `not_implemented` in BROKER mode — before the request body is read — whenever
+ * the api lacks the broker write capability AND the write names a pull request.
+ *
+ * Correct broker writes to GITHUB need two things at once: identity-dependent
+ * behavior (the self-approval guard, submit idempotency-by-self, own-comment
+ * detection) that reads a resolved bot login — a GitHub App installation token
+ * cannot resolve its own login from GitHub (`GET /user` answers 403), so it
+ * exists only when the deployment configures `REVU_BOT_LOGIN` — AND the
+ * stamping + journaling `WriteDecorator`, without which a mediated write would
+ * post unstamped as the bare shared bot and leave no audit row. The gate
+ * therefore keys on `api.brokerWritesEnabled`, the capability only the broker
+ * decorator confers (boot injects it exactly when the bot login is configured):
+ * the api structurally cannot be write-enabled without stamping + journaling,
+ * so a session-shape/assembly mismatch fails CLOSED to an honest 501, exactly
+ * as `listPulls` does. A capable broker serves all four through the same shared
+ * write path direct mode uses. Direct mode serves all four unchanged — its
+ * writes are gated by mode, not by this capability.
+ *
+ * NONE of that applies to a review of a local branch pair. Such a write reaches
+ * no GitHub, posts as nobody, and has no bot login to resolve, so refusing it
+ * for want of a bot identity would make local reviews reads-only in precisely
+ * the deployment they exist for — with a message pointing at a GitHub App that
+ * is not involved. The gate is therefore decided per REVIEW, not per route
+ * template, and skips the local band.
+ *
+ * `addReaction` is deliberately absent from this table, and its absence is
+ * structural rather than an oversight: its route carries only the comment id,
+ * so the review it lands on is resolved from the query string or the request
+ * body inside its handler. It is gated there, against that ONE resolved value.
  */
-const BROKER_GATED_WRITE_ROUTES: readonly {
+const BROKER_GATED_PULL_WRITE_ROUTES: readonly {
   method: string
   path: string
-}[] = [
-  ROUTES.submitReview,
-  ROUTES.replyToThread,
-  ROUTES.resolveThread,
-  ROUTES.addReaction,
-]
+}[] = [ROUTES.submitReview, ROUTES.replyToThread, ROUTES.resolveThread]
 
 /**
  * Match a request path against a route template, returning captured `:param`
@@ -186,6 +203,42 @@ function matchRoute(
 function prNumberOf(params: Record<string, string>): number | null {
   const n = Number(params.n)
   return Number.isInteger(n) && n > 0 ? n : null
+}
+
+/**
+ * Whether an already-resolved REVIEW id names a review of a local branch pair.
+ *
+ * `null` — an id that never parsed — is not local. An unreadable id must not
+ * open a gate that a readable one would close, so the reads-only refusal stands
+ * exactly where it stands today for anything that is not demonstrably local.
+ *
+ * The parameter is a review id and nothing else. The entity band sits ABOVE the
+ * review band, so a locally minted comment id satisfies the underlying
+ * predicate while naming no review at all; handing one to this would report
+ * "local" for a write against any comment whatsoever, including a comment on a
+ * pull request.
+ */
+function namesLocalReview(reviewId: number | null): boolean {
+  return reviewId !== null && isLocalReviewId(reviewId)
+}
+
+/**
+ * The refusal a broker without a bot identity answers a GitHub-bound write
+ * with: an honest `not_implemented` (501) naming the missing configuration, so
+ * the reader is not left hunting for a failure in the write itself.
+ *
+ * `path` is the URL pathname; a query string is deliberately not echoed.
+ */
+function readsOnlyBrokerRefusal(method: string, path: string): Response {
+  return json(
+    {
+      code: 'not_implemented',
+      message:
+        `${method} ${path} is not available: this broker has no bot identity ` +
+        '(REVU_BOT_LOGIN) configured, so it is reads-only.',
+    },
+    501,
+  )
 }
 
 /**
@@ -345,25 +398,26 @@ export async function handleDirectApi(
     return json(session)
   }
 
-  // A broker whose api lacks the broker write capability is reads-only: the
-  // four write endpoints answer `not_implemented` (501) before any write
-  // executes, the same honest placeholder `listPulls` uses. The capability is
-  // conferred only by the stamping + journaling decorator (injected at boot
-  // exactly when the bot identity is configured), so the gate opens only when
-  // every served write is stamped and journaled. Direct mode falls through
-  // unchanged.
+  // A broker whose api lacks the broker write capability is reads-only for
+  // writes that reach GITHUB: those answer `not_implemented` (501) before any
+  // write executes and before any body is read, the same honest placeholder
+  // `listPulls` uses. The capability is conferred only by the stamping +
+  // journaling decorator (injected at boot exactly when the bot identity is
+  // configured), so the gate opens only when every served write is stamped and
+  // journaled.
+  //
+  // The decision is made against the REVIEW the write names, not against the
+  // route it arrived on: a write to a local review reaches no GitHub and needs
+  // no bot identity, so it is served here exactly as it is in direct mode. An
+  // id that fails to parse is not local and is refused unchanged. Direct mode
+  // falls through untouched. `addReaction` is gated inside its own handler,
+  // where the review it lands on is resolved.
   if (mode === 'broker' && !api.brokerWritesEnabled) {
-    for (const route of BROKER_GATED_WRITE_ROUTES) {
-      if (method === route.method && matchRoute(route.path, path)) {
-        return json(
-          {
-            code: 'not_implemented',
-            message:
-              `${method} ${path} is not available: this broker has no bot identity ` +
-              '(REVU_BOT_LOGIN) configured, so it is reads-only.',
-          },
-          501,
-        )
+    for (const route of BROKER_GATED_PULL_WRITE_ROUTES) {
+      if (method !== route.method) continue
+      const params = matchRoute(route.path, path)
+      if (params !== null && !namesLocalReview(prNumberOf(params))) {
+        return readsOnlyBrokerRefusal(method, path)
       }
     }
   }
@@ -575,17 +629,24 @@ export async function handleDirectApi(
     }
 
     // ——— addReaction: POST /api/comments/:id/reactions ———
-    // The route carries only the comment id; the owning PR rides as `?pr=<n>` (or
-    // a `prNumber` body field), the same accommodation the mock router makes.
+    // The route carries only the comment id; the owning review rides as
+    // `?pr=<n>` (or a `prNumber` body field), the same accommodation the mock
+    // router makes.
     if (method === ROUTES.addReaction.method) {
       const params = matchRoute(ROUTES.addReaction.path, path)
       if (params) {
-        const commentId = Number(params.id)
-        if (!Number.isInteger(commentId) || commentId <= 0) {
-          return errorJson('not_found', `Bad comment id "${params.id}".`, 400)
-        }
         const raw = await readJsonBody(req)
-        const body = validateReactionBody(raw)
+        // The owning review, resolved ONCE. The query wins when it names a
+        // positive integer; otherwise a numeric body field stands in. The two
+        // sources are not equally strict — the body fallback admits zero,
+        // negatives and non-integers where the query does not — which is
+        // exactly why the resolution lives in one place: every later decision
+        // reads THIS binding, so nothing downstream can re-derive a different
+        // number from the same request. A request carrying both a `?pr=` and a
+        // disagreeing body `prNumber` is the case that makes it matter: the
+        // review a later reader would band and the review the write lands on
+        // are then two different, equally plausible positive integers, and a
+        // write sent to the wrong one still answers 200.
         const prFromQuery = Number(url.searchParams.get('pr'))
         const prNumber =
           Number.isInteger(prFromQuery) && prFromQuery > 0
@@ -593,6 +654,20 @@ export async function handleDirectApi(
             : typeof raw.prNumber === 'number'
               ? raw.prNumber
               : null
+        // The reads-only broker gate for this route, decided against the review
+        // just resolved — never against `params.id`, which is a COMMENT id: the
+        // entity band sits above the review band, so a locally minted comment id
+        // satisfies the review-band predicate while saying nothing about the
+        // review, and gating on it would open the gate for reactions on pull
+        // requests too. Runs before the body is validated so a reads-only
+        // broker's refusal is unaffected by the body's shape.
+        if (mode === 'broker' && !api.brokerWritesEnabled && !namesLocalReview(prNumber)) {
+          return readsOnlyBrokerRefusal(method, path)
+        }
+        const commentId = Number(params.id)
+        if (!Number.isInteger(commentId) || commentId <= 0) {
+          return errorJson('not_found', `Bad comment id "${params.id}".`, 400)
+        }
         if (prNumber === null) {
           return errorJson(
             'not_found',
@@ -600,6 +675,7 @@ export async function handleDirectApi(
             400,
           )
         }
+        const body = validateReactionBody(raw)
         return json(await api.addReaction(prNumber, commentId, body.reaction as ReactionKey))
       }
     }
