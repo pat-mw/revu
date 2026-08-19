@@ -122,11 +122,12 @@ describe('host store: drafts are reachable only through the owning coder.owner b
  * These are STORE-level claims only. The store makes per-human keying possible;
  * it does not enforce who the caller is. The matching HTTP claim — that a
  * spoofed `humanId` in a request body is overwritten by the session identity
- * before the store is touched, as the pull-request draft route already proves
- * below — cannot be made here, because no route dispatches a local-review draft
- * yet. That gap is deliberate and named so it is not mistaken for coverage: it
- * becomes assertable when the dispatch exists, and until then the store's keying
- * is a necessary condition for isolation rather than a sufficient one.
+ * before the store is touched, as the pull-request draft route proves below —
+ * is made against a real daemon serving a real local review in
+ * `local-reviews-serve.test.ts`, which is where a local-review draft is actually
+ * dispatched over the wire. Keeping the two apart is deliberate: the keying
+ * asserted here is a necessary condition for isolation, and the route asserted
+ * there is what makes it sufficient.
  */
 describe('direct store: a local-review draft is private to the human it was written for', () => {
   let dir: string
