@@ -18,13 +18,14 @@ The daemon track below it (M8.2, M8.3, M8.4) is complete and in review on #73 / 
 | **OQ5 design pass** — the `LocalReviewSurface` seam + the five findings | fable | ✅ spec only, no code |
 | **M8.5.4** — boot relaxation | opus | ✅ `5bfdf38` — 2453 · 1 · 0 · 91 |
 | **M8.5.1** — band dispatch on the direct surface | opus | ✅ `369af01` — 2458 · 1 · 0 · 92 |
-| **M8.5.9** — two daemons on one data dir | opus | ✅ `6a837ae` — **2460 · 1 · 0 · 92** |
-| **M8.5.10** — the local surface factory | opus | **dispatched** |
-| **M8.5.2** — create / list / branches routes | opus | **dispatched** |
+| **M8.5.9** — two daemons on one data dir | opus | ✅ `6a837ae` — 2460 · 1 · 0 · 92 |
+| **M8.5.2** — create / list / branches routes | opus | ✅ `4a281ba` — 2474 · 1 · 0 · 92 |
+| **M8.5.10** — the local surface factory | opus | ✅ `d239db6` — **2528 · 1 · 0 · 93** |
+| **M8.5.5** — boot assembly (`index.ts`) | opus | **dispatched** |
+| **M8.5.3** — `listPulls` with local reviews merged | opus | **dispatched** |
 
-`.10` writes `local-surface.ts` (+ its new test); `.2` writes `direct-router.ts`, `direct-router.test.ts`,
-`direct-api.ts`, `direct-api.test.ts`. Disjoint, so they run together. Remaining after them:
-**`.3` → `.8` → `.6`** on the router chain, `.5` (boot assembly, `index.ts`) once `.10` lands, then `.7`.
+Remaining after this pair: **`.8` → `.6`** on the router chain, then **`.7`** (the offline HTTP proof), then
+`Verify` → the fable-tier adversarial review of the full diff → the PR.
 
 **Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
 one, and every number matched the worker's report.
