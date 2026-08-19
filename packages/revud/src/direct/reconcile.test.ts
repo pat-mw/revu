@@ -102,11 +102,14 @@ function fakeStore(opts: {
     getDraft: () => opts.draft,
     getSnapshot: () => opts.snapshot,
     getBlob: (sha: string) => opts.blobs[sha] ?? null,
+    // The one record, read by both. A second, independent map here would let
+    // the pre-flight and the classifier disagree about what the store holds,
+    // which is precisely the divergence the pre-flight exists to prevent.
+    hasBlob: (sha: string) => opts.blobs[sha] !== undefined,
     // Everything below is off-limits to reconcile; touching it is a bug.
     getImmutable: unexpected('getImmutable'),
     putImmutable: unexpected('putImmutable'),
     putSnapshot: unexpected('putSnapshot'),
-    hasBlob: unexpected('hasBlob'),
     putBlobs: unexpected('putBlobs'),
     putDraft: unexpected('putDraft'),
     deleteDraft: unexpected('deleteDraft'),
@@ -124,6 +127,7 @@ function fakeStore(opts: {
     patchLocalReviewSync: unexpected('patchLocalReviewSync'),
     nextLocalEntityId: unexpected('nextLocalEntityId'),
     getLocalSnapshot: unexpected('getLocalSnapshot'),
+    getLocalCommentAuthors: unexpected('getLocalCommentAuthors'),
     putLocalSnapshot: unexpected('putLocalSnapshot'),
     getLocalDraft: unexpected('getLocalDraft'),
     putLocalDraft: unexpected('putLocalDraft'),
@@ -428,6 +432,68 @@ describe('reconcileDraft — classification against the fresh snapshot', () => {
     // search re-points it to line 6 with its real context.
     expect(only.kind).toBe('drifted')
     expect(only.kind === 'drifted' ? only.newLine : null).toBe(6)
+  })
+})
+
+describe('reconcileDraft — missing objects are reported, never classified', () => {
+  test('an absent anchor blob is a typed re-syncable answer, not a deleted line', () => {
+    // The lie this replaces: a blob the store cannot produce resolves to null,
+    // which the classifier reads as "no content to match" and reports as
+    // `lost` / `line-deleted`. A human acting on that drops a comment whose
+    // line is still there. Absence of the OBJECT and absence of the LINE are
+    // different facts and only one of them is recoverable by re-syncing.
+    const { draft, snapshot, blobs } = forcePushFixture()
+    delete blobs['sha-head']
+    const store = fakeStore({ draft, snapshot, blobs })
+
+    let thrown: unknown
+    try {
+      reconcileDraft({ store, humanId: HUMAN }, 5)
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(ApiError)
+    expect((thrown as ApiError).code).toBe('not_found')
+    expect((thrown as ApiError).message).toMatch(/re-sync/i)
+  })
+
+  test('nothing is classified when an object is missing', () => {
+    // The absence half, stated separately so it cannot be satisfied by the
+    // throw alone. Its permanent negative control is the genuine
+    // `lost` / `line-deleted` case elsewhere in this file, which runs in the
+    // same gate with every blob present — so "no line-deleted was reported"
+    // cannot rot into "nothing classifies at all".
+    const { draft, snapshot, blobs } = forcePushFixture()
+    delete blobs['sha-head']
+    const store = fakeStore({ draft, snapshot, blobs })
+    let report: ReturnType<typeof reconcileDraft> | null = null
+    try {
+      report = reconcileDraft({ store, humanId: HUMAN }, 5)
+    } catch {
+      report = null
+    }
+    expect(report).toBeNull()
+  })
+
+  test('a binary anchor blob is present, not missing', () => {
+    // A pre-flight written against "did resolveBlobLines return null" instead
+    // of "does the object exist" is red here and green nowhere else: a binary
+    // blob yields no lines and is nonetheless perfectly present, so re-syncing
+    // would fix nothing and the report must be produced normally.
+    const { draft, snapshot, blobs } = forcePushFixture()
+    blobs['sha-head'] = { ...blobs['sha-head'], binary: true, content: '' }
+    const store = fakeStore({ draft, snapshot, blobs })
+    const report = reconcileDraft({ store, humanId: HUMAN }, 5)
+    expect(report.results).toHaveLength(draft.comments.length)
+  })
+
+  test('the draft is untouched by the refusal', () => {
+    const { draft, snapshot, blobs } = forcePushFixture()
+    delete blobs['sha-head']
+    const before = structuredClone(draft)
+    const store = fakeStore({ draft, snapshot, blobs })
+    expect(() => reconcileDraft({ store, humanId: HUMAN }, 5)).toThrow(ApiError)
+    expect(store.getDraft(HUMAN, 5)).toStrictEqual(before)
   })
 })
 

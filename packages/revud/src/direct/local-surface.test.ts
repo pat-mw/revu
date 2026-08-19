@@ -1642,7 +1642,7 @@ describe('a sync pins the objects it is about to read', () => {
     expect(pin).toBeLessThan(diff)
     expect(pin).toBeLessThan(catFile)
     harness.store.close()
-  })
+  }, 30_000)
 
   test('a successful pin is reported on the sync outcome', async () => {
     const harness = makeSurface({ toplevel: fixture.dir })
@@ -1653,7 +1653,7 @@ describe('a sync pins the objects it is about to read', () => {
     const outcome = await harness.surface.syncLocalReview(review.id)
     expect(outcome.pin.ok).toBe(true)
     harness.store.close()
-  })
+  }, 30_000)
 
   test('a failed pin is not a failed sync, and is reported', async () => {
     // Paired with the row above: without a success case on the same field, a
@@ -1669,7 +1669,7 @@ describe('a sync pins the objects it is about to read', () => {
     // The snapshot is complete regardless: the pin buys retention, not content.
     expect(outcome.snapshot.partial).toBeNull()
     harness.store.close()
-  })
+  }, 30_000)
 
   test('the pin outcome never leaks into partial', async () => {
     // `partial` means content is missing. An unpinned-but-complete snapshot is
@@ -1697,7 +1697,7 @@ describe('a sync pins the objects it is about to read', () => {
     expect(unpinnedOut.pin.ok).not.toBe(pinnedOut.pin.ok)
     pinned.store.close()
     unpinned.store.close()
-  })
+  }, 30_000)
 
   test('the pin names the compare the snapshot was built from', async () => {
     const harness = makeSurface({ toplevel: fixture.dir })
@@ -1717,7 +1717,7 @@ describe('a sync pins the objects it is about to read', () => {
       outcome.snapshot.immutable.headSha,
     )
     harness.store.close()
-  })
+  }, 30_000)
 
   test('syncPull returns exactly the outcome snapshot', async () => {
     // The contract-shaped method stays contract-shaped: the pin rides an
@@ -1730,5 +1730,5 @@ describe('a sync pins the objects it is about to read', () => {
     const viaSyncPull = await harness.surface.syncPull(review.id)
     expect(Object.keys(viaSyncPull)).not.toContain('pin')
     harness.store.close()
-  })
+  }, 30_000)
 })

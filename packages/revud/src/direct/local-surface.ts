@@ -45,6 +45,7 @@ import {
 import type { ReconcileStore } from './reconcile'
 import { reconcileDraft as runReconcileDraft } from './reconcile'
 import type { DirectStore } from './store'
+import { StoreUnreadableError } from './store'
 
 /**
  * The operations a locally created review supports, as one narrow interface the
@@ -555,6 +556,39 @@ async function qualifyRef(
  * would happen to come back empty anyway, because "empty for the wrong
  * repository" and "empty for this one" must not be distinguishable answers.
  */
+/**
+ * Runs a read that depends on the immutable half being on disk, and turns the
+ * store's corruption error into an answer the reader can act on.
+ *
+ * The store is right to throw. Its envelope names a compare key with no
+ * immutable row, and returning a snapshot with an empty immutable half would
+ * report a broken store as an ordinary one — so it must not be softened, and a
+ * test asserts it still throws when called directly.
+ *
+ * But the two states that produce that throw are not equally hopeless. A
+ * genuinely corrupt row and a data directory that was moved, restored from a
+ * partial backup, or pruned out from under a review are indistinguishable at
+ * the store, and the second is repaired completely by syncing again. Answering
+ * a 500 for both tells the reader their daemon is broken when their review is
+ * one command from working. So the throw is kept and translated here, at the
+ * edge, where "re-sync to rebuild" is a thing a client can render and act on.
+ */
+function rebuildable<T>(localId: number, read: () => T): T {
+  try {
+    return read()
+  } catch (cause) {
+    if (cause instanceof StoreUnreadableError) {
+      throw new ApiError(
+        'not_found',
+        `The stored content for local review #${localId} is no longer in this data directory, ` +
+          'so it cannot be opened. Re-sync it to rebuild from the repository. Nothing written ' +
+          'against it — drafts, threads, viewed marks — has been touched.',
+      )
+    }
+    throw cause
+  }
+}
+
 export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalReviewSurface {
   const { store } = deps
   const humanId = deps.session.human.id
@@ -574,6 +608,10 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     getDraft: (who, localId) => store.getLocalDraft(who, localId),
     getSnapshot: (localId) => store.getLocalSnapshot(localId),
     getBlob: (sha) => store.getBlob(sha),
+    // The same content-addressed table `getBlob` reads. Blobs are shared
+    // between both producers, so there is one existence question and one
+    // answer to it.
+    hasBlob: (sha) => store.hasBlob(sha),
   }
 
   return {
@@ -689,7 +727,12 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
 
       // Read AFTER every await above, so a write that landed while git was being
       // read is not republished away by the envelope written below.
-      const previous = store.getLocalSnapshot(localId)
+      // The authorship map is read on its own rather than off a whole snapshot.
+      // A re-sync is the documented repair for a data directory that lost its
+      // immutable rows, and the full read throws in exactly that state — so
+      // taking the map from it would make the repair impossible to perform, or,
+      // if softened, would make it destroy the one field it cannot rebuild.
+      const previousCommentAuthors = store.getLocalCommentAuthors(localId)
       const threads = store.listLocalThreads(localId)
       const reviewComments = threads.reduce((total, thread) => total + thread.comments.length, 0)
 
@@ -751,7 +794,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
           // reader's own — nothing is stamped into a body, and no forge login
           // stands behind a synthesized author — so a comment whose entry is
           // dropped here can never be attributed by anything again.
-          commentAuthors: previous?.mutable.commentAuthors ?? {},
+          commentAuthors: previousCommentAuthors,
         },
       }
 
@@ -777,7 +820,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       // never been synced; an id it does not own is refused before the read,
       // exactly as an absent one is.
       requireReview(deps, localId)
-      return store.getLocalSnapshot(localId)
+      return rebuildable(localId, () => store.getLocalSnapshot(localId))
     },
 
     getDraft(localId: number): ReviewDraft | null {
@@ -806,7 +849,12 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
 
     reconcileDraft(localId: number): ReconcileReport {
       requireReview(deps, localId)
-      return runReconcileDraft({ store: reconcileStore, humanId }, localId)
+      // Reconcile reads the snapshot too, so it meets the same absence and owes
+      // the same answer. Left untranslated it would be the one path that
+      // reports a missing data directory as a corrupt daemon.
+      return rebuildable(localId, () =>
+        runReconcileDraft({ store: reconcileStore, humanId }, localId),
+      )
     },
 
     getFileViewed(localId: number): FileViewedState {
