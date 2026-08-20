@@ -10,8 +10,9 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.8 — re-sync, rebase safety, and object pinning — is In Progress at 6/8** on
-`m8.8/resync-and-pinning`, pushed, **no PR yet**. Nothing is running. The four questions that blocked this
+**M8.8 — re-sync, rebase safety, and object pinning — is In Review at 6/8** on
+`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`. The two remaining units land on the
+same branch and update the PR. Nothing is running. The four questions that blocked this
 session's dispatch were put to the owner and **all four are answered** — recorded below and written into the
 tickets they bind.
 
@@ -29,8 +30,10 @@ main tree after every unit.
 
 **Remaining: M8.8.6 and M8.8.7 — both app-side, and they share `reconcile-dialog.tsx`, so they run in
 sequence, 6 then 7.** M8.8.6's staleness half wants M8.5.3's `listPulls` merge (a soft dependency — until then
-`useStaleness` returns `null` and the banner degrades rather than blocking). **No PR opens for M8.8 until 8/8
-and an adversarial pass** — §8 is review-before-PR, and the ticket is not complete.
+`useStaleness` returns `null` and the banner degrades rather than blocking). **The PR is open at 6/8 on purpose.** Stacked PRs are the repo's protocol, opened every session — and a
+branch without one gets no CI, because `ci.yml` triggers only on `pull_request` and pushes to `main`. §8
+orders the adversarial review *before the PR*; it is not a rule that the ticket must be complete first.
+The full-diff adversarial pass is still owed before this is considered done.
 
 ### The owner's rulings — 2026-08-19
 
@@ -65,7 +68,7 @@ Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
 **The stack, bottom-up — nine PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
-(M8.5) → #77 (a store fix, not M8) → `m8.8` (no PR yet). `main` is untouched at `177068a`.
+(M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 6/8). `main` is untouched at `177068a`.
 
 ### What M8.5 delivered (in review on #76)
 
@@ -95,7 +98,7 @@ is derived from it, never the other way round.**
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Review** | 10 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | [#76](https://github.com/pat-mw/revu/pull/76) |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
-| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Progress** | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
+| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (6/8) | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |

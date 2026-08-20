@@ -3,14 +3,20 @@
 Cross-session handover. **Newest at the top** — the first entry is the live one. Written so a cold agent can
 act from it alone.
 
-## 2026-08-19 — Session 6 (the interview, and six of M8.8) — **M8.8 is 6/8, pushed, no PR**
+## 2026-08-19 — Session 6 (the interview, and six of M8.8) — **M8.8 is 6/8, on PR #78**
 
 > All four blocking questions were put to the owner and **answered**. Six of M8.8's eight units landed on
 > `m8.8/resync-and-pinning`. `main` is untouched at `177068a`. Nothing is in flight and no worktree is in use.
 >
-> ⚠️ **This branch has never been through CI.** `ci.yml` triggers on `pull_request` and on pushes to `main`
-> only, so a branch with no PR gets **no runner at all**. Every gate here was run locally under `TZ=UTC` —
-> the standing practice that exists because two PRs shipped red this week — but that is evidence, not proof.
+> ⚠️ **CI had never run on this branch until the PR opened.** `ci.yml` triggers on `pull_request` and on
+> pushes to `main` only, so a pushed branch with no PR gets **no runner at all**. The PR was opened at 6/8 to
+> close that gap — **check its result before trusting the local gate**, which reproduces CI by design only
+> under `TZ=UTC`.
+>
+> **Correction carried forward:** an earlier draft of this entry justified withholding the PR by §8. That was
+> wrong. **Stacked PRs are the repo's protocol, opened every session and every milestone; merging is what
+> stays out of bounds.** §8 orders the adversarial review *before the PR opens* — it does not require the
+> ticket to be complete. See `.claude/skills/revu/memories/pr-cadence.md`.
 
 ### Start here
 
@@ -119,7 +125,7 @@ degrading to `{}` would have made the documented repair destroy the one field it
 ### The stack — ten branches, nine PRs, none merged
 
 `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76 (M8.5) → #77 (a store fix) →
-**`m8.8/resync-and-pinning` (no PR)**.
+**[#78](https://github.com/pat-mw/revu/pull/78) — `m8.8/resync-and-pinning`, M8.8 at 6/8**.
 
 **#77 was re-linearized.** It had forked at `0b32368` and never picked up `048638c`, so what the last handover
 called a chain was a fork. Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 · 1 · 0 · 95)**,
@@ -129,8 +135,8 @@ force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
 ### Next
 
-1. **M8.8.6 then M8.8.7** — app-side, sequential on `reconcile-dialog.tsx`. Then M8.8's `Verify`, then an
-   adversarial pass over the whole diff, **then** the PR. §8 is review-before-PR; do not open it early.
+1. **M8.8.6 then M8.8.7** — app-side, sequential on `reconcile-dialog.tsx`. They land on the existing branch
+   and update #78. Then M8.8's `Verify`, then the full-diff adversarial pass, which is still owed.
 2. **M8.10 in the same session** — ruling 4 was given on that condition. Its OQ2 (prune cadence) needs the
    owner before M8.10.6 wires a call site.
 3. **M8.9** is independent and unblocked; ruling 2 settles its trigger.
