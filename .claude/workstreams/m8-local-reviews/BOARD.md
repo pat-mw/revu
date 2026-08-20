@@ -10,7 +10,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.8 is In Review at 8/8 with its adversarial pass done, and M8.10 is In Review at 3/7.** M8.8 sits on
+**M8.8 is In Review at 8/8 with its adversarial pass done, and M8.10 is In Review at 4/7.** M8.8 sits on
 `m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`; M8.10 sits on
 `m8.10/retention-and-gc`, PR [#79](https://github.com/pat-mw/revu/pull/79), based on M8.8. **Nothing is running.**
 
@@ -56,10 +56,16 @@ The full-diff adversarial pass is still owed before this is considered done.
 **M8.10 landed its first wave alongside M8.8, as ruling 4 requires** — the pin set was only allowed to be
 unbounded because the collector arrives right behind it, and it now has. **M8.10.1** (the store's second
 `DELETE`), **M8.10.2** (`dropPinnedRefs`, the milestone's only ref-deletion path) and **M8.10.3** (the
-fail-closed live-`compareKey` read) are on [#79](https://github.com/pat-mw/revu/pull/79).
+fail-closed live-`compareKey` read) and **M8.10.4** (the immutable sweep) are on
+[#79](https://github.com/pat-mw/revu/pull/79), **CI green**.
 
-**Remaining on M8.10, in dependency order: M8.10.4 → M8.10.7 → M8.10.5 → M8.10.6.** M8.10.4 (prune
-unreferenced immutable halves) needs M8.10.3, which has landed. **M8.10.7 (the in-flight-sync gate) must
+**A CI red on #79 was not the change under review**, and is worth knowing before the next push: a
+thousand-call allocator test measured **437ms locally and 9372ms on the runner** against Bun's 5000ms
+default. The gate now passes `--timeout=20000` in the root `package.json` `test` *and* `check` scripts —
+**not** in `bunfig.toml`, which Bun ignores for that key.
+
+**M8.10.4 has landed too — the immutable sweep.** **Remaining, in dependency order: M8.10.7 → M8.10.5 →
+M8.10.6.** **M8.10.7 (the in-flight-sync gate) must
 land before M8.10.6 wires any caller** — it is the guard every prune call site routes through, and a guard
 written after its callers encodes what they do rather than what they must never do. M8.10.5 (the blob
 prune) needs 3 and 4 and ships **dark behind a policy flag** per ruling 3. M8.10.6 needs all six and, per
@@ -105,7 +111,7 @@ trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the cha
 
 **The stack, bottom-up — eleven PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
 (M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8) →
-[#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 3/7). `main` is untouched at `177068a`.
+[#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 4/7). `main` is untouched at `177068a`.
 
 ### What M8.5 delivered (in review on #76)
 
@@ -137,7 +143,7 @@ is derived from it, never the other way round.**
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
-| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (3/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
+| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
 

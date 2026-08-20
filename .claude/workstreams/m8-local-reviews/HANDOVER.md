@@ -55,9 +55,20 @@ re-sync itself fail. Needs a reason field on `StoreUnreadableError`; belongs to 
   under test produces.
 - **Ticket line pointers are unreliable.** **Every** pointer in M8.10's Context table was stale and one
   file path was wrong (`direct-router.ts` is not under `direct/`). Read the seam first.
-- **Gate flake:** discriminator is the test **count** — a real regression keeps it, the flake loses tests.
-  Check whether a test is genuinely slow before dismissing it; several drive real syncs and carry explicit
-  timeouts.
+- **⚠️ CI went red on #79 for a test the change never touched, and local could not reproduce it — ever.**
+  `store.test.ts`'s thousand-call allocator runs a thousand durable allocations, each its own fsync:
+  **437ms locally, 9372ms on the runner**, against Bun's built-in **5000ms** default. A 21x gap, so local
+  timings predict nothing for anything fsync-bound or git-bound — and roughly half the local-review tests
+  drive a real `git` while only half of *those* carried an explicit budget. The gate now passes
+  `--timeout=20000` in the root `package.json` **`test` and `check`** scripts (raise it in both or they
+  disagree). It is deliberately **not** in `bunfig.toml`: Bun reads no `timeout` key there — verified, a
+  declared value is silently ignored — so a fix put in that file looks right and does nothing.
+  **The same test can flake on any PR from #73 up**, since it predates this branch; the remedy is this
+  one-line script change, cherry-picked, and I did not retarget the lower branches to apply it.
+- **Gate flake:** discriminator is the test **count** — a timeout **keeps** it (the test ran and failed),
+  the lost-test flake **drops** it. Check whether a test is genuinely slow before dismissing it; several
+  drive real syncs and carry explicit timeouts. When CI is red and local is green, grep the CI log for
+  `timed out after` **before** suspecting the diff.
 
 ### For M8.11 when it starts
 - `oracleResults` (`reconcile.test.ts:289`) replays only the mock's *classification*, not `newCommits`.
