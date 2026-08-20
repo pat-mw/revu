@@ -97,9 +97,9 @@ describe('whether the branch was rewritten', () => {
 
 describe('the line under the dialog title', () => {
   test('a rewritten branch is described as rewritten, not as new work', () => {
-    // The whole reason this module exists. Three rewritten commits are three
-    // SHAs the draft never saw, not three pieces of work that landed on top of
-    // it, and the count alone cannot tell the human which of those happened.
+    // The whole reason this module exists. A rewrite is not three pieces of
+    // work that landed on top of the draft's head, and the count alone cannot
+    // tell the human which of the two happened.
     expect(
       compareChangeLine({
         draftHeadSha: DRAFT_HEAD,
@@ -107,13 +107,12 @@ describe('the line under the dialog title', () => {
         commits: REWRITTEN,
         newCommits: REWRITTEN,
       }),
-    ).toBe('a1b2c3d → f6e5d4c · the branch was rewritten — 3 commits, all new SHAs')
+    ).toBe('a1b2c3d → f6e5d4c · the branch was rewritten — 3 commits in the compare')
   })
 
   test('and a rewrite of exactly one commit reads as one commit', () => {
-    // An amend. Both halves of the phrasing inflect — the noun and the claim
-    // about the SHAs — so a plural left hard-coded in either place shows up
-    // here and nowhere else.
+    // A single-commit compare, which is the only place the noun inflects, so a
+    // plural left hard-coded shows up here and nowhere else.
     expect(
       compareChangeLine({
         draftHeadSha: DRAFT_HEAD,
@@ -121,7 +120,31 @@ describe('the line under the dialog title', () => {
         commits: [commit('aa')],
         newCommits: [commit('aa')],
       }),
-    ).toBe('a1b2c3d → f6e5d4c · the branch was rewritten — 1 commit, a new SHA')
+    ).toBe('a1b2c3d → f6e5d4c · the branch was rewritten — 1 commit in the compare')
+  })
+
+  test('an amended tip does not get its untouched ancestors called new', () => {
+    // The commonest rewrite there is, and the one that catches an overstated
+    // line. Amending the tip replaces ONE commit; every commit below it keeps
+    // the SHA the reviewer already read. The draft's head is gone, so the
+    // producer hands over the whole compare and the rewrite phrasing is right —
+    // but the sentence may only claim what is known, which is that the reviewed
+    // head is gone. Any wording asserting the commits themselves are new is
+    // false here, and the commit list rendered directly beneath this line prints
+    // those unchanged short SHAs where the human can read the contradiction.
+    const kept = [commit('c1'), commit('c2')]
+    const amended = [...kept, commit('c3prime')]
+    const line = compareChangeLine({
+      draftHeadSha: DRAFT_HEAD,
+      currentHeadSha: CURRENT_HEAD,
+      commits: amended,
+      newCommits: amended,
+    })
+    expect(line).toBe('a1b2c3d → f6e5d4c · the branch was rewritten — 3 commits in the compare')
+    expect(line).not.toContain('new SHA')
+    // The control that keeps the assertion above from passing on a line that
+    // simply stopped mentioning the rewrite at all.
+    expect(line).toContain('rewritten')
   })
 
   test('an ordinary fast-forward still reads exactly as it always has', () => {

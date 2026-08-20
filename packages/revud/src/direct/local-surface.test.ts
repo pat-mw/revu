@@ -45,6 +45,17 @@
  * the caller holds no draft: only a foreign review the caller DOES hold a draft
  * on can tell the guard apart from the delegate's own refusal.
  *
+ * **A data directory that lost its content is answered, not reported as a
+ * broken daemon.** Every verb that reads a snapshot meets the same absence when
+ * the store no longer holds the immutable half its envelope names, and every one
+ * of them owes the same answer: the typed not-found that names re-syncing as the
+ * repair. Each case here asserts both halves of that — the refusal, and that
+ * performing the repair makes the identical call succeed — because a message
+ * naming a remedy is a promise, and a promise nothing checks is wording. A
+ * positive control sits alongside them: the unwrapped store read still throws in
+ * the same state, so none of the cases can be green over a fixture that never
+ * reached it.
+ *
  * **Head resolution failures on ordinary repository states are typed.** A
  * branch deleted after its review was created, and a recorded merge base the
  * clone can no longer count from, are states a user can reach without touching
@@ -53,6 +64,7 @@
  * broker at all — so both must refuse with a typed `ApiError` instead.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -73,7 +85,7 @@ import type { LocalReviewSurface, LocalReviewSurfaceDeps } from './local-surface
 import { listPins, pinRefsFor } from './local-pins'
 import { localSnapshot } from './local-write-fakes'
 import type { DirectStore } from './store'
-import { openDirectStore } from './store'
+import { StoreUnreadableError, openDirectStore } from './store'
 
 const SESSION: Session = {
   human: {
@@ -1731,4 +1743,253 @@ describe('a sync pins the objects it is about to read', () => {
     expect(Object.keys(viaSyncPull)).not.toContain('pin')
     harness.store.close()
   }, 30_000)
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// A data directory that no longer holds the content its reviews were built from.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** The body of the draft the fixture below saves, so its survival is pinned to a literal. */
+const SURVIVING_DRAFT_BODY = 'Unsubmitted text, written before the content went missing.'
+
+/** One review in the failing state, plus every id a verb needs to reach it. */
+interface LostContent {
+  readonly harness: Harness
+  readonly localId: number
+  /**
+   * The head the review was synced at. The removal does not move it, so one
+   * value serves the refused call and the repeated call after the repair.
+   */
+  readonly headSha: string
+  /** A thread that really exists, created by a submit while the content was whole. */
+  readonly threadId: string
+  /** The root comment of that thread. */
+  readonly commentId: number
+  dispose(): void
+}
+
+/**
+ * A synced local review with one submitted thread, whose immutable half is then
+ * removed from the store while everything else it owns stays where it was.
+ *
+ * On a real data directory rather than an in-memory one, because the removal is
+ * a second connection deleting rows behind the surface's back and a private
+ * in-memory database admits no second connection. Emptying the shared
+ * content-addressed table is what a data directory that was moved, restored from
+ * a partial backup, or pruned leaves behind: the envelope still names a compare
+ * key and the row that key addresses is not there. Deleting the review's own row
+ * instead would be a different fixture, since an absent review is already a
+ * clean answer.
+ *
+ * The submit runs BEFORE the removal so the thread and the comment the reply,
+ * the resolve and the reaction address are real. Invented ids would make every
+ * refusal below pass for the wrong reason — those three verbs answer an unknown
+ * id with a not-found of their own — and would leave the repaired half of each
+ * case with nothing to succeed against.
+ */
+async function reviewWithItsContentRemoved(): Promise<LostContent> {
+  const dataDir = mkdtempSync(join(tmpdir(), 'revu-local-write-rebuild-'))
+  const seeding = makeSurface({ toplevel: fixture.dir, store: openDirectStore({ dataDir }) })
+  const { localId, snapshot } = await createdAndSynced(seeding)
+  await seeding.surface.submitReview({
+    prNumber: localId,
+    expectedHeadSha: snapshot.immutable.headSha,
+    event: 'COMMENT',
+    body: 'One note, written while the content was still here.',
+    comments: [pendingComment(fixture.paths.modified, 2)],
+  })
+  const [seeded] = seeding.surface.listThreads(localId)
+
+  // Saved after the submit, which deletes any draft it succeeds on. A draft that
+  // the seeding consumed would make the survival assertion below vacuous.
+  seeding.surface.saveDraft({
+    humanId: SESSION.human.id,
+    prNumber: localId,
+    headSha: snapshot.immutable.headSha,
+    compareKey: snapshot.immutable.compareKey,
+    body: SURVIVING_DRAFT_BODY,
+    event: 'COMMENT',
+    comments: [pendingComment(fixture.paths.modified, 4)],
+    createdAt: FIXED_NOW,
+    updatedAt: FIXED_NOW,
+  })
+  seeding.store.close()
+
+  const raw = new Database(join(dataDir, 'direct.sqlite'))
+  raw.run('DELETE FROM immutables')
+  raw.close()
+
+  const harness = makeSurface({ toplevel: fixture.dir, store: openDirectStore({ dataDir }) })
+  return {
+    harness,
+    localId,
+    headSha: snapshot.immutable.headSha,
+    threadId: seeded.id,
+    commentId: seeded.comments[0].id,
+    dispose: (): void => {
+      harness.store.close()
+      rmSync(dataDir, { recursive: true, force: true })
+    },
+  }
+}
+
+/**
+ * Runs a verb that must refuse and hands the refusal back typed.
+ *
+ * A capture rather than a `toThrow` matcher because every case below asserts
+ * three separate things about the same error — its class, its contract code, and
+ * the phrase that says which refusal it is — and a matcher proving only that
+ * something was thrown would let a different refusal satisfy all three.
+ */
+async function refusalFrom(verb: () => Promise<unknown>): Promise<ApiError> {
+  let thrown: unknown
+  try {
+    await verb()
+  } catch (err) {
+    thrown = err
+  }
+  expect(thrown).toBeInstanceOf(ApiError)
+  // Stated rather than left implied: these two classes are what separate
+  // "rebuild this" from "your daemon is broken", and the transport maps only one
+  // of them to a 500.
+  expect(thrown).not.toBeInstanceOf(StoreUnreadableError)
+  return thrown as ApiError
+}
+
+/**
+ * The refusal a verb owes when the content behind the review is gone: the code a
+ * client routes on, and the wording that names the repair.
+ *
+ * The second phrase is pinned as a literal because the code and the word
+ * "re-sync" alone cannot identify this refusal — a thread that does not exist
+ * answers `not_found` too, and more than one refusal on this surface names
+ * syncing as its remedy. This sentence belongs to the translation of an
+ * unreadable store and to nothing else.
+ */
+function expectRebuildRefusal(refused: ApiError): void {
+  expect(refused.code).toBe('not_found')
+  expect(refused.message).toMatch(/re-sync it to rebuild/i)
+  expect(refused.message).toMatch(/no longer in this data directory/i)
+}
+
+describe('every write verb answers a lost data directory with the repair, not a 500', () => {
+  test('the fixture really reaches the failing state, and the port is where it is answered', async () => {
+    const lost = await reviewWithItsContentRemoved()
+    // The positive control, and the block is worthless without it: an absence
+    // asserted over a fixture that never reached the failing state proves
+    // nothing, and every case below would stay green with the translation
+    // deleted outright.
+    expect(() => lost.harness.store.getLocalSnapshot(lost.localId)).toThrow(StoreUnreadableError)
+    // The other half of the pair. Softening the store and translating at the
+    // port look identical from a verb, and only asserting both — the store still
+    // throws, the port answers — tells them apart. The port is also the seam the
+    // four verbs actually read through, so this is the claim the cases below
+    // rest on rather than a restatement of them.
+    const port = buildLocalWriteDeps(lost.harness.deps, lost.localId)
+    let thrown: unknown
+    try {
+      port.getLocalSnapshot(lost.localId)
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(ApiError)
+    expectRebuildRefusal(thrown as ApiError)
+    lost.dispose()
+  }, 60_000)
+
+  test('a submit refuses with the repair, and re-syncing makes the same submit land', async () => {
+    const lost = await reviewWithItsContentRemoved()
+    const { surface } = lost.harness
+    const submitting = (): Promise<unknown> =>
+      surface.submitReview({
+        prNumber: lost.localId,
+        expectedHeadSha: lost.headSha,
+        event: 'COMMENT',
+        body: 'A second note.',
+        comments: [pendingComment(fixture.paths.modified, 3)],
+      })
+
+    expectRebuildRefusal(await refusalFrom(submitting))
+
+    // The remedy, performed and then measured. A message that names a repair is
+    // a promise, and without this half it would be actionable in wording only.
+    await surface.syncPull(lost.localId)
+    expect(await submitting()).toMatchObject({ status: 'ok' })
+    // Two: the one the fixture seeded and the one that just landed. The seeded
+    // thread surviving the removal is part of the claim — the repair rebuilds
+    // the content, it does not start the review over.
+    expect(surface.listThreads(lost.localId)).toHaveLength(2)
+    lost.dispose()
+  }, 60_000)
+
+  test('a reply refuses with the repair, and re-syncing makes the same reply land', async () => {
+    const lost = await reviewWithItsContentRemoved()
+    const { surface } = lost.harness
+    const replying = (): Promise<unknown> =>
+      surface.replyToThread(lost.localId, lost.threadId, 'Agreed.')
+
+    expectRebuildRefusal(await refusalFrom(replying))
+
+    await surface.syncPull(lost.localId)
+    expect(await replying()).toMatchObject({ body: 'Agreed.' })
+    expect(surface.listThreads(lost.localId)[0].comments).toHaveLength(2)
+    lost.dispose()
+  }, 60_000)
+
+  test('a resolve refuses with the repair, and re-syncing makes the same resolve land', async () => {
+    const lost = await reviewWithItsContentRemoved()
+    const { surface } = lost.harness
+    const resolving = (): Promise<unknown> =>
+      surface.resolveThread(lost.localId, lost.threadId, true)
+
+    expectRebuildRefusal(await refusalFrom(resolving))
+
+    await surface.syncPull(lost.localId)
+    expect(await resolving()).toMatchObject({ isResolved: true })
+    expect(surface.listThreads(lost.localId)[0].isResolved).toBe(true)
+    lost.dispose()
+  }, 60_000)
+
+  test('a reaction refuses with the repair, and re-syncing makes the same reaction land', async () => {
+    const lost = await reviewWithItsContentRemoved()
+    const { surface } = lost.harness
+    const reacting = (): Promise<unknown> =>
+      surface.addReaction(lost.localId, lost.commentId, 'heart')
+
+    expectRebuildRefusal(await refusalFrom(reacting))
+
+    await surface.syncPull(lost.localId)
+    expect(await reacting()).toMatchObject({ heart: 1, total_count: 1 })
+    expect(surface.listThreads(lost.localId)[0].comments[0].reactions.heart).toBe(1)
+    lost.dispose()
+  }, 60_000)
+
+  test('none of the four refusals touches the draft', async () => {
+    const lost = await reviewWithItsContentRemoved()
+    const { surface } = lost.harness
+    // Readable in the failing state because the draft lives in its own table,
+    // which the removal did not empty. Read before as well as after, so the
+    // assertion is about survival rather than about a draft that was never there.
+    expect(surface.getDraft(lost.localId)?.body).toBe(SURVIVING_DRAFT_BODY)
+
+    await refusalFrom(() =>
+      surface.submitReview({
+        prNumber: lost.localId,
+        expectedHeadSha: lost.headSha,
+        event: 'COMMENT',
+        body: 'A second note.',
+        comments: [pendingComment(fixture.paths.modified, 3)],
+      }),
+    )
+    await refusalFrom(() => surface.replyToThread(lost.localId, lost.threadId, 'Agreed.'))
+    await refusalFrom(() => surface.resolveThread(lost.localId, lost.threadId, true))
+    await refusalFrom(() => surface.addReaction(lost.localId, lost.commentId, 'heart'))
+
+    const kept = surface.getDraft(lost.localId)
+    expect(kept?.body).toBe(SURVIVING_DRAFT_BODY)
+    // The pending comment too, not just the body: a draft stripped of the notes
+    // it carried is as lost to its writer as one deleted outright.
+    expect(kept?.comments).toHaveLength(1)
+    lost.dispose()
+  }, 60_000)
 })

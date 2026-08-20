@@ -420,8 +420,8 @@ describe('an advancing base branch moves the compare key with the head standing 
  * how this walk would fail to notice pinning being removed.
  *
  * It reports success rather than failure, because a failing pin is a different
- * scenario (M8.8.2 covers it) and would let the sync take a visibly different
- * path. Here the sync must believe it pinned.
+ * scenario — asserted where the sync surface is tested — and would let the sync
+ * take a visibly different path. Here the sync must believe it pinned.
  */
 function unpinnedRunner(): CommandRunner {
   const real = createBunCommandRunner()

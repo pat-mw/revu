@@ -11,9 +11,11 @@ import { shortSha } from '@/lib/time'
  * head is never a member of it — a membership test over that list would return
  * "rewritten" for every ordinary fast-forward as well, which is every case.
  * Asked of the FULL compare the test is exact: the head the draft's anchors
- * were captured against is either still somewhere in the range, or it is gone,
- * and gone means every commit now in the range carries a SHA the draft never
- * saw.
+ * were captured against is either still somewhere in the range, or it is gone.
+ * Note what "gone" does and does not establish — it says the reviewed head no
+ * longer exists, and NOTHING about the commits beneath it. An amended tip
+ * leaves every earlier commit on the SHA the reviewer already saw, so a caller
+ * that reads this as "the whole range is new" would be overstating it.
  *
  * An EMPTY list answers `true`, and that is the honest answer rather than an
  * edge case slipped past: an empty compare really does not contain the draft
@@ -64,11 +66,18 @@ export interface CompareChange {
  * Two phrasings, because there are two genuinely different events and counting
  * them the same way tells a lie in one of them. Commits landing ON TOP of the
  * draft's head are new work, and "N new commits" is exactly right. A REWRITE
- * replaces the head the draft was written against, which leaves every commit in
- * the range unrecognized — so the count is the size of the whole compare, and
- * calling ten rewritten commits "10 new commits" reports ten pieces of new work
- * where there may be none. The same ten commits under new SHAs is a different
- * thing to be told, and it is the thing that explains why the anchors moved.
+ * replaces the head the draft was written against, so the count becomes the size
+ * of the whole compare, and calling ten rewritten commits "10 new commits"
+ * reports ten pieces of new work where there may be none.
+ *
+ * The rewrite phrasing says "in the compare" and deliberately makes NO claim
+ * about the individual commits, because only one fact is actually known here:
+ * the head the draft was written against is gone. Whether the commits below it
+ * are also new is not established and is usually FALSE — amending the tip is
+ * the commonest rewrite there is, and it leaves every earlier commit with the
+ * SHA the reviewer already saw. An earlier draft of this line claimed "all new
+ * SHAs", which the commit list rendered directly beneath it would have
+ * contradicted on screen.
  *
  * Falls back to the plain count in the two cases where a rewrite cannot be
  * claimed honestly:
@@ -89,8 +98,7 @@ export function compareChangeLine({
   const known = commits !== null && commits !== undefined
   if (known && count > 0 && isRewritten(commits, draftHeadSha)) {
     const noun = count === 1 ? 'commit' : 'commits'
-    const shas = count === 1 ? 'a new SHA' : 'all new SHAs'
-    return `${range} · the branch was rewritten — ${count} ${noun}, ${shas}`
+    return `${range} · the branch was rewritten — ${count} ${noun} in the compare`
   }
   return `${range} · ${count} new ${count === 1 ? 'commit' : 'commits'}`
 }
