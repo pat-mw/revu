@@ -139,6 +139,9 @@ function fakeStore(opts: {
     putLocalThread: unexpected('putLocalThread'),
     listLocalSubmittedReviews: unexpected('listLocalSubmittedReviews'),
     putLocalSubmittedReview: unexpected('putLocalSubmittedReview'),
+    deleteLocalReview: unexpected('deleteLocalReview'),
+    listLiveCompareKeys: unexpected('listLiveCompareKeys'),
+    listImmutableKeys: unexpected('listImmutableKeys'),
     close: () => {},
   }
 }

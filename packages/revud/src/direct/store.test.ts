@@ -2409,6 +2409,509 @@ describe('local submitted reviews: recorded per review, ids kept exact', () => {
   })
 })
 
+/**
+ * The six tables a local review's rows live in, each with the column that names
+ * the review, spelled out rather than derived from the store's own statements.
+ *
+ * A count taken through the same list the delete loops over would agree with the
+ * delete however wrong the delete became — a table dropped from both would read
+ * as an empty table nobody had to clean. These are literals, so a table the
+ * delete stops naming still gets counted here and still has to come back zero.
+ */
+const LOCAL_TABLES_BY_REVIEW: readonly { table: string; column: string }[] = [
+  { table: 'local_reviews', column: 'id' },
+  { table: 'local_snapshots', column: 'local_id' },
+  { table: 'local_threads', column: 'local_id' },
+  { table: 'local_reviews_submitted', column: 'local_id' },
+  { table: 'local_drafts', column: 'local_id' },
+  { table: 'local_viewed', column: 'local_id' },
+]
+
+/**
+ * Raw per-table row counts for one local review id, read through a handle of its
+ * own rather than through the store.
+ *
+ * Raw on purpose. Every store read is keyed through the review row, so once that
+ * row is gone the store cannot see a leftover envelope or a leftover thread at
+ * all — asking it would return the same empty answer whether the rows were
+ * removed or merely orphaned. Only a direct count distinguishes the two, and
+ * "orphaned" is exactly the failure a single delete statement produces.
+ */
+function localRowCounts(id: number): Record<string, number> {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const counts: Record<string, number> = {}
+  for (const { table, column } of LOCAL_TABLES_BY_REVIEW) {
+    const row = raw
+      .query(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} = ?`)
+      .get(id) as { n: number }
+    counts[table] = row.n
+  }
+  raw.close()
+  return counts
+}
+
+/**
+ * Populate every one of the six local tables for one branch pair and return the
+ * review's id. Two humans hold a draft and viewed state, because the drafts and
+ * viewed rows are keyed by the human as well as the review and a delete narrowed
+ * to one human would still look complete with only one human present.
+ */
+function seedEveryLocalTable(store: DirectStore, over: Partial<NewLocalReview> = {}): number {
+  const id = store.createLocalReview(newLocalReview(over)).id
+  store.putLocalSnapshot(snapshot(id, `base...head-${id}`))
+  store.putLocalThread(id, localThread('t-a'))
+  store.putLocalThread(id, localThread('t-b'))
+  store.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + id))
+  store.putLocalDraft(draft('h1', id, 'unsubmitted text belonging to h1'))
+  store.putLocalDraft(draft('h2', id, 'unsubmitted text belonging to h2'))
+  store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+  store.setLocalViewed('h2', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+  return id
+}
+
+/**
+ * Arm a single aborting trigger on one local table's DELETE and return a freshly
+ * opened store, so a removal fails partway through its transaction while the
+ * statements before it have already run.
+ *
+ * This is the negative control for atomicity. "All six tables emptied together"
+ * is only worth something while a delete that emptied five of them would be
+ * observably rolled back, and nothing a caller can pass makes one of the six
+ * statements fail on its own.
+ */
+function armLocalDeleteTripwire(store: DirectStore, table: string): DirectStore {
+  store.close()
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run(
+    `CREATE TRIGGER refuse_delete_${table} BEFORE DELETE ON ${table} ` +
+      `BEGIN SELECT RAISE(ABORT, 'refused: DELETE on ${table}'); END`,
+  )
+  raw.close()
+  return open()
+}
+
+describe('removing a local review takes all six of its tables, or none of them', () => {
+  test('every one of the six local tables gives up its rows for that review', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+
+    // Pinned before the delete, so the assertion after it is against rows that
+    // demonstrably existed rather than against a table that was empty all along.
+    expect(localRowCounts(id)).toEqual({
+      local_reviews: 1,
+      local_snapshots: 1,
+      local_threads: 2,
+      local_reviews_submitted: 1,
+      local_drafts: 2,
+      local_viewed: 2,
+    })
+
+    store.deleteLocalReview(id)
+    store.close()
+
+    expect(localRowCounts(id)).toEqual({
+      local_reviews: 0,
+      local_snapshots: 0,
+      local_threads: 0,
+      local_reviews_submitted: 0,
+      local_drafts: 0,
+      local_viewed: 0,
+    })
+  })
+
+  test('the returned counts equal the rows that existed', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const removed = store.deleteLocalReview(id)
+    store.close()
+
+    // The counts are the evidence a caller has that the delete reached every
+    // table, so they are asserted as an exact record and not merely as
+    // "something was removed". Two threads, two humans' drafts and two humans'
+    // viewed rows, so a count that silently collapsed to one-per-table is red.
+    expect(removed).toEqual({
+      reviewsDeleted: 1,
+      snapshotsDeleted: 1,
+      threadsDeleted: 2,
+      submittedReviewsDeleted: 1,
+      draftsDeleted: 2,
+      viewedDeleted: 2,
+    })
+  })
+
+  test('every read of the removed review answers empty-or-null, for both humans', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    store.deleteLocalReview(id)
+
+    expect(store.getLocalReview(id)).toBeNull()
+    expect(store.getLocalSnapshot(id)).toBeNull()
+    expect(store.getLocalDraft('h1', id)).toBeNull()
+    expect(store.getLocalDraft('h2', id)).toBeNull()
+    expect(store.getLocalViewed('h1', id)).toEqual({})
+    expect(store.getLocalViewed('h2', id)).toEqual({})
+    expect(store.listLocalThreads(id)).toEqual([])
+    expect(store.getLocalThread(id, 't-a')).toBeNull()
+    expect(store.listLocalSubmittedReviews(id)).toEqual([])
+    expect(store.getLocalCommentAuthors(id)).toEqual({})
+    expect(store.listLocalReviews('acme/widgets')).toEqual([])
+    store.close()
+  })
+
+  test('a second, unrelated local review keeps every one of its rows', () => {
+    const store = open()
+    const doomed = seedEveryLocalTable(store)
+    const kept = seedEveryLocalTable(store, { headRef: 'refs/heads/feature/y', title: 'y' })
+
+    store.deleteLocalReview(doomed)
+
+    expect(localRowCounts(kept)).toEqual({
+      local_reviews: 1,
+      local_snapshots: 1,
+      local_threads: 2,
+      local_reviews_submitted: 1,
+      local_drafts: 2,
+      local_viewed: 2,
+    })
+    expect(store.getLocalReview(kept)!.headRef).toBe('refs/heads/feature/y')
+    expect(store.getLocalDraft('h1', kept)!.body).toBe('unsubmitted text belonging to h1')
+    expect(store.getLocalDraft('h2', kept)!.body).toBe('unsubmitted text belonging to h2')
+    expect(store.listLocalThreads(kept).map((t) => t.id)).toEqual(['t-a', 't-b'])
+    expect(store.listLocalSubmittedReviews(kept)).toHaveLength(1)
+    expect(store.getLocalViewed('h1', kept)['a.ts']!.viewed).toBe(true)
+    expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([kept])
+    store.close()
+  })
+
+  test('deleting an id that was never created is a no-op returning all-zero counts', () => {
+    const store = open()
+    const kept = seedEveryLocalTable(store)
+
+    // Never minted, and deliberately inside the reserved local band so the id is
+    // the shape a caller would really pass rather than a value the statement
+    // could reject on sight.
+    const removed = store.deleteLocalReview(LOCAL_REVIEW_ID_BASE + 9999)
+
+    expect(removed).toEqual({
+      reviewsDeleted: 0,
+      snapshotsDeleted: 0,
+      threadsDeleted: 0,
+      submittedReviewsDeleted: 0,
+      draftsDeleted: 0,
+      viewedDeleted: 0,
+    })
+    // Idempotent rather than an error: a retried removal has to be safe, and
+    // "already gone" is the outcome the caller wanted. Nothing else moved.
+    expect(store.getLocalReview(kept)!.id).toBe(kept)
+    store.close()
+  })
+
+  test('deleting the same review twice is safe: the second call removes nothing', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    expect(store.deleteLocalReview(id).reviewsDeleted).toBe(1)
+    expect(store.deleteLocalReview(id)).toEqual({
+      reviewsDeleted: 0,
+      snapshotsDeleted: 0,
+      threadsDeleted: 0,
+      submittedReviewsDeleted: 0,
+      draftsDeleted: 0,
+      viewedDeleted: 0,
+    })
+    store.close()
+  })
+
+  test('the removed id is never minted again, so no row can be adopted by a later review', () => {
+    const store = open()
+    const removed = seedEveryLocalTable(store)
+    store.deleteLocalReview(removed)
+
+    // The high-water mark only moves up, so the next review gets a fresh id even
+    // though the previous one is free. That is what makes a delete that missed a
+    // row a leak rather than a corruption: an orphan can never be adopted.
+    const next = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/z' }))
+    expect(next.id).toBeGreaterThan(removed)
+    store.close()
+  })
+
+  test('the shared immutable half and the blobs are left alone: no cascade from a review', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const compareKey = `base...head-${id}`
+    store.putBlobs([{ sha: 'headblob', path: 'a.ts', content: 'v1', size: 2, binary: false }])
+
+    store.deleteLocalReview(id)
+
+    // Content-addressed and shared — the same compare key can back a pull
+    // request and other local reviews — so removing one here would be a cascade
+    // into storage this review does not own. Whether a cached half is still
+    // needed is a question about references across the whole store.
+    expect(store.getImmutable(compareKey)).not.toBeNull()
+    expect(store.hasBlob('headblob')).toBe(true)
+    store.close()
+  })
+
+  test('deleteLocalReview against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    store.close()
+    // A removal that cannot reach disk must surface as a typed persist failure,
+    // never as a success reporting counts nothing wrote.
+    expect(() => store.deleteLocalReview(id)).toThrow(StoreWriteError)
+  })
+
+  test('a refused statement rolls the whole removal back: five tables do not go alone', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const before = localRowCounts(id)
+
+    // `local_viewed` is the LAST of the six statements, so every other delete has
+    // already run inside the transaction when this one aborts. Anything less than
+    // a full rollback leaves five emptied tables behind.
+    const armed = armLocalDeleteTripwire(store, 'local_viewed')
+    const err = writeErrorFrom(() => {
+      armed.deleteLocalReview(id)
+    })
+    armed.close()
+
+    expect(err.table).toBe('local_reviews+dependents')
+    expect(err.message).toContain('refused: DELETE on local_viewed')
+    // Byte for byte what it was: a removal that failed removed nothing.
+    expect(localRowCounts(id)).toEqual(before)
+  })
+})
+
+/**
+ * Run `fn` and return the `StoreUnreadableError` it threw.
+ *
+ * The CLASS is the assertion, not the fact of throwing, and the two are easy to
+ * confuse here because both failures throw. A row this store cannot read
+ * honestly is a `StoreUnreadableError`, which the daemon answers as a failed
+ * persist; a raw driver error escaping the same read reaches the router as an
+ * unrecognised throw and is reported as something else entirely. Catching the
+ * error and checking its type is the only shape that tells those apart —
+ * `toThrow(StoreUnreadableError)` would too, but not the row it names, and the
+ * error's own message promises a row can be repaired or removed.
+ */
+function unreadableErrorFrom(fn: () => unknown): StoreUnreadableError {
+  try {
+    fn()
+  } catch (err) {
+    if (err instanceof StoreUnreadableError) return err
+    throw err
+  }
+  throw new Error('expected a StoreUnreadableError; the read returned instead')
+}
+
+/** Overwrite one snapshot table's stored envelope with arbitrary bytes. */
+function corruptEnvelope(table: string, column: string, key: number, data: string): void {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run(`UPDATE ${table} SET data = ? WHERE ${column} = ?`, [data, key])
+  raw.close()
+}
+
+describe('the live compareKey set, computed fail-closed', () => {
+  test('a snapshot whose envelope is not JSON aborts the read as StoreUnreadableError', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.close()
+
+    corruptEnvelope('snapshots', 'pr_number', 204, 'not json')
+
+    // The class carries the whole meaning. An unreadable row is a condition the
+    // daemon reports as a failed persist; a driver error leaking out of the same
+    // read arrives as an unrecognised throw and is reported as something else. So
+    // "it threw" is not the assertion — both do.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.table).toBe('snapshots')
+    // The row, not merely the table. The error tells a human to repair or remove
+    // the row, and an error that cannot say which row makes that unactionable.
+    expect(err.rowKey).toBe('204')
+  })
+
+  test('a local snapshot whose envelope is not JSON aborts the read too', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+    store.close()
+
+    corruptEnvelope('local_snapshots', 'local_id', id, '{not valid json')
+
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.table).toBe('local_snapshots')
+    expect(err.rowKey).toBe(String(id))
+  })
+
+  test('a valid envelope with no compareKey at all throws rather than returning a short set', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putSnapshot(snapshot(205, 'other...head'))
+    store.close()
+
+    // Valid JSON, and every field a snapshot envelope carries except the one
+    // that names its immutable half. Nothing about reading it fails; the value
+    // is simply not there.
+    corruptEnvelope('snapshots', 'pr_number', 204, JSON.stringify({ prNumber: 204, mutable: {} }))
+
+    // Returning `['other...head']` here would be the catastrophe: a shorter set
+    // is not a smaller answer, it is a claim that `pr...head` is referenced by
+    // nothing — and the caller of this read removes what nothing references.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.table).toBe('snapshots')
+    expect(err.rowKey).toBe('204')
+  })
+
+  test('a compareKey of the empty string throws: empty is not a key, it is a missing one', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.close()
+
+    corruptEnvelope(
+      'snapshots',
+      'pr_number',
+      204,
+      JSON.stringify({ prNumber: 204, compareKey: '', mutable: {} }),
+    )
+
+    // An empty string is present where a key should be, so a check for absence
+    // alone waves it through — and it can match no `immutables` row, which makes
+    // it exactly as dangerous as a missing one and harder to notice.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.rowKey).toBe('204')
+  })
+
+  test('a compareKey that is not a string throws: it can name no immutables row', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+    store.close()
+
+    corruptEnvelope(
+      'local_snapshots',
+      'local_id',
+      id,
+      JSON.stringify({ prNumber: id, compareKey: 17, mutable: {} }),
+    )
+
+    // `immutables.compare_key` is TEXT, so a number can match no row there. It
+    // is neither absent nor empty, which is precisely why a guard written as two
+    // equality checks lets it through and a type check does not.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.rowKey).toBe(String(id))
+  })
+
+  test('one PR snapshot and one local snapshot on distinct compares return both keys', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    // Both tables, because the immutable half is content-addressed by SHAs git
+    // produced and does not know which kind of review asked for it. A set built
+    // from one table would report the other's keys as referenced by nothing.
+    expect(store.listLiveCompareKeys()).toEqual(['local...head', 'pr...head'])
+    store.close()
+  })
+
+  test('two snapshots sharing one compareKey return it once', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'shared...head'))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'shared...head'))
+
+    // One stored copy of the expensive half backs both reviews, so the set is a
+    // set: the answer is which halves are needed, not how many times each is
+    // asked for.
+    expect(store.listLiveCompareKeys()).toEqual(['shared...head'])
+    store.close()
+  })
+
+  test('an empty store references nothing, and says so without failing', () => {
+    const store = open()
+    // Empty is an ordinary answer, distinct from the refusal an unreadable row
+    // produces — a store nobody has synced yet references no immutable half.
+    expect(store.listLiveCompareKeys()).toEqual([])
+    expect(store.listImmutableKeys()).toEqual([])
+    store.close()
+  })
+
+  test('removing a local review drops its compareKey from the live set, not from the cache', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    store.deleteLocalReview(id)
+
+    // The two reads answer different questions, and this is where that shows.
+    // The envelope is gone so nothing references `local...head` any more, while
+    // the cached half is still on disk — reclaiming it is a separate decision
+    // taken against the whole reference set, never a cascade from one delete.
+    expect(store.listLiveCompareKeys()).toEqual(['pr...head'])
+    expect(store.listImmutableKeys()).toEqual(['local...head', 'pr...head'])
+    store.close()
+  })
+})
+
+describe('the immutable cache reports everything it holds, orphans included', () => {
+  test('listImmutableKeys returns keys no snapshot names', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    // A half cached by a sync whose comparison nothing references any more —
+    // exactly what a rebased branch leaves behind on every sync, since a fresh
+    // merge base mints a fresh key and the previous one is never named again.
+    store.putImmutable(immutable('orphan...head'))
+
+    // The orphans are the point. Without them this read answers with the
+    // question: a reclamation decided by comparing the stored set against the
+    // referenced set has nothing to compare if the stored set is pre-filtered.
+    expect(store.listImmutableKeys()).toEqual(['orphan...head', 'pr...head'])
+    expect(store.listLiveCompareKeys()).toEqual(['pr...head'])
+    store.close()
+  })
+
+  test('the two reads are what an unreferenced half is defined by, and nothing else', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan-a...head'))
+    store.putImmutable(immutable('orphan-b...head'))
+
+    const live = new Set(store.listLiveCompareKeys())
+    const unreferenced = store.listImmutableKeys().filter((key) => !live.has(key))
+
+    // Reference-based, never age-based. Nothing in the `immutables` schema
+    // records when a row was written, so there is no timestamp to sweep on even
+    // if one were wanted — the constraint is made physical by the table itself.
+    expect(unreferenced).toEqual(['orphan-a...head', 'orphan-b...head'])
+    store.close()
+  })
+
+  test('neither read is a write: both are refused nothing under the PR-keyed tripwires', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    const armed = armPrKeyedTripwires(store)
+    const id = armed.createLocalReview(newLocalReview({})).id
+    armed.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    // Reads, and the tripwires guard UPDATE and DELETE as well as INSERT — so a
+    // reclamation read that "helpfully" tidied a row as it went would abort here
+    // rather than quietly discard a pull request's snapshot.
+    expect(armed.listLiveCompareKeys()).toEqual(['local...head', 'pr...head'])
+    expect(armed.listImmutableKeys()).toEqual(['local...head', 'pr...head'])
+    armed.close()
+  })
+})
+
 describe('the append-only audit journal', () => {
   test('appendAudit persists a row that survives a reopen, fields intact', () => {
     const store = open()
@@ -2693,6 +3196,7 @@ const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
   putLocalThread: true,
   listLocalSubmittedReviews: true,
   putLocalSubmittedReview: true,
+  deleteLocalReview: true,
 }
 
 /** The local method names, sorted, as the interface declares them. */
@@ -2937,12 +3441,27 @@ describe('local writes never touch a PR-keyed table', () => {
    * and its control fail in the same run or neither is worth anything.
    */
   test('every local method runs end to end without firing one tripwire', () => {
-    const armed = armPrKeyedTripwires(open())
+    const seeded = open()
+    // One row per guarded table, stored BEFORE the tripwires go up, keyed to the
+    // number the first local review will be minted at.
+    //
+    // Load-bearing rather than scene-setting. SQLite runs a BEFORE UPDATE or
+    // BEFORE DELETE trigger once per MATCHED row, so against empty guarded
+    // tables a local statement mis-aimed at `snapshots` would match nothing, fire
+    // nothing, and pass — the absence this test asserts would hold for the wrong
+    // reason. These rows are what a mis-aimed statement can hit.
+    seeded.putSnapshot(snapshot(LOCAL_REVIEW_ID_BASE, 'pr...head'))
+    seeded.appendAudit(auditEntry({ githubId: 1, pr: LOCAL_REVIEW_ID_BASE }))
+    seeded.recordPrAuthor(LOCAL_REVIEW_ID_BASE, 'h-priya')
+    const armed = armPrKeyedTripwires(seeded)
     const { store, driven } = recordingStore(armed)
 
     const review = store.createLocalReview(newLocalReview({}))
     const id = review.id
-    expect(id).toBeGreaterThanOrEqual(LOCAL_REVIEW_ID_BASE)
+    // Pinned to the exact number, not merely to the band: the seeded rows above
+    // are keyed to that number, and a mint that started elsewhere would leave
+    // them unreachable and the guard decorative.
+    expect(id).toBe(LOCAL_REVIEW_ID_BASE)
     expect(store.getLocalReview(id)!.headRef).toBe('refs/heads/feature/x')
     expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([id])
 
@@ -2975,6 +3494,24 @@ describe('local writes never touch a PR-keyed table', () => {
     store.deleteLocalDraft('h1', id)
     expect(store.getLocalDraft('h1', id)).toBeNull()
 
+    // The keyspace's only multi-table delete, driven LAST because it removes the
+    // review everything above was written against. Six DELETE statements in one
+    // transaction is the widest reach anything here has, and the tripwires are
+    // what say it reaches no further: a DELETE that named `snapshots` instead of
+    // `local_snapshots` would abort here rather than quietly discard a pull
+    // request's cached snapshot.
+    store.putLocalDraft(draft('h2', id, 'a second human, so the delete spans humans'))
+    store.setLocalViewed('h2', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+    expect(store.deleteLocalReview(id)).toEqual({
+      reviewsDeleted: 1,
+      snapshotsDeleted: 1,
+      threadsDeleted: 1,
+      submittedReviewsDeleted: 1,
+      draftsDeleted: 1,
+      viewedDeleted: 2,
+    })
+    expect(store.getLocalReview(id)).toBeNull()
+
     armed.close()
 
     // Read back out of the calls that actually happened and compared against the
@@ -2994,12 +3531,12 @@ describe('local writes never touch a PR-keyed table', () => {
     expect(onTheStore).toEqual(declaredLocalMethods())
   })
 
-  test('the local surface is eighteen methods', () => {
+  test('the local surface is nineteen methods', () => {
     // An independent literal, not another expression over the same map. Every
     // other coverage check here compares two derived sets, and derived sets stay
     // in agreement through a method deleted from the interface, the map and the
     // sweep together — a hardcoded count is the only one of these that notices
     // the swept surface silently shrinking. Changing it is a deliberate act.
-    expect(declaredLocalMethods()).toHaveLength(18)
+    expect(declaredLocalMethods()).toHaveLength(19)
   })
 })
