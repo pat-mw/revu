@@ -481,3 +481,35 @@ Recorded as a durable memory.
 
 **Next.** M8.8.6 → M8.8.7 → Verify → adversarial pass → PR. **M8.10 belongs to the same session as M8.8**
 (ruling 4); its OQ2 needs the owner first. M8.9 is independent and unblocked.
+
+**update — 2026-08-20**
+
+**Done.** M8.8 completed at 8/8 and had its owed full-diff adversarial pass; M8.10 opened at 3/7.
+
+- **M8.8.6** (`bc847ad`) — the rewrite the UI must not miscount, plus D8 base advance. **The unit's Check
+  was wrong twice**, and either error would have shipped a green test that proves nothing: `isRewritten`
+  asked of `newCommits` reports *every* fast-forward as a rewrite (that list is the slice **after** the
+  draft head, so the head is never in it), and "commit on the base branch only" does **not** move
+  `compareKey` at all — the base tip is explicitly not part of the key, which moves only when the base
+  absorbs a commit the head already carries.
+- **M8.8.7** (`407911a`) — a refused submit now leaves the draft describing its own head. `headSha` and
+  `compareKey` move as one argument; no signature in the app takes one without the other.
+- **The adversarial pass** (`bbc4bc6`) — 16 raw findings → 5 survived independent refutation → 4 fixed,
+  1 recorded as M8.8 OQ8. Verdict on the pre-fix tree was **not safe to push**.
+- **M8.10.1 / .2 / .3** (`3423324`) — the store's second `DELETE`, the only ref-deletion path in the
+  milestone, and the fail-closed live-`compareKey` read.
+
+**Decisions.**
+- **Ruling 5 (owner):** the retention prune runs **after every successful local sync** — the tightest
+  growth bound, pruning where the churn is created. M8.10.7's gate spends the in-flight-sync objection.
+  Binds M8.10.6 to drive the prune **at a real sync**, not by calling it directly.
+- **M8.10 OQ4 resolved from the repo, not the owner** — M8.2 shipped the high-water mark, so the id-reuse
+  class is unreachable and the hold on the whole ticket is lifted.
+- **Blobs are deliberately left untranslated** by `rebuildable`: provisioning skips SHAs the store claims
+  to hold, so a present-but-corrupt blob survives every sync and "re-sync" would be a second false remedy.
+
+**Blockers.** None. M8.10 OQ2 and OQ4 are both closed.
+
+**Next.** M8.10.4 → M8.10.7 → M8.10.5 → M8.10.6, in that order (the gate must exist before any caller is
+wired). Then **M8.9**, independent and unblocked. **M8.11 remains the real critical path** — it gates 3 of
+the 6 exit criteria and has not started; unit percentage does not close the milestone, the criteria do.

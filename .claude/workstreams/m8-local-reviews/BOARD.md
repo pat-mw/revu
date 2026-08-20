@@ -10,11 +10,17 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.8 — re-sync, rebase safety, and object pinning — is In Review at 8/8, units complete** on
-`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`. **All eight units have landed.**
-What remains before the ticket can be called done is the ticket's own `Verify` and the **full-diff
-adversarial pass, which is running now** — six dimension reviewers over `prefs/lost-update...HEAD`, every
-finding put to two independent refuters that default to refuting. Five questions have now been put to the owner
+**M8.8 is In Review at 8/8 with its adversarial pass done, and M8.10 is In Review at 3/7.** M8.8 sits on
+`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`; M8.10 sits on
+`m8.10/retention-and-gc`, PR [#79](https://github.com/pat-mw/revu/pull/79), based on M8.8. **Nothing is running.**
+
+**The full-diff adversarial pass is done and its findings are fixed.** Six dimension reviewers over
+`prefs/lost-update...HEAD`, one independent refuter per finding defaulting to refuting: **16 raw → 5
+survived → 4 fixed, 1 recorded as owed** (M8.8 OQ8). The synthesis verdict on the pre-fix tree was **not
+safe to push**, on the strength of a guard that could not observe the thing it guarded. All four fixes are
+in `bbc4bc6`; the detail is in the M8.8 ticket's `## Log`.
+
+**What M8.8 still owes is only its own `Verify`.** Five questions have now been put to the owner
 across two sessions and **all five are answered** — recorded below and written into the tickets they bind.
 
 | unit | what landed | commit |
@@ -28,7 +34,9 @@ across two sessions and **all five are answered** — recorded below and written
 | **M8.8.6** rewrite copy + D8 | **the unit's Check was wrong twice**; the base tip is not in `compareKey` | `bc847ad` |
 | **M8.8.7** the stale draft head | fixed where the re-anchor happens, **before** the submit a refusal survives | `407911a` |
 
-**Gate at the tip: 2718 pass · 1 skip · 0 fail · 99 files**, under `TZ=UTC`, re-run by the orchestrator in the
+**Gate: M8.8 alone 2741 pass · 1 skip · 0 fail · 100 files; the M8.10 tip 2800 pass · 1 skip · 0 fail ·
+101 files.** Both run under `TZ=UTC`, and M8.8 was re-gated **in isolation after the branch cut** rather
+than inferred from the combined tree. Older figure for reference: 2718/99**, under `TZ=UTC`, re-run by the orchestrator in the
 main tree after every unit. **CI on #78 is fully green** — `check`, `conformance-matrix` and `e2e` all
 passed on the 6/8 tip, which is why the PR was opened before the ticket was complete.
 
@@ -45,11 +53,17 @@ branch without one gets no CI, because `ci.yml` triggers only on `pull_request` 
 orders the adversarial review *before the PR*; it is not a rule that the ticket must be complete first.
 The full-diff adversarial pass is still owed before this is considered done.
 
-**M8.10 is in flight alongside it, as ruling 4 requires.** Its first wave is running on the same working
-tree but a disjoint file set: the store's second `DELETE` plus the fail-closed live-`compareKey` read
-(`store.ts`/`store.test.ts`), and the only ref-deletion path in the milestone plus the
-pin-survives-`git gc` story (`retention.ts`/`retention.test.ts`, both new). It branches to
-`m8.10/retention-and-gc` off the M8.8 tip once the wave integrates.
+**M8.10 landed its first wave alongside M8.8, as ruling 4 requires** — the pin set was only allowed to be
+unbounded because the collector arrives right behind it, and it now has. **M8.10.1** (the store's second
+`DELETE`), **M8.10.2** (`dropPinnedRefs`, the milestone's only ref-deletion path) and **M8.10.3** (the
+fail-closed live-`compareKey` read) are on [#79](https://github.com/pat-mw/revu/pull/79).
+
+**Remaining on M8.10, in dependency order: M8.10.4 → M8.10.7 → M8.10.5 → M8.10.6.** M8.10.4 (prune
+unreferenced immutable halves) needs M8.10.3, which has landed. **M8.10.7 (the in-flight-sync gate) must
+land before M8.10.6 wires any caller** — it is the guard every prune call site routes through, and a guard
+written after its callers encodes what they do rather than what they must never do. M8.10.5 (the blob
+prune) needs 3 and 4 and ships **dark behind a policy flag** per ruling 3. M8.10.6 needs all six and, per
+**ruling 5**, must drive the prune **at a real local sync**, not by calling the prune function directly.
 
 ### The owner's rulings — 2026-08-19
 
@@ -89,8 +103,9 @@ unreachable, so M8.10 may start.
 Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
-**The stack, bottom-up — ten PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
-(M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8). `main` is untouched at `177068a`.
+**The stack, bottom-up — eleven PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+(M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8) →
+[#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 3/7). `main` is untouched at `177068a`.
 
 ### What M8.5 delivered (in review on #76)
 
@@ -120,9 +135,9 @@ is derived from it, never the other way round.**
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Review** | 10 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | [#76](https://github.com/pat-mw/revu/pull/76) |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
-| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8) | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
+| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
-| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **Todo** (unblocked) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
+| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (3/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
 
