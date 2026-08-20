@@ -10,11 +10,11 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.8 — re-sync, rebase safety, and object pinning — is In Review at 6/8** on
-`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`. The two remaining units land on the
-same branch and update the PR. Nothing is running. The four questions that blocked this
-session's dispatch were put to the owner and **all four are answered** — recorded below and written into the
-tickets they bind.
+**M8.8 — re-sync, rebase safety, and object pinning — is In Review at 7/8** on
+`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`. The last unit lands on the
+same branch and updates the PR. **M8.8.7 is running now** (the stale-`draft.headSha` fix — `reconcile-plan.ts`,
+`state/drafts.ts`, and the `apply()` rework in `reconcile-dialog.tsx`). Five questions have now been put to the owner
+across two sessions and **all five are answered** — recorded below and written into the tickets they bind.
 
 | unit | what landed | commit |
 | --- | --- | --- |
@@ -24,13 +24,21 @@ tickets they bind.
 | **M8.8.4** missing objects | the `line-deleted` lie closed, **and the re-sync advice made to actually work** | `048ea90` |
 | **M8.8.5** deleted/renamed branch | survival walk + runtime deletion tripwire; **no production change needed** | `b52f181` |
 | **M8.8.8** prune survival | the pinned/unpinned pair — the control fails when the pin is removed | `cb2c5a0` |
+| **M8.8.6** rewrite copy + D8 | **the unit's Check was wrong twice**; the base tip is not in `compareKey` | `bc847ad` |
 
-**Gate at the tip: 2702 pass · 1 skip · 0 fail · 98 files**, under `TZ=UTC`, re-run by the orchestrator in the
-main tree after every unit.
+**Gate at the tip: 2718 pass · 1 skip · 0 fail · 99 files**, under `TZ=UTC`, re-run by the orchestrator in the
+main tree after every unit. **CI on #78 is fully green** — `check`, `conformance-matrix` and `e2e` all
+passed on the 6/8 tip, which is why the PR was opened before the ticket was complete.
 
-**Remaining: M8.8.6 and M8.8.7 — both app-side, and they share `reconcile-dialog.tsx`, so they run in
-sequence, 6 then 7.** M8.8.6's staleness half wants M8.5.3's `listPulls` merge (a soft dependency — until then
-`useStaleness` returns `null` and the banner degrades rather than blocking). **The PR is open at 6/8 on purpose.** Stacked PRs are the repo's protocol, opened every session — and a
+**M8.8.6 corrected its own Check in two places, and both would have shipped a test that proves nothing.**
+`isRewritten` must be asked of the **full** compare, never `newCommits` — that list is `commits.slice(draftHeadIndex + 1)`,
+so the draft head is never in it and a membership test there reports *every* fast-forward as a rewrite. And
+"commit on the base branch only" does **not** move `compareKey`: the base tip is explicitly not part of the
+key (`local-sync.ts:146`), which moves only when the base absorbs a commit the head already carries. Both
+corrections, and a third unnamed state (an empty compare is not a rewrite), are recorded in the ticket's `## Log`.
+
+**Remaining: M8.8.7 alone.** M8.8.6's staleness half wants M8.5.3's `listPulls` merge (a soft dependency — until then
+`useStaleness` returns `null` and the banner degrades rather than blocking). **The PR was opened at 6/8 on purpose.** Stacked PRs are the repo's protocol, opened every session — and a
 branch without one gets no CI, because `ci.yml` triggers only on `pull_request` and pushes to `main`. §8
 orders the adversarial review *before the PR*; it is not a rule that the ticket must be complete first.
 The full-diff adversarial pass is still owed before this is considered done.
@@ -45,6 +53,7 @@ Each is recorded in full at the Open question it closes; the ticket file is auth
 | 2 | What triggers archive detection in direct mode | **On each sync of that review.** No new timer, no GitHub work on an inbox poll. | M8.9 OQ2 |
 | 3 | Is the blob prune on by default | **Off, behind an explicit policy flag.** The immutable prune runs live; the blob walk ships dark. | M8.10 OQ1 |
 | 4 | What bounds the pin set before retention lands | **Keep every pin.** Unbounded but correct — on the condition that **M8.10 lands in the same session as M8.8**. | M8.8 OQ4 |
+| 5 | When the retention prune runs (2026-08-20) | **After every successful local sync** — the tightest growth bound, pruning where the churn is created. M8.10.7's gate spends the in-flight-sync objection. **M8.10.6's Check must drive it at a real sync**, not by calling the prune directly. | M8.10 OQ2 |
 
 **Two of these bind work beyond the ticket they were asked about, and neither is optional:**
 
@@ -58,8 +67,13 @@ Each is recorded in full at the Open question it closes; the ticket file is auth
 
 **Still open and deliberately not asked** (the handover's second tier — each belongs to the session that needs
 it): M8.9 OQ1 (what GitHub call feeds detection) and OQ8 (a PR against a different base); M8.8 OQ5 (throw or
-report on missing objects); M8.9 OQ9. **M8.10 OQ2 — when the prune runs — is narrowed by ruling 3 but not
-answered by it**, and must be settled before M8.10.6 wires a call site.
+report on missing objects); M8.9 OQ9.
+
+**M8.10 is now unblocked on both of its holds.** OQ2 is ruling 5 above. **OQ4 — id reuse vs a high-water
+mark, which held the whole ticket — resolved from the repo, not the owner:** M8.2 shipped the high-water
+mark (`store.ts:1621`, `local_review_id_high_water`, whose own doc at `:1605-1619` spells out that it is
+"not `MAX(id) + 1`" precisely because that would re-issue a deleted review's id). The id-reuse class is
+unreachable, so M8.10 may start.
 
 ### The stack was re-linearized before M8.8 branched
 
@@ -67,8 +81,8 @@ answered by it**, and must be settled before M8.10.6 wires a call site.
 Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
-**The stack, bottom-up — nine PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
-(M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 6/8). `main` is untouched at `177068a`.
+**The stack, bottom-up — ten PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+(M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 7/8). `main` is untouched at `177068a`.
 
 ### What M8.5 delivered (in review on #76)
 
@@ -98,9 +112,9 @@ is derived from it, never the other way round.**
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Review** | 10 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | [#76](https://github.com/pat-mw/revu/pull/76) |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
-| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (6/8) | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
+| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (7/8) | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
-| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
+| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **Todo** (unblocked) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
 
