@@ -1,5 +1,15 @@
 /**
- * Retention: the only path that drops a local review's pinned refs.
+ * Retention: the only path that drops a local review's pinned refs, and the only
+ * one that reclaims a cached half of a comparison nothing references any more.
+ *
+ * The two are the same subject seen from either end of the same store. A pin ref
+ * keeps the git objects a synced snapshot was read from; a cached immutable half
+ * keeps the rows that snapshot was assembled into. Both are held for exactly as
+ * long as something needs them and released by an explicit act rather than by a
+ * clock, and getting either release wrong loses content that has no second
+ * source. So they live in one module, under one doctrine, and the guards that
+ * keep the ref drop from reaching past its own namespace are the guards that keep
+ * the cache sweep from reaching past what is unreferenced.
  *
  * A local review is built from one clone and nothing else. Its diff and its
  * blob bytes were read out of a single object database, and there is no second
@@ -51,14 +61,18 @@
  *
  * ## What never happens here
  *
- * No object is ever reclaimed. Dropping a ref makes objects collectable; it is
- * git's own schedule, or the user's own command, that decides when the space
- * comes back. This module never runs a garbage collection, never touches the
- * working tree, and never writes a ref — the whole of its effect is the removal
- * of names it discovered under one review's own prefix. Nor does it issue any
- * storage statement: pins are refs in an object database rather than rows, so
- * eviction has nothing to rewrite and never reaches for a whole-file operation
- * such as VACUUM.
+ * No object is ever reclaimed by a drop. Dropping a ref makes objects
+ * collectable; it is git's own schedule, or the user's own command, that decides
+ * when the space comes back. Nothing here runs a garbage collection, touches the
+ * working tree, or writes a ref — the whole of a drop's effect is the removal of
+ * names it discovered under one review's own prefix.
+ *
+ * Nor does anything here reach for a whole-file storage operation. The cache
+ * sweep removes rows, one keyed statement at a time, through the store's own
+ * durable write path, and it never reclaims the file those rows sat in. A
+ * whole-file rewrite such as VACUUM cannot run inside a transaction and takes an
+ * exclusive lock on the file every unsubmitted draft lives in, so reaching for
+ * one would block every reader of the store to recover space nobody asked for.
  *
  * ## Hardening
  *
@@ -77,6 +91,7 @@
 import { isLocalReviewId } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import { runGit } from './local-git'
+import type { DirectStore, ImmutableDeletion } from './store'
 
 /** The namespace every pin lives under, and this module's discovery root. */
 const PIN_ROOT = 'refs/revu/reviews'
@@ -176,4 +191,73 @@ export async function dropPinnedRefs(
     dropped.push(ref)
   }
   return { ok: true, count: dropped.length, dropped }
+}
+
+/**
+ * Removes every cached immutable half that no stored snapshot references, and
+ * reports what went.
+ *
+ * The rule is one subtraction and nothing else: a half is reclaimable exactly
+ * when the cache holds its key and no snapshot in either table names it. There
+ * is no age in it, no last-sync time, no cap on how many halves the cache may
+ * keep. That is not a policy left open for a later refinement — the cache
+ * records nothing about when a row was written, so there is no clock to read
+ * even if one were wanted, and a half a live snapshot names is needed however
+ * long ago the review it belongs to was last synced. An expiry added here would
+ * be a rule about age applied to a table that has never known the age of
+ * anything.
+ *
+ * ## Removing too much is the failure that does not degrade
+ *
+ * The two mistakes are not symmetric, and the whole shape of this follows from
+ * which one to prefer. Leaving an unreferenced half behind costs disk and
+ * nothing else; the next sweep takes it. Removing a half a live snapshot names
+ * makes that review UNOPENABLE — the read that re-assembles it finds no
+ * immutable half and refuses outright rather than handing back a snapshot with
+ * an empty one, so what the caller gets is a failed persist and a review that
+ * will not open again. The instinct that a derived half can simply be rebuilt by
+ * re-syncing is what makes the mistake tempting, and it is wrong on exactly the
+ * path this serves: a local review's comparison was computed from one clone, and
+ * a branch rewritten since no longer holds the commits its compare key names.
+ *
+ * So this proposes and the store disposes. The candidate set is computed here,
+ * and the store recomputes what is live inside the same transaction that issues
+ * the deletes, which is the only place a snapshot written after these reads can
+ * still be caught. A candidate that went live in that window keeps its half, at
+ * the cost of one row that waits for the next sweep.
+ *
+ * ## Why this throws where a ref drop returns
+ *
+ * `dropPinnedRefs` resolves every outcome as a value, because a drop that failed
+ * part-way has already removed refs a caller has to reconcile against. This one
+ * refuses outright, because there is no partial progress to report and nothing
+ * to reconcile: a snapshot envelope that will not parse means the reference set
+ * is not known, and every deletion built on a reference set that is not known is
+ * a guess. `StoreUnreadableError` travels out with nothing removed. A persist
+ * that failed travels out as `StoreWriteError`, with the transaction rolled back
+ * rather than swallowed into a success that removed part of what it named.
+ *
+ * ## What is never touched
+ *
+ * Only the cache of immutable halves. Not a draft — unsubmitted text is the
+ * irreplaceable state in this store, and no reclamation may reach it for any
+ * reason. Not the content-addressed blob table, which is keyed by git blob SHA
+ * and shares no key space with a comparison. Not a snapshot envelope in either
+ * table: the live set is READ from both and written to neither, and the
+ * pull-request keyspace in particular is one the local path has no standing to
+ * remove rows from. And never a half a snapshot still names, not even to force a
+ * fresh sync — the two-half cache is the whole reason a warm re-sync is cheap,
+ * and invalidating it on purpose would be a cache clear wearing a reclamation's
+ * name.
+ */
+export function pruneImmutables(store: DirectStore): ImmutableDeletion {
+  // The stored set is read BEFORE the live set, so a snapshot persisted between
+  // the two reads names a key that was never a candidate. That ordering can only
+  // ever narrow the proposal, which is the safe direction; what actually makes
+  // the sweep safe is the store recomputing the live set inside the deleting
+  // transaction, since a snapshot written after both reads is invisible to
+  // either order.
+  const stored = store.listImmutableKeys()
+  const live = new Set(store.listLiveCompareKeys())
+  return store.deleteImmutables(stored.filter((key) => !live.has(key)))
 }

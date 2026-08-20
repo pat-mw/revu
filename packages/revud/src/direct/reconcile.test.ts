@@ -142,6 +142,7 @@ function fakeStore(opts: {
     deleteLocalReview: unexpected('deleteLocalReview'),
     listLiveCompareKeys: unexpected('listLiveCompareKeys'),
     listImmutableKeys: unexpected('listImmutableKeys'),
+    deleteImmutables: unexpected('deleteImmutables'),
     close: () => {},
   }
 }

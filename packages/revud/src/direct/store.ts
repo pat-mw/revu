@@ -32,11 +32,13 @@ import {
  * The tables split state by how it is keyed and how long it lives:
  *
  *   - `immutables` — the immutable half of a snapshot, keyed by
- *     `compareKey = merge_base…head` (NOT by head alone), append-only and
- *     cache-forever with no TTL. This is what lets `syncPull` skip the diff/base-
- *     tree/commits work on a warm re-sync of an unchanged comparison. Nothing
- *     records when a row here was written, so what the table holds can only ever
- *     be judged against what still references it, never against its age.
+ *     `compareKey = merge_base…head` (NOT by head alone), cache-forever with no
+ *     TTL. This is what lets `syncPull` skip the diff/base-tree/commits work on a
+ *     warm re-sync of an unchanged comparison. Nothing records when a row here
+ *     was written, so what the table holds can only ever be judged against what
+ *     still references it, never against its age. The one statement that removes
+ *     a row does so because no stored snapshot names its key; there is no age at
+ *     which a row a snapshot still names becomes removable.
  *   - `snapshots` — the per-PR assembled snapshot (mutable half + a reference to
  *     the immutable half's compareKey). Overwritten on every sync.
  *   - `blobs` — content-addressed by git blob SHA, append-only, cache-forever,
@@ -280,6 +282,25 @@ export interface LocalReviewDeletion {
   submittedReviewsDeleted: number
   draftsDeleted: number
   viewedDeleted: number
+}
+
+/**
+ * What one `deleteImmutables` call removed from the content cache.
+ *
+ * The keys as well as the count, because a count on its own cannot tell a call
+ * that removed the two unreferenced halves it proposed from one that removed two
+ * halves a snapshot still needed. Both report `2`, and only one of them has
+ * broken a review. A caller reconciling its own view of the cache needs the
+ * names, and so does any assertion that a referenced half was left alone.
+ *
+ * `removed` names the rows that are GONE, not the keys that were proposed. A
+ * proposed key that named no row, and one that turned out to be referenced after
+ * all, are both absent from it — so the count and the list always agree with the
+ * table rather than with the request.
+ */
+export interface ImmutableDeletion {
+  count: number
+  removed: string[]
 }
 
 /**
@@ -650,6 +671,56 @@ export interface DirectStore {
    * mints a fresh compare key on every sync and leaves the previous one behind.
    */
   listImmutableKeys(): string[]
+  /**
+   * Remove the named rows from the immutable cache, keeping every key a live
+   * snapshot still references.
+   *
+   * REFERENCE-BASED, never age-based. A key is removed only because no row in
+   * either snapshot table names it. Nothing about how long a row has sat here
+   * enters the decision, and no column records it either — a half a live
+   * snapshot names is needed however long ago the review it belongs to was last
+   * synced, and a half nothing names is reclaimable the moment it is written.
+   *
+   * The live set is recomputed HERE, inside the same transaction as the deletes,
+   * which is why this takes candidates rather than a verdict. A caller reads the
+   * stored set and the live set, subtracts, and calls; between those reads and
+   * this statement another writer can persist a snapshot naming one of the keys
+   * it is about to propose. Removing that key STRANDS the envelope: the read
+   * that re-assembles the snapshot finds no immutable half and refuses outright
+   * rather than returning a half-empty one, so the review will not open again —
+   * and on the local path there is no second tier to rebuild the half from, since
+   * a rewritten branch no longer holds the commits its compare key names.
+   * Recomputing under the write lock closes that window. A candidate that became
+   * live is simply left alone rather than refused: it is the ordinary outcome of
+   * a concurrent sync, not a caller's mistake, and the cost of keeping it is one
+   * row until the next reclamation.
+   *
+   * `BEGIN IMMEDIATE` rather than the deferred transaction a plain call opens,
+   * because this READS before it writes. A deferred transaction takes its read
+   * snapshot at the recompute and asks for the write lock at the first delete, so
+   * a commit landing in between makes that snapshot stale and SQLite refuses the
+   * upgrade WITHOUT consulting the busy handler — waiting cannot refresh a
+   * snapshot that is already stale. Taking the lock up front turns the wait into
+   * a plain busy wait the connection's timeout does cover, and it is what makes
+   * the recomputed set current at the moment the deletes run.
+   *
+   * FAIL CLOSED: a snapshot envelope that will not parse, or that names no usable
+   * key, throws `StoreUnreadableError` and the transaction aborts with nothing
+   * removed. Skipping that row instead would read as "this snapshot references
+   * nothing", which turns every half it really did reference into a candidate —
+   * the one direction that destroys data.
+   *
+   * Touches `immutables` and nothing else. Not `blobs`, which is content-
+   * addressed by git blob SHA and shares no key space with a comparison; not a
+   * draft, which is irreplaceable local work no reclamation may reach; and not
+   * `snapshots`, which this READS to build the live set and never writes.
+   *
+   * Duplicates among the keys collapse, and a key that names no row removes
+   * nothing — so a repeated call over an already-reclaimed cache reports zero
+   * rather than failing. A failed persist surfaces as `StoreWriteError` with the
+   * whole transaction rolled back, never as a success that removed part of it.
+   */
+  deleteImmutables(keys: string[]): ImmutableDeletion
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -727,6 +798,30 @@ function collectCompareKeys(
     }
     into.add(compareKey)
   }
+}
+
+/**
+ * Every `compareKey` a live snapshot references, across BOTH snapshot tables.
+ *
+ * ONE definition, called by the public read and by the recheck the delete path
+ * runs inside its own transaction, so "still needed" cannot come to mean two
+ * different things in the two places that ask it. A second copy is exactly where
+ * the two tables would drift apart, and a live set that lost one of them does not
+ * answer a smaller question — it reports every key held only by the missing table
+ * as referenced by nothing at all, which is the input a reclamation acts on.
+ *
+ * Both tables, because one compare key can back a pull request and a local review
+ * at the same time: the immutable half is content-addressed by the SHAs git
+ * produced locally and knows nothing about which kind of review asked for it.
+ *
+ * A set rather than a list, so a key two snapshots share is counted once. The
+ * question is which halves are needed, never how many references each has.
+ */
+function liveCompareKeys(db: Database): Set<string> {
+  const keys = new Set<string>()
+  collectCompareKeys(db, 'snapshots', 'pr_number', keys)
+  collectCompareKeys(db, 'local_snapshots', 'local_id', keys)
+  return keys
 }
 
 /**
@@ -1729,9 +1824,9 @@ export function openDirectStore(
     },
 
     listLiveCompareKeys(): string[] {
-      // One set across both tables, so a key backing a pull request and a local
-      // review at once is counted once rather than twice — the answer is which
-      // halves are needed, not how many references each has.
+      // The same `liveCompareKeys` the delete path rechecks with, so the set a
+      // caller subtracts against and the set the removal is finally judged by
+      // are one definition rather than two that agree today.
       //
       // Not wrapped in `write()`, like every other read in this file. That
       // wrapper exists to give a failed MUTATION a type a caller can act on, and
@@ -1739,13 +1834,11 @@ export function openDirectStore(
       // would be reported as a persist failure for a persist nobody asked for.
       // The refusal this read does raise is a `StoreUnreadableError`, which the
       // wrapper would have passed through unchanged anyway.
-      const keys = new Set<string>()
-      collectCompareKeys(db, 'snapshots', 'pr_number', keys)
-      collectCompareKeys(db, 'local_snapshots', 'local_id', keys)
+      //
       // Sorted so the answer is stable and comparable between calls. The order
       // means nothing; fixing it stops a caller reading meaning into whatever
       // order the storage engine happened to return.
-      return [...keys].sort()
+      return [...liveCompareKeys(db)].sort()
     },
 
     listImmutableKeys(): string[] {
@@ -1757,6 +1850,42 @@ export function openDirectStore(
         .query('SELECT compare_key FROM immutables ORDER BY compare_key ASC')
         .all() as { compare_key: string }[]
       return rows.map((row) => row.compare_key)
+    },
+
+    deleteImmutables(keys: string[]): ImmutableDeletion {
+      return write('immutables', () => {
+        const removed: string[] = []
+        const tx = db.transaction(() => {
+          // Emptied on entry rather than at declaration, so a transaction the
+          // engine runs a second time cannot report the first attempt's
+          // removals alongside its own.
+          removed.length = 0
+          // Recomputed inside the transaction, under the write lock the
+          // immediate begin below has already taken. This is the whole guard:
+          // a snapshot persisted after the caller subtracted its sets is live
+          // here, and its half is left where it is.
+          const live = liveCompareKeys(db)
+          // A set, so a key named twice is one statement and one entry in the
+          // report rather than a count that exceeds the rows that existed.
+          for (const key of new Set(keys)) {
+            // Under-removal costs disk until the next reclamation. Over-removal
+            // makes a review unopenable, and on the local path unrecoverably so.
+            if (live.has(key)) continue
+            const result = db.run('DELETE FROM immutables WHERE compare_key = ?', [key])
+            // Counted from the statement rather than from the request, so a key
+            // that matched no row is absent from the report instead of inflating
+            // it. A repeat over an already-reclaimed cache reports zero.
+            if (result.changes > 0) removed.push(key)
+          }
+        })
+        // Immediate, because the recompute above is a READ every delete below it
+        // depends on. A deferred begin would take its read snapshot at that
+        // recompute and ask for the write lock afterwards, and SQLite refuses
+        // that upgrade without consulting the busy handler once another commit
+        // has landed — a wait cannot refresh a snapshot that is already stale.
+        tx.immediate()
+        return { count: removed.length, removed }
+      })
     },
 
     close(): void {

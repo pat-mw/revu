@@ -1230,6 +1230,15 @@ describe('the local entity id allocator', () => {
     expect(first).toBe(LOCAL_ENTITY_ID_BASE)
   })
 
+  // A thousand durable allocations, each its own `UPDATE ... RETURNING` against a
+  // store opened with `synchronous = FULL`, so the wall time is a thousand real
+  // fsyncs and is set by the disk rather than by the code under test. On a fast
+  // local SSD that is a few hundred milliseconds; on a slower or network-backed
+  // volume it is an order of magnitude more, which overruns the default per-test
+  // limit while nothing is wrong. The explicit budget is what keeps the failure
+  // meaning "the allocator stopped working" instead of "this disk is slow" — it
+  // is deliberately far above the observed worst case, because a timeout tuned
+  // close to the measurement just moves the flake.
   test('a thousand successive calls are strictly increasing safe integers', () => {
     const store = open()
     const issued: number[] = []
@@ -1249,7 +1258,7 @@ describe('the local entity id allocator', () => {
     // that returned a constant satisfies neither, but a subtler one might satisfy
     // only one.
     expect(new Set(issued).size).toBe(1000)
-  })
+  }, 30_000)
 
   test('a reopen continues above the last issued value rather than restarting at the base', () => {
     const store = open()
@@ -2909,6 +2918,186 @@ describe('the immutable cache reports everything it holds, orphans included', ()
     expect(armed.listLiveCompareKeys()).toEqual(['local...head', 'pr...head'])
     expect(armed.listImmutableKeys()).toEqual(['local...head', 'pr...head'])
     armed.close()
+  })
+})
+
+/** How many rows the immutable cache holds, counted through a handle of its own. */
+function immutableRowCount(): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM immutables').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+describe('removing cached halves removes only what nothing references', () => {
+  test('a key no snapshot names gives up its row, and the row is really gone', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    expect(immutableRowCount()).toBe(2)
+
+    expect(store.deleteImmutables(['orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+
+    expect(immutableRowCount()).toBe(1)
+    expect(store.getImmutable('orphan...head')).toBeNull()
+    store.close()
+  })
+
+  test('a key a pull-request snapshot still names is left exactly where it is', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+
+    // The caller asked for a live key, which is what a caller that read its two
+    // sets before a concurrent sync landed will do. The answer is to leave the
+    // row alone, not to remove it and not to refuse the whole call: the race is
+    // the ordinary shape of a reclamation, not a mistake to report.
+    expect(store.deleteImmutables(['pr...head'])).toEqual({ count: 0, removed: [] })
+
+    expect(immutableRowCount()).toBe(1)
+    // The consequence the refusal exists to prevent, asserted as a consequence:
+    // the snapshot still opens.
+    expect(store.getSnapshot(204)).not.toBeNull()
+    store.close()
+  })
+
+  test('a key a local snapshot still names is left where it is too', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    // Both tables, because one compare key can back either kind of review and
+    // the cached half knows nothing about which asked for it. A recheck reading
+    // one table would report the other's live halves as referenced by nothing.
+    expect(store.deleteImmutables(['local...head'])).toEqual({ count: 0, removed: [] })
+
+    expect(store.getLocalSnapshot(id)).not.toBeNull()
+    store.close()
+  })
+
+  test('a live key and an orphan named together: only the orphan goes', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+
+    // The mixed batch is the one that separates "refuses live keys" from
+    // "refuses batches containing one" — the orphan still has to go.
+    expect(store.deleteImmutables(['pr...head', 'orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+
+    expect(store.listImmutableKeys()).toEqual(['pr...head'])
+    store.close()
+  })
+
+  test('an unreadable envelope aborts the removal with every row still present', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    store.close()
+
+    corruptEnvelope('snapshots', 'pr_number', 204, 'not json')
+
+    // The recheck runs INSIDE the deleting transaction, so a row it cannot
+    // parse aborts the transaction rather than the read that preceded it. A row
+    // skipped instead would read as "this snapshot references nothing", and
+    // `pr...head` would become a candidate on the strength of it.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.deleteImmutables(['orphan...head']))
+    expect(err.table).toBe('snapshots')
+    expect(err.rowKey).toBe('204')
+    reopened.close()
+
+    // Nothing removed, not even the orphan that really was one: an unknown
+    // reference set makes every deletion built on it a guess.
+    expect(immutableRowCount()).toBe(2)
+  })
+
+  test('a key that names no row removes nothing and does not fail', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+
+    // Counted from the statement rather than from the request, so a repeat over
+    // an already-reclaimed cache reports zero instead of claiming a removal.
+    expect(store.deleteImmutables(['never...stored'])).toEqual({ count: 0, removed: [] })
+
+    expect(immutableRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('one key named twice is one row and one entry in the report', () => {
+    const store = open()
+    store.putImmutable(immutable('orphan...head'))
+
+    // A count taken from the request would say two here, over a table that only
+    // ever held one matching row.
+    expect(store.deleteImmutables(['orphan...head', 'orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+
+    expect(immutableRowCount()).toBe(0)
+    store.close()
+  })
+
+  test('an empty request is a clean no-op', () => {
+    const store = open()
+    store.putImmutable(immutable('orphan...head'))
+    expect(store.deleteImmutables([])).toEqual({ count: 0, removed: [] })
+    // Named nothing, removed nothing: the empty list is not "everything
+    // unreferenced", which is the reading that would empty the cache.
+    expect(immutableRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('neither a blob nor a draft is reachable from a cached-half removal', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    store.putBlobs([
+      { sha: 'headblob', path: 'a.ts', content: 'text', size: 4, binary: false },
+    ])
+    store.putDraft(draft('h1', 204, 'unsubmitted text'))
+
+    store.deleteImmutables(['orphan...head'])
+
+    // `blobs` is keyed by git blob SHA and shares no key space with a
+    // comparison; a draft is irreplaceable local work. Neither is derivable from
+    // a compare key, so neither may travel with one.
+    expect(store.getBlob('headblob')).not.toBeNull()
+    expect(store.getDraft('h1', 204)?.body).toBe('unsubmitted text')
+    store.close()
+  })
+
+  test('removing a cached half touches no PR-keyed table', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    const armed = armPrKeyedTripwires(store)
+
+    // The live set is READ from `snapshots`, which is required — and the
+    // tripwires guard UPDATE and DELETE as well as INSERT, so a recheck that
+    // "helpfully" tidied a row as it went would abort here.
+    expect(armed.deleteImmutables(['orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+    armed.close()
+  })
+
+  test('deleteImmutables against a closed database throws StoreWriteError', () => {
+    const store = open()
+    store.putImmutable(immutable('orphan...head'))
+    store.close()
+    // Never a silent success: a reclamation that could not persist must not
+    // report rows as removed that are still on disk.
+    const err = writeErrorFrom(() => {
+      store.deleteImmutables(['orphan...head'])
+    })
+    expect(err.table).toBe('immutables')
   })
 })
 

@@ -1,10 +1,11 @@
 /**
- * Retention: the one path that drops a local review's pinned refs, and the
- * structural guards that keep that path from growing a second tier.
+ * Retention: the one path that drops a local review's pinned refs, the one that
+ * reclaims unreferenced halves of the content cache, and the structural guards
+ * that keep either from growing a second tier.
  *
  * A local review's file blobs have no second source. The objects its snapshot
  * was read from live in exactly one object database, and a pin ref is what
- * keeps them there. Dropping those refs is therefore the only place in the
+ * keeps them there. Dropping those refs is therefore one of the two places in the
  * local path where retention can be lost, so the suite is organised around the
  * two ways a drop can be wrong:
  *
@@ -18,6 +19,31 @@
  *      make the object unreachable, collect hard, prove it survived; then drop,
  *      collect again, prove it is gone. That turns "retention is an explicit
  *      delete rather than an accident of garbage collection" into an assertion.
+ *
+ * ## The cache sweep fails in one direction only
+ *
+ * The other place retention can be lost is the shared cache of immutable halves,
+ * and its two mistakes are nothing like symmetric. Leaving an unreferenced half
+ * behind costs disk; the next sweep takes it. Removing a half a live snapshot
+ * still names makes that review UNOPENABLE, with no symptom until someone opens
+ * it — the envelope survives intact, the table merely looks tidier, and the
+ * assembling read then refuses outright. So the sweep legs are built around one
+ * assertion, `expectEverySnapshotStillReadable`, which opens every snapshot in
+ * both tables and requires that none of them refuses. Every sweep-shaped test
+ * ends with it; a sweep test that did not would be measuring only what was
+ * removed, which is the half of the story that never catches this.
+ *
+ * That assertion carries two controls of its own, because a sweep like it is
+ * exactly the shape that passes while asserting nothing. It is run over an
+ * untouched store, where it must be green, and over a store with one referenced
+ * half removed by hand, where it must be red — and it refuses to pass at all
+ * unless the fixture seeded a snapshot of each kind for it to open.
+ *
+ * The pair that pins "no expiry" is a separate leg and deliberately so: a live
+ * half whose every recorded timestamp is years old survives, while an orphan
+ * written moments earlier goes. Any predicate over row age, `created_at` or
+ * `last_synced_at` reverses that pair, which is the only durable way to hold a
+ * cache-forever rule against a later editor.
  *
  * ## Why a source scan sits in a behavioural suite
  *
@@ -38,14 +64,22 @@
  * failed expectation, so two absence assertions sharing a body leave the second
  * unfalsifiable.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Database } from 'bun:sqlite'
+import type { ReviewDraft, Snapshot, SnapshotImmutable } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import { createBunCommandRunner } from './command-runner'
 import { pinRefsFor, pinSnapshotObjects } from './local-pins'
-import { dropPinnedRefs } from './retention'
+import { dropPinnedRefs, pruneImmutables } from './retention'
+import {
+  openDirectStore,
+  StoreUnreadableError,
+  StoreWriteError,
+  type DirectStore,
+} from './store'
 
 /** A local id inside the reserved local-review band. */
 const LOCAL_ID = 1_000_000_001
@@ -232,6 +266,482 @@ describe('a drop refuses before it spawns anything it should not', () => {
   })
 })
 
+/** The data directory each cache-sweep test gets to itself. */
+let storeDir: string
+
+/** The pull request every cache-sweep fixture is seeded around. */
+const SEEDED_PR = 204
+
+/** The comparison the seeded pull request's snapshot currently references. */
+const LIVE_PR_KEY = 'A...B'
+/** The comparison the seeded local review's snapshot currently references. */
+const LIVE_LOCAL_KEY = 'C...D'
+/** The half left behind by the pull request's previous comparison. */
+const ORPHAN_PR_KEY = 'A...old'
+/** The half left behind by the local review's previous comparison. */
+const ORPHAN_LOCAL_KEY = 'C...old'
+
+/**
+ * A timestamp years before every other date in this file, used wherever a test
+ * has to make a row old. Nothing in the sweep reads it; that is the point.
+ */
+const LONG_AGO = '2019-03-04T05:06:07.000Z'
+
+/** A store over the per-test data directory. */
+function openStore(): DirectStore {
+  return openDirectStore({ dataDir: storeDir })
+}
+
+/** The immutable half of one comparison, with just enough shape to be stored. */
+function immutableHalf(compareKey: string): SnapshotImmutable {
+  return {
+    compareKey,
+    mergeBaseSha: 'merge-base',
+    headSha: 'head',
+    files: [
+      {
+        sha: 'headblob',
+        filename: 'a.ts',
+        status: 'modified',
+        additions: 1,
+        deletions: 0,
+        changes: 1,
+        patch: '@@ -1 +1 @@',
+      },
+    ],
+    blobIndex: { 'a.ts': { base: 'baseblob', head: 'headblob' } },
+    commits: [],
+  }
+}
+
+/**
+ * A whole snapshot over one comparison. `syncedAt` is a parameter because the
+ * pair that pins "no expiry" needs a live snapshot whose own timestamp is years
+ * stale, and a fixture that hard-coded one date could not express it.
+ */
+function storedSnapshot(
+  id: number,
+  compareKey: string,
+  syncedAt = '2026-01-01T00:00:00.000Z',
+): Snapshot {
+  return {
+    prNumber: id,
+    syncedAt,
+    partial: null,
+    syncStats: { blobsFetched: 0, blobsReused: 0, requests: 0 },
+    immutable: immutableHalf(compareKey),
+    mutable: {
+      fetchedAt: syncedAt,
+      pull: { number: id } as Snapshot['mutable']['pull'],
+      threads: [],
+      issueComments: [],
+      reviews: [],
+      checks: [],
+    },
+  }
+}
+
+/** An unsubmitted draft, the one piece of state no reclamation may ever reach. */
+function unsubmittedDraft(humanId: string, id: number, body: string): ReviewDraft {
+  return {
+    humanId,
+    prNumber: id,
+    headSha: 'head',
+    compareKey: 'merge-base...head',
+    body,
+    event: 'COMMENT',
+    comments: [],
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  }
+}
+
+/**
+ * Seed one pull-request snapshot, one local review with a snapshot of its own,
+ * and the two halves their previous comparisons left behind.
+ *
+ * Both kinds of review, because the immutable cache is shared between them and a
+ * sweep that consulted only one table would report the other's live halves as
+ * referenced by nothing. Two orphans rather than one, because a sweep that stops
+ * after its first delete still empties a single-orphan fixture.
+ */
+function seedTwoLiveAndTwoOrphans(store: DirectStore): number {
+  store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY))
+  const localId = store.createLocalReview({
+    repo: 'acme/widgets',
+    baseRef: 'refs/heads/main',
+    headRef: 'refs/heads/feature/x',
+    title: 'feature/x',
+  }).id
+  store.putLocalSnapshot(storedSnapshot(localId, LIVE_LOCAL_KEY))
+  store.putImmutable(immutableHalf(ORPHAN_PR_KEY))
+  store.putImmutable(immutableHalf(ORPHAN_LOCAL_KEY))
+  return localId
+}
+
+/**
+ * How many rows the immutable cache holds, counted through a handle of its own.
+ *
+ * Raw rather than through `listImmutableKeys`, because a sweep and a read of the
+ * same table that went wrong the same way would agree with each other. The count
+ * is the independent witness.
+ */
+function immutableRowCount(): number {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM immutables').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+/** One snapshot table's stored envelope bytes, exactly as they sit on disk. */
+function readEnvelope(table: string, column: string, key: number): string {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const row = raw.query(`SELECT data FROM ${table} WHERE ${column} = ?`).get(key) as {
+    data: string
+  }
+  raw.close()
+  return row.data
+}
+
+/** Replace one snapshot table's stored envelope with the given bytes. */
+function writeEnvelope(table: string, column: string, key: number, data: string): void {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  raw.run(`UPDATE ${table} SET data = ? WHERE ${column} = ?`, [data, key])
+  raw.close()
+}
+
+/**
+ * The three tables whose integer key is a real GitHub pull-request number. A
+ * reclamation driven by the local path may read them and may never write them.
+ */
+const PR_KEYED_TABLES = ['snapshots', 'audit_log', 'pr_author'] as const
+
+/**
+ * Arm an aborting trigger over every write event of the pull-request keyspace
+ * and hand back a freshly opened store.
+ *
+ * Every event rather than just `DELETE`, because the forbidden thing is any
+ * write at all: an `UPDATE` that blanked an envelope and an `INSERT` that
+ * fabricated one are as far outside the local path's standing as a removal, and
+ * the journal in particular is append-only with no removal counterpart by
+ * design.
+ */
+function armPrKeyedTripwires(store: DirectStore): DirectStore {
+  store.close()
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  for (const table of PR_KEYED_TABLES) {
+    for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
+      raw.run(
+        `CREATE TRIGGER tripwire_${table}_${event.toLowerCase()} BEFORE ${event} ON ${table} ` +
+          `BEGIN SELECT RAISE(ABORT, 'refused: ${event} on ${table}'); END`,
+      )
+    }
+  }
+  raw.close()
+  return openStore()
+}
+
+/**
+ * Prove the armed tripwires really bite, by issuing the write they forbid.
+ *
+ * Without this, "the sweep wrote no pull-request table" would pass just as
+ * cleanly over triggers that were never created, created on another table, or
+ * created against an event nothing raises.
+ */
+function expectPrSnapshotWritesRefused(): void {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  try {
+    expect(() => raw.run('DELETE FROM snapshots WHERE pr_number = ?', [SEEDED_PR])).toThrow()
+    expect(() => raw.run("UPDATE snapshots SET data = '{}' WHERE pr_number = ?", [SEEDED_PR])).toThrow()
+  } finally {
+    raw.close()
+  }
+}
+
+/**
+ * Opens every snapshot the store holds and asserts that not one of them refuses.
+ *
+ * This is the acceptance test the whole sweep exists to satisfy, and it is an
+ * acceptance test only while EVERY sweep-shaped test below ends with it. The
+ * failure it catches has no other symptom: a removed half leaves the envelope
+ * that references it perfectly intact, so the table looks tidier and the store
+ * looks fine, and the damage surfaces only when someone opens the review — at
+ * which point the assembling read finds no immutable half and refuses outright.
+ * A review that will not open is not a degraded review, and on the local path it
+ * is not a re-syncable one either: the comparison was computed from one clone,
+ * and a branch rewritten since no longer holds the commits its key names.
+ *
+ * The two counts are the control. A store holding no snapshots satisfies
+ * "nothing threw" without opening anything, which is precisely how a sweep like
+ * this passes while asserting nothing — so every fixture is required to have
+ * seeded at least one snapshot of each kind, and the loops below are required to
+ * have something to loop over.
+ *
+ * Read raw rather than through the store, because the store's own enumerations
+ * go through the review row: a listing cannot show a snapshot whose review is
+ * gone, and it is exactly the rows nothing lists that a reclamation strands.
+ */
+function expectEverySnapshotStillReadable(store: DirectStore): void {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const prNumbers = (
+    raw.query('SELECT pr_number FROM snapshots ORDER BY pr_number ASC').all() as {
+      pr_number: number
+    }[]
+  ).map((row) => row.pr_number)
+  const localIds = (
+    raw.query('SELECT local_id FROM local_snapshots ORDER BY local_id ASC').all() as {
+      local_id: number
+    }[]
+  ).map((row) => row.local_id)
+  raw.close()
+
+  expect(prNumbers.length).toBeGreaterThan(0)
+  expect(localIds.length).toBeGreaterThan(0)
+
+  for (const prNumber of prNumbers) {
+    expect(() => store.getSnapshot(prNumber)).not.toThrow()
+    expect(store.getSnapshot(prNumber)).not.toBeNull()
+  }
+  for (const localId of localIds) {
+    expect(() => store.getLocalSnapshot(localId)).not.toThrow()
+    expect(store.getLocalSnapshot(localId)).not.toBeNull()
+  }
+}
+
+describe('the readable-snapshot sweep is a live assertion before anything is swept', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('an untouched store passes the sweep', () => {
+    // The sweep's own baseline: seeded and never reclaimed, every snapshot
+    // opens. Without this, a red further down could be the sweep being wrong
+    // about a healthy store rather than the reclamation being wrong about it.
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('the sweep fails when a half a live snapshot names is taken away', () => {
+    // And the sweep proved to bite, against the exact damage it exists to catch:
+    // one referenced half removed by hand, with the envelope left alone. An
+    // assertion that never fails is not an assertion, and this is the failure the
+    // whole module is built to prevent.
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    store.close()
+
+    const raw = new Database(join(storeDir, 'direct.sqlite'))
+    raw.run('DELETE FROM immutables WHERE compare_key = ?', [LIVE_PR_KEY])
+    raw.close()
+
+    const reopened = openStore()
+    expect(() => expectEverySnapshotStillReadable(reopened)).toThrow()
+    // The class as well as the throw: an unreadable store is what the daemon
+    // reports as a failed persist, and any other error arriving from the same
+    // read would be reported as something else entirely.
+    expect(() => reopened.getSnapshot(SEEDED_PR)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+})
+
+describe('sweeping the immutable cache by reference', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('every snapshot the store holds is still readable after a sweep', () => {
+    // The load-bearing leg. Every other assertion in this block is about what
+    // the sweep removed; this one is about what it must not have, and it is the
+    // only one that fails when the live set is computed from one snapshot table
+    // instead of both — a shape in which the sweep still reports a plausible
+    // count while a pull request's half is gone and its review will not open.
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    pruneImmutables(store)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('both unreferenced halves go and both referenced halves stay', () => {
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    // Pinned before the sweep, so the count after it is against rows that
+    // demonstrably existed rather than against a table that was short all along.
+    expect(immutableRowCount()).toBe(4)
+
+    const result = pruneImmutables(store)
+
+    expect(result.count).toBe(2)
+    expect(immutableRowCount()).toBe(2)
+    // Which two, not merely how many: a sweep that removed one orphan and one
+    // live half also leaves two rows behind and also reports two removed.
+    expect(store.listImmutableKeys()).toEqual([LIVE_PR_KEY, LIVE_LOCAL_KEY])
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('the sweep names the halves it removed', () => {
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+
+    const result = pruneImmutables(store)
+
+    // The report is what a caller reconciling its own view of the cache acts
+    // on, so it names rows rather than counting them.
+    expect(result.removed).toEqual([ORPHAN_PR_KEY, ORPHAN_LOCAL_KEY])
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('a second sweep over an already-swept store removes nothing', () => {
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    expect(pruneImmutables(store).count).toBe(2)
+
+    // Idempotent, because a reclamation that ran once has to be safe to run
+    // again: there is no state saying which keys were already considered, and
+    // "already gone" is the outcome the caller asked for.
+    expect(pruneImmutables(store)).toEqual({ count: 0, removed: [] })
+    expect(immutableRowCount()).toBe(2)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('a half stale by years survives while an orphan written moments ago is removed', () => {
+    // The hard constraint made executable. Every timestamp this store records
+    // about the live half is years in the past — the snapshot's own `syncedAt`
+    // and the review's `last_synced_at` — while the orphan is written last and
+    // is therefore the newest row in the table by every ordering the storage
+    // engine could offer. An age predicate of any kind reverses this pair.
+    const store = openStore()
+    store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY, LONG_AGO))
+    const localId = store.createLocalReview({
+      repo: 'acme/widgets',
+      baseRef: 'refs/heads/main',
+      headRef: 'refs/heads/feature/x',
+      title: 'feature/x',
+    }).id
+    store.putLocalSnapshot(storedSnapshot(localId, LIVE_LOCAL_KEY, LONG_AGO))
+    store.patchLocalReviewSync(localId, {
+      baseSha: 'C',
+      mergeBaseSha: 'C',
+      headSha: 'D',
+      dirty: false,
+      lastSyncedAt: LONG_AGO,
+    })
+    store.putImmutable(immutableHalf(ORPHAN_LOCAL_KEY))
+
+    const result = pruneImmutables(store)
+
+    expect(result.removed).toEqual([ORPHAN_LOCAL_KEY])
+    expect(store.listImmutableKeys()).toEqual([LIVE_PR_KEY, LIVE_LOCAL_KEY])
+    // Read back rather than assumed: the pair says nothing about expiry unless
+    // the surviving half really is the stale one.
+    expect(store.getLocalReview(localId)?.lastSyncedAt).toBe(LONG_AGO)
+    expect(store.getLocalSnapshot(localId)?.syncedAt).toBe(LONG_AGO)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('an unparseable snapshot envelope aborts the sweep with every row intact', () => {
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    store.close()
+
+    const original = readEnvelope('snapshots', 'pr_number', SEEDED_PR)
+    writeEnvelope('snapshots', 'pr_number', SEEDED_PR, 'not json')
+
+    const reopened = openStore()
+    expect(() => pruneImmutables(reopened)).toThrow(StoreUnreadableError)
+    // Not merely that it threw. A row that cannot be parsed names no key, and a
+    // sweep that treated it as naming none would turn every half it really
+    // referenced into a candidate — so the count is what says the refusal
+    // happened before any statement ran, not part-way through them.
+    expect(immutableRowCount()).toBe(4)
+    reopened.close()
+
+    // Repaired, so the sweep can speak for what it did to the OTHER rows: if the
+    // aborted attempt had removed anything on its way to the refusal, a snapshot
+    // here would refuse too.
+    writeEnvelope('snapshots', 'pr_number', SEEDED_PR, original)
+    const repaired = openStore()
+    expectEverySnapshotStillReadable(repaired)
+    repaired.close()
+  })
+
+  test('a refused delete rolls the whole sweep back, leaving all four rows', () => {
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    store.close()
+
+    // Refuses the SECOND of the two candidates, so the first has already been
+    // deleted inside the transaction when the abort arrives. A count of three
+    // afterwards is a sweep that is not one transaction; a count of four is the
+    // rollback. The literal is independent of anything the sweep computes.
+    const raw = new Database(join(storeDir, 'direct.sqlite'))
+    raw.run(
+      'CREATE TRIGGER refuse_one_delete BEFORE DELETE ON immutables ' +
+        `WHEN OLD.compare_key = '${ORPHAN_LOCAL_KEY}' ` +
+        "BEGIN SELECT RAISE(ABORT, 'refused: this row is not to be removed'); END",
+    )
+    raw.close()
+
+    const reopened = openStore()
+    // A persist that failed is never swallowed into a success that removed part
+    // of what it named.
+    expect(() => pruneImmutables(reopened)).toThrow(StoreWriteError)
+    expect(immutableRowCount()).toBe(4)
+    expectEverySnapshotStillReadable(reopened)
+    reopened.close()
+  })
+
+  test('no draft is touched by a sweep, local or pull-request', () => {
+    const store = openStore()
+    const localId = seedTwoLiveAndTwoOrphans(store)
+    store.putLocalDraft(unsubmittedDraft('h1', localId, 'unsubmitted local text'))
+    store.putDraft(unsubmittedDraft('h1', SEEDED_PR, 'unsubmitted pull request text'))
+
+    expect(pruneImmutables(store).count).toBe(2)
+
+    // Unsubmitted text is the one thing in this store that cannot be recomputed
+    // from anywhere, so a reclamation that reached it would be destroying the
+    // only copy of a human's work to recover cache space.
+    expect(store.getLocalDraft('h1', localId)?.body).toBe('unsubmitted local text')
+    expect(store.getDraft('h1', SEEDED_PR)?.body).toBe('unsubmitted pull request text')
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('the sweep reads the pull-request tables and writes none of them', () => {
+    const store = openStore()
+    seedTwoLiveAndTwoOrphans(store)
+    const armed = armPrKeyedTripwires(store)
+
+    // The live set is built by READING `snapshots`, which is required — a set
+    // that skipped it would report the pull request's half as unreferenced. What
+    // is forbidden is writing there, and the tripwires guard every write event.
+    const result = pruneImmutables(armed)
+
+    expect(result.removed).toEqual([ORPHAN_PR_KEY, ORPHAN_LOCAL_KEY])
+    // The control for the assertion above: a tripwire that was never installed,
+    // or installed on the wrong table, would let the sweep pass without
+    // guarding anything.
+    expectPrSnapshotWritesRefused()
+    expectEverySnapshotStillReadable(armed)
+    armed.close()
+  })
+})
+
 /**
  * The modules the source scan reads. Retention is scanned for everything; the
  * direct store joins it only for the storage-statement ban, because the two
@@ -293,12 +803,18 @@ function specifierBasename(specifier: string): string {
 /**
  * Everything retention is allowed to depend on.
  *
- * A subset rule rather than an exact set: the drop path gains its store import
- * only once eviction has stored state to reconcile against, and an exact-set
- * assertion would be red in the interval for no reason. What the rule actually
- * forbids is the arrival of a *new kind* of dependency — a network tier, an
- * SDK, a second command seam — and a subset rule catches that the moment it
- * lands.
+ * A subset rule rather than an exact set, because the module does not use every
+ * entry at every moment: the store import arrived only once retention had stored
+ * state to reconcile against, and an exact-set assertion would have been red in
+ * the interval for no reason. What the rule actually forbids is the arrival of a
+ * *new kind* of dependency — a network tier, an SDK, a second command seam — and
+ * a subset rule catches that the moment it lands.
+ *
+ * `./store` is here because the cache sweep reasons about rows it must never
+ * reach for itself. It reads two key sets through the store surface and hands
+ * back candidates; the deletes, the transaction they share and the durability
+ * wrapper around them all stay behind that seam, so there is no second statement
+ * anywhere that can remove a cached half.
  *
  * `./local-git` is here because it owns the hardened argv form: it is the only
  * module that assembles a git command, places rev operands behind
