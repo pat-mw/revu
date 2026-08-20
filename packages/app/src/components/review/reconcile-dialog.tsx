@@ -24,22 +24,9 @@ import { useDraft, useDraftActions, useReconcile, useSubmitReview } from '@/stat
 import { qk, useBlob, useSnapshot, useSyncPull } from '@/state/queries'
 import { describeApiError } from './error-copy'
 import { compareChangeLine } from './reconcile-copy'
+import { planReconcileApply } from './reconcile-plan'
+import type { ReconcileDecision } from './reconcile-plan'
 import { firstBodyLine } from './pending-list'
-
-/**
- * The per-comment verdict a human hands down in the reconcile dialog. Every
- * comment in the report must carry one before Apply enables:
- *
- * - `keep`     — clean rows, pre-decided: the anchor line is untouched.
- * - `accept`   — take the drifted anchor's suggested new line.
- * - `reanchor` — pin the comment to an explicitly chosen line on the new head.
- * - `drop`     — remove the comment from the draft (reversible until Apply).
- */
-export type ReconcileDecision =
-  | { kind: 'keep' }
-  | { kind: 'accept' }
-  | { kind: 'reanchor'; line: number }
-  | { kind: 'drop' }
 
 export interface ReconcileDialogProps {
   prNumber: number
@@ -63,27 +50,6 @@ function initialDecisions(
   return map
 }
 
-/**
- * Re-capture an anchor at `line` (1-based) from blob content: the exact line
- * text plus up to three neighbors each side, in file order — the last element
- * of `contextBefore` is the line immediately above, the first element of
- * `contextAfter` is the line immediately below. When the comment spans a range,
- * `startLine` re-captures the range's START line text so the next reconcile can
- * validate the start independently; it stays null for a single-line comment.
- */
-function captureAnchor(
-  lines: string[],
-  line: number,
-  startLine: number | null,
-): PendingComment['anchor'] {
-  return {
-    lineText: lines[line - 1] ?? '',
-    contextBefore: lines.slice(Math.max(0, line - 4), Math.max(0, line - 1)),
-    contextAfter: lines.slice(line, line + 3),
-    startLineText: startLine !== null ? (lines[startLine - 1] ?? '') : null,
-  }
-}
-
 const LOST_REASON: Record<LostResult['reason'], string> = {
   'line-deleted': 'that line no longer exists',
   'file-deleted': 'the file was deleted',
@@ -97,9 +63,14 @@ const LOST_REASON: Record<LostResult['reason'], string> = {
  * clean, drifted, or lost — and nothing is mutated or dropped without an
  * explicit per-row decision. Cancel closes with the draft byte-identical;
  * Apply commits the decisions to the draft (re-captured anchors included),
- * flushes, and re-submits against the new head. A second head-move during
- * apply loops back through sync + reconcile into a fresh report instead of
- * failing.
+ * moves the draft's recorded head onto the compare those anchors were captured
+ * against, flushes, and re-submits against the new head. A second head-move
+ * during apply loops back through sync + reconcile into a fresh report instead
+ * of failing.
+ *
+ * The head move happens before the submit rather than after it, because a
+ * submit that comes back refused leaves the draft standing: a draft that
+ * survives has to survive describing the head its comments belong to.
  *
  * The backdrop is deliberately inert: a mis-click must not eat an
  * eleven-comment decision session. Closing requires the explicit Cancel, the
@@ -165,77 +136,57 @@ export function ReconcileDialog({
   const blobShaFor = (comment: PendingComment): string | null =>
     selectAnchorBlobSha(snapshot?.immutable.blobIndex[comment.path], comment.side)
 
+  /**
+   * Lines of a blob on the freshly synced snapshot, fetched through the shared
+   * cache so a blob already loaded for a row on screen is not fetched twice.
+   * Content-addressed, hence never stale and never collected.
+   */
+  const resolveLines = async (sha: string): Promise<string[] | null> => {
+    const blob = await queryClient.fetchQuery({
+      queryKey: qk.blob(sha),
+      queryFn: () => api.getBlob(sha),
+      staleTime: Infinity,
+      gcTime: Infinity,
+    })
+    return blob && !blob.binary ? blobLines(blob.content) : null
+  }
+
   const apply = async () => {
     if (!draft || !allDecided || busy) return
     setBusy(true)
     try {
-      let kept = 0
-      let dropped = 0
-      const updated: PendingComment[] = []
-      for (const comment of draft.comments) {
-        const decision = decisions[comment.key]
-        const result = live.results.find((r) => r.comment.key === comment.key)
-        if (!decision || !result) {
-          // Written after this report was generated — carried along untouched.
-          updated.push(comment)
-          kept++
-          continue
-        }
-        if (decision.kind === 'drop') {
-          actions.removeComment(comment.key)
-          dropped++
-          continue
-        }
-        if (decision.kind === 'keep') {
-          updated.push(comment)
-          kept++
-          continue
-        }
-        const newLine =
-          decision.kind === 'accept'
-            ? result.kind === 'drifted'
-              ? result.newLine
-              : comment.line
-            : decision.line
-        const newStartLine =
-          decision.kind === 'accept'
-            ? result.kind === 'drifted'
-              ? result.newStartLine
-              : comment.start_line
-            : comment.start_line !== null
-              ? Math.max(1, comment.start_line + (decision.line - comment.line))
-              : null
-        const sha = blobShaFor(comment)
-        const blob = sha
-          ? await queryClient.fetchQuery({
-              queryKey: qk.blob(sha),
-              queryFn: () => api.getBlob(sha),
-              staleTime: Infinity,
-              gcTime: Infinity,
-            })
-          : null
-        const lines = blob && !blob.binary ? blobLines(blob.content) : []
-        const next: PendingComment = {
-          ...comment,
-          line: newLine,
-          start_line: newStartLine,
-          anchor: captureAnchor(lines, newLine, newStartLine),
-          updatedAt: new Date().toISOString(),
-        }
-        actions.upsertComment(next)
-        updated.push(next)
-        kept++
-      }
+      // Everything the decisions do is computed first, as a value, and only
+      // then written. A blob that fails to load therefore leaves the draft
+      // exactly as the human left it, instead of half re-anchored against a
+      // head the draft does not record.
+      const plan = await planReconcileApply({
+        draft,
+        results: live.results,
+        decisions,
+        blobIndex: snapshot?.immutable.blobIndex,
+        currentHeadSha: live.currentHeadSha,
+        currentCompareKey: snapshot?.immutable.compareKey,
+        resolveLines,
+      })
+      for (const key of plan.removedKeys) actions.removeComment(key)
+      for (const comment of plan.reanchored) actions.upsertComment(comment)
+      // BEFORE the submit, deliberately. The comments just written anchor
+      // against the freshly synced head, and a submit that comes back
+      // `conflict` — or throws — leaves the draft in place. It has to be left
+      // in place describing the head its comments actually belong to,
+      // otherwise the next reconcile measures its delta from a head those
+      // comments no longer correspond to and reports the whole branch as new.
+      if (plan.nextHead !== null) actions.setHead(plan.nextHead)
       await actions.flush()
       const outcome = await submit.mutateAsync({
         prNumber,
         expectedHeadSha: live.currentHeadSha,
         event: draft.event,
         body: draft.body,
-        comments: updated,
+        comments: plan.updated,
       })
       if (outcome.status === 'ok') {
-        toast({ kind: 'success', ...reconcileSuccessCopy(mode, kept, dropped) })
+        toast({ kind: 'success', ...reconcileSuccessCopy(mode, plan.kept, plan.dropped) })
         onOpenChange(false)
       } else if (outcome.status === 'head_moved') {
         toast({
