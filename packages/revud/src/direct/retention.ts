@@ -74,6 +74,21 @@
  * exclusive lock on the file every unsubmitted draft lives in, so reaching for
  * one would block every reader of the store to recover space nobody asked for.
  *
+ * ## A sweep waits for the writes that are still in progress
+ *
+ * A sync does not write a review in one statement. The immutable half, the blob
+ * bytes, and the envelope that names them land at three separate moments with
+ * awaits in between, and until the last of them lands the fresh rows are named
+ * by nothing. A sweep that runs inside that window judges them against a store
+ * that has not finished being written, reads them as unreferenced because they
+ * genuinely are not referenced YET, and removes work that is still being done.
+ *
+ * So a sweep asks first. `withSyncInFlight` counts the syncs a daemon has
+ * running, every sweep reads that count before it removes anything, and a
+ * non-zero count makes the sweep a reported no-op. The refusal is a returned
+ * value rather than a throw, and it is whole rather than partial: a sweep that
+ * removed some rows and then noticed a sync would have done the damage already.
+ *
  * ## Hardening
  *
  * Every argument travels as an element of an argv array through the injected
@@ -194,6 +209,107 @@ export async function dropPinnedRefs(
 }
 
 /**
+ * How many syncs this daemon has running right now.
+ *
+ * The count exists because a sync is not one write. It puts the immutable half
+ * down, provisions blob bytes, and lands the envelope that names both — three
+ * moments with awaits between them, which is three chances for another request
+ * on the same daemon to run a sweep against a store that is mid-write. Inside
+ * that window the fresh rows are referenced by nothing, so every reference-based
+ * rule correctly reports them as unreferenced and wrongly concludes they may go.
+ *
+ * The counter is what makes the window visible. It is moved by
+ * `withSyncInFlight` and by nothing else, and read by every sweep before it
+ * removes a row. The field is plain rather than hidden behind accessors because
+ * this module holds the one writer and every reader; a caller that reached past
+ * the wrapper to move it by hand would be writing the exact defect the wrapper
+ * exists to prevent, and no amount of encapsulation stops someone determined to
+ * write it.
+ *
+ * ## What this does not cover, stated plainly
+ *
+ * One process. The count lives in this daemon's memory and can only speak for
+ * the syncs this daemon started. Two daemons opened on one data directory each
+ * keep a count of their own and neither can see the other's, so a sweep in one
+ * is not held off by a sync in the other and the window between them stays
+ * exactly as wide as it was. That is a real gap and this is not a fix for it —
+ * closing it needs a claim recorded in the store the other process can read,
+ * not a number in a process the other process cannot see.
+ */
+export interface SyncGate {
+  /** Syncs entered and not yet left. Zero means a sweep may remove rows. */
+  inFlight: number
+}
+
+/**
+ * A gate with nothing in flight.
+ *
+ * One per daemon, handed to the sync path and to the sweeps together. Two gates
+ * over one store are the same as no gate at all: each sweep would consult a
+ * count no sync ever moves, and the guard would report a clean zero forever
+ * while the window stayed open.
+ */
+export function createSyncGate(): SyncGate {
+  return { inFlight: 0 }
+}
+
+/**
+ * What a sweep answers when it declined to remove anything.
+ *
+ * A value, not a throw and not a silent zero. A throw would make a sweep that
+ * correctly stood aside indistinguishable from one that failed, and a caller
+ * catching it would learn nothing about whether the store was reclaimed. A zero
+ * count would be worse still: it reads as "nothing was reclaimable", which is a
+ * statement about the store, when the truth is that the store was never
+ * examined. The reason and the count are both named so a caller can log why it
+ * stood aside and decide whether to ask again.
+ */
+export interface SweepSkipped {
+  readonly skipped: 'syncs-in-flight'
+  readonly inFlight: number
+}
+
+/**
+ * Whether a sweep may remove anything right now, expressed as the value it must
+ * answer with when it may not.
+ *
+ * One function, so every sweep asks the same question and refuses in the same
+ * shape. A sweep over a second table adopts the gate by calling this first and
+ * returning what it hands back when it is not null — there is no second rule
+ * about what counts as in flight, no second spelling of the refusal, and
+ * nothing about this check that is specific to the table being swept.
+ */
+export function sweepHeldOff(gate: SyncGate): SweepSkipped | null {
+  if (gate.inFlight === 0) return null
+  return { skipped: 'syncs-in-flight', inFlight: gate.inFlight }
+}
+
+/**
+ * Runs one sync inside the gate: the count rises before it starts and falls when
+ * it is over, whatever "over" turned out to mean.
+ *
+ * The wrapper holds the `try`/`finally` rather than the call site, and that is
+ * the whole reason it exists. A call site bracketing its own await would be one
+ * implementation per caller, and the exit is the half that gets written wrong: a
+ * sync that REJECTS must still release the count. A count left pinned has no
+ * symptom of its own — every later sweep stands aside and reports it, which
+ * from the outside is indistinguishable from a sweep that keeps finding nothing
+ * to reclaim — so the store simply grows and nothing ever says why.
+ *
+ * `return await` rather than `return` is load-bearing here: returning the
+ * promise unawaited would run the `finally` while the sync was still going, and
+ * the count would fall the instant the sync began.
+ */
+export async function withSyncInFlight<T>(gate: SyncGate, fn: () => Promise<T>): Promise<T> {
+  gate.inFlight += 1
+  try {
+    return await fn()
+  } finally {
+    gate.inFlight -= 1
+  }
+}
+
+/**
  * Removes every cached immutable half that no stored snapshot references, and
  * reports what went.
  *
@@ -226,6 +342,27 @@ export async function dropPinnedRefs(
  * still be caught. A candidate that went live in that window keeps its half, at
  * the cost of one row that waits for the next sweep.
  *
+ * ## Why an in-flight sync makes this a no-op
+ *
+ * The subtraction is correct about the store and wrong about the moment. A sync
+ * writes the immutable half first and the envelope that names it last, so
+ * between the two there is a half that no snapshot references and that is not an
+ * orphan at all — it is the front of a review still being written. Sweeping it
+ * loses more than the row: the envelope write that follows restores the row but
+ * reads the half's own `partial` off disk to carry it forward, finds nothing
+ * there, and records the comparison as COMPLETE. A capped or truncated half
+ * quietly becomes a whole one, and every later reader of that key is told the
+ * comparison is entire when it never was.
+ *
+ * So the gate is read before the sets are, and a non-zero count ends the call
+ * with the two reads unmade and nothing removed. The skip is whole rather than
+ * partial for the same reason the sweep is one transaction: a sweep that removed
+ * rows and then noticed a sync has already done whatever damage it was going to.
+ *
+ * The check is a SKIP and never an age rule. Nothing here asks how old a row is,
+ * how long a sync has been running, or when the gate last read zero — a sweep
+ * either runs the same reference subtraction it always ran, or it does not run.
+ *
  * ## Why this throws where a ref drop returns
  *
  * `dropPinnedRefs` resolves every outcome as a value, because a drop that failed
@@ -250,7 +387,15 @@ export async function dropPinnedRefs(
  * and invalidating it on purpose would be a cache clear wearing a reclamation's
  * name.
  */
-export function pruneImmutables(store: DirectStore): ImmutableDeletion {
+export function pruneImmutables(
+  store: DirectStore,
+  gate: SyncGate,
+): ImmutableDeletion | SweepSkipped {
+  // Asked before either set is read, so a sweep that stands aside has examined
+  // nothing and cannot have removed anything on its way to the refusal.
+  const heldOff = sweepHeldOff(gate)
+  if (heldOff !== null) return heldOff
+
   // The stored set is read BEFORE the live set, so a snapshot persisted between
   // the two reads names a key that was never a candidate. That ordering can only
   // ever narrow the proposal, which is the safe direction; what actually makes

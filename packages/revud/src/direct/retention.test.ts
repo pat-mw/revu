@@ -69,16 +69,33 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
-import type { ReviewDraft, Snapshot, SnapshotImmutable } from '@revu/shared'
+import type { FileBlob, ReviewDraft, Snapshot, SnapshotImmutable } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import { createBunCommandRunner } from './command-runner'
+import {
+  CONFORMANCE_REPO,
+  CONFORMANCE_SESSION,
+  MOVING_BASE_PR,
+  movingBaseClient,
+} from './conformance-fakes'
+import { createDirectApi } from './direct-api'
+import type { GithubClient } from './github-client'
+import type { LocalReviewSurface } from './local-surface'
 import { pinRefsFor, pinSnapshotObjects } from './local-pins'
-import { dropPinnedRefs, pruneImmutables } from './retention'
+import {
+  createSyncGate,
+  dropPinnedRefs,
+  pruneImmutables,
+  sweepHeldOff,
+  withSyncInFlight,
+  type SyncGate,
+} from './retention'
 import {
   openDirectStore,
   StoreUnreadableError,
   StoreWriteError,
   type DirectStore,
+  type ImmutableDeletion,
 } from './store'
 
 /** A local id inside the reserved local-review band. */
@@ -393,6 +410,50 @@ function immutableRowCount(): number {
   return row.n
 }
 
+/**
+ * How many blob rows the store holds, counted through a handle of its own.
+ *
+ * The blob table has no sweep of its own yet, so this exists to say what a sweep
+ * of the immutable cache did NOT do to it: the two tables share no key space,
+ * and a reclamation that reached across from one to the other would be reaching
+ * for bytes the local path cannot fetch again.
+ */
+function blobRowCount(): number {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM blobs').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+/** How many pull-request envelopes are on disk, counted the same independent way. */
+function snapshotRowCount(): number {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM snapshots').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+/**
+ * Runs a sweep that is expected to RUN, and hands back what it removed.
+ *
+ * The sweep may now decline, and a declined sweep removes nothing and reports
+ * zero of everything — which is indistinguishable, at every assertion below,
+ * from a sweep that ran over a store with nothing to reclaim. Every leg that is
+ * about what a sweep removes therefore goes through this, so a sweep that
+ * quietly stood aside is a loud failure rather than a green test measuring
+ * nothing. The default gate is a fresh one per call: legs that are not about the
+ * gate get an idle one that nothing else can have moved.
+ */
+function sweep(store: DirectStore, gate: SyncGate = createSyncGate()): ImmutableDeletion {
+  const result = pruneImmutables(store, gate)
+  if ('skipped' in result) {
+    throw new Error(
+      `the sweep stood aside with ${result.inFlight} sync(s) in flight, so it measured nothing`,
+    )
+  }
+  return result
+}
+
 /** One snapshot table's stored envelope bytes, exactly as they sit on disk. */
 function readEnvelope(table: string, column: string, key: number): string {
   const raw = new Database(join(storeDir, 'direct.sqlite'))
@@ -567,7 +628,7 @@ describe('sweeping the immutable cache by reference', () => {
     // count while a pull request's half is gone and its review will not open.
     const store = openStore()
     seedTwoLiveAndTwoOrphans(store)
-    pruneImmutables(store)
+    sweep(store)
     expectEverySnapshotStillReadable(store)
     store.close()
   })
@@ -579,7 +640,7 @@ describe('sweeping the immutable cache by reference', () => {
     // demonstrably existed rather than against a table that was short all along.
     expect(immutableRowCount()).toBe(4)
 
-    const result = pruneImmutables(store)
+    const result = sweep(store)
 
     expect(result.count).toBe(2)
     expect(immutableRowCount()).toBe(2)
@@ -594,7 +655,7 @@ describe('sweeping the immutable cache by reference', () => {
     const store = openStore()
     seedTwoLiveAndTwoOrphans(store)
 
-    const result = pruneImmutables(store)
+    const result = sweep(store)
 
     // The report is what a caller reconciling its own view of the cache acts
     // on, so it names rows rather than counting them.
@@ -606,12 +667,12 @@ describe('sweeping the immutable cache by reference', () => {
   test('a second sweep over an already-swept store removes nothing', () => {
     const store = openStore()
     seedTwoLiveAndTwoOrphans(store)
-    expect(pruneImmutables(store).count).toBe(2)
+    expect(sweep(store).count).toBe(2)
 
     // Idempotent, because a reclamation that ran once has to be safe to run
     // again: there is no state saying which keys were already considered, and
     // "already gone" is the outcome the caller asked for.
-    expect(pruneImmutables(store)).toEqual({ count: 0, removed: [] })
+    expect(sweep(store)).toEqual({ count: 0, removed: [] })
     expect(immutableRowCount()).toBe(2)
     expectEverySnapshotStillReadable(store)
     store.close()
@@ -641,7 +702,7 @@ describe('sweeping the immutable cache by reference', () => {
     })
     store.putImmutable(immutableHalf(ORPHAN_LOCAL_KEY))
 
-    const result = pruneImmutables(store)
+    const result = sweep(store)
 
     expect(result.removed).toEqual([ORPHAN_LOCAL_KEY])
     expect(store.listImmutableKeys()).toEqual([LIVE_PR_KEY, LIVE_LOCAL_KEY])
@@ -662,7 +723,7 @@ describe('sweeping the immutable cache by reference', () => {
     writeEnvelope('snapshots', 'pr_number', SEEDED_PR, 'not json')
 
     const reopened = openStore()
-    expect(() => pruneImmutables(reopened)).toThrow(StoreUnreadableError)
+    expect(() => sweep(reopened)).toThrow(StoreUnreadableError)
     // Not merely that it threw. A row that cannot be parsed names no key, and a
     // sweep that treated it as naming none would turn every half it really
     // referenced into a candidate — so the count is what says the refusal
@@ -699,7 +760,7 @@ describe('sweeping the immutable cache by reference', () => {
     const reopened = openStore()
     // A persist that failed is never swallowed into a success that removed part
     // of what it named.
-    expect(() => pruneImmutables(reopened)).toThrow(StoreWriteError)
+    expect(() => sweep(reopened)).toThrow(StoreWriteError)
     expect(immutableRowCount()).toBe(4)
     expectEverySnapshotStillReadable(reopened)
     reopened.close()
@@ -711,7 +772,7 @@ describe('sweeping the immutable cache by reference', () => {
     store.putLocalDraft(unsubmittedDraft('h1', localId, 'unsubmitted local text'))
     store.putDraft(unsubmittedDraft('h1', SEEDED_PR, 'unsubmitted pull request text'))
 
-    expect(pruneImmutables(store).count).toBe(2)
+    expect(sweep(store).count).toBe(2)
 
     // Unsubmitted text is the one thing in this store that cannot be recomputed
     // from anywhere, so a reclamation that reached it would be destroying the
@@ -730,7 +791,7 @@ describe('sweeping the immutable cache by reference', () => {
     // The live set is built by READING `snapshots`, which is required — a set
     // that skipped it would report the pull request's half as unreferenced. What
     // is forbidden is writing there, and the tripwires guard every write event.
-    const result = pruneImmutables(armed)
+    const result = sweep(armed)
 
     expect(result.removed).toEqual([ORPHAN_PR_KEY, ORPHAN_LOCAL_KEY])
     // The control for the assertion above: a tripwire that was never installed,
@@ -739,6 +800,427 @@ describe('sweeping the immutable cache by reference', () => {
     expectPrSnapshotWritesRefused()
     expectEverySnapshotStillReadable(armed)
     armed.close()
+  })
+})
+
+/**
+ * A promise the test resolves by hand, and the two halves of the handle needed
+ * to do it.
+ *
+ * Every interleave below is ordered by these rather than by a sleep. A sleep
+ * asserts that one thing probably happened before another and pays real
+ * wall-clock for the guess; a promise the test holds asserts it exactly, because
+ * the sync cannot pass the point it is parked at until this call is made.
+ */
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+  reject: (reason: unknown) => void
+}
+
+function deferred(): Deferred {
+  let resolve!: () => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<void>((res, rej) => {
+    resolve = () => {
+      res()
+    }
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+/**
+ * A hosted client whose mutable-half fetch parks until the test lets it through,
+ * and announces when it has been reached.
+ *
+ * `getIssueComments` is the park point because of where it sits in the sync: it
+ * is the FIRST call the mutable half makes, so the engine has already written
+ * the immutable half under its compare key and has not yet assembled — let alone
+ * persisted — the envelope that would name it. That is precisely the window a
+ * reference-based sweep gets wrong, and parking anywhere earlier would find no
+ * fresh row to be wrong about.
+ */
+function pausableHostedClient(inner: GithubClient): {
+  client: GithubClient
+  reached: Promise<void>
+  release: () => void
+} {
+  const arrived = deferred()
+  const held = deferred()
+  const client: GithubClient = {
+    ...inner,
+    async getIssueComments(...args: Parameters<GithubClient['getIssueComments']>) {
+      arrived.resolve()
+      await held.promise
+      return inner.getIssueComments(...args)
+    },
+  }
+  return { client, reached: arrived.promise, release: held.resolve }
+}
+
+/**
+ * The same fake, reporting the merge-base tree listing as TRUNCATED.
+ *
+ * A truncated listing gives the immutable half an incompleteness of its OWN —
+ * a property of the comparison, stored on the cached row and reattached to every
+ * later reuse of that key. It is the field the interleave destroys permanently,
+ * which is why one leg below needs a half that has one.
+ */
+function truncatedTreeClient(state: { mergeBaseSha: string; unresolvedComments: number }): GithubClient {
+  const base = movingBaseClient(state)
+  return {
+    ...base,
+    async getTree(...args: Parameters<GithubClient['getTree']>) {
+      const tree = await base.getTree(...args)
+      return { ...tree, truncated: true }
+    },
+  }
+}
+
+/**
+ * A local surface that serves `syncPull` and refuses everything else by name.
+ *
+ * Only the sync is exercised here, and a double that answered the rest with
+ * plausible values would let a leg drift onto a path it never meant to test
+ * without saying so. The refusal names the method, so if that ever happens the
+ * failure explains itself.
+ */
+function localSurfaceDouble(syncPull: (localId: number) => Promise<Snapshot>): LocalReviewSurface {
+  return new Proxy({} as LocalReviewSurface, {
+    get(_target, property) {
+      if (property === 'syncPull') return syncPull
+      return () => {
+        throw new Error(`the local double serves syncPull alone, not ${String(property)}`)
+      }
+    },
+  })
+}
+
+/** The blob bytes a local sync puts down before its envelope lands. */
+const FRESH_BLOB_SHA = 'freshblob'
+
+/** One blob row, shaped as the provisioning path writes it. */
+function localBlob(sha: string): FileBlob {
+  return { sha, path: 'a.ts', content: 'fresh bytes\n', size: 12, binary: false }
+}
+
+/** The review row every interleave leg's local half is created from. */
+const LOCAL_REVIEW_INPUT = {
+  repo: 'acme/widgets',
+  baseRef: 'refs/heads/main',
+  headRef: 'refs/heads/feature/x',
+  title: 'feature/x',
+} as const
+
+describe('a sweep stands aside while a sync is still writing', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('a hosted sync mid-write is left alone, and the same sweep runs once it is over', async () => {
+    const store = openStore()
+    // One local snapshot, so the readable-snapshot assertion below has a
+    // snapshot of each kind to open, and one genuine orphan, so the sweep has
+    // something it really would remove. Without the orphan the "removed
+    // nothing" assertion would hold over a store where there was nothing to
+    // remove, which is the shape this whole leg is trying not to be.
+    const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+    store.putLocalSnapshot(storedSnapshot(localId, LIVE_LOCAL_KEY))
+    store.putImmutable(immutableHalf(ORPHAN_PR_KEY))
+
+    const gate = createSyncGate()
+    const paused = pausableHostedClient(movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }))
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: paused.client,
+      repo: CONFORMANCE_REPO,
+      store,
+      syncGate: gate,
+    })
+
+    const syncing = api.syncPull(MOVING_BASE_PR)
+    await paused.reached
+
+    // The window is MEASURED, not assumed. The fresh half is on disk under its
+    // compare key and no envelope names it — which is exactly why the reference
+    // subtraction would propose it — and the count says how many rows a sweep
+    // would find to be wrong about.
+    expect(store.listImmutableKeys()).toContain('MB1...HEAD-FIXED')
+    expect(snapshotRowCount()).toBe(0)
+    expect(immutableRowCount()).toBe(3)
+
+    const held = pruneImmutables(store, gate)
+
+    // A value naming the reason and the count, so a caller can log why the
+    // store was not reclaimed rather than reading a zero as "nothing to do".
+    expect(held).toEqual({ skipped: 'syncs-in-flight', inFlight: 1 })
+    // Whole, not partial: the orphan it would have removed is still there too.
+    expect(immutableRowCount()).toBe(3)
+    expect(store.listImmutableKeys()).toContain(ORPHAN_PR_KEY)
+    // The blob table is untouched by this sweep at every moment. On the hosted
+    // path it is also still EMPTY here, which is a fact about where the window
+    // sits: the engine writes blob bytes as the last act of provisioning, with
+    // no await between that write and the envelope, so a hosted sync's fresh
+    // bytes are never exposed the way its fresh immutable half is.
+    expect(blobRowCount()).toBe(0)
+
+    paused.release()
+    await syncing
+
+    // The falsification of the skip: the SAME sweep over the SAME store, with
+    // the sync finished, removes the orphan. A guard that skipped forever and a
+    // guard that skips only while a sync runs are the same green test without
+    // this half.
+    expect(blobRowCount()).toBeGreaterThan(0)
+    const swept = sweep(store, gate)
+    expect(swept.removed).toEqual([ORPHAN_PR_KEY])
+    expect(store.listImmutableKeys()).toEqual(['MB1...HEAD-FIXED', LIVE_LOCAL_KEY].sort())
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test("the immutable half's own incompleteness survives a sweep attempted mid-sync", async () => {
+    // Why the interleave is not merely untidy. The envelope write rewrites the
+    // immutable row, so a half removed mid-sync appears to come back — but that
+    // write carries the row's own `partial` forward by READING it off disk, and
+    // a row that was removed reads as absent, which is recorded as complete. A
+    // comparison that was truncated is then cached forever as a whole one, and
+    // every later reuse of that key repeats the lie.
+    const store = openStore()
+    const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+    store.putLocalSnapshot(storedSnapshot(localId, LIVE_LOCAL_KEY))
+
+    const gate = createSyncGate()
+    const paused = pausableHostedClient(truncatedTreeClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }))
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: paused.client,
+      repo: CONFORMANCE_REPO,
+      store,
+      syncGate: gate,
+    })
+
+    const syncing = api.syncPull(MOVING_BASE_PR)
+    await paused.reached
+    // Recorded before the sweep is attempted, so the assertion afterwards is
+    // against a value that demonstrably existed rather than one that may never
+    // have been written.
+    expect(store.getImmutable('MB1...HEAD-FIXED')?.partial).not.toBeNull()
+
+    pruneImmutables(store, gate)
+
+    paused.release()
+    const snapshot = await syncing
+
+    const cached = store.getImmutable('MB1...HEAD-FIXED')
+    expect(cached?.partial).not.toBeNull()
+    expect(cached?.partial?.reason).toContain('truncated')
+    // And the snapshot the caller was handed says so too, so the honesty is not
+    // confined to a row nobody reads.
+    expect(snapshot.partial?.reason).toContain('truncated')
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('a local review sync mid-write is left alone, with its fresh blob bytes exposed', async () => {
+    // The other half of the window, and the one that cannot be recovered. The
+    // local surface writes blob bytes and then reads git three more times before
+    // its envelope lands, so on this path it is the BYTES that sit on disk
+    // referenced by nothing — and a local review's bytes came from one clone
+    // with no second tier to fetch them from again.
+    const store = openStore()
+    store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY))
+    store.putImmutable(immutableHalf(ORPHAN_LOCAL_KEY))
+    const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+
+    const arrived = deferred()
+    const held = deferred()
+    const gate = createSyncGate()
+    // The double reproduces the real surface's ORDER, which is the only part of
+    // it this leg depends on: bytes down, more git read, envelope last.
+    const surface = localSurfaceDouble(async (id: number) => {
+      const snapshot = storedSnapshot(id, LIVE_LOCAL_KEY)
+      store.putBlobs([localBlob(FRESH_BLOB_SHA)])
+      arrived.resolve()
+      await held.promise
+      store.putLocalSnapshot(snapshot)
+      return snapshot
+    })
+    // No hosted client and no repository: this daemon reviews local branch pairs
+    // and nothing else, which is the deployment where the loss is permanent.
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      store,
+      localReviews: surface,
+      syncGate: gate,
+    })
+
+    const syncing = api.syncPull(localId)
+    await arrived.promise
+
+    // The window, measured: the bytes are on disk and nothing names them.
+    expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
+    expect(store.getLocalSnapshot(localId)).toBeNull()
+
+    const blobsBefore = blobRowCount()
+    const held2 = pruneImmutables(store, gate)
+
+    // The assertion that would be red if only the hosted branch were wrapped.
+    expect(held2).toEqual({ skipped: 'syncs-in-flight', inFlight: 1 })
+    expect(immutableRowCount()).toBe(2)
+    expect(blobRowCount()).toBe(blobsBefore)
+    expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
+
+    held.resolve()
+    await syncing
+
+    const swept = sweep(store, gate)
+    expect(swept.removed).toEqual([ORPHAN_LOCAL_KEY])
+    expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('a sync that REJECTS leaves nothing in flight, and the next sweep runs', async () => {
+    // The assertion that matters most. A count left pinned by a failed sync has
+    // no symptom: every later sweep stands aside and reports it, which from the
+    // outside is a sweep that keeps finding nothing to reclaim. The store grows
+    // forever and the only evidence is a number nobody is looking at.
+    const store = openStore()
+    const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+    store.putLocalSnapshot(storedSnapshot(localId, LIVE_LOCAL_KEY))
+    store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY))
+    store.putImmutable(immutableHalf(ORPHAN_PR_KEY))
+
+    const gate = createSyncGate()
+    const refusing: GithubClient = {
+      ...movingBaseClient({ mergeBaseSha: 'MB1', unresolvedComments: 0 }),
+      async getPullDetail() {
+        throw new Error('the fake refuses to describe this pull request')
+      },
+    }
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      github: refusing,
+      repo: CONFORMANCE_REPO,
+      store,
+      syncGate: gate,
+    })
+
+    await expect(api.syncPull(MOVING_BASE_PR)).rejects.toThrow(
+      'the fake refuses to describe this pull request',
+    )
+
+    expect(gate.inFlight).toBe(0)
+    // Read through the helper, which turns a sweep that stood aside into a
+    // failure — so this is an assertion about the sweep RUNNING, not merely
+    // about a counter reading zero.
+    const swept = sweep(store, gate)
+    expect(swept.removed).toEqual([ORPHAN_PR_KEY])
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+
+  test('two overlapping syncs hold the sweep off until BOTH have left', async () => {
+    const store = openStore()
+    const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+    store.putLocalSnapshot(storedSnapshot(localId, LIVE_LOCAL_KEY))
+    store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY))
+    store.putImmutable(immutableHalf(ORPHAN_PR_KEY))
+
+    const gate = createSyncGate()
+    const first = deferred()
+    const second = deferred()
+    // Entered, not awaited: the count rises when the wrapper is CALLED, so both
+    // are in flight here with no timer involved in saying so.
+    const a = withSyncInFlight(gate, () => first.promise)
+    const b = withSyncInFlight(gate, () => second.promise)
+
+    expect(pruneImmutables(store, gate)).toEqual({ skipped: 'syncs-in-flight', inFlight: 2 })
+
+    first.resolve()
+    await a
+
+    // One left, one still writing — and a sweep that decremented to zero on the
+    // first exit would run here and take the second sync's rows with it.
+    expect(pruneImmutables(store, gate)).toEqual({ skipped: 'syncs-in-flight', inFlight: 1 })
+    expect(immutableRowCount()).toBe(3)
+
+    second.resolve()
+    await b
+
+    expect(gate.inFlight).toBe(0)
+    expect(sweep(store, gate).removed).toEqual([ORPHAN_PR_KEY])
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  })
+})
+
+describe('the wrapper owns both halves of the count', () => {
+  test('a fresh gate has nothing in flight', () => {
+    expect(createSyncGate().inFlight).toBe(0)
+  })
+
+  test('the count is raised for the duration and lowered after', async () => {
+    const gate = createSyncGate()
+    const parked = deferred()
+    const running = withSyncInFlight(gate, () => parked.promise)
+
+    expect(gate.inFlight).toBe(1)
+
+    parked.resolve()
+    await running
+
+    expect(gate.inFlight).toBe(0)
+  })
+
+  test('the wrapped value is handed back unchanged', async () => {
+    expect(await withSyncInFlight(createSyncGate(), async () => 'the snapshot')).toBe('the snapshot')
+  })
+
+  test('a rejected body releases the count and the rejection travels out', async () => {
+    const gate = createSyncGate()
+    await expect(
+      withSyncInFlight(gate, async () => {
+        throw new Error('the sync failed')
+      }),
+    ).rejects.toThrow('the sync failed')
+    expect(gate.inFlight).toBe(0)
+  })
+
+  test('a body that throws before its first await releases the count too', async () => {
+    // A synchronous throw takes a different route out of an async function than
+    // a rejection does, and a wrapper that bracketed only the awaited part would
+    // pin the count on exactly this shape.
+    const gate = createSyncGate()
+    await expect(
+      withSyncInFlight(gate, () => {
+        throw new Error('refused before anything ran')
+      }),
+    ).rejects.toThrow('refused before anything ran')
+    expect(gate.inFlight).toBe(0)
+  })
+
+  test('the count returns to zero after a run and a sweep is not skipped', async () => {
+    // The pair that makes "released" mean something: after one full run the gate
+    // reads zero AND the check built on it answers that a sweep may proceed.
+    const gate = createSyncGate()
+    await withSyncInFlight(gate, async () => undefined)
+    expect(sweepHeldOff(gate)).toBeNull()
+  })
+
+  test('the check reports the reason and the count while a sync is in flight', async () => {
+    const gate = createSyncGate()
+    const parked = deferred()
+    const running = withSyncInFlight(gate, () => parked.promise)
+    expect(sweepHeldOff(gate)).toEqual({ skipped: 'syncs-in-flight', inFlight: 1 })
+    parked.resolve()
+    await running
   })
 })
 

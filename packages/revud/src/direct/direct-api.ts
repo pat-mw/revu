@@ -26,6 +26,7 @@ import type { GithubClient } from './github-client'
 import type { LocalReviewSurface } from './local-surface'
 import { shortRefName, synthesizeLocalUser } from './local-sync'
 import { reconcileDraft as runReconcileDraft } from './reconcile'
+import { createSyncGate, withSyncInFlight, type SyncGate } from './retention'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
 import { syncPull as runSyncPull } from './sync'
@@ -307,6 +308,20 @@ export interface DirectApiDeps {
    * whoever assembles the surface.
    */
   localReviews?: LocalReviewSurface
+
+  /**
+   * The in-flight counter this daemon's syncs are entered into, so a retention
+   * sweep running for another request can tell that a review is mid-write.
+   *
+   * Injected rather than minted here whenever a sweep is also wired, because the
+   * gate only guards anything while the sync path and the sweep hold the SAME
+   * one: two gates over one data directory each report a count the other's work
+   * never moves, and both read a clean zero while the window they exist to close
+   * stands wide open. Absent, this surface keeps a private gate — correct for a
+   * daemon that never sweeps, and the reason no existing caller has to grow an
+   * argument to keep working.
+   */
+  syncGate?: SyncGate
 }
 
 /**
@@ -474,6 +489,7 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
   const now = deps.now ?? (() => new Date().toISOString())
   const writeDecorator =
     deps.writeDecorator ?? createDirectWriteDecorator(deps.session.human)
+  const syncGate = deps.syncGate ?? createSyncGate()
 
   /**
    * The local surface to serve this review id from, or `null` when the id names
@@ -696,18 +712,32 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     },
 
     async syncPull(prNumber: number): Promise<Snapshot> {
-      const local = localFor(prNumber)
-      if (local !== null) return local.syncPull(prNumber)
-      return runSyncPull(
-        {
-          ...githubTarget(),
-          store: deps.store,
-          ...(deps.runner !== undefined ? { runner: deps.runner } : {}),
-          ...(deps.cwd !== undefined ? { cwd: deps.cwd } : {}),
-          ...(deps.now !== undefined ? { now: deps.now } : {}),
-        },
-        prNumber,
-      )
+      // BOTH branches are inside the gate, and the dispatch that chooses between
+      // them is inside it too. Each one leaves a different piece of a review
+      // exposed on the way through: the hosted engine puts the immutable half
+      // down and lands its envelope several awaits later, while the local
+      // surface writes the blob bytes and then reads git three more times before
+      // its envelope lands — and on that side the bytes have no second source to
+      // be refetched from. Gating one branch would leave the other's window
+      // exactly as wide as it is now.
+      //
+      // The wrapper holds the try/finally, so a refusal raised by the dispatch
+      // itself — an id from the local band on a daemon that serves no local
+      // reviews — releases the count on its way out like any other failure.
+      return withSyncInFlight(syncGate, async () => {
+        const local = localFor(prNumber)
+        if (local !== null) return local.syncPull(prNumber)
+        return runSyncPull(
+          {
+            ...githubTarget(),
+            store: deps.store,
+            ...(deps.runner !== undefined ? { runner: deps.runner } : {}),
+            ...(deps.cwd !== undefined ? { cwd: deps.cwd } : {}),
+            ...(deps.now !== undefined ? { now: deps.now } : {}),
+          },
+          prNumber,
+        )
+      })
     },
 
     async getRateLimit(): Promise<RateLimitInfo> {
