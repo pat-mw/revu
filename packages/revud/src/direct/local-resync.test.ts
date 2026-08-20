@@ -333,6 +333,79 @@ describe('source corroboration, not the check', () => {
 })
 
 // ————————————————————————————————————————————————————————————————————————————
+// The base side is read live, and that is observable.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * Advances the base branch by absorbing a commit the head branch already
+ * carries, leaving the head branch exactly where it was.
+ *
+ * A plain new commit on the base branch would not do. The reviewed range starts
+ * at the merge base — the common ancestor of the two tips — and a commit the
+ * head branch does not contain can never become one, so an advance along
+ * unrelated work moves the base tip and nothing else. Only an advance that
+ * brings in a commit the head already has moves the ancestor, which is the case
+ * where reading the base side live is observable at all.
+ *
+ * The identity, signing and hook flags are passed for the same reason the
+ * fixture passes them on every commit: a runner has no git identity, and a
+ * developer machine has a signing key and hooks that this merge must not reach.
+ */
+async function absorbIntoBase(fixture: FixtureRepo, sha: string): Promise<void> {
+  await git(fixture, ['checkout', '-q', fixture.baseBranch])
+  await git(fixture, [
+    '-c',
+    'user.email=base-advance@revu.invalid',
+    '-c',
+    'user.name=Base Advance',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+    'merge',
+    '-q',
+    '--no-ff',
+    '--no-edit',
+    sha,
+  ])
+}
+
+describe('an advancing base branch moves the compare key with the head standing still', () => {
+  let h: Harness
+  let headBefore = ''
+  let headAfter = ''
+  let compareKeyBefore = ''
+  let compareKeyAfter = ''
+
+  beforeAll(async () => {
+    h = await seed()
+    const before = h.surface.getSnapshot(h.localId)
+    if (before === null) throw new Error('the seed did not store a snapshot')
+    headBefore = before.immutable.headSha
+    compareKeyBefore = before.immutable.compareKey
+
+    // Only the base branch is touched between the two syncs.
+    await absorbIntoBase(h.fixture, h.fixture.headCommitShas[0])
+
+    const after = await h.surface.syncPull(h.localId)
+    headAfter = after.immutable.headSha
+    compareKeyAfter = after.immutable.compareKey
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('the head is byte-identical and the compare key is not', () => {
+    // Both halves or neither, because either one alone is satisfied by a bug. A
+    // compare key frozen at whatever the first sync answered passes the
+    // head-unchanged half; a compare key that moved only because the head moved
+    // passes the differs half. Only the pair says the range was recomputed
+    // against the base branch as it is now rather than as it was first seen.
+    expect(headAfter).toBe(headBefore)
+    expect(compareKeyAfter).not.toBe(compareKeyBefore)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
 // The pin, proved against a real collection.
 // ————————————————————————————————————————————————————————————————————————————
 

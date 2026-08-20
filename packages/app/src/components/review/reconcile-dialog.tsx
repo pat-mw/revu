@@ -23,6 +23,7 @@ import { relativeTime, shortSha } from '@/lib/time'
 import { useDraft, useDraftActions, useReconcile, useSubmitReview } from '@/state/drafts'
 import { qk, useBlob, useSnapshot, useSyncPull } from '@/state/queries'
 import { describeApiError } from './error-copy'
+import { compareChangeLine } from './reconcile-copy'
 import { firstBodyLine } from './pending-list'
 
 /**
@@ -282,9 +283,12 @@ export function ReconcileDialog({
           <DialogTitle>Reconcile your review</DialogTitle>
           <div className="flex items-center gap-2 font-mono text-2xs text-ink-mut">
             <span>
-              {shortSha(live.draftHeadSha)} → {shortSha(live.currentHeadSha)} ·{' '}
-              {live.newCommits.length} new{' '}
-              {live.newCommits.length === 1 ? 'commit' : 'commits'}
+              {compareChangeLine({
+                draftHeadSha: live.draftHeadSha,
+                currentHeadSha: live.currentHeadSha,
+                commits: snapshot?.immutable.commits,
+                newCommits: live.newCommits,
+              })}
             </span>
             <button
               type="button"
