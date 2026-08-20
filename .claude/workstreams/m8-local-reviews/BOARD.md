@@ -78,10 +78,13 @@ opened. CI is green on all nine PRs.
 
 ## Tickets
 
-**95 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**97 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
 count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
-from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14).
+from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14), and from 95 as three more
+units were appended rather than absorbed during implementation (M8.5.9, M8.5.10, M8.7.13, M8.8.8 — against
+M8.5's and M8.8's original counts). **The table below is the authority; this sentence has drifted twice and
+is derived from it, never the other way round.**
 
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
