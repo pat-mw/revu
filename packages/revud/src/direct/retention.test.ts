@@ -45,6 +45,32 @@
  * `last_synced_at` reverses that pair, which is the only durable way to hold a
  * cache-forever rule against a later editor.
  *
+ * ## The blob pass fails in the same direction, worse, and more quietly
+ *
+ * Reclaiming the file bytes is the third thing this module can do, and it is
+ * built on its own acceptance assertion for the same reason:
+ * `expectEveryReferencedBlobStillPresent` reads back every SHA the surviving
+ * comparisons name and requires the store to still hold it. Every blob-pass leg
+ * below ends with it, and it carries the same two controls — green over an
+ * untouched store, red over one with a referenced blob removed by hand.
+ *
+ * What makes it worse than the half sweep is sharing. A blob row is content-
+ * addressed, so it is claimed by every comparison whose index names that SHA,
+ * across pull requests and local reviews alike — which is why the fixture seeds
+ * one blob named by a live pull request AND by a superseded local half, and
+ * asserts that it really is shared before relying on it. A reference set built
+ * from one kind of review's comparisons removes that blob and breaks a review
+ * nobody was reclaiming for.
+ *
+ * What makes it quieter is the failure mode. A missing half makes a review
+ * refuse to open. A missing blob does not: reconciling a draft resolves each
+ * pending comment's anchor through a blob read, an absent blob reads as "no
+ * content to match", and the comment is classified LOST — anchors disappear in
+ * bulk with no error anywhere. That is why the pass is off by default, and why
+ * the policy is pinned by a PAIR rather than by its off case alone: without the
+ * on half, "off by default" and "the blob pass never worked" are the same green
+ * suite.
+ *
  * ## Why a source scan sits in a behavioural suite
  *
  * Two of the module's constraints are negatives over every code path at once —
@@ -85,15 +111,20 @@ import { pinRefsFor, pinSnapshotObjects } from './local-pins'
 import {
   createSyncGate,
   dropPinnedRefs,
+  pruneBlobs,
   pruneImmutables,
   sweepHeldOff,
   withSyncInFlight,
+  type BlobPruneWithheld,
+  type BlobRetentionPolicy,
+  type SweepSkipped,
   type SyncGate,
 } from './retention'
 import {
   openDirectStore,
   StoreUnreadableError,
   StoreWriteError,
+  type BlobDeletion,
   type DirectStore,
   type ImmutableDeletion,
 } from './store'
@@ -309,8 +340,23 @@ function openStore(): DirectStore {
   return openDirectStore({ dataDir: storeDir })
 }
 
-/** The immutable half of one comparison, with just enough shape to be stored. */
-function immutableHalf(compareKey: string): SnapshotImmutable {
+/** The blob index every fixture uses unless it is about which SHAs are named. */
+const DEFAULT_BLOB_INDEX: SnapshotImmutable['blobIndex'] = {
+  'a.ts': { base: 'baseblob', head: 'headblob' },
+}
+
+/**
+ * The immutable half of one comparison, with just enough shape to be stored.
+ *
+ * `blobIndex` is a parameter because the blob pass is entirely about which SHAs
+ * a surviving comparison names: a fixture that hard-coded one index could not
+ * express two comparisons sharing a blob, which is the case the whole pass has
+ * to get right.
+ */
+function immutableHalf(
+  compareKey: string,
+  blobIndex: SnapshotImmutable['blobIndex'] = DEFAULT_BLOB_INDEX,
+): SnapshotImmutable {
   return {
     compareKey,
     mergeBaseSha: 'merge-base',
@@ -326,7 +372,7 @@ function immutableHalf(compareKey: string): SnapshotImmutable {
         patch: '@@ -1 +1 @@',
       },
     ],
-    blobIndex: { 'a.ts': { base: 'baseblob', head: 'headblob' } },
+    blobIndex,
     commits: [],
   }
 }
@@ -340,13 +386,14 @@ function storedSnapshot(
   id: number,
   compareKey: string,
   syncedAt = '2026-01-01T00:00:00.000Z',
+  blobIndex: SnapshotImmutable['blobIndex'] = DEFAULT_BLOB_INDEX,
 ): Snapshot {
   return {
     prNumber: id,
     syncedAt,
     partial: null,
     syncStats: { blobsFetched: 0, blobsReused: 0, requests: 0 },
-    immutable: immutableHalf(compareKey),
+    immutable: immutableHalf(compareKey, blobIndex),
     mutable: {
       fetchedAt: syncedAt,
       pull: { number: id } as Snapshot['mutable']['pull'],
@@ -1159,6 +1206,642 @@ describe('a sweep stands aside while a sync is still writing', () => {
     expectEverySnapshotStillReadable(store)
     store.close()
   })
+})
+
+/** The blob only the live pull request's comparison names. */
+const PR_BLOB = 'blob-pr-head'
+/** The blob only the live local review's comparison names. */
+const LOCAL_BLOB = 'blob-local-head'
+/**
+ * The blob named by the live pull request's comparison AND by the local
+ * review's superseded one — the case content addressing makes ordinary and the
+ * one an over-eager reclamation destroys.
+ */
+const SHARED_BLOB = 'blob-shared-base'
+/** The blob only the superseded local comparison names. The single candidate. */
+const ORPHAN_BLOB = 'blob-orphan-head'
+/** A blob no comparison has ever named, sorting last. */
+const LOOSE_BLOB = 'blob-zz-loose'
+
+/** One blob row, shaped as the provisioning path writes it. */
+function blobRow(sha: string): FileBlob {
+  return { sha, path: 'a.ts', content: `bytes of ${sha}\n`, size: 16, binary: false }
+}
+
+/**
+ * Seed a store whose blob table is shared the way a real one is: one live pull
+ * request, one live local review, one superseded local comparison, and four
+ * blobs whose reference pattern spans all three.
+ *
+ * The shared blob is the whole reason this fixture is shaped this way. Blob rows
+ * are content-addressed, so one row backs every comparison whose index names
+ * that SHA — a base-side blob unchanged between a pull request and a local
+ * branch really is one row — and a reclamation that reasons about one review's
+ * halves alone proposes it for deletion. A fixture where each review's blobs
+ * were disjoint would let that mistake pass.
+ */
+function seedSharedBlobs(store: DirectStore): number {
+  store.putSnapshot(
+    storedSnapshot(SEEDED_PR, LIVE_PR_KEY, undefined, {
+      'a.ts': { base: SHARED_BLOB, head: PR_BLOB },
+    }),
+  )
+  const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+  store.putLocalSnapshot(
+    storedSnapshot(localId, LIVE_LOCAL_KEY, undefined, {
+      'a.ts': { base: null, head: LOCAL_BLOB },
+    }),
+  )
+  // The half the local review's previous comparison left behind: nothing names
+  // it any more, so the immutable sweep takes it — and with it the only other
+  // claim on the shared blob.
+  store.putImmutable(
+    immutableHalf(ORPHAN_LOCAL_KEY, {
+      'a.ts': { base: SHARED_BLOB, head: ORPHAN_BLOB },
+    }),
+  )
+  store.putBlobs([
+    blobRow(PR_BLOB),
+    blobRow(LOCAL_BLOB),
+    blobRow(SHARED_BLOB),
+    blobRow(ORPHAN_BLOB),
+  ])
+  return localId
+}
+
+/**
+ * Every blob SHA the store's SURVIVING comparisons name, walked independently of
+ * the code under test.
+ *
+ * Read raw and walked here rather than asked of the store, for the reason every
+ * count in this file is taken through a second handle: a reclamation and a read
+ * of the same table that went wrong the same way would agree with each other.
+ * Both sides of every path, because a base-side SHA is exactly what a head-only
+ * walk loses.
+ */
+function referencedBlobShasOnDisk(): string[] {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const rows = raw
+    .query('SELECT data FROM immutables ORDER BY compare_key ASC')
+    .all() as { data: string }[]
+  raw.close()
+  const shas = new Set<string>()
+  for (const row of rows) {
+    const stored = JSON.parse(row.data) as { immutable: SnapshotImmutable }
+    for (const sides of Object.values(stored.immutable.blobIndex)) {
+      if (sides.base) shas.add(sides.base)
+      if (sides.head) shas.add(sides.head)
+    }
+  }
+  return [...shas].sort()
+}
+
+/**
+ * Reads back every blob SHA a surviving comparison names and asserts that not
+ * one of them is missing from the store.
+ *
+ * This is the acceptance test the whole blob pass exists to satisfy, and it is
+ * an acceptance test only while EVERY blob-pass test below ends with it. The
+ * failure it catches has no other symptom, and that is what separates it from
+ * the readable-snapshot assertion it mirrors. A missing immutable half makes a
+ * review refuse to open, loudly. A missing blob does not: reconciling a draft
+ * resolves each pending comment's anchor through a blob read, an absent blob
+ * reads as "there is no content to match against", and the comment is
+ * classified LOST. The reviewer's anchors go missing in bulk and nothing
+ * anywhere reports an error.
+ *
+ * The two counts are the control. A store holding no comparisons, or
+ * comparisons naming no SHAs, satisfies "nothing was missing" without checking
+ * anything — precisely how an assertion like this passes while asserting
+ * nothing — so both are required to be non-empty.
+ *
+ * It assumes a fixture that really provisioned every SHA its comparisons name.
+ * That is true of every fixture here and is not a universal property of the
+ * store: a snapshot recorded as partial names SHAs no tier could fetch, and a
+ * store holding one would fail this for a reason that has nothing to do with
+ * reclamation.
+ */
+function expectEveryReferencedBlobStillPresent(store: DirectStore): void {
+  const raw = new Database(join(storeDir, 'direct.sqlite'))
+  const surviving = (raw.query('SELECT COUNT(*) AS n FROM immutables').get() as { n: number }).n
+  raw.close()
+  const referenced = referencedBlobShasOnDisk()
+
+  // Something to walk, and something for the walk to have found. A store with no
+  // comparisons left, or comparisons naming no content, satisfies "nothing was
+  // missing" without checking a single row.
+  expect(surviving).toBeGreaterThan(0)
+  expect(referenced.length).toBeGreaterThan(0)
+
+  for (const sha of referenced) {
+    expect(store.getBlob(sha)).not.toBeNull()
+  }
+}
+
+/**
+ * Runs a blob pass that is expected to RUN, and hands back what it removed.
+ *
+ * The pass may decline for either of two reasons, and a declined pass removes
+ * nothing and reports zero of everything — indistinguishable, at every assertion
+ * below, from a pass that ran over a store with nothing to reclaim. Every leg
+ * that is about what the pass removes therefore goes through this, so a pass
+ * that quietly stood aside or was never enabled is a loud failure rather than a
+ * green test measuring nothing.
+ */
+function sweepBlobs(store: DirectStore, gate: SyncGate = createSyncGate()): BlobDeletion {
+  const result = pruneBlobs(store, gate, { reclaimBlobs: true })
+  if ('skipped' in result) {
+    throw new Error(
+      `the blob pass stood aside with ${result.inFlight} sync(s) in flight, so it measured nothing`,
+    )
+  }
+  if ('withheld' in result) {
+    throw new Error('the blob pass was withheld by policy, so it measured nothing')
+  }
+  return result
+}
+
+/**
+ * Reclaims the halves and then the bytes, in the order a caller runs them.
+ *
+ * The blob policy is threaded through rather than fixed, because the pair that
+ * pins "off by default" needs the SAME call with and without it — and "without
+ * it" has to mean the argument is genuinely absent, not passed as false, or the
+ * default is never exercised.
+ *
+ * The half pass is required to have run: it is what leaves the surviving
+ * comparisons the byte pass reads, and a byte pass that followed a half pass
+ * which stood aside would be measuring the wrong store.
+ */
+function fullPrune(
+  store: DirectStore,
+  gate: SyncGate = createSyncGate(),
+  policy?: BlobRetentionPolicy,
+): BlobDeletion | SweepSkipped | BlobPruneWithheld {
+  sweep(store, gate)
+  return policy === undefined ? pruneBlobs(store, gate) : pruneBlobs(store, gate, policy)
+}
+
+describe('the referenced-blob assertion is live before any byte is reclaimed', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('an untouched store passes it', () => {
+    // The baseline: seeded and never reclaimed, every named blob is present.
+    // Without this, a red further down could be the assertion being wrong about
+    // a healthy store rather than the reclamation being wrong about it.
+    const store = openStore()
+    seedSharedBlobs(store)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('it fails when a blob a surviving comparison names is taken away', () => {
+    // And the assertion proved to bite, against the exact damage it exists to
+    // catch: one referenced blob removed by hand, with the comparison that names
+    // it left intact. An assertion that never fails is not an assertion.
+    const store = openStore()
+    seedSharedBlobs(store)
+    store.close()
+
+    const raw = new Database(join(storeDir, 'direct.sqlite'))
+    raw.run('DELETE FROM blobs WHERE sha = ?', [SHARED_BLOB])
+    raw.close()
+
+    const reopened = openStore()
+    expect(() => expectEveryReferencedBlobStillPresent(reopened)).toThrow()
+    reopened.close()
+  })
+
+  test('the fixture really does share one blob between the two kinds of review', () => {
+    // The claim every leg below rests on, asserted rather than assumed. If the
+    // pull request's comparison and the superseded local one did not name the
+    // same SHA, the cross-review legs would be testing disjoint stores and would
+    // pass over a reclamation that reasons about one review at a time.
+    const store = openStore()
+    seedSharedBlobs(store)
+
+    const prIndex = store.getImmutable(LIVE_PR_KEY)?.immutable.blobIndex['a.ts']
+    const orphanIndex = store.getImmutable(ORPHAN_LOCAL_KEY)?.immutable.blobIndex['a.ts']
+
+    expect([prIndex?.base, orphanIndex?.base]).toEqual([SHARED_BLOB, SHARED_BLOB])
+    store.close()
+  })
+})
+
+describe('reclaiming blobs by reference', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('every blob a surviving comparison names is still present after a full prune', () => {
+    // The load-bearing leg. Every other assertion in this block is about what
+    // the pass removed; this one is about what it must not have, and it is the
+    // only one that fails when the reference set is built from one kind of
+    // review's comparisons instead of every stored one — a shape in which the
+    // pass still reports a plausible count while another review's content is
+    // gone and its reviewer's comments will silently classify as lost.
+    const store = openStore()
+    seedSharedBlobs(store)
+    // With the policy ON, because a withheld pass removes nothing and would
+    // satisfy this without the reclamation ever having been examined.
+    fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('a blob only an orphaned comparison named is removed', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    // Pinned before the pass, so the count after it is against rows that
+    // demonstrably existed rather than against a table that was short all along.
+    expect(blobRowCount()).toBe(4)
+
+    const result = fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+
+    // Which one, not merely how many: a pass that removed the orphan's blob and
+    // the shared one also leaves rows behind and also reports a removal.
+    expect(result).toEqual({ count: 1, removed: [ORPHAN_BLOB] })
+    expect(blobRowCount()).toBe(3)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('a blob shared with a live pull request survives the orphan that also named it', () => {
+    // The over-deletion this whole pass is shaped against. The shared blob's
+    // only OTHER claim went with the superseded local half; a reference set
+    // drawn from the local side alone therefore reports it as named by nothing,
+    // and removes bytes a pull request nobody was reclaiming still depends on.
+    const store = openStore()
+    seedSharedBlobs(store)
+
+    fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+
+    expect(store.getBlob(SHARED_BLOB)).not.toBeNull()
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('a live pull request keeps its own blob through the same pass', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+
+    fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+
+    // The unshared half of the same claim: a blob named by one live comparison
+    // and nothing else is not a candidate either.
+    expect(store.getBlob(PR_BLOB)).not.toBeNull()
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('deleting the local review leaves the pull request’s blobs exactly where they are', () => {
+    // The whole story end to end: a local review is removed, its half becomes
+    // unreferenced and goes, its own blob becomes unnamed and goes — and the
+    // pull request that shared a blob with it is untouched. This is the cross
+    // review breakage the pass must not cause, driven by the act that really
+    // causes it.
+    const store = openStore()
+    const localId = seedSharedBlobs(store)
+
+    store.deleteLocalReview(localId)
+    fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+
+    expect(store.listBlobShas()).toEqual([PR_BLOB, SHARED_BLOB].sort())
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('a second full prune over an already-reclaimed store removes nothing', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    expect(sweepBlobs(store)).toEqual({ count: 0, removed: [] })
+
+    // Idempotent, because a reclamation that ran once has to be safe to run
+    // again: there is no state saying which SHAs were already considered, and
+    // "already gone" is the outcome the caller asked for. The first call above
+    // removes nothing because the orphaned half is still there naming its blob
+    // — which is itself the ordering claim: bytes are judged against what the
+    // half pass left behind.
+    const first = fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+    expect(first).toEqual({ count: 1, removed: [ORPHAN_BLOB] })
+    expect(fullPrune(store, createSyncGate(), { reclaimBlobs: true })).toEqual({
+      count: 0,
+      removed: [],
+    })
+
+    expect(blobRowCount()).toBe(3)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('a blob stale by years survives while one written moments ago is removed', () => {
+    // The hard constraint made executable. Every timestamp this store records
+    // about the live pull request is years in the past, while the orphan's blob
+    // is written last and is therefore the newest row in the table by every
+    // ordering the storage engine could offer. An age predicate of any kind
+    // reverses this pair — and the blob table records no time at all, so there
+    // is nothing to read even if one were wanted.
+    const store = openStore()
+    store.putSnapshot(
+      storedSnapshot(SEEDED_PR, LIVE_PR_KEY, LONG_AGO, {
+        'a.ts': { base: SHARED_BLOB, head: PR_BLOB },
+      }),
+    )
+    const localId = store.createLocalReview(LOCAL_REVIEW_INPUT).id
+    store.patchLocalReviewSync(localId, {
+      baseSha: 'C',
+      mergeBaseSha: 'C',
+      headSha: 'D',
+      dirty: false,
+      lastSyncedAt: LONG_AGO,
+    })
+    store.putBlobs([blobRow(SHARED_BLOB), blobRow(PR_BLOB)])
+    store.putBlobs([blobRow(ORPHAN_BLOB)])
+
+    expect(sweepBlobs(store)).toEqual({ count: 1, removed: [ORPHAN_BLOB] })
+
+    // Read back rather than assumed: the pair says nothing about expiry unless
+    // the surviving rows really are the stale ones.
+    expect(store.getLocalReview(localId)?.lastSyncedAt).toBe(LONG_AGO)
+    expect(store.getSnapshot(SEEDED_PR)?.syncedAt).toBe(LONG_AGO)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('no draft is touched by a blob pass, local or pull-request', () => {
+    const store = openStore()
+    const localId = seedSharedBlobs(store)
+    store.putLocalDraft(unsubmittedDraft('h1', localId, 'unsubmitted local text'))
+    store.putDraft(unsubmittedDraft('h1', SEEDED_PR, 'unsubmitted pull request text'))
+
+    fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+
+    // Unsubmitted text is the one thing in this store that cannot be recomputed
+    // from anywhere, so a reclamation that reached it would be destroying the
+    // only copy of a human's work to recover cache space.
+    expect(store.getLocalDraft('h1', localId)?.body).toBe('unsubmitted local text')
+    expect(store.getDraft('h1', SEEDED_PR)?.body).toBe('unsubmitted pull request text')
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('the pass reads the pull-request tables and writes none of them', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    const armed = armPrKeyedTripwires(store)
+
+    // The half pass READS `snapshots` to decide what survives, which is
+    // required. What is forbidden is writing there, and the tripwires guard
+    // every write event.
+    const result = fullPrune(armed, createSyncGate(), { reclaimBlobs: true })
+
+    expect(result).toEqual({ count: 1, removed: [ORPHAN_BLOB] })
+    // The control for the assertion above: a tripwire that was never installed,
+    // or installed on the wrong table, would let the pass go by unguarded.
+    expectPrSnapshotWritesRefused()
+    expectEveryReferencedBlobStillPresent(armed)
+    armed.close()
+  })
+
+  test('an unparseable comparison aborts the pass with every blob intact', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    store.close()
+
+    const raw = new Database(join(storeDir, 'direct.sqlite'))
+    raw.run('UPDATE immutables SET data = ? WHERE compare_key = ?', ['not json', LIVE_PR_KEY])
+    raw.close()
+
+    const reopened = openStore()
+    expect(() => sweepBlobs(reopened)).toThrow(StoreUnreadableError)
+    // Not merely that it threw. A comparison that cannot be parsed names no
+    // SHAs, and a pass that treated it as naming none would turn every blob it
+    // really referenced into a candidate — so the count is what says the refusal
+    // happened before any statement ran, not part-way through them.
+    expect(blobRowCount()).toBe(4)
+    reopened.close()
+  })
+
+  test('a refused delete rolls the whole pass back, leaving all five rows', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    // A second candidate, sorting after the first, so the pass has two rows to
+    // remove and the abort can arrive with one already deleted.
+    store.putBlobs([blobRow(LOOSE_BLOB)])
+    store.close()
+
+    // Refuses the SECOND candidate. A count of four afterwards is a pass that is
+    // not one transaction; a count of five is the rollback. The literal is
+    // independent of anything the pass computes.
+    const raw = new Database(join(storeDir, 'direct.sqlite'))
+    raw.run(
+      'CREATE TRIGGER refuse_one_blob_delete BEFORE DELETE ON blobs ' +
+        `WHEN OLD.sha = '${LOOSE_BLOB}' ` +
+        "BEGIN SELECT RAISE(ABORT, 'refused: these bytes are not to be removed'); END",
+    )
+    raw.close()
+
+    const reopened = openStore()
+    // A persist that failed is never swallowed into a success that removed part
+    // of what it named.
+    expect(() => fullPrune(reopened, createSyncGate(), { reclaimBlobs: true })).toThrow(
+      StoreWriteError,
+    )
+    expect(blobRowCount()).toBe(5)
+    expectEveryReferencedBlobStillPresent(reopened)
+    reopened.close()
+  })
+})
+
+describe('the blob pass is off until a caller turns it on', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('a full prune WITHOUT the blob policy leaves the orphan-only blob where it is', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    expect(blobRowCount()).toBe(4)
+
+    const result = fullPrune(store)
+
+    // The half pass ran — the superseded comparison is gone — and the byte pass
+    // did not, over a store that demonstrably had a blob to reclaim. Without the
+    // orphan present this would hold over a store where there was nothing to
+    // remove, which is the shape this pair exists not to be.
+    expect(store.listImmutableKeys()).toEqual([LIVE_PR_KEY, LIVE_LOCAL_KEY])
+    expect(result).toEqual({ withheld: 'blob-reclamation-not-enabled' })
+    expect(blobRowCount()).toBe(4)
+    expect(store.getBlob(ORPHAN_BLOB)).not.toBeNull()
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('the SAME full prune WITH the blob policy removes exactly that blob', () => {
+    // The falsification of the half above, and the half of this pair that stops
+    // "off by default" from decaying into "the blob pass never worked". The
+    // fixture is identical and the only difference is the flag.
+    const store = openStore()
+    seedSharedBlobs(store)
+    expect(blobRowCount()).toBe(4)
+
+    const result = fullPrune(store, createSyncGate(), { reclaimBlobs: true })
+
+    expect(result).toEqual({ count: 1, removed: [ORPHAN_BLOB] })
+    expect(blobRowCount()).toBe(3)
+    expect(store.getBlob(ORPHAN_BLOB)).toBeNull()
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('an explicit false is the same refusal as an absent policy', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+
+    // The default and the written-out position have to mean the same thing, or
+    // a caller stating its position explicitly would get behaviour a caller
+    // omitting it does not.
+    expect(fullPrune(store, createSyncGate(), { reclaimBlobs: false })).toEqual({
+      withheld: 'blob-reclamation-not-enabled',
+    })
+    expect(blobRowCount()).toBe(4)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('the refusal is a named reason rather than a zero count', () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+
+    const result = pruneBlobs(store, createSyncGate())
+
+    // A zero count would read as "there were no unreferenced bytes", which is a
+    // statement about the store — when the truth is that the store was never
+    // examined. A caller must be able to tell those apart.
+    expect('count' in result).toBe(false)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+
+  test('the withheld reason is distinct from the in-flight skip', async () => {
+    const store = openStore()
+    seedSharedBlobs(store)
+    const gate = createSyncGate()
+    const parked = deferred()
+    const running = withSyncInFlight(gate, () => parked.promise)
+
+    // Two refusals that a caller responds to differently: a sync in flight is
+    // temporary and worth retrying past, while a policy that is off persists
+    // until a deployment changes its mind. Reported as one value they would be
+    // indistinguishable, and a daemon that never reclaims bytes would look like
+    // one that is merely busy.
+    expect(pruneBlobs(store, gate, { reclaimBlobs: true })).toEqual({
+      skipped: 'syncs-in-flight',
+      inFlight: 1,
+    })
+
+    parked.resolve()
+    await running
+
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  })
+})
+
+describe('the blob pass stands aside while a sync is still writing', () => {
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-prune-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('a local sync mid-write keeps its fresh bytes, policy on or not', async () => {
+    // The window that cannot be recovered from. The local surface writes blob
+    // bytes and then reads git three more times before its envelope lands, so on
+    // this path it is the BYTES that sit on disk named by nothing — and a local
+    // review's bytes came from one clone, with no GitHub tier to fetch them from
+    // again once the branch is rewritten and its pins are dropped.
+    const store = openStore()
+    const localId = seedSharedBlobs(store)
+
+    const arrived = deferred()
+    const held = deferred()
+    const gate = createSyncGate()
+    // The double reproduces the real surface's ORDER, which is the only part of
+    // it this leg depends on: bytes down, more git read, envelope last.
+    const surface = localSurfaceDouble(async (id: number) => {
+      const snapshot = storedSnapshot(id, 'E...F', undefined, {
+        'a.ts': { base: null, head: FRESH_BLOB_SHA },
+      })
+      store.putBlobs([localBlob(FRESH_BLOB_SHA)])
+      arrived.resolve()
+      await held.promise
+      store.putLocalSnapshot(snapshot)
+      return snapshot
+    })
+    // No hosted client and no repository: this daemon reviews local branch pairs
+    // and nothing else, which is the deployment where the loss is permanent.
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      store,
+      localReviews: surface,
+      syncGate: gate,
+    })
+
+    const syncing = api.syncPull(localId)
+    await arrived.promise
+
+    // The window, measured: the bytes are on disk and no comparison names them,
+    // which is exactly why the reference subtraction would propose them.
+    expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
+    expect(store.listReferencedBlobShas()).not.toContain(FRESH_BLOB_SHA)
+    const before = blobRowCount()
+
+    const heldOff = pruneBlobs(store, gate, { reclaimBlobs: true })
+
+    // A value naming the reason and the count, so a caller can log why the store
+    // was not reclaimed rather than reading a zero as "nothing to do" — and the
+    // gate is consulted BEFORE the policy, so an enabled pass refuses on the
+    // same terms a disabled one would never have reached.
+    expect(heldOff).toEqual({ skipped: 'syncs-in-flight', inFlight: 1 })
+    // Whole, not partial: the orphan's blob it would have removed is still there
+    // too, and so are the fresh bytes.
+    expect(blobRowCount()).toBe(before)
+    expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
+    expect(store.getBlob(ORPHAN_BLOB)).not.toBeNull()
+
+    held.resolve()
+    await syncing
+
+    // The falsification of the skip: the SAME pass over the SAME store, with the
+    // sync finished, runs and removes the bytes the re-sync really did strand —
+    // the superseded comparison's blob and the one only it named — while the
+    // fresh bytes, now named by the envelope that landed, stay exactly where
+    // they are. A guard that skipped forever and a guard that skips only while a
+    // sync runs are the same green test without this half.
+    sweep(store, gate)
+    const swept = sweepBlobs(store, gate)
+    expect(swept.removed).toEqual([LOCAL_BLOB, ORPHAN_BLOB])
+    expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  }, 30_000)
 })
 
 describe('the wrapper owns both halves of the count', () => {

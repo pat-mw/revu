@@ -41,8 +41,12 @@ import {
  *     which a row a snapshot still names becomes removable.
  *   - `snapshots` — the per-PR assembled snapshot (mutable half + a reference to
  *     the immutable half's compareKey). Overwritten on every sync.
- *   - `blobs` — content-addressed by git blob SHA, append-only, cache-forever,
- *     no TTL: identical SHA ⇒ identical bytes.
+ *   - `blobs` — content-addressed by git blob SHA, cache-forever, no TTL:
+ *     identical SHA ⇒ identical bytes. Nothing records when a row was written,
+ *     so what the table holds can only be judged against what still names it.
+ *     The one statement that removes a row does so because no stored comparison
+ *     references the SHA on either side of any path; there is no age at which a
+ *     referenced blob becomes removable, and no ordinary path removes one at all.
  *   - `drafts` — per-human, per-PR review drafts. The irreplaceable local work;
  *     they must survive a version bump and a restart.
  *   - `viewed` — per-human, per-PR per-file viewed state.
@@ -299,6 +303,26 @@ export interface LocalReviewDeletion {
  * table rather than with the request.
  */
 export interface ImmutableDeletion {
+  count: number
+  removed: string[]
+}
+
+/**
+ * What one `deleteBlobs` call removed from the content-addressed blob table.
+ *
+ * The same shape as a cached-half removal and for the same reason: a count on
+ * its own cannot tell a call that removed the bytes it proposed from one that
+ * removed bytes a stored comparison still names. `removed` lists the SHAs whose
+ * rows are GONE, so a proposed SHA that named no row, and one that turned out to
+ * be referenced after all, are both absent from it — the report always agrees
+ * with the table rather than with the request.
+ *
+ * The names matter more here than anywhere else in this file. Blob bytes are
+ * content-addressed, so one row is shared by every comparison whose index names
+ * that SHA, and a removal that was wrong is not confined to the review it was
+ * reclaiming for. A count cannot say which review's content went; a list can.
+ */
+export interface BlobDeletion {
   count: number
   removed: string[]
 }
@@ -722,6 +746,120 @@ export interface DirectStore {
    */
   deleteImmutables(keys: string[]): ImmutableDeletion
 
+  // ——— what the blob table is holding, and what still names it ———
+  /**
+   * Every git blob SHA the `blobs` table holds, sorted ascending — INCLUDING
+   * SHAs no stored comparison names any more.
+   *
+   * The unreferenced ones are the entire point, exactly as they are for the
+   * immutable cache. `blobs` is append-only with no TTL and nothing in its
+   * schema records when a row was written, so what is stored can only be judged
+   * against what references it; a read that quietly returned the referenced ones
+   * would be answering with the question. Unreferenced rows are the ordinary
+   * state of this table rather than a fault: a rebased branch mints a fresh
+   * compare key on every sync, and the file contents behind the previous one are
+   * stored again under whatever SHAs the new comparison names.
+   *
+   * Sorted so the answer is stable and comparable between calls. The order
+   * carries no meaning; fixing it keeps a caller from reading meaning into
+   * whatever the storage engine happened to return.
+   */
+  listBlobShas(): string[]
+  /**
+   * Every git blob SHA a STORED COMPARISON references — the union of both sides
+   * of every path in every `immutables` row's `blobIndex` — with duplicates
+   * collapsed and the result sorted ascending.
+   *
+   * The `immutables` table is the whole of the reference set, because it is the
+   * only place a blob SHA is ever recorded: a snapshot envelope names a compare
+   * key and nothing else, and the index behind that key is what names bytes. So
+   * a blob is referenced exactly when some cached half still names it, and a
+   * half that no snapshot references keeps its bytes alive until that half is
+   * itself reclaimed. That ordering is deliberate — reclaiming halves first and
+   * bytes second means the byte pass never has to reason about which comparison
+   * is live, only about which ones are still stored.
+   *
+   * BOTH SIDES of every path, never the head alone. A base-side SHA is what a
+   * comment anchored to the left of a diff is resolved through, and an index
+   * walked head-only reports every unchanged base blob as referenced by nothing.
+   *
+   * FAIL CLOSED, and this is the contract's whole substance. A row whose stored
+   * JSON will not parse, whose `blobIndex` is not an object, or whose per-path
+   * entry names a side that is neither `null` nor a non-empty string, throws
+   * `StoreUnreadableError` and the read aborts. No row and no path is ever
+   * skipped. The asymmetry forces it: this is a set of bytes that are still
+   * NEEDED, so a row left out does not make the answer smaller, it asserts that
+   * the comparison references no content at all, and every blob it really did
+   * name becomes reclaimable.
+   *
+   * What that costs is worth spelling out. Blob bytes are content-addressed and
+   * therefore SHARED — one row backs every comparison whose index names that
+   * SHA, across pull requests and local reviews alike — so bytes removed on the
+   * strength of a skipped row break reviews that had nothing to do with the one
+   * being reclaimed. On the pull-request path the loss is repairable: the next
+   * sync re-fetches the blob from GitHub. On the local path there is no such
+   * tier, and once the branch has been rewritten and its pinned refs dropped,
+   * the row was the only copy in existence.
+   *
+   * A SHA that is present but not a non-empty string is refused on the same
+   * terms as a malformed one. `blobs.sha` is TEXT, so an empty string or a
+   * number can match no row there; they are as unusable as an absent SHA and
+   * harder to notice, which is why the guard is a type check rather than a pair
+   * of equality tests. A side that is genuinely `null` is not a refusal at all —
+   * an added file has no base and a removed one has no head, and both are
+   * ordinary.
+   */
+  listReferencedBlobShas(): string[]
+  /**
+   * Remove the named rows from the blob table, keeping every SHA a stored
+   * comparison still references.
+   *
+   * REFERENCE-BASED, never age-based. A SHA is removed only because no
+   * `immutables` row names it on either side of any path. Nothing about how long
+   * a row has sat here enters the decision, and no column records it either.
+   *
+   * The reference set is recomputed HERE, inside the same transaction as the
+   * deletes, which is why this takes candidates rather than a verdict. A caller
+   * reads the stored set and the referenced set, subtracts, and calls; between
+   * those reads and this statement another writer can cache a half whose index
+   * names one of the SHAs it is about to propose. Removing those bytes does not
+   * make a review refuse to open — it makes it open WRONG, which is worse,
+   * because nothing reports it: the reconcile pass resolves a pending comment's
+   * anchor text through a blob read, an absent blob reads as "there is no
+   * content to match against", and the classifier marks the comment LOST. A
+   * reviewer's anchors go missing in bulk with no error anywhere. Recomputing
+   * under the write lock closes that window; a candidate that became referenced
+   * is left alone rather than refused, which is the ordinary outcome of a
+   * concurrent sync and costs one row until the next reclamation.
+   *
+   * `BEGIN IMMEDIATE` rather than the deferred transaction a plain call opens,
+   * because this READS before it writes. A deferred transaction takes its read
+   * snapshot at the recompute and asks for the write lock at the first delete, so
+   * a commit landing in between makes that snapshot stale and SQLite refuses the
+   * upgrade WITHOUT consulting the busy handler. Taking the lock up front turns
+   * the wait into a plain busy wait the connection's timeout does cover.
+   *
+   * FAIL CLOSED: an `immutables` row that will not parse, or whose index is not
+   * a walkable shape, throws `StoreUnreadableError` and the transaction aborts
+   * with nothing removed. Skipping that row instead would read as "this
+   * comparison names no content", which turns every blob it really did name into
+   * a candidate — the one direction that destroys bytes.
+   *
+   * Touches `blobs` and nothing else. Not `immutables`, which this READS to build
+   * the reference set and never writes; not a draft, which is irreplaceable local
+   * work no reclamation may reach; and not a snapshot envelope in either table.
+   * And never a blob a stored comparison still names, not even to force a fresh
+   * fetch — the content-addressed table is the reason a warm re-sync is cheap,
+   * and invalidating it on purpose would be a cache clear wearing a
+   * reclamation's name.
+   *
+   * Duplicates among the SHAs collapse, and a SHA that names no row removes
+   * nothing — so a repeated call over an already-reclaimed table reports zero
+   * rather than failing. A failed persist surfaces as `StoreWriteError` with the
+   * whole transaction rolled back, never as a success that removed part of it.
+   */
+  deleteBlobs(shas: string[]): BlobDeletion
+
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
 }
@@ -822,6 +960,108 @@ function liveCompareKeys(db: Database): Set<string> {
   collectCompareKeys(db, 'snapshots', 'pr_number', keys)
   collectCompareKeys(db, 'local_snapshots', 'local_id', keys)
   return keys
+}
+
+/**
+ * Refuse one `immutables` row, naming it and saying what about its blob index
+ * could not be walked. One spelling of the refusal, so every guard below reports
+ * the same way and a human is told which row to repair or remove.
+ */
+function unwalkableIndex(compareKey: string, detail: string): StoreUnreadableError {
+  return new StoreUnreadableError(
+    'immutables',
+    compareKey,
+    new Error(
+      `${detail}, so the blob SHAs this comparison depends on cannot be identified`,
+    ),
+  )
+}
+
+/**
+ * Add every blob SHA one stored comparison's index names to `into`, walking BOTH
+ * sides of every path.
+ *
+ * The walk is the same one the provisioning path performs when it decides which
+ * bytes a snapshot needs: entries of the index, `base` then `head`, nulls
+ * skipped, and a SHA that appears on several paths counted once because the
+ * table is content-addressed and a path is only a display hint. Provisioning
+ * pairs each SHA with a representative path because it has a `FileBlob` to
+ * build; this needs the set alone. The two must agree on which SHAs an index
+ * names, or bytes one of them provisions are bytes the other proposes to remove
+ * — so the sides walked, and the treatment of a null side, are the part that is
+ * held identical rather than the return shape.
+ *
+ * FAIL CLOSED at every step. An index that is not a walkable object, an entry
+ * that is not an object, and a side that is neither `null` nor a non-empty
+ * string all refuse the whole read. Skipping any of them would shrink a set of
+ * things that are still NEEDED, and a shrunken reference set is how live bytes
+ * become candidates for deletion.
+ */
+function addBlobShas(compareKey: string, blobIndex: unknown, into: Set<string>): void {
+  if (typeof blobIndex !== 'object' || blobIndex === null || Array.isArray(blobIndex)) {
+    throw unwalkableIndex(compareKey, 'the stored comparison has no walkable blob index')
+  }
+  for (const [path, sides] of Object.entries(blobIndex as Record<string, unknown>)) {
+    if (typeof sides !== 'object' || sides === null || Array.isArray(sides)) {
+      throw unwalkableIndex(compareKey, `the blob index entry for "${path}" is not a pair of sides`)
+    }
+    const entry = sides as { base?: unknown; head?: unknown }
+    for (const side of ['base', 'head'] as const) {
+      const sha: unknown = entry[side]
+      // A genuinely absent side is ordinary rather than a fault: an added file
+      // has no base and a removed one has no head.
+      if (sha === null) continue
+      if (typeof sha !== 'string' || sha.length === 0) {
+        throw unwalkableIndex(
+          compareKey,
+          `the ${side} side of "${path}" is neither absent nor a usable blob SHA`,
+        )
+      }
+      into.add(sha)
+    }
+  }
+}
+
+/**
+ * Every blob SHA a stored comparison references, across the WHOLE immutable
+ * cache.
+ *
+ * ONE definition, called by the public read and by the recheck the delete path
+ * runs inside its own transaction, so "still needed" cannot come to mean two
+ * different things in the two places that ask it. A second copy is exactly where
+ * they would drift apart, and a reference set that lost part of the table does
+ * not answer a smaller question — it reports every SHA named only by the missing
+ * part as referenced by nothing at all, which is the input a reclamation acts on.
+ *
+ * EVERY row, with no join to either snapshot table. A cached half that no
+ * snapshot names still holds a claim on its bytes: it is a cache entry a warm
+ * re-sync of that comparison will reuse, and reclaiming its content while
+ * keeping the index that names it would leave a half that reassembles into a
+ * snapshot whose blobs are gone. Halves are reclaimed by their own pass first;
+ * what survives it is what speaks for the bytes. Restricting this to the halves
+ * one KIND of review references is the failure the whole read is shaped against
+ * — the immutable cache is shared, so a set built from the local side alone
+ * proposes every pull request's blobs for deletion, and content-addressing means
+ * those bytes are frequently the same bytes.
+ *
+ * A set rather than a list, so a SHA several comparisons share is counted once.
+ * The question is which bytes are needed, never how many references each has.
+ */
+function referencedBlobShas(db: Database): Set<string> {
+  const shas = new Set<string>()
+  const rows = db.query('SELECT compare_key, data FROM immutables').all() as {
+    compare_key: string
+    data: string
+  }[]
+  for (const row of rows) {
+    const stored = parseRow<StoredImmutable>('immutables', row.compare_key, row.data)
+    const immutable: unknown = stored.immutable
+    if (typeof immutable !== 'object' || immutable === null) {
+      throw unwalkableIndex(row.compare_key, 'the stored row carries no comparison')
+    }
+    addBlobShas(row.compare_key, (immutable as { blobIndex?: unknown }).blobIndex, shas)
+  }
+  return shas
 }
 
 /**
@@ -1876,6 +2116,67 @@ export function openDirectStore(
             // that matched no row is absent from the report instead of inflating
             // it. A repeat over an already-reclaimed cache reports zero.
             if (result.changes > 0) removed.push(key)
+          }
+        })
+        // Immediate, because the recompute above is a READ every delete below it
+        // depends on. A deferred begin would take its read snapshot at that
+        // recompute and ask for the write lock afterwards, and SQLite refuses
+        // that upgrade without consulting the busy handler once another commit
+        // has landed — a wait cannot refresh a snapshot that is already stale.
+        tx.immediate()
+        return { count: removed.length, removed }
+      })
+    },
+
+    listBlobShas(): string[] {
+      // Every row, with no predicate — no age, no `created_at`, nothing that
+      // moves with the clock. There is no such column to filter on here, and
+      // that absence is the constraint made physical: what the table holds can
+      // only be judged against what references it.
+      const rows = db.query('SELECT sha FROM blobs ORDER BY sha ASC').all() as {
+        sha: string
+      }[]
+      return rows.map((row) => row.sha)
+    },
+
+    listReferencedBlobShas(): string[] {
+      // The same `referencedBlobShas` the delete path rechecks with, so the set
+      // a caller subtracts against and the set the removal is finally judged by
+      // are one definition rather than two that agree today.
+      //
+      // Not wrapped in `write()`, like every other read in this file. That
+      // wrapper exists to give a failed MUTATION a type a caller can act on, and
+      // there is no mutation here to have failed. The refusal this read does
+      // raise is a `StoreUnreadableError`, which the wrapper would have passed
+      // through unchanged anyway.
+      return [...referencedBlobShas(db)].sort()
+    },
+
+    deleteBlobs(shas: string[]): BlobDeletion {
+      return write('blobs', () => {
+        const removed: string[] = []
+        const tx = db.transaction(() => {
+          // Emptied on entry rather than at declaration, so a transaction the
+          // engine runs a second time cannot report the first attempt's
+          // removals alongside its own.
+          removed.length = 0
+          // Recomputed inside the transaction, under the write lock the
+          // immediate begin below has already taken. This is the whole guard: a
+          // comparison cached after the caller subtracted its sets is referenced
+          // here, and its bytes are left where they are.
+          const referenced = referencedBlobShas(db)
+          // A set, so a SHA named twice is one statement and one entry in the
+          // report rather than a count that exceeds the rows that existed.
+          for (const sha of new Set(shas)) {
+            // Under-removal costs disk until the next reclamation. Over-removal
+            // silently unmoors a reviewer's pending comments, and on the local
+            // path it destroys the only copy of the content they anchored to.
+            if (referenced.has(sha)) continue
+            const result = db.run('DELETE FROM blobs WHERE sha = ?', [sha])
+            // Counted from the statement rather than from the request, so a SHA
+            // that matched no row is absent from the report instead of inflating
+            // it. A repeat over an already-reclaimed table reports zero.
+            if (result.changes > 0) removed.push(sha)
           }
         })
         // Immediate, because the recompute above is a READ every delete below it

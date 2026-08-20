@@ -143,6 +143,9 @@ function fakeStore(opts: {
     listLiveCompareKeys: unexpected('listLiveCompareKeys'),
     listImmutableKeys: unexpected('listImmutableKeys'),
     deleteImmutables: unexpected('deleteImmutables'),
+    listBlobShas: unexpected('listBlobShas'),
+    listReferencedBlobShas: unexpected('listReferencedBlobShas'),
+    deleteBlobs: unexpected('deleteBlobs'),
     close: () => {},
   }
 }

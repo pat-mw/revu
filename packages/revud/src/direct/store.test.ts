@@ -57,7 +57,18 @@ function open(): DirectStore {
   return openDirectStore({ dataDir: dir })
 }
 
-function immutable(compareKey: string): SnapshotImmutable {
+/**
+ * The immutable half of one comparison. `blobIndex` is a parameter because the
+ * blob-reference reads are entirely about which SHAs an index names: a fixture
+ * that hard-coded one index could not express two comparisons sharing a blob,
+ * which is the case those reads exist to get right.
+ */
+function immutable(
+  compareKey: string,
+  blobIndex: SnapshotImmutable['blobIndex'] = {
+    'a.ts': { base: 'baseblob', head: 'headblob' },
+  },
+): SnapshotImmutable {
   return {
     compareKey,
     mergeBaseSha: 'base',
@@ -73,7 +84,7 @@ function immutable(compareKey: string): SnapshotImmutable {
         patch: '@@ -1 +1 @@',
       },
     ],
-    blobIndex: { 'a.ts': { base: 'baseblob', head: 'headblob' } },
+    blobIndex,
     commits: [],
   }
 }
@@ -3098,6 +3109,369 @@ describe('removing cached halves removes only what nothing references', () => {
       store.deleteImmutables(['orphan...head'])
     })
     expect(err.table).toBe('immutables')
+  })
+})
+
+/** How many rows the blob table holds, counted through a handle of its own. */
+function blobRowCount(): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM blobs').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+/** Overwrite one cached half's stored bytes with arbitrary ones. */
+function corruptImmutable(compareKey: string, data: string): void {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run('UPDATE immutables SET data = ? WHERE compare_key = ?', [data, compareKey])
+  raw.close()
+}
+
+/** One blob row, shaped as the provisioning path writes it. */
+function blob(sha: string): FileBlob {
+  return { sha, path: 'a.ts', content: `bytes of ${sha}\n`, size: 16, binary: false }
+}
+
+describe('the blob table reports everything it holds, unreferenced rows included', () => {
+  test('listBlobShas returns SHAs no stored comparison names', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+
+    // The unreferenced ones are the point. A reclamation decided by comparing
+    // the stored set against the referenced set has nothing to compare if the
+    // stored set is pre-filtered.
+    expect(store.listBlobShas()).toEqual(['live', 'stranded'])
+    expect(store.listReferencedBlobShas()).toEqual(['live'])
+    store.close()
+  })
+
+  test('the two reads are what an unreferenced blob is defined by, and nothing else', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded-a'), blob('stranded-b')])
+
+    const referenced = new Set(store.listReferencedBlobShas())
+    const unreferenced = store.listBlobShas().filter((sha) => !referenced.has(sha))
+
+    // Reference-based, never age-based. Nothing in the `blobs` schema records
+    // when a row was written, so there is no timestamp to sweep on even if one
+    // were wanted — the constraint is made physical by the table itself.
+    expect(unreferenced).toEqual(['stranded-a', 'stranded-b'])
+    store.close()
+  })
+
+  test('neither read is a write: both are refused nothing under the PR-keyed tripwires', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putBlobs([blob('baseblob'), blob('headblob')])
+    const armed = armPrKeyedTripwires(store)
+
+    // Reads, and the tripwires guard UPDATE and DELETE as well as INSERT — so a
+    // reclamation read that "helpfully" tidied a row as it went would abort here.
+    expect(armed.listBlobShas()).toEqual(['baseblob', 'headblob'])
+    expect(armed.listReferencedBlobShas()).toEqual(['baseblob', 'headblob'])
+    armed.close()
+  })
+})
+
+describe('the referenced blob set, computed fail-closed', () => {
+  test('both sides of a path are referenced, never the head alone', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: 'old', head: 'new' } }))
+
+    // The base side is what a comment anchored to the left of a diff resolves
+    // through. A head-only walk reports every unchanged base blob as referenced
+    // by nothing, which is a proposal to delete the content half the diff is
+    // rendered from.
+    expect(store.listReferencedBlobShas()).toEqual(['new', 'old'])
+    store.close()
+  })
+
+  test('a null side is ordinary and contributes no reference', () => {
+    const store = open()
+    store.putImmutable(
+      immutable('pr...head', {
+        'added.ts': { base: null, head: 'fresh' },
+        'gone.ts': { base: 'was-there', head: null },
+      }),
+    )
+
+    // An added file has no base and a removed one has no head. Neither is a
+    // malformed row, and neither names a blob.
+    expect(store.listReferencedBlobShas()).toEqual(['fresh', 'was-there'])
+    store.close()
+  })
+
+  test('a SHA carried by two paths is reported once', () => {
+    const store = open()
+    store.putImmutable(
+      immutable('pr...head', {
+        'a.ts': { base: null, head: 'same' },
+        'copy.ts': { base: null, head: 'same' },
+      }),
+    )
+
+    // Content-addressed: an unchanged-content rename puts one SHA on two paths,
+    // and the question is which bytes are needed rather than how many
+    // references each has.
+    expect(store.listReferencedBlobShas()).toEqual(['same'])
+    store.close()
+  })
+
+  test('the set spans every stored comparison, not the ones one kind of review names', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'pr-only' } }))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+    store.putImmutable(
+      immutable('local...head', { 'a.ts': { base: null, head: 'local-only' } }),
+    )
+    // A half no snapshot names any more still holds a claim on its bytes: it is
+    // a cache entry a warm re-sync of that comparison reuses.
+    store.putImmutable(immutable('old...head', { 'a.ts': { base: null, head: 'cached' } }))
+
+    // A set built from one kind of review's halves proposes every other kind's
+    // blobs for deletion — and because the table is content-addressed, those are
+    // frequently the same bytes.
+    expect(store.listReferencedBlobShas()).toEqual(['cached', 'local-only', 'pr-only'])
+    store.close()
+  })
+
+  test('a cached half whose stored bytes are not JSON aborts the read, naming the row', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable('pr...head', 'not json')
+
+    // The class carries the whole meaning: a row that cannot be parsed names no
+    // SHAs, and a read that treated it as naming none would turn every blob it
+    // really referenced into a candidate.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+  })
+
+  test('a comparison whose blob index is not an object aborts the read', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable(
+      'pr...head',
+      JSON.stringify({ compareKey: 'pr...head', immutable: { blobIndex: 'a.ts' } }),
+    )
+
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.table).toBe('immutables')
+    reopened.close()
+  })
+
+  test('a side that is neither absent nor a string aborts the read', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable(
+      'pr...head',
+      JSON.stringify({
+        compareKey: 'pr...head',
+        immutable: { blobIndex: { 'a.ts': { base: null, head: 7 } } },
+      }),
+    )
+
+    // A number can match no row in a TEXT-keyed table, so it is as unusable as
+    // an absent SHA and harder to notice — which is why the guard is a type
+    // check rather than a pair of equality tests.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+  })
+
+  test('an empty-string side aborts the read on the same terms', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable(
+      'pr...head',
+      JSON.stringify({
+        compareKey: 'pr...head',
+        immutable: { blobIndex: { 'a.ts': { base: '', head: 'fine' } } },
+      }),
+    )
+
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+  })
+})
+
+describe('removing blobs removes only what nothing references', () => {
+  test('a SHA no comparison names gives up its row, and the row is really gone', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+    expect(blobRowCount()).toBe(2)
+
+    expect(store.deleteBlobs(['stranded'])).toEqual({ count: 1, removed: ['stranded'] })
+
+    expect(blobRowCount()).toBe(1)
+    expect(store.getBlob('stranded')).toBeNull()
+    store.close()
+  })
+
+  test('a SHA a stored comparison still names is left exactly where it is', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live')])
+
+    // The caller asked for a referenced SHA, which is what a caller that read
+    // its two sets before a concurrent sync landed will do. The answer is to
+    // leave the row alone, not to remove it and not to refuse the whole call.
+    expect(store.deleteBlobs(['live'])).toEqual({ count: 0, removed: [] })
+
+    expect(blobRowCount()).toBe(1)
+    // The consequence the refusal exists to prevent, asserted as a consequence:
+    // the bytes a pending comment's anchor is resolved through are still there.
+    expect(store.getBlob('live')).not.toBeNull()
+    store.close()
+  })
+
+  test('a SHA named by a half nothing references is still left where it is', () => {
+    const store = open()
+    // No snapshot names this comparison, so the half is reclaimable — but until
+    // it IS reclaimed it is a cache entry a warm re-sync reuses, and a reuse
+    // that found its bytes gone would assemble a snapshot with no content.
+    store.putImmutable(immutable('orphan...head', { 'a.ts': { base: null, head: 'cached' } }))
+    store.putBlobs([blob('cached')])
+
+    expect(store.deleteBlobs(['cached'])).toEqual({ count: 0, removed: [] })
+
+    expect(store.getBlob('cached')).not.toBeNull()
+    store.close()
+  })
+
+  test('a referenced SHA and an unreferenced one named together: only the loose one goes', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+
+    // The mixed batch separates "refuses referenced SHAs" from "refuses batches
+    // containing one" — the unreferenced row still has to go.
+    expect(store.deleteBlobs(['live', 'stranded'])).toEqual({
+      count: 1,
+      removed: ['stranded'],
+    })
+
+    expect(store.listBlobShas()).toEqual(['live'])
+    store.close()
+  })
+
+  test('a comparison that will not parse aborts the removal with every row present', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+    store.close()
+
+    corruptImmutable('pr...head', 'not json')
+
+    // The recheck runs INSIDE the deleting transaction, so a row it cannot parse
+    // aborts the transaction rather than the read that preceded it. A row
+    // skipped instead would read as "this comparison names no content", and
+    // `live` would become a candidate on the strength of it.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.deleteBlobs(['stranded']))
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+
+    // Nothing removed, not even the row that really was loose: an unknown
+    // reference set makes every deletion built on it a guess.
+    expect(blobRowCount()).toBe(2)
+  })
+
+  test('a SHA that names no row removes nothing and does not fail', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+
+    // Counted from the statement rather than from the request, so a repeat over
+    // an already-reclaimed table reports zero instead of claiming a removal.
+    expect(store.deleteBlobs(['never...stored'])).toEqual({ count: 0, removed: [] })
+
+    expect(blobRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('one SHA named twice is one row and one entry in the report', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+
+    // A count taken from the request would say two here, over a table that only
+    // ever held one matching row.
+    expect(store.deleteBlobs(['stranded', 'stranded'])).toEqual({
+      count: 1,
+      removed: ['stranded'],
+    })
+
+    expect(blobRowCount()).toBe(0)
+    store.close()
+  })
+
+  test('an empty request is a clean no-op', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+    expect(store.deleteBlobs([])).toEqual({ count: 0, removed: [] })
+    // Named nothing, removed nothing: the empty list is not "everything
+    // unreferenced", which is the reading that would empty the table.
+    expect(blobRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('neither a cached half nor a draft is reachable from a blob removal', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putBlobs([blob('stranded')])
+    store.putDraft(draft('h1', 204, 'unsubmitted text'))
+
+    store.deleteBlobs(['stranded'])
+
+    // The half is READ to build the reference set and never written; a draft is
+    // irreplaceable local work. Neither is derivable from a blob SHA, so neither
+    // may travel with one.
+    expect(store.getImmutable('pr...head')).not.toBeNull()
+    expect(store.getDraft('h1', 204)?.body).toBe('unsubmitted text')
+    store.close()
+  })
+
+  test('removing a blob touches no PR-keyed table', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putBlobs([blob('stranded')])
+    const armed = armPrKeyedTripwires(store)
+
+    // Nothing in the reference set is read from the pull-request keyspace at
+    // all, and the tripwires guard UPDATE and DELETE as well as INSERT — so a
+    // recheck that reached sideways would abort here.
+    expect(armed.deleteBlobs(['stranded'])).toEqual({ count: 1, removed: ['stranded'] })
+    armed.close()
+  })
+
+  test('deleteBlobs against a closed database throws StoreWriteError', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+    store.close()
+    // Never a silent success: a reclamation that could not persist must not
+    // report rows as removed that are still on disk.
+    const err = writeErrorFrom(() => {
+      store.deleteBlobs(['stranded'])
+    })
+    expect(err.table).toBe('blobs')
   })
 })
 

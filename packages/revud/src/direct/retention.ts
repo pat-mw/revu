@@ -1,6 +1,7 @@
 /**
- * Retention: the only path that drops a local review's pinned refs, and the only
- * one that reclaims a cached half of a comparison nothing references any more.
+ * Retention: the only path that drops a local review's pinned refs, the only one
+ * that reclaims a cached half of a comparison nothing references any more, and
+ * the only one that can reclaim the file bytes no surviving comparison names.
  *
  * The two are the same subject seen from either end of the same store. A pin ref
  * keeps the git objects a synced snapshot was read from; a cached immutable half
@@ -89,6 +90,24 @@
  * value rather than a throw, and it is whole rather than partial: a sweep that
  * removed some rows and then noticed a sync would have done the damage already.
  *
+ * ## Two passes over two tables, and only one of them runs
+ *
+ * The halves and the bytes are reclaimed by separate calls, deliberately not
+ * folded into one. The half pass is what actually bounds growth and it runs
+ * live. The byte pass is gated behind a policy flag the caller has to set, and
+ * the default is off — so a deployment gets the sweep that bounds the store
+ * without carrying the risk of the sweep that can destroy content.
+ *
+ * The risk is not the same on the two tables. A cached half belongs to exactly
+ * one comparison, and removing a live one makes that review refuse to open,
+ * loudly. A blob row is content-addressed, so it is shared by every comparison
+ * whose index names that SHA — across pull requests and local reviews alike —
+ * and removing a live one breaks a review that had nothing to do with the one
+ * being reclaimed for, silently, by making a reviewer's pending comments
+ * classify as lost. The cost of leaving the byte pass off is a table that only
+ * grows, which is visible and reversible; the cost of getting it wrong on the
+ * local path is content that existed in one place and now exists in none.
+ *
  * ## Hardening
  *
  * Every argument travels as an element of an argv array through the injected
@@ -106,7 +125,7 @@
 import { isLocalReviewId } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import { runGit } from './local-git'
-import type { DirectStore, ImmutableDeletion } from './store'
+import type { BlobDeletion, DirectStore, ImmutableDeletion } from './store'
 
 /** The namespace every pin lives under, and this module's discovery root. */
 const PIN_ROOT = 'refs/revu/reviews'
@@ -405,4 +424,151 @@ export function pruneImmutables(
   const stored = store.listImmutableKeys()
   const live = new Set(store.listLiveCompareKeys())
   return store.deleteImmutables(stored.filter((key) => !live.has(key)))
+}
+
+/**
+ * Whether the caller wants the blob table reclaimed as well as the halves.
+ *
+ * A flag rather than an inference, and one the caller has to write down. The
+ * question "may bytes be removed" is a deployment's to answer and not this
+ * module's to guess from the state of the store: nothing readable here
+ * distinguishes a workspace whose reviews are all backed by a remote from one
+ * whose local reviews are the only copy of what they were read from.
+ */
+export interface BlobRetentionPolicy {
+  /**
+   * Off unless a caller says otherwise. False means the blob pass examines
+   * nothing and removes nothing; true means it runs the same reference
+   * subtraction the immutable sweep runs, over the blob table.
+   */
+  readonly reclaimBlobs: boolean
+}
+
+/** The default position: the halves are reclaimed, the bytes are not. */
+const BLOBS_ARE_KEPT: BlobRetentionPolicy = { reclaimBlobs: false }
+
+/**
+ * What the blob pass answers when the policy did not enable it.
+ *
+ * A value of its own, for the reason `SweepSkipped` is one: a zero count would
+ * read as "there were no unreferenced bytes", which is a statement about the
+ * store, when the truth is that the store was never examined. The two refusals
+ * stay distinguishable from each other too — standing aside for a sync in flight
+ * is a temporary condition a caller may retry past, while this one persists
+ * until a deployment changes its mind, and a caller that logged them as one
+ * thing could not tell a daemon that never reclaims bytes from one that is
+ * merely busy.
+ */
+export interface BlobPruneWithheld {
+  readonly withheld: 'blob-reclamation-not-enabled'
+}
+
+/**
+ * Removes every blob no stored comparison references any more, and reports what
+ * went — but only when the caller's policy enables it, which by default it does
+ * not.
+ *
+ * Runs AFTER the immutable sweep and reads what that sweep left behind. Every
+ * surviving `immutables` row is walked, both sides of every path, and a SHA no
+ * surviving row names is a candidate. Running it first would be harmless but
+ * pointless: the halves that are about to go are still naming their bytes, so
+ * nothing the caller cared about would be proposed.
+ *
+ * ## Why this is strictly riskier than reclaiming the halves
+ *
+ * Blob rows are content-addressed, which is exactly what makes them dangerous to
+ * remove. One row is SHARED by every comparison whose index names that SHA, and
+ * those comparisons belong to pull requests and local reviews indiscriminately —
+ * two reviews of the same file at the same content are one row. So a single
+ * over-deletion is never confined to the review being reclaimed for; it breaks
+ * whichever other review happened to name the same bytes.
+ *
+ * And it breaks it quietly, which is the part that decides the default. A missing
+ * immutable half makes a review refuse to open, loudly, at the read that
+ * reassembles it. A missing blob does not: reconciling a draft resolves each
+ * pending comment's anchor text through a blob read, an absent blob reads as
+ * "there is no content to match against", and the classifier marks the comment
+ * LOST. A reviewer's anchors disappear in bulk with no error anywhere — which is
+ * the precise failure that object pinning and this whole module exist to prevent.
+ *
+ * ## The recovery asymmetry, which is the reason this ships dark
+ *
+ * The two paths do not lose the same amount. A pull request's blob is
+ * re-fetchable: the next sync of that comparison asks GitHub for the SHA and
+ * gets the bytes back, so a wrong deletion there costs a request and nothing
+ * else. A local review's blob has no such tier. There is no GitHub blob source
+ * on the local path at all — the bytes were read out of one clone's object
+ * database, they are kept reachable only by the pins that name them, and once
+ * the branch has been rewritten and those pins dropped, the row that was
+ * deleted was the only copy of that content in existence. Nothing re-fetches it,
+ * because there is nowhere to fetch it from.
+ *
+ * That is why the flag exists and why it is off. The immutable sweep is what
+ * actually bounds growth and it runs live; this pass is kept callable and kept
+ * dark, so a deployment can reclaim halves without carrying the byte risk.
+ *
+ * ## The accepted cost, stated rather than re-argued
+ *
+ * With the policy off, `blobs` grows monotonically and it is the largest table
+ * in the store. Every re-sync of a rebased branch mints a fresh compare key,
+ * indexes the same files under whatever SHAs the new comparison produced, and
+ * stores their contents again; nothing ever shrinks it. That is real and it is
+ * accepted. The growth is visible — it is the size of the data directory — and
+ * it is recoverable at any time by turning the flag on. A wrong delete is
+ * neither visible nor recoverable. The asymmetry that decides this is RECOVERY,
+ * not size.
+ *
+ * ## Why an in-flight sync makes this a no-op, more urgently than for halves
+ *
+ * The gate is read first, before the policy and before either set, so a pass
+ * that stands aside has examined nothing. The window it guards is wider here
+ * than for the immutable cache and on the worse path: a local sync writes blob
+ * bytes and then makes three further git reads before its snapshot envelope
+ * lands, so there is a real stretch during which fresh bytes sit on disk with
+ * nothing naming them. They are not orphans — they are the front of a review
+ * still being written — and deleting them there is the unrecoverable case.
+ *
+ * The check is a SKIP and never an age rule. Nothing here asks how old a row is,
+ * how long a sync has been running, or when the gate last read zero.
+ *
+ * ## What is never touched
+ *
+ * Only rows of the content-addressed blob table, and only ones nothing names.
+ * Not a draft — unsubmitted text is the irreplaceable state in this store and no
+ * reclamation may reach it for any reason. Not an immutable half, which this
+ * READS to build the reference set and never writes. Not a snapshot envelope in
+ * either table. And never a referenced blob, not even to force a fresh fetch:
+ * the two-half cache is why a warm re-sync is cheap, and invalidating it on
+ * purpose would be a cache clear wearing a reclamation's name.
+ *
+ * Like the immutable sweep, this proposes and the store disposes: the candidate
+ * set is computed here, and the store recomputes what is referenced inside the
+ * same transaction that issues the deletes. A candidate that became referenced
+ * in that window keeps its bytes, at the cost of one row until the next pass. A
+ * comparison that will not parse throws `StoreUnreadableError` with nothing
+ * removed, because a reference set that is not known makes every deletion built
+ * on it a guess; a persist that fails throws `StoreWriteError` with the
+ * transaction rolled back.
+ */
+export function pruneBlobs(
+  store: DirectStore,
+  gate: SyncGate,
+  policy: BlobRetentionPolicy = BLOBS_ARE_KEPT,
+): BlobDeletion | SweepSkipped | BlobPruneWithheld {
+  // Asked before the policy and before either set is read, so a pass that stands
+  // aside has examined nothing and cannot have removed anything on its way to
+  // the refusal.
+  const heldOff = sweepHeldOff(gate)
+  if (heldOff !== null) return heldOff
+  if (!policy.reclaimBlobs) return { withheld: 'blob-reclamation-not-enabled' }
+
+  // The stored set is read BEFORE the referenced set, so a comparison cached
+  // between the two reads names a SHA that was never a candidate. That ordering
+  // can only ever narrow the proposal, which is the safe direction; what
+  // actually makes the pass safe is the store recomputing the reference set
+  // inside the deleting transaction, since a half written after both reads is
+  // invisible to either order.
+  const stored = store.listBlobShas()
+  const referenced = new Set(store.listReferencedBlobShas())
+  return store.deleteBlobs(stored.filter((sha) => !referenced.has(sha)))
 }
