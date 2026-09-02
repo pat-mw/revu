@@ -643,3 +643,24 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
   guard; a stored PR URL column for an Enterprise host; a shared conformance case for draft verbs on a
   deleted review; the stale `.claude/worktrees/agent-*` directories.
 
+
+**update — 2026-09-02 (M8.9 scratch-repo proof)**
+- **Done:** M8.9's both-halves proof against the real scratch repository — the last `Verify` line no session
+  had a token for. revud `--direct` from `tmp/revu-sandbox`, the flow walked in the served app, a real PR
+  ([pat-mw/revu-sandbox#6](https://github.com/pat-mw/revu-sandbox/pull/6)) opened for the same branch pair.
+  Exactly that review archived (banner linking to #6; thread, submitted review and pending draft kept; no
+  submit, no verdict picker); a second review of the same head against another base stayed live; the PR
+  carried **zero** comments, reviews and reactions; the four writes refused naming #6; `gh pr close` did not
+  un-archive; deleting the head branch left the frozen snapshot servable. Recorded in M8.9's `## Log`, the
+  Verify line ticked, the in-gate assertions it corroborates named. No code changed. Gate on the tip re-run
+  first: **3348 · 1 · 0 · 117**; CI green on #82 and #83; no base in the chain has merged.
+- **Decisions:** none new. One open question filed, deliberately unasked: **M8.9 OQ10** — on an archived
+  review the inline gutter composer still opens and a draft `PUT` is accepted (the design lists drafts under
+  "reads stay open"; the bar's composer is withheld as promised). Either answer is one unit.
+- **Blockers:** none. The handover's "bonus" live leg C cannot run — `conformance-live.test.ts` is not
+  committed, so a token only reseeds the scratch repo and reports `skipped-deferred`; not attempted.
+- **Next:** the owner merges the fourteen-PR chain bottom-up; this record rides `board/m8.9-scratch-proof`
+  stacked on #83. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
+  shared conformance case for draft verbs on a deleted review; the stale `.claude/worktrees/agent-*`
+  directories; a committed live direct runner if leg C is ever meant to run; OQ10's unit; the title field's
+  append-not-replace nit.

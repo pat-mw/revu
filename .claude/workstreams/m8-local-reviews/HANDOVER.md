@@ -1,3 +1,77 @@
+## 2026-09-02 (later) — M8.9's scratch-repo proof is done; every M8 Verify line has now run
+
+### Orient
+1. `git checkout board/m8.9-scratch-proof` — stack tip for the *record* (board-only, no code), base
+   `m8.12/delete-confirm` ([PR #83](https://github.com/pat-mw/revu/pull/83)). Code tip is still `m8.12/delete-confirm`.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3348 pass · 1 skip · 0 fail · 117 files**
+   (re-run on the tip this session, before anything else).
+3. CI was green on #82 and #83 at the start of this session (`gh pr checks 82` / `83`). **No base in the chain
+   has merged** — `gh pr list` shows fourteen OPEN, #69 → … → #80 → #82 → #83.
+4. Read `BOARD.md` → this entry → whatever the owner asks for.
+
+### State
+`main` untouched. **Fifteen PRs once this board PR opens, one linear chain, none merged.** Every M8 ticket is
+In Review; **every `Verify` line in M8 has now actually run**, the last being M8.9's scratch-repo both-halves
+proof. No Todo ticket remains. **Stacked PRs are the protocol. Never merge, never commit to `main`, never
+retarget ahead of a merge.**
+
+### What this session did
+- **Ran M8.9's both-halves proof for real** against `pat-mw/revu-sandbox`, in the served app, revud `--direct`
+  from `tmp/revu-sandbox` with the `gh auth token` credential path. PR
+  [pat-mw/revu-sandbox#6](https://github.com/pat-mw/revu-sandbox/pull/6) (now closed). Observed exactly what
+  the design promises: the matching review archived on its next sync (banner linking to #6; thread, submitted
+  review and pending draft kept; no submit, no verdict picker; inbox chip `archived · superseded by #6`); the
+  second review of the same head against `fixture/base-advances-target` stayed live (OQ8); the PR carried
+  **zero** comments, reviews and reactions (D1); the four writes refused naming #6; closing the PR did not
+  un-archive; deleting the head branch left the frozen snapshot servable with zero requests. The full record,
+  the Verify tick and the in-gate assertions it corroborates are in M8.9's ticket; `LOG.md` and `BOARD.md`
+  updated. **No code changed.**
+- Cleaned up: proof branch deleted locally and remotely, the five fixture PRs untouched, the temporary
+  `.claude/launch.json` entry reverted, the daemon stopped.
+
+### Next, in order
+1. **Nothing in M8 is left to build or to verify.** The owner merges the chain bottom-up; each exit criterion
+   ticks in `MILESTONE.md` as the run that proves it lands. If a base merges, rebase the rest and retarget.
+2. **Open question for the owner — M8.9 OQ10** (deliberately unasked, recorded in the ticket): on an archived
+   review the **inline gutter composer still opens and a draft `PUT` answers 200**. The bar's composer and
+   verdict picker are withheld as M8.9.6 promised, and the design lists drafts under "reads stay open", so this
+   is the design as written — but it is a composer whose text can never be submitted. Either answer is one
+   unit (refuse in the write sink + a conformance case + hide the gutter behind the same predicate, or keep it
+   and say so in the guide).
+3. **Follow-ups on the board, not tickets:** `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
+   shared conformance case for draft verbs on a deleted review; the stale `.claude/worktrees/agent-*`
+   directories; **a committed live direct runner** if leg C is ever meant to run (see Landmines); OQ10's unit;
+   the create dialog's title field appends to the pre-filled branch name instead of replacing it (cosmetic —
+   the proof review is titled `proof/archive-2026-09-02Proof: …`).
+
+### What this session learned — apply before calling anything done
+- **A promised "bonus" run needs a committed runner.** The previous handover offered
+  `GH_TOKEN=$(gh auth token) bun run conformance:matrix` as a live leg C. `scripts/conformance-matrix.ts`
+  reseeds the scratch repo and then looks for `packages/revud/src/direct/conformance-live.test.ts`, **which
+  does not exist** — so the "bonus" would have force-pushed every fixture branch and reported
+  `skipped-deferred`. Read the runner's `existsSync` targets before promising a live leg. Not attempted.
+- **"Direct mode works there" was one config line short.** The sandbox clone had `user.email` and no
+  `user.name`; direct mode refuses to boot without both. Set locally in the clone now (`git -C tmp/revu-sandbox
+  config user.name …`), left in place.
+- **The walk against the real transport again found what the unit level cannot express** — not a defect this
+  time but a design edge (OQ10). Do the walk; read the persisted store beside the page (`sqlite3 -readonly
+  <REVU_DATA_DIR>/direct.sqlite` — tables `local_reviews`, `local_reviews_submitted`, `local_threads`,
+  `local_drafts`) so a stale page is distinguishable from a transport that did nothing.
+- **`mutable.reviews` is `[]` on a local review by design** (`local-surface.ts` — the submitted summary lives
+  in `local_reviews_submitted`); "renders its submitted review" means the stored summary plus its thread. Do
+  not read the empty list as a lost submit.
+
+### Landmines
+- **The sandbox's `origin/pr/*` refs are `refs/pull/*/head`, fetched by the seed.** Any `git fetch --prune` in
+  `tmp/revu-sandbox` deletes them locally; restore with
+  `git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'`.
+- **zsh `echo` of a JSON body turns `\n` inside strings into raw control characters** — a parsed id comes back
+  empty and every probe 404s on a malformed route. Pipe `curl` straight into the parser.
+- **A hidden preview tab throttles the app's timers; the daemon's own state does not lie.** The archive showed
+  on the page within one re-sync here, but read `/api/local-reviews` alongside the page anyway.
+- Standing: `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC`; **NEVER `git add -A`**; `--end-of-options`; ticket line
+  pointers rot — read the seam; a fix landing in the same edit as its test has no red — obtain one by control.
+
 ## 2026-09-02 — M8.9 (#82) and M8.12 (#83) are In Review; no Todo ticket remains in M8
 
 ### Orient

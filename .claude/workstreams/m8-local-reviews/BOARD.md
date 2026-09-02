@@ -18,7 +18,7 @@ M8**; the milestone closes when the chain merges.
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
 | **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
 | **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI green** (check · conformance-matrix · e2e · docs-build) |
-| **M8.9** archive when a PR appears | In Review, **8/8, `Verify` run**, adversarial pass done (five findings landed) | `m8.9/archive-on-pr` · [#82](https://github.com/pat-mw/revu/pull/82) | 3276 · 1 · 0 · 116, matrix A/B/E/F/G PASS, e2e ×2 PASSED, **CI green** (check · conformance-matrix · e2e · docs-build) |
+| **M8.9** archive when a PR appears | In Review, **8/8, `Verify` fully run** (scratch-repo both-halves proof done, 2026-09-02 — [revu-sandbox#6](https://github.com/pat-mw/revu-sandbox/pull/6)), adversarial pass done (five findings landed) | `m8.9/archive-on-pr` · [#82](https://github.com/pat-mw/revu/pull/82) | 3276 · 1 · 0 · 116, matrix A/B/E/F/G PASS, e2e ×2 PASSED, **CI green** (check · conformance-matrix · e2e · docs-build) |
 | **M8.12** delete confirmation | In Review, **3/3, `Verify` green**, adversarial pass done (one blocker + six findings landed) | `m8.12/delete-confirm` · [#83](https://github.com/pat-mw/revu/pull/83) | 3348 · 1 · 0 · 117, **CI green** (check · conformance-matrix · e2e; docs-build not triggered — no docs changed) |
 
 **M8.12 lands the delete affordance** (in review on #83): the app had no way to delete a local review at all,
@@ -44,6 +44,21 @@ Decisions recorded at the ticket's open questions: targeted `state=open` query, 
 and the inbox learns it, a derived link, no archive on a different base, freeze. Two pre-existing contract
 facts surfaced by the block and pinned, not changed: `createLocalReview` answers `headSha: null` everywhere,
 and `RevuApi.listPulls` / `DirectApi.listPulls` take different shapes (the router bridges them).
+
+**M8.9's scratch-repo proof ran (2026-09-02, later session)** — the one `Verify` line no session had a token
+for. Against `pat-mw/revu-sandbox` from the served app in direct mode: the local review of `main ← proof/…`
+archived on its next sync once [PR #6](https://github.com/pat-mw/revu-sandbox/pull/6) existed, the banner linked
+to it, the thread, the submitted review and the pending draft all survived, a second review of the same head
+against another base stayed live, the PR carried **zero** comments, reviews and reactions, closing the PR did
+not un-archive, and deleting the head branch left the frozen snapshot servable. Full record in the ticket's
+`## Log`. **Two things it surfaced, neither changed:** on an archived review the **inline gutter composer still
+opens and a draft `PUT` is accepted** (the bar's composer and verdict picker are withheld as promised) — filed
+as M8.9 **OQ10**, the owner's call; and the handover's "bonus" live leg C **has no committed runner**
+(`conformance-live.test.ts` does not exist), so a token only reseeds the scratch repo and reports
+`skipped-deferred`. **Follow-ups added here:** a committed live direct runner if leg C is ever meant to run;
+OQ10's one unit whichever way it lands; the create dialog's title field appends to the pre-filled branch name
+instead of replacing it (cosmetic). The sandbox clone now carries a local `user.name` — direct mode refuses to
+boot without it.
 
 **M8.11 closes the milestone's proof** (in review on #80): the local-review conformance suite, written once,
 runs as three **required** matrix legs (E mock in-process · F revud-mock over HTTP · G the direct engine over a
@@ -152,7 +167,7 @@ is derived from it, never the other way round.**
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8, `Verify` green) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
-| [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | **In Review** (8/8, `Verify` run) | 8 | revud, app, shared | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | [#82](https://github.com/pat-mw/revu/pull/82) |
+| [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | **In Review** (8/8, `Verify` fully run) | 8 | revud, app, shared | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | [#82](https://github.com/pat-mw/revu/pull/82) |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | **In Review** (8/8, `Verify` green) | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | [#80](https://github.com/pat-mw/revu/pull/80) |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | **In Review** (3/3, `Verify` green) | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | [#83](https://github.com/pat-mw/revu/pull/83) |
@@ -206,7 +221,7 @@ gap in the plan, not a gap in the work. **As of 2026-09-02 every row below has a
 | --- | --- |
 | Full loop works with no remote, no token, no network | M8.5, M8.11 |
 | Re-sync / amend / rebase keep drafts alive; no mass-`lost` from missing objects | M8.8 |
-| Nothing ever reaches GitHub — structurally enforced + asserted | M8.4, M8.11 |
+| Nothing ever reaches GitHub — structurally enforced + asserted | M8.4, M8.11; corroborated live by M8.9's scratch-repo proof (a real PR with zero comments, reviews and reactions) |
 | No synthetic id in `snapshots.pr_number` / `audit_log.pr` / `pr_author.pr` | M8.2 |
 | Conformance leg green in every transport; `check` + e2e green | M8.11 |
 | No GitHub-flavored affordance on a local review | M8.7 |
