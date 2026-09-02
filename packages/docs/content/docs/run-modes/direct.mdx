@@ -174,10 +174,12 @@ Three things differ from a pull-request review, and each is deliberate:
   here.
 - **Nothing is ever published.** The local write path holds no GitHub client at
   all — the capability is structurally absent from the module rather than
-  declined by a branch inside it — so a local comment cannot reach GitHub, and
-  no publish or export action exists. When a pull request later covers the same
-  branch pair the local review goes read-only and keeps everything, and nothing
-  in it is copied across.
+  declined by a branch inside it — so a local comment cannot reach GitHub, no
+  publish or export action exists, and nothing in a local review is ever copied
+  to a pull request. A local review is *designed* to be archived read-only,
+  keeping everything it holds, once a pull request for the same branch pair is
+  detected; that detection is not yet wired, so today a local review stays open
+  until you delete it.
 
 Local reviews persist to the same SQLite file as everything else, in their own
 tables. Full walkthrough:
@@ -194,9 +196,18 @@ Direct mode's environment variables:
 | `REVU_REPO` | origin remote | Repository override (`owner/name`); a `--repo` flag wins over it. |
 | `REVU_DATA_DIR` | `~/.local/share/revu` | Durable SQLite store (drafts, snapshots, blobs, viewed state). |
 | `REVU_ROLE` | `contractor` | Session role; `lead` to start as a lead. |
+| `REVU_LOCAL_ONLY` | `0` | `1`/`true` drops the requirement for a GitHub repository, so the daemon boots with no `origin`, no token and no viewer, serving local reviews alone; `0`/`false` keeps the default. `--local-only` is the equivalent flag. |
 | `REVU_DIST_DIR` | `packages/app/dist` | Directory of the built frontend the daemon serves. |
 | `GH_TOKEN` | — | Token override, ahead of `GITHUB_TOKEN` and `gh auth token`. |
 | `GITHUB_TOKEN` | — | Token override, ahead of `gh auth token`. |
+
+`REVU_LOCAL_ONLY` takes `1`/`true` or `0`/`false` and nothing else: any other
+value is refused at startup rather than quietly read as *off*. The switch also
+belongs to direct mode alone — set it with `mock` or `broker` resolved and the
+daemon refuses to start rather than ignore it. And it lifts a requirement rather
+than cutting a connection: in a repository that *does* have an `origin`, a
+local-only daemon still resolves that origin and probes GitHub as usual, and
+serves its pull requests beside local reviews.
 
 ## The full check gate
 

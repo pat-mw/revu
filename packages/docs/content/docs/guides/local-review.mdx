@@ -15,8 +15,12 @@ only thing that changes is what is being named: a branch pair instead of a pull
 request.
 
 Local reviews are a capability of [direct mode](/docs/run-modes/direct), not a
-run mode of their own. Follow along in mock mode — the demo workspace already
-holds one, **Pre-tag review of release/0.41** (`main ← release/0.41`).
+run mode of their own. In a repository with no GitHub `origin`, start the daemon
+with `bun run revud --direct --local-only` (or `REVU_LOCAL_ONLY=1`) so it stops
+requiring a resolvable repository and a token; a repository that *does* have an
+`origin` needs no switch, and offers local reviews beside its pull requests.
+Follow along in mock mode — the demo workspace already holds one, **Pre-tag
+review of release/0.41** (`main ← release/0.41`).
 
 ## 1. Create the review
 
@@ -151,21 +155,25 @@ to a client's repository.
 
 ## 7. When a pull request appears
 
-A branch reviewed locally is often pushed later. When a pull request comes to
-cover the same pair, the local review is **superseded**: it goes read-only, its
-state chip changes to **archived**, and it keeps everything — every thread,
-every draft, all of its history.
+A branch reviewed locally is often pushed later.
 
-**Nothing in it is copied to the pull request. Not ever.** There is no publish
-action, no export, and no code path that would carry a local comment to GitHub.
-That is the whole point of reviewing locally: the feedback that exists to be
-thrown away — the wrong first approach, the misread requirement — never becomes
-part of the record on someone else's repository.
+**Nothing in a local review is ever copied to the pull request. Not ever.**
+There is no publish action, no export, and no code path that would carry a local
+comment to GitHub, whether or not a pull request ever appears. That is the whole
+point of reviewing locally: the feedback that exists to be thrown away — the
+wrong first approach, the misread requirement — never becomes part of the record
+on someone else's repository.
+
+What a pull request is meant to change is the local review's *state*. A local
+review is designed to be archived read-only once a pull request for the same
+branch pair is detected, keeping everything it holds — every thread, every
+draft, all of its history. That detection is not yet wired, so today a local
+review stays open until you delete it.
 
 <Callout title="Read-only, never destructive">
-Supersession is recorded on the review itself. A superseded review is archived,
-not deleted, and a pull request later closed without merging does not un-archive
-it — create a new local review for the pair instead.
+Archiving is a marker on the review itself, never a delete: an archived review
+keeps everything it holds, and a pull request later closed without merging will
+not un-archive it — create a new local review for the pair instead.
 </Callout>
 
 ## Where to go next
