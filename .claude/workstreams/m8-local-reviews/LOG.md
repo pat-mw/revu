@@ -643,3 +643,48 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
   guard; a stored PR URL column for an Enterprise host; a shared conformance case for draft verbs on a
   deleted review; the stale `.claude/worktrees/agent-*` directories.
 
+
+**update — 2026-09-02 (M8.9 scratch-repo proof)**
+- **Done:** M8.9's both-halves proof against the real scratch repository — the last `Verify` line no session
+  had a token for. revud `--direct` from `tmp/revu-sandbox`, the flow walked in the served app, a real PR
+  ([pat-mw/revu-sandbox#6](https://github.com/pat-mw/revu-sandbox/pull/6)) opened for the same branch pair.
+  Exactly that review archived (banner linking to #6; thread, submitted review and pending draft kept; no
+  submit, no verdict picker); a second review of the same head against another base stayed live; the PR
+  carried **zero** comments, reviews and reactions; the four writes refused naming #6; `gh pr close` did not
+  un-archive; deleting the head branch left the frozen snapshot servable. Recorded in M8.9's `## Log`, the
+  Verify line ticked, the in-gate assertions it corroborates named. No code changed. Gate on the tip re-run
+  first: **3348 · 1 · 0 · 117**; CI green on #82 and #83; no base in the chain has merged.
+- **Decisions:** none new. One open question filed, deliberately unasked: **M8.9 OQ10** — on an archived
+  review the inline gutter composer still opens and a draft `PUT` is accepted (the design lists drafts under
+  "reads stay open"; the bar's composer is withheld as promised). Either answer is one unit.
+- **Blockers:** none. The handover's "bonus" live leg C cannot run — `conformance-live.test.ts` is not
+  committed, so a token only reseeds the scratch repo and reports `skipped-deferred`; not attempted.
+- **Next:** the owner merges the fourteen-PR chain bottom-up; this record rides `board/m8.9-scratch-proof`
+  stacked on #83. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
+  shared conformance case for draft verbs on a deleted review; the stale `.claude/worktrees/agent-*`
+  directories; a committed live direct runner if leg C is ever meant to run; OQ10's unit; the title field's
+  append-not-replace nit.
+
+**update — 2026-09-02 (verification only)**
+- **Done:** re-verified the stack tip: gate **3348 · 1 · 0 · 117** (67 s, zero `(fail)` lines in the teed
+  log); fifteen PRs open in one chain, none merged, `origin/main` still `177068a`; CI green on #84. Looked for
+  an OQ10 ruling and found none (no PR comments beyond the Vercel bot, no reviews, no review-thread comments,
+  no issues). Pinned OQ10's seams in the handover — the app predicate and its single consumer, the gutter's
+  ungated open path, `saveDraft` on both transports, the shared archived-cases file, the guide paragraph — so
+  the ruling executes as one unit either way. **No code changed**; this record rides #84.
+- **Decisions:** none. OQ10 stays the owner's call, deliberately unmade here.
+- **Blockers:** the chain waits on the owner's merges and on the OQ10 ruling; nothing else is runnable.
+- **Next:** unchanged — rebase and retarget on a merge; OQ10's unit on a ruling; follow-ups only on request.
+
+**update — 2026-09-02 (landing audit)**
+- **Done:** the owner asked whether every M8 milestone had landed. Ran a read-only audit of the stack tip —
+  27 auditors over the chain, all twelve tickets, the six exit criteria and eight design-doc sections; 99 gaps
+  (0 blocker · 4 major · 95 minor); the 4 majors and 7 behaviour-level minors each put to three independent
+  refuters, **none refuted**; a completeness critic last. Record: `AUDIT-2026-09-02.md`. Verdict: the code and
+  its gate are on the tip and the exit criteria hold there; what survives is four majors, ruling 4 without a
+  unit, an unspecified archived-review delete, and doc/board drift. **No code changed.** Fixed the board's
+  M8.10 row (read 4/7, is 8/8).
+- **Decisions:** none — every surviving item is the owner's call or a unit for the next session.
+- **Blockers:** the owner's rulings (OQ10; ruling 4's live-pin bound; archived delete; pre- or post-merge for
+  the majors).
+- **Next:** rulings, then one unit per major with a control seen red, then one docs commit for the drift.
