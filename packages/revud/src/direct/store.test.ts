@@ -907,15 +907,11 @@ describe('local reviews: mint, read, list', () => {
   test('a superseded branch pair returns the superseded review, minting no successor', () => {
     const store = open()
     const original = store.createLocalReview(newLocalReview({}))
+    // Superseded through the store's own write rather than through a raw handle,
+    // so what this asserts is the behaviour of a branch pair after the supported
+    // way of archiving it — not after a column poke no caller can perform.
+    store.markLocalReviewArchived(original.id, 4242)
     store.close()
-
-    // Mark the review superseded by a pull request through a raw handle: nothing
-    // in the store surface writes this column yet, and the one-way-door rule is
-    // exactly what a later writer of it depends on. Without this the column has
-    // no behavioral assertion at all.
-    const raw = new Database(join(dir, 'direct.sqlite'))
-    raw.run('UPDATE local_reviews SET archived_pr = 4242 WHERE id = ?', [original.id])
-    raw.close()
 
     const reopened = open()
     const again = reopened.createLocalReview(newLocalReview({}))
@@ -3806,6 +3802,7 @@ const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
   putLocalThread: true,
   listLocalSubmittedReviews: true,
   putLocalSubmittedReview: true,
+  markLocalReviewArchived: true,
   deleteLocalReview: true,
 }
 
@@ -4105,6 +4102,12 @@ describe('local writes never touch a PR-keyed table', () => {
     store.deleteLocalDraft('h1', id)
     expect(store.getLocalDraft('h1', id)).toBeNull()
 
+    // An UPDATE on `local_reviews`, and the guarded `snapshots` row above is
+    // keyed to this very id — so a statement mis-aimed at the pull-request table
+    // would match that row and abort here rather than overwrite it.
+    store.markLocalReviewArchived(id, 4242)
+    expect(store.getLocalReview(id)!.archivedPr).toBe(4242)
+
     // The keyspace's only multi-table delete, driven LAST because it removes the
     // review everything above was written against. Six DELETE statements in one
     // transaction is the widest reach anything here has, and the tripwires are
@@ -4142,12 +4145,301 @@ describe('local writes never touch a PR-keyed table', () => {
     expect(onTheStore).toEqual(declaredLocalMethods())
   })
 
-  test('the local surface is twenty methods', () => {
+  test('the local surface is twenty-one methods', () => {
     // An independent literal, not another expression over the same map. Every
     // other coverage check here compares two derived sets, and derived sets stay
     // in agreement through a method deleted from the interface, the map and the
     // sweep together — a hardcoded count is the only one of these that notices
     // the swept surface silently shrinking. Changing it is a deliberate act.
-    expect(declaredLocalMethods()).toHaveLength(20)
+    expect(declaredLocalMethods()).toHaveLength(21)
+  })
+})
+
+
+/**
+ * One review's `archived_pr` cell exactly as SQLite holds it, read through a
+ * handle of its own.
+ *
+ * Raw on purpose: a refused write is asserted against the bytes on disk, not
+ * against a store read that might be answering out of a statement cache or out
+ * of the same aborted transaction. An id that names no row reads back `null` as
+ * well, which is safe here because every caller seeds the row first.
+ */
+function archivedPrOnDisk(id: number): number | null {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT archived_pr FROM local_reviews WHERE id = ?').get(id) as
+    | { archived_pr: number | null }
+    | null
+  raw.close()
+  return row ? row.archived_pr : null
+}
+
+/**
+ * Arm a single aborting trigger on `local_reviews` UPDATE and return a freshly
+ * opened store, so the archiving statement fails at exactly the statement that
+ * writes the column and at nothing before it.
+ *
+ * The caller must seed the row BEFORE arming. SQLite runs a `BEFORE UPDATE`
+ * trigger once per MATCHED row, so against a table with no matching row the
+ * trigger is installed, fires nothing, and the statement completes — a refusal
+ * that never happened would read as a pass.
+ */
+function armLocalReviewUpdateTripwire(store: DirectStore): DirectStore {
+  store.close()
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run(
+    'CREATE TRIGGER refuse_local_review_update BEFORE UPDATE ON local_reviews ' +
+      "BEGIN SELECT RAISE(ABORT, 'refused: UPDATE on local_reviews'); END",
+  )
+  raw.close()
+  return open()
+}
+
+/**
+ * Numbers that are not a pull request number, each for its own reason: the first
+ * value of the reserved local-review band and one above it (a synthetic review
+ * id, the value most likely to be passed by mistake because the caller is
+ * holding one), zero and a negative (no pull request carries either), a
+ * fraction, `NaN`, an infinity, and an integer past the exactly representable
+ * range. Every one of them would sit in the column indistinguishable from a real
+ * pull request to a later reader.
+ */
+const REFUSED_PR_NUMBERS: readonly number[] = [
+  LOCAL_REVIEW_ID_BASE,
+  LOCAL_REVIEW_ID_BASE + 41,
+  0,
+  -1,
+  4.5,
+  Number.NaN,
+  Number.POSITIVE_INFINITY,
+  Number.MAX_SAFE_INTEGER + 1,
+]
+
+/**
+ * Archiving marks a local review as superseded by the pull request that now
+ * covers the same branch pair. Two properties carry the whole feature: the
+ * column is write-once, and the write is one column wide.
+ */
+describe('archiving a local review under the pull request that superseded it', () => {
+  test('the first number stands: a second mark carrying another number changes nothing', () => {
+    const store = open()
+    const created = store.createLocalReview(newLocalReview({}))
+    store.markLocalReviewArchived(created.id, 7)
+    store.markLocalReviewArchived(created.id, 99)
+    const read = store.getLocalReview(created.id)
+    const listed = store.listLocalReviews('acme/widgets')
+    store.close()
+
+    // Write-once. A pull request observed after the first is a re-observation,
+    // not a correction of which one superseded the branch pair, and rewriting the
+    // column would relabel history a reader has already been shown.
+    expect(read!.archivedPr).toBe(7)
+    // Read back through the listing as well: both reads project the same column
+    // through the same named column list, and a projection that dropped it would
+    // answer null from one of them while the other stayed green.
+    expect(listed.map((r) => r.archivedPr)).toEqual([7])
+    // `updated_at` records when the review's own sync-derived state last moved. A
+    // pull request appearing elsewhere moved none of it, so the stamp is left
+    // alone and a caller ordering by recency is not told the branch changed.
+    expect(read!.updatedAt).toBe(created.updatedAt)
+  })
+
+  test('archiving writes one column and rewrites nothing: every other row survives intact', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const before = localRowCounts(id)
+    const seededDraft = store.getLocalDraft('h1', id)
+    const seededThread = store.getLocalThread(id, 't-a')
+    const seededSubmitted = store.listLocalSubmittedReviews(id)
+    const seededViewed = store.getLocalViewed('h1', id)
+    const seededSnapshot = store.getLocalSnapshot(id)
+    // The seeds are real documents, so the byte comparisons below cannot pass by
+    // comparing one absent read against another.
+    expect(seededDraft).not.toBeNull()
+    expect(seededThread).not.toBeNull()
+    expect(seededSnapshot).not.toBeNull()
+    expect(seededSubmitted).toHaveLength(1)
+
+    store.markLocalReviewArchived(id, 7)
+
+    // Positive control first. "Nothing else changed" says nothing at all after a
+    // call that changed nothing whatsoever.
+    expect(store.getLocalReview(id)!.archivedPr).toBe(7)
+
+    // Pinned to literals rather than only to `before`, so a seeder that quietly
+    // stopped populating a table cannot make "unchanged" true by leaving that
+    // table empty on both sides of the archive.
+    expect(before).toEqual({
+      local_reviews: 1,
+      local_snapshots: 1,
+      local_threads: 2,
+      local_reviews_submitted: 1,
+      local_drafts: 2,
+      local_viewed: 2,
+    })
+    expect(localRowCounts(id)).toEqual(before)
+
+    // Counts alone would miss a row rewritten in place, so each document is
+    // compared as the exact bytes it serialises to. Drafts are the reason the
+    // comparison is that strict: unsubmitted text is the one thing this store
+    // holds that cannot be rebuilt from git.
+    expect(JSON.stringify(store.getLocalDraft('h1', id))).toBe(JSON.stringify(seededDraft))
+    expect(JSON.stringify(store.getLocalThread(id, 't-a'))).toBe(JSON.stringify(seededThread))
+    expect(JSON.stringify(store.listLocalSubmittedReviews(id))).toBe(
+      JSON.stringify(seededSubmitted),
+    )
+    expect(JSON.stringify(store.getLocalViewed('h1', id))).toBe(JSON.stringify(seededViewed))
+    expect(JSON.stringify(store.getLocalSnapshot(id))).toBe(JSON.stringify(seededSnapshot))
+    store.close()
+  })
+
+  test('the column is already in the schema: archiving is a write, not a migration step', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // A store opened at the current version reads the column back as null on a
+    // fresh row and takes a write into it, so the version literal below is pinned
+    // to a schema demonstrably carrying the column rather than to a bare number.
+    expect(store.getLocalReview(id)!.archivedPr).toBeNull()
+    store.markLocalReviewArchived(id, 7)
+    expect(store.getLocalReview(id)!.archivedPr).toBe(7)
+    store.close()
+
+    // An independent literal. Teaching the store one more statement adds no
+    // migration step, so raising this stays a deliberate act tied to a schema
+    // change rather than a side effect of a new write.
+    expect(STORE_VERSION).toBe(4)
+  })
+
+  test('markLocalReviewArchived against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.close()
+    expect(() => store.markLocalReviewArchived(id, 7)).toThrow(StoreWriteError)
+  })
+
+  test('a refused UPDATE surfaces as a StoreWriteError naming local_reviews', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    // Seeded before arming: a BEFORE UPDATE trigger fires per matched row, so an
+    // unseeded table would leave the tripwire installed and never fired.
+    const armed = armLocalReviewUpdateTripwire(store)
+    const err = writeErrorFrom(() => armed.markLocalReviewArchived(id, 7))
+    armed.close()
+
+    expect(err.table).toBe('local_reviews')
+    expect(err.message).toContain('refused: UPDATE on local_reviews')
+    // ABORT rolled the statement back, so what happened is a refusal rather than
+    // a throw raised after the column had already landed.
+    expect(archivedPrOnDisk(id)).toBeNull()
+  })
+
+  test('a number that is not a pull request number is refused before the database is touched', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+
+    for (const refused of REFUSED_PR_NUMBERS) {
+      expect(() => store.markLocalReviewArchived(id, refused)).toThrow(RangeError)
+    }
+    // The guard runs before the statement, so none of them reached a column whose
+    // every later reader treats its contents as a pull request that exists on
+    // GitHub.
+    expect(archivedPrOnDisk(id)).toBeNull()
+
+    // Positive control in the same body: the guard refuses those values, not the
+    // call itself.
+    store.markLocalReviewArchived(id, 7)
+    expect(archivedPrOnDisk(id)).toBe(7)
+    store.close()
+  })
+
+  test('an id that names no review writes nothing and throws nothing', () => {
+    const store = open()
+    const present = store.createLocalReview(newLocalReview({})).id
+    // Plain UPDATE semantics, and documented as such. The caller has just read
+    // the review it is archiving, so an id matching nothing means the review was
+    // removed underneath it — and a retried archive of a removed review has to be
+    // safe rather than loud.
+    expect(() => store.markLocalReviewArchived(present + 1, 7)).not.toThrow()
+    expect(store.getLocalReview(present)!.archivedPr).toBeNull()
+    expect(localReviewCount()).toBe(1)
+    store.close()
+  })
+})
+
+/**
+ * The store's own source, read off disk, so a claim about what it deletes is a
+ * claim about the file that ships rather than about a note kept beside it.
+ */
+function storeSource(): string {
+  return readFileSync(join(import.meta.dir, 'store.ts'), 'utf8')
+}
+
+/**
+ * Every table named by a `DELETE FROM` in some SQL-bearing source, lowercased,
+ * de-duplicated and sorted.
+ *
+ * Case-insensitive on the keyword AND on the identifier, then reported
+ * lowercased: SQL is case-blind about both, so two spellings of one table are
+ * one entry and a lower-case statement can never slip past a gate that only
+ * looked for the upper-case form. The gap between the keywords is any run of
+ * whitespace, so a statement broken across lines is still seen.
+ */
+function deleteTargets(source: string): string[] {
+  const found = new Set<string>()
+  for (const match of source.matchAll(/\bDELETE\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)/gi)) {
+    found.add(match[1]!.toLowerCase())
+  }
+  return [...found].sort()
+}
+
+/**
+ * Every table the store is allowed to remove rows from, written out as an
+ * explicit literal.
+ *
+ * The point is the gate, not the list: a statement that removes rows from a
+ * table not named here fails this file until somebody adds the name, which makes
+ * widening what the store destroys a deliberate, reviewed act rather than a line
+ * that slid in beside a feature. Drafts are why — `local_drafts` and `drafts`
+ * hold text nothing can rebuild, and the two content-addressed tables are shared
+ * across reviews, so an unreviewed delete against any of them is unrecoverable
+ * in a way an unreviewed insert never is.
+ */
+const DELETE_ALLOWED_TABLES: readonly string[] = [
+  'blobs',
+  'drafts',
+  'immutables',
+  'local_drafts',
+  'local_reviews',
+  'local_reviews_submitted',
+  'local_snapshots',
+  'local_threads',
+  'local_viewed',
+]
+
+describe('every row-removing statement in the store names an allowlisted table', () => {
+  test('the source under test is the store file itself, read off disk', () => {
+    const source = storeSource()
+    // The self-check that keeps the gate honest. A read that came back empty — a
+    // moved file, a wrong path — would let the extractor find nothing and the
+    // allowlist would then have to be empty to pass, which is the one way this
+    // gate can be green while asserting nothing at all.
+    expect(source.length).toBeGreaterThan(0)
+    expect(source).toContain('CREATE TABLE')
+  })
+
+  test('the extractor reports exactly the tables a fixture removes from, in either case', () => {
+    const fixture =
+      "db.run('DELETE FROM x WHERE id = ?', [id])\n" +
+      'const lowerCaseIsStillSql = true\n' +
+      "db.run('delete from y')\n"
+    // Both spellings report, and they report under one lower-cased name each.
+    expect(deleteTargets(fixture)).toEqual(['x', 'y'])
+    // And a source that removes nothing reports nothing, so an empty answer means
+    // "no such statement" rather than "the extractor matches nothing ever".
+    expect(deleteTargets('SELECT * FROM z WHERE id = ?')).toEqual([])
+  })
+
+  test('the store removes rows from exactly the allowlisted tables and no others', () => {
+    expect(deleteTargets(storeSource())).toEqual([...DELETE_ALLOWED_TABLES])
   })
 })
