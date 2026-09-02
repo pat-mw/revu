@@ -8,10 +8,12 @@
  * mid-transfer, using one of the `expectPartialSync*` builders. That is the one
  * assertion the contract leaves to the transport; everything else is shared.
  *
- * `runLocalReviewDeleteConformance` is the block for deleting a local review.
- * It is registered separately because it needs a branch pair the
- * implementation can review rather than a fixture pull number, so a runner
- * whose implementation serves local reviews adds it beside the main suite.
+ * `runLocalReviewConformanceSuite` is the block for the whole review loop over
+ * a branch pair with no pull request behind it, and
+ * `runLocalReviewDeleteConformance` the block for deleting one. Both are
+ * registered separately because they need a branch pair the implementation can
+ * review rather than a fixture pull number, so a runner whose implementation
+ * serves local reviews adds them beside the main suite.
  */
 export {
   expectPartialSyncResolves,
@@ -34,3 +36,9 @@ export type {
   LocalDeletePair,
   LocalReviewRowCounts,
 } from './local-delete.ts'
+export { runLocalReviewConformanceSuite } from './local-suite.ts'
+export type {
+  LocalCompareShape,
+  LocalReviewApi,
+  LocalReviewConformanceConfig,
+} from './local-suite.ts'
