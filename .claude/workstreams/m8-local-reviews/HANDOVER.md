@@ -1,3 +1,94 @@
+## 2026-08-20 (close) — M8.8 and M8.10 are both DONE and green; start at M8.9 or M8.11
+
+### Orient
+1. `git checkout m8.10/retention-and-gc` — stack tip, PR #79, base `m8.8/resync-and-pinning`.
+2. `TZ=UTC bun run check` → expect **2919 pass · 1 skip · 0 fail · 103 files**. The 1 skip is pre-existing.
+3. **Check CI on #78 and #79 before building on either.** Both were green at hand-off.
+4. Read `BOARD.md` → this entry → the ticket you are picking up.
+
+### State
+`main` untouched at `177068a`. **Eleven PRs, one linear chain, none merged.** Working tree clean; both
+branches match their remotes.
+
+| ticket | state |
+| --- | --- |
+| **M8.8** — re-sync, rebase safety, object pinning | **8/8, `Verify` green, adversarial pass discharged.** #78 |
+| **M8.10** — retention and GC | **8/8, `Verify` green.** #79 |
+
+Everything below M8.8 in the stack is unchanged and still In Review.
+
+### Next, in order
+1. **M8.9 — archive when a PR appears.** Independent and unblocked; ruling 2 settled its trigger (on each
+   sync of that review — no timer, no GitHub work on an inbox poll). Branch it off `m8.10/retention-and-gc`
+   and stack the PR on #79.
+2. **M8.11 is the real critical path.** It gates **3 of the 6 exit criteria** and has not started. Unit
+   percentage does not close the milestone; the criteria do. Read the "For M8.11" notes below before
+   designing its conformance leg.
+3. **M8.12** — delete confirmation, which now has a real server refusal to render against rather than a
+   guess: `unprocessable`, message `… still holds an unsubmitted draft with text in it — discard that
+   draft, then delete the review.` The two-step flow is discard → delete.
+
+### The two lessons this session paid for — apply them before calling anything done
+- **A unit percentage is not a done ticket.** M8.10 hit 7/7 with the owner's ruling 1 unimplemented in
+  *both* transports, because the ruling was recorded at an Open question and **never turned into a unit**.
+  Before closing a ticket, check every ruling filed against its open questions has a unit implementing it.
+- **A contract method with no conformance leg is a divergence waiting to be found by a user.**
+  `deleteLocalReview` had none, which is the single reason three wire-level disagreements cleared the gate.
+  When you touch a contract method, check it has a parity leg; if it does not, that is the first work.
+
+### The owner's five rulings — settled, do not re-ask
+1. **Delete + draft → the server refuses.** **DONE** — `unprocessable`, precondition, both transports.
+2. **Archive detection → on each sync of that review.** Not yet implemented; it is M8.9's.
+3. **Blob prune → off by default** behind an explicit policy flag. **DONE** — the default is encoded in the
+   type, and a withheld pass names its reason rather than returning a zero count.
+4. **Keep every pin**, conditional on M8.10 landing alongside M8.8. **DISCHARGED.**
+5. **The prune runs after every successful local sync.** **DONE** — it fires after the in-flight wrapper
+   exits, proved by a witness recording the gate count at the moment the deleting statement is reached.
+
+Still open, deliberately unasked: M8.9 OQ1/OQ8/OQ9, M8.8 OQ5.
+**M8.8 OQ8** — `rebuildable` promises "re-sync to rebuild" for two corruption shapes that make the re-sync
+itself fail. Needs a reason field on `StoreUnreadableError`; belongs to whoever next owns `store.ts`.
+
+### One deviation the owner may want to revisit
+M8.10's `Verify` forbids modifying `packages/shared/src/api/`. `client.ts`'s `deleteLocalReview` docstring
+was corrected, because ruling 1 made its claim that drafts are "deliberately left behind" false in both
+transports. **Comment-only — no type, shape, field or signature moved.** Splitting it into its own contract
+commit is one command.
+
+### Landmines
+- **`TZ=UTC bun run check` before every push. The local gate is not CI.** One allocator case runs **437ms
+  locally and 9372ms on a runner** — 21x, because runners fsync far slower. The gate now passes
+  `--timeout=20000` from the root `package.json`; **Bun ignores a `timeout` key in `bunfig.toml`** (verified
+  on 1.3.11), so raise it in `test` **and** `check` or the two disagree.
+- **NEVER `git add -A`.** Stage explicit paths; `git diff --cached --stat` before committing.
+- **⚠️ A git argv without `--end-of-options` is rejected before the spawn** — reports success, does nothing.
+  Route through `runGit` with refs/prefixes/SHAs in `revs`.
+- **⚠️ A trigger-based absence test is vacuous if no row matches** — SQLite fires `BEFORE DELETE` triggers
+  once per *matched* row. Seed before arming.
+- **⚠️ Asserting an error code is not asserting a path.** Two failures here raise `not_found` and both say
+  "re-sync"; pin a phrase only the path under test produces.
+- **⚠️ A staged red that gets skipped ships a vacuous test.** One acceptance leg ran with its policy flag
+  off, so it was withheld and asserted nothing until the flag was passed.
+- **Ticket line pointers are worthless.** **Every** pointer in M8.10's Context table was stale, some by 40+
+  lines, and one file path was wrong (`direct-router.ts` is not under `direct/`). Read the seam first.
+- **A `:memory:` store gives no second handle** for `SELECT COUNT(*)`; the raw handle is this suite's
+  independent witness. Use `mkdtempSync`.
+- **`DirectApiDeps.syncGate` is optional by design** — the wrapper and every prune read one binding inside
+  `createDirectApi`, so it cannot come apart by omission. Making it required would touch 40 construction
+  sites for no safety gain.
+
+### For M8.11 when it starts
+- `deleteLocalReview` now HAS a three-transport conformance leg (`packages/shared/conformance/local-delete.ts`)
+  — reuse that shape rather than inventing a second one.
+- The mock has **no `immutables` table**, so orphaning cannot exist there and the prune is invisible through
+  `RevuApi`. Retention is proven by revud-internal tests only. (M8.10 OQ9 — confirm that gap is deliberate.)
+- **Two pre-existing divergences were found and left alone**, both out of scope but real: on an unknown
+  local id the mock's `getSnapshot`/`getDraft`/`getFileViewed` answer `null`/`{}` while direct's local
+  surface answers `not_found`; and the mock's `saveDraft` stores under the body's `humanId` while direct
+  re-keys to the session. Either could bite a conformance leg that reads those surfaces.
+- `oracleResults` (`reconcile.test.ts:289`) replays only the mock's *classification*, not `newCommits`.
+- M8.8.4's pre-flight was deliberately not mirrored into the mock (the state is unreachable there).
+
 ## 2026-08-20 (later) — M8.10 is 7/7 units and NOT done; start at M8.10.8
 
 ### Orient
