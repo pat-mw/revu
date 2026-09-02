@@ -501,8 +501,12 @@ export function syncLocalReview(id: number): Snapshot {
       store.putLocalReview(record)
     }
   } else {
+    // Frozen only once the stored snapshot agrees with the row: a mark the
+    // snapshot does not yet reflect (set by another writer, or by hand) earns
+    // exactly one more real sync, so an archived review never serves a
+    // snapshot that still calls itself open.
     const frozen = store.getSnapshot(record.id)
-    if (frozen) return frozen
+    if (frozen && frozen.mutable.pull.state === 'closed') return frozen
   }
 
   const at = nowISO()

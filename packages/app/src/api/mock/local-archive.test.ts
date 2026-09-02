@@ -267,6 +267,27 @@ describe('an archived review is frozen at its last sync', () => {
     expect(record.lastSyncedAt).not.toBe(FROZEN_SENTINEL_SYNCED_AT)
   })
 
+  test('a mark the stored snapshot does not yet reflect earns exactly one catch-up sync', () => {
+    // The sync that finds a pull request stores a snapshot that already reads
+    // closed, so an archived review normally freezes onto a closed snapshot.
+    // A mark the snapshot does not reflect — set by hand here, as another
+    // writer would — must not freeze the review onto a stale open snapshot:
+    // one more real sync brings the snapshot into agreement with the row, and
+    // only then does the freeze take hold.
+    const { id } = createLocalReview(uncoveredPair('catch-up'))
+    const live = syncLocalReview(id)
+    expect(live.mutable.pull.state).toBe('open')
+
+    store.putLocalReview({ ...storedRecord(id), archivedPr: 4242 })
+
+    const caughtUp = syncLocalReview(id)
+    expect(caughtUp.mutable.pull.state).toBe('closed')
+    expect(store.getSnapshot(id)?.mutable.pull.state).toBe('closed')
+
+    const frozen = syncLocalReview(id)
+    expect(JSON.stringify(frozen)).toBe(JSON.stringify(caughtUp))
+  })
+
   test('an archived record with no stored snapshot syncs once, then freezes', () => {
     const id = putArchivedRecordWithoutSnapshot({
       baseName: 'main',
