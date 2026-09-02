@@ -307,3 +307,38 @@ exhaustiveness guard is red-first.
 - The app track is finished through M8.7. The daemon track is untouched and unblocked: **M8.2, M8.3, M8.4 are
   mutually independent** and all three need only M8.1. M8.5 needs all four.
 - Nothing merges until the whole workstream lands; `main` stays at `177068a`.
+
+**update — 2026-08-17 (session 4, the daemon — dispatch)**
+
+**Done**
+- **Board re-verified against the repo before any work**, per the board's own opening line. Every present-tense
+  claim held this time: In flight empty, tree clean at `d0cc1d0`, one worktree, four PRs with the stated bases,
+  `main` at `177068a`, `m8.6` ahead of its remote by one. Baseline gate re-run in the main tree:
+  **1611 pass · 1 skip · 0 fail · 83 files**.
+- **`m8.6/app-creation-flow` pushed** (`0c17be9`), moving that board-docs commit out of #72's range and into
+  #71's, where it belongs. Every ref is now pushed.
+- **Three lane branches created at `96b63de`** and the daemon track dispatched as three concurrent lanes —
+  the first genuinely parallel wave in this workstream. `m8.2/store-v4` is pushed and is the chain's base.
+- **The three guard rails dispatched first, one per lane**: M8.2.7 (nine PR-keyed tripwires, armed and green
+  on today's store), M8.3.8 (the D7 source scan plus the seeded real-git fixture harness), M8.4.6 (the
+  no-GitHub-client structural scan). M8.3.8 and M8.4.6 land **red by design** — both assert their target
+  modules exist, which is what stops them passing vacuously.
+
+**Decisions**
+- **The roadmap's S3 wave table was not dispatched.** It assumes the orchestrator can merge two workers'
+  versions of one file; integration is by copying whole files out of isolated worktrees, so two workers on one
+  file means one is silently discarded. The lanes run at the corrected widths.
+- **Integration and gating stay serial even though the work is parallel** — one main tree, and the gate ends in
+  a repo-wide `vite build`, so gates cannot overlap. Worker time is what parallelises.
+- **Within a lane, each unit is integrated before the next is dispatched**, because the units share files.
+- **All three branches start at the same commit and are rebased into the linear chain before their PRs open**
+  (§6), with the gate re-run after each rebase — a mechanical rebase is not a proof.
+
+**Blockers**
+- None new. **M8.12 OQ1** and **M8.10 OQ4** remain unruled and both bite at M8.10, not here. The two findings
+  handed to M8.1 by the app track are still unabsorbed and still ownerless.
+
+**Next**
+- Integrate and gate each lane's first unit, then walk each lane's chain. PRs open per ticket the moment that
+  ticket's `Verify` is green — after a fable-tier adversarial review of its full diff, never batched to session
+  end. Nothing merges; `main` stays at `177068a`.

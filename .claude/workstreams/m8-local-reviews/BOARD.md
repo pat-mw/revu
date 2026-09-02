@@ -10,25 +10,197 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing.** No unit is dispatched, no agent is running, no worktree is in use, the tree is clean and
-everything landed is committed and pushed. **M8.7 is `In Review` on PR [#72](https://github.com/pat-mw/revu/pull/72)**
-(base `m8.6`): all thirteen units landed, `Verify` green, the fable-tier adversarial review of the full diff
-run and its findings closed.
+**The daemon track is dispatched as three concurrent lanes.** M8.2, M8.3 and M8.4 are `In Progress`. Each
+lane has its own branch and its own serial unit chain; the lanes never share a file, so three workers run
+against each other while integration and gating stay serial in the main tree.
 
-**The next work is the daemon track**, which is untouched and unblocked: **M8.2, M8.3 and M8.4 are mutually
-independent**, own genuinely disjoint file sets, and each needs only M8.1. That is the first three-lane
-parallel wave in this workstream. ⚠️ **The roadmap's S3 wave table cannot be dispatched as written** — see
-`HANDOVER.md`'s top entry, which carries the corrected widths and names the four collisions.
+| lane | branch | chain (execution order, not numbering) | landed | in flight | lane tip |
+| --- | --- | --- | --- | --- | --- |
+| **A — M8.2** store v4 | `m8.2/store-v4` (base `m8.7`) | `.7 → .1 → .2 → .3 → .4 → .5 → .6` | **ALL 7 — `Verify` green, fable review run, fixes landed** | **none — `In Review` on [#73](https://github.com/pat-mw/revu/pull/73)** | `70dd63d` |
+| **B — M8.3** git builder | `m8.3/local-snapshot-builder` | `.8 → .1 → .2 → [.3 → .4 → .5 → .6] ∥ [.7] → .9` — the bracketed chain is serial on `local-sync.ts`+its test; `.7` is parallel to it (`local-git.ts` only) | **`.8 .1 .2 .3 .7`** — 5/9 | **`.4`** | `c0b14f2` |
+| **C — M8.4** write sink | `m8.4/local-write-sink` | `.6 → .1 → .8 → .2 → [.3 → .4 → .5] → .7 → .9` — `.7` and `.9` write **only** `local-writes.test.ts`, so they are serial, never two-wide | **`.6 .1 .8 .2`** — 4/9 | **`.3`** | `769dba2` |
+
+**The `lane tip` column is the STEP ZERO fast-forward target** for the next dispatch in that lane, and it
+advances as each unit lands. A worker whose worktree is still at the repo base commit has neither the lane's
+landed modules nor `node_modules`, and any result it produces before fast-forwarding is void.
+
+✅ **All three lanes now gate GREEN at `bun run check` exit 0**, and both deliberately-red guard rails are
+green: M8.3.8's went **24 → 8** at M8.3.1 → **0** at M8.3.2, and M8.4.6's went **11 → 9 → 8 → 0** at M8.4.2.
+Each drop was measured by moving the new file aside and back, so the guards are proved to be *reading* rather
+than passing by having nothing to read.
+
+### ⚠️ Two collisions the plan did not have — both cost width, neither cost work
+
+1. **M8.3.1's `process.cwd()` coverage guard is *designed* to go red when a new `local-*.ts` module appears**, so
+   **M8.3.2 had to edit `local-git.test.ts`** — the file M8.3.7 owns. Those two cannot overlap. M8.3.7 still ran
+   parallel to the `.3→.4→.5→.6` chain, just *after* `.2` rather than beside it. The forcing function worked
+   exactly as designed; it cost one unit of width, which is the right trade.
+2. **Every M8.2 unit that widens the `DirectStore` interface must also edit `direct/reconcile.test.ts`**, whose
+   fake enumerates every method so unlisted ones throw. The ticket's Verify claimed "exactly three files" and was
+   wrong; corrected there. New entries must **throw like the others**, never be no-ops, or reconcile silently
+   gains write access to a local table.
+
+### ⚠️ An orchestration hazard of this three-branch topology, hit once
+
+**`git checkout` aborts when the board has uncommitted edits, and the integration copy that follows then lands
+in the WRONG branch's tree.** It happened once this session: the checkout printed `Aborting`, the copy went into
+lane A's tree, and the gate failed loudly at exit 2. Recovered by deleting the misplaced files and committing the
+board edit where it belonged. **Commit or stash board edits before switching lanes**, and read the checkout's
+output rather than assuming it succeeded — with one working tree serving three lanes, a failed switch silently
+redirects an integration.
+
+### ⚠️ This file is authoritative on `m8.2/store-v4` only — a consequence of three concurrent branches
+
+Three lanes means three branches, and `BOARD.md` is one file. Maintaining it on all three would guarantee a
+conflict at every rebase, so:
+
+- **`BOARD.md` is written only on `m8.2/store-v4`, the chain base.** The copies on `m8.3` and `m8.4` are stale
+  until those branches are rebased onto their true bases, which happens before their PRs open. **A cold session
+  must `git checkout m8.2/store-v4` before trusting this file** — that is step 1 of the handover.
+- **Each ticket's `## Log` rides its own lane's branch**, because those are three different files and never
+  conflict. So M8.3's and M8.4's unit records live on their branches, not here.
+- This is a **deliberate deviation** from the "ticket State, Log and BOARD.md change in the same edit" rule,
+  forced by concurrency: the two writes happen in the same *integration step* but land on two branches. Recorded
+  rather than silently done. Ticket **State** rows and the table below stay here, so this file remains the one
+  place that claims what is `In Progress`.
+
+**All three guard rails have landed. Two are deliberately RED and that is the protocol, not a fault** — §4
+requires a guard rail to land before the code it constrains, and both assert their target modules *exist*,
+which is exactly what stops them passing vacuously on a tree with nothing to scan:
+
+| guard | commit | state now | goes green at |
+| --- | --- | --- | --- |
+| **M8.2.7** — nine PR-keyed tripwires | `4d7eb60` | **green and armed** — it constrains *today's* store, so there was nothing to wait for | already green |
+| **M8.3.8** — D7 source scan + real-git fixture | `d1c697e` | **24 fail**, all in `local-no-github.test.ts`; the fixture self-test is green | M8.3.2 (M8.3.1 drops it to 6) |
+| **M8.4.6** — no-GitHub-client scan | `4504876` | **11 fail**, all in `local-write-isolation.test.ts`; 28 assertions already pass | M8.4.2 |
+
+**Anyone who greens one of these by making its existence assertion conditional, skipping when a file is
+missing, or deriving the expected file set from whichever files happen to exist, has destroyed the guard while
+leaving it green.** The last variant is the "two quantities that move together" shape. Both were verified to
+*be able* to go green (placeholders created, scan run clean, placeholders deleted) — without that, a designed
+red is indistinguishable from a guard that can never pass.
+
+Every commit is otherwise gated green in the main tree, and each ticket `## Log` records the exact failure count
+and its location at that commit.
+
+### What the three guard rails measured — all three ban lists, and two dead members found
+
+Directive: every absence assertion gets a control that proves it can fail, and no ban list is trusted because
+it is written down. Running total across this workstream: **eight of ten measured lists contained a dead
+member.** This session's three:
+
+- **M8.2.7 — nine tripwires, all nine proved to fire by name.** The control caught a vacuous assertion *inside
+  the unit*: a `COUNT(*) type='trigger' === 9` pin that **nine wrong triggers satisfy**. Replaced with a
+  behavioral abort. Two SQLite facts verified rather than assumed, each of which would have produced a
+  never-firing trigger: `BEFORE INSERT` fires on an upsert even when it takes the `DO UPDATE` branch, and a
+  `BEFORE UPDATE`/`DELETE` row trigger fires only per **matched** row (so each guarded table is seeded before
+  arming — without that, six of nine would have read as installed while never firing once).
+- **M8.3.8 — six banned tokens, all six fire, and the suspected redundancy was overturned.** `getBlob` and
+  `getBlobObjects` are **disjoint, not subsumed**, because of the trailing `\b`: `/\bgetBlob\b/` does not match
+  `getBlobObjects(…)`. Written unbounded, `getBlob` would have made `getBlobObjects` dead weight. Five of six
+  are additionally witnessed against the *real* source of the modules that legitimately carry the vocabulary,
+  and the unwitnessed remainder is pinned as a literal.
+- **M8.4.6 — one genuinely dead discriminator, kept but pinned.** `./github-client` is **fully subsumed** by the
+  "basename contains github" rule and can never be the unique cause of a failure; it is kept with the
+  subsumption asserted by a test, so it cannot rot into a false sense of independent coverage. The *other*
+  suspected redundancy is not one: `https://` is not implied by `api.github.com` — each trips on a string the
+  other does not.
+
+### The daemon track — exactly what has landed, and the gate at that commit
+
+Every gate below was re-run **by the orchestrator in the main tree**, never trusted from a worker's isolated
+worktree. Counts differ per lane because the three branches carry disjoint work and have not been rebased into
+the chain yet.
+
+| unit | commit | lane | gate in the main tree at that commit |
+| --- | --- | --- | --- |
+| board — three-lane dispatch | `96b63de` | A (shared ancestor) | docs only |
+| board — rulings propagated into unit text | `ef6b851` | A (shared ancestor) | docs only |
+| **M8.2.7** — nine PR-keyed tripwires, armed | `4d7eb60` | A | **1617 pass · 1 skip · 0 fail · 83 files** |
+| **M8.2.1** — v4 schema, six tables, two high-water marks | `fbf17bb` | A | 1621 pass · 1 skip · 0 fail · 83 files |
+| board — the whole `DELETE` budget named | `78579f8` | A | docs only |
+| **M8.2.2** — mint / read / list / sync-patch / allocator | `a5844e1` | A | 1643 pass · 1 skip · 0 fail · 83 files |
+| **M8.2.3** — `local_snapshots`, immutable half untouched | `252d895` | A | 1655 pass · 1 skip · 0 fail · 83 files |
+| **M8.2.4** — per-human local drafts + viewed | `a133991` | A | **1667 pass · 1 skip · 0 fail · 83 files** |
+| **M8.3.8** — D7 scan + seeded real-git fixture | `d1c697e` | B | 1647 pass · 1 skip · **24 fail** · 85 files — all 24 the designed red |
+| **M8.3.1** — hardened git seam (fable tier) | `8c87a44` | B | 1730 pass · 1 skip · **8 fail** · 86 files — designed red, down from 24 |
+| **M8.3.2** — ref resolution + merge base, live base tip | `9f52bfe` | B | 1778 pass · 1 skip · 0 fail · 87 files — **first exit 0 on B** |
+| **M8.3.3** — raw diff → `files` + `blobIndex` | `aec7b7e` | B | 1867 pass · 1 skip · 0 fail · 87 files |
+| **M8.3.7** — `listBranches` | `c0b14f2` | B | **1900 pass · 1 skip · 0 fail · 87 files** |
+| **M8.4.6** — no-GitHub-client structural scan | `4504876` | C | 1639 pass · 1 skip · **11 fail** · 84 files — all 11 the designed red |
+| **M8.4.1** — the module and its port | `4387987` | C | 1656 pass · 1 skip · **9 fail** · 85 files — designed red |
+| **M8.4.8** — the in-memory harness | `060eba5` | C | 1664 pass · 1 skip · **8 fail** · 85 files — designed red |
+| **M8.4.2** — local id minting | `4e7475d` | C | 1720 pass · 1 skip · 0 fail · 86 files — **first exit 0 on C** |
+| guard — scan both local test files | `769dba2` | C | **1721 pass · 1 skip · 0 fail · 86 files** |
+
+`bunx tsc -b` and `bunx oxlint` are clean at every commit above, including the two carrying a red test leg —
+the deliberate reds are assertion failures, never compile failures.
+
+### Findings this session, beyond the units themselves
+
+**Live defects found in code that predates M8 — both on the pull-request path:**
+
+1. **`putSnapshot`'s preservation read sat outside the durability wrapper** (found by M8.2.3). Any read fault on
+   `immutables` during a snapshot write — a disk I/O error, a corrupt page, or `SQLITE_BUSY`, and this codebase
+   explicitly contemplates two daemons sharing one `REVU_DATA_DIR` — escaped as a raw untyped driver error, missed
+   the router's `instanceof` check, and became a **generic 500 instead of `persist_failed`**. Fixed for both
+   producers. The closed-database `RangeError` that exposed it is test-only; the hole was not.
+2. **A raw NUL byte was committed inside a source file** (found by M8.4.8, verified independently before
+   integrating). It made the file **binary to `git diff`**, so its contents were invisible in a diff — and this
+   milestone gates every PR on a fable-tier adversarial review **of the full diff**. It would have passed that
+   review unread. Fixed; both files verified at 0 control bytes.
+
+**Three findings for M8.1** — two inherited from the app track, one new. None is a type change; all three are the
+owner's to absorb, and **the mock is the specification, so none is cosmetic**:
+
+- `dirty: true` is **unrepresentable** — no fixture sets it, so the dirty banner's data path has never executed
+  against a true value anywhere. One seeded fixture closes it.
+- The mock emits a **session shape the real daemon never produces** (`viewerLogin` omitted while `brokerLogin` is
+  set).
+- **NEW:** `BranchRef.isDefault`'s docstring says "Exactly one entry in a branch listing carries `true`", but a
+  repo with **no origin** must carry **no** marker, and M8.3.7's fixture leg asserts exactly that. A **docstring
+  inaccuracy, not a type problem** — no `packages/shared` change was made or needed, so it is not a frozen-contract
+  stop.
+
+**One question for the owner, deliberately not answered here.** `direct-router.ts:187` maps `StoreWriteError`
+**and** `StoreUnreadableError` to the same `persist_failed` (500), by design per its docstring. So a client cannot
+distinguish a retryable persist failure from a corrupt row on disk. M8.2.3 preserves the distinction *in process*;
+making it real **end to end** needs a separate wire code, which is **a ticket of its own** and was deliberately
+not smuggled into a store unit.
+
+**The running tally on guards that assert nothing is now twelve measured lists, ten with a dead member.** What the
+measurements found this session, beyond the three guard rails:
+
+- **A dead member is not always a dead *guard*.** `getBlob` vs `getBlobObjects` are **disjoint** because of a
+  trailing `\b`; written unbounded, the short one would have made the long one dead weight.
+- **Three subsumptions found and pinned rather than left implicit**: the raw diff's all-zero object-name mapping is
+  subsumed by the status rules (removing it turned only 2 tests red, **neither a `blobIndex` assertion**); the
+  compare key's separator-count pin can **never** be the unique cause of a red; and three of the id-band sweep's
+  six clauses are arithmetic consequences of the floor. All three are now executable assertions, so the
+  subsumption goes red if the constants move — not comments that rot.
+- **Two new failure shapes for the memories.** (a) **A control that edits the wrong site reports a false green** —
+  one falsification silently hit a different function's transaction because the pattern was no longer unique.
+  (b) **A coverage guard expressed as a loop over a version constant is only falsifiable once that constant
+  moves** — the ladder pin was green until `STORE_VERSION` was bumped as its own step.
+- **`Object.keys` cannot see an optional interface member the factory never sets** — invisible to `tsc`, to the
+  key-set assertion, and to the D7 scan. Closed with a **type-level mutual-assignability check** against a
+  written-out member tuple, which is the only thing that can see a member the runtime never materializes.
+
+**The wave widths came from `HANDOVER.md`'s top entry, not from `ROADMAP.md`'s S3 table**, which plans
+`3 → 4 → 6 → 6 → 4 → 2 → 1 → 1` on the assumption that the orchestrator can merge two workers' versions of
+one file. It cannot — integration is by copying whole files out of isolated worktrees — so the honest widths
+are `3 → 4 → 3 → 4 → 2 → 1 → 1 → 1` and the four collisions are named there. Do not re-derive them.
 
 **The stack, bottom-up — four PRs open, none merged.** `main` → `m8/local-reviews-design`
 ([#69](https://github.com/pat-mw/revu/pull/69)) → `m8.1` ([#70](https://github.com/pat-mw/revu/pull/70)) →
 `m8.6` ([#71](https://github.com/pat-mw/revu/pull/71)) → `m8.7` ([#72](https://github.com/pat-mw/revu/pull/72)).
 #69 has no ticket row below because it is the design/board PR, not a ticket — but it gates the merge order.
+The three new lanes extend it: `m8.2` on `m8.7`, then `m8.3` on `m8.2`, `m8.4` on `m8.3`. All three branches
+**start** at `d0cc1d0` because they run concurrently; each is rebased onto its true base before its PR opens,
+per `SESSION_PROTOCOL.md` §6 ("parallel results get rebased into the chain before their PRs open").
 
-⚠️ **One ref is not pushed:** local `m8.6/app-creation-flow` is **ahead of its remote by one commit**
-(`0c17be9`, a board-docs commit). Its *content* is safe — it is an ancestor of `m8.7`'s tip and therefore on
-the remote — but PR #71's diff does not contain it and it rides in #72's range instead. Push `m8.6` and it
-moves to where it belongs.
+✅ **Every ref is pushed.** `m8.6/app-creation-flow` was one commit ahead of its remote (`0c17be9`, board
+docs); it is pushed, so that commit now sits in #71's range instead of riding in #72's.
 
 | ticket | state | where |
 | --- | --- | --- |
@@ -85,9 +257,9 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
-| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | Todo | 7 | revud | M8.1 | `m8.2/store-v4` | — |
-| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
-| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
+| [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | **In Review** | 7 | revud | M8.1 | `m8.2/store-v4` | [#73](https://github.com/pat-mw/revu/pull/73) |
+| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Progress** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
+| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Progress** | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |

@@ -5,6 +5,139 @@ act from it alone.
 
 ---
 
+## 2026-08-17 — Session 4 (the daemon) — **M8.2 COMPLETE on #73; M8.3 and M8.4 at 7/9 each**
+
+> **This entry is live.** Two workers were in flight when it was written — see *In flight* below; a cold session
+> re-dispatches them. `BOARD.md` (on `m8.2/store-v4`) is the minute-to-minute truth. **No §5 stop condition was
+> hit.** Nothing merged; `main` is untouched at `177068a`.
+
+### Start here
+
+1. **`git checkout m8.2/store-v4`** — the board is authoritative *only* there (three lanes, one `BOARD.md`;
+   maintaining it on all three would conflict at every rebase). The copies on `m8.3`/`m8.4` are stale until
+   those branches rebase.
+2. `bun run check` per lane — **all three gate green at exit 0**: `m8.2` **1702**, `m8.3` **2032**, `m8.4`
+   **1787** pass, each with 1 pre-existing skip and 0 fail.
+3. Read `BOARD.md`'s **In flight right now** for the lane table and per-commit gate ledger.
+
+### Where each lane stands
+
+| lane | branch | tip | landed | left |
+| --- | --- | --- | --- | --- |
+| **A — M8.2** | `m8.2/store-v4` | `69cd6d7` | **all 7 — DONE**, `Verify` green, fable review run, its fixes landed | **nothing — `In Review` on [#73](https://github.com/pat-mw/revu/pull/73)** |
+| **B — M8.3** | `m8.3/local-snapshot-builder` | `9dfc2ee` | `.8 .1 .2 .3 .7 .4 .5` — 7/9 | **`.6` (in flight), then `.9`** |
+| **C — M8.4** | `m8.4/local-write-sink` | `bce196b` | `.6 .1 .8 .2 .3 .4 .5` — 7/9 | **`.7` (in flight), then `.9`** |
+
+**The stack, bottom-up — five PRs, none merged:** `main` → #69 → #70 → #71 → #72 → **#73**. When M8.3 and M8.4
+finish, **rebase `m8.3` onto `m8.2`'s tip and `m8.4` onto `m8.3`'s**, re-run the gate after each rebase (a
+mechanical rebase is not a proof), then open their PRs in that order.
+
+### ⚠️ In flight — re-dispatch these two
+
+- **M8.3.6** — `provisionBlobs` local-only + `detectDirtyWorktree`. Files: `blobs.ts`, `blobs.test.ts`,
+  `local-sync.ts`, `local-sync.test.ts`. **`local-sync.ts` EXISTS and must be extended** (the ticket's
+  file-creation inversion is already resolved — M8.3.2 created it). Fast-forward target `9dfc2ee`.
+- **M8.4.7** — optimistic-path convergence. **Adds tests only**, to `local-writes.test.ts`; changes no production
+  code. Fast-forward target `bce196b`. It was briefed to **first measure whether its Check is already covered**
+  by the earlier whole-object comparisons, and to skip duplicates rather than add noise.
+
+Then **M8.3.9** (structural parity with the GitHub producer, a new file) and **M8.4.9** (the full loop + the
+draft-survival matrix, `local-writes.test.ts` only — **serial with M8.4.7, same file**).
+
+### Then, per ticket: `Verify` → fable-tier review of the FULL diff → PR. In that order, never batched.
+
+That is §8 and it earned its keep on M8.2: the review found **no blockers but a real band violation** —
+SQLite casts a non-numeric string to `0` silently, so a corrupted id high-water mark minted **id 1**, inside the
+forge's PR-number range, in the table whose whole purpose is to stay out of it, and then overwrote the corrupt
+value. Fixed by moving the guards into the statement's `WHERE` clause, because the entity allocator runs with
+**no surrounding transaction** and a check on the result would refuse only after the overwrite committed.
+
+### Decisions not to relitigate
+
+- **Integration is serial even though the work is parallel.** One tree, and the gate ends in a repo-wide
+  `vite build`, so gates cannot overlap. Worker time is what parallelises; that is the whole win.
+- **Workers never commit.** The orchestrator copies whole files out of the worktree, gates **in the main tree**,
+  and commits. Never trust a gate from a worker's tree.
+- **Within a lane, integrate a unit before dispatching the next** — they share files.
+- **`BOARD.md` lives on `m8.2` only; each ticket's `## Log` rides its own lane.** A deliberate deviation from
+  "same edit", forced by concurrency and recorded in the board.
+- **Every brief opens with STEP ZERO** (`git log` → `git merge --ff-only <lane tip>` → `bun install`). A worktree
+  is created at the repo BASE commit with no `node_modules`; any result produced before that is void.
+
+### Hazards — three of these cost real time this session
+
+1. **`git checkout` aborts on uncommitted board edits, and the integration copy that follows lands in the WRONG
+   lane's tree.** Happened once; the gate caught it at exit 2. **Commit or stash board edits before switching
+   lanes, and read the checkout's output** rather than assuming it succeeded.
+2. **Reverting a break-observe-revert control is dangerous — three incidents.** `git checkout -- <file>`
+   discarded a whole unit's production diff; a targeted revert whose anchor was `putDraft` also matched inside
+   `putLocalDraft` and corrupted the pull-request path; the adversarial reviewer hit the same trap independently.
+   **Verify a revert restored exactly the control's edit** — diff against a pristine copy, do not trust the edit's
+   return.
+3. **A raw NUL byte in a source file makes it binary to `git diff`.** One was committed here. Its contents are
+   then **invisible in a diff** — and every PR in this milestone is gated on a review *of the full diff*, so it
+   would have passed unread. Check with `file(1)` or a byte scan.
+4. **`gh pr create` uses a GraphQL mutation that 503'd repeatedly** while queries worked. `gh api repos/<o>/<r>/pulls
+   -X POST` over REST worked first time. Use it if `pr create` fails.
+5. **A host-machine sleep kills every in-flight worker at once**, mid-response. It happened here to both lanes
+   simultaneously. **That is a harness stall, not a failed Check — re-dispatch at the SAME tier, do not
+   escalate**, and prefer **resuming** the worker (its transcript, and therefore its already-recorded red
+   observations, survive) over restarting it from scratch. A resumed worker must first re-establish footing:
+   `git status --porcelain` and `git diff --numstat` in its worktree, confirm HEAD is still the lane tip, and
+   re-run `bun install` — **a stall can leave a worktree mid-edit, and `node_modules` may be gone.** Ask it
+   explicitly to re-derive any observation it can no longer evidence rather than restate it from memory.
+
+### Findings that belong to other tickets — none absorbed silently
+
+**For M8.1 (the contract), now FOUR:** `dirty: true` is unrepresentable (no fixture sets it); the mock emits a
+session shape the daemon never produces (`viewerLogin` omitted while `brokerLogin` is set); **`BranchRef.isDefault`'s
+docstring says "exactly one entry carries true" but a repo with no origin must carry none** — a docstring
+inaccuracy, not a type problem; and **`newCommits` genuinely diverges** — the mock returns a constant `0` because
+its store has no commit list, while the sink mirrors the hosted path's delta.
+
+**For M8.5 (daemon wiring):**
+- **The port's `putLocalReviewSummary` does NOT match the store's `putLocalSubmittedReview`** — the v4 tables do
+  **not** satisfy the slice structurally. Wire with an explicit mapping, never a spread. (A spread that misses
+  the member is a compile error, so it cannot be silently skipped.)
+- **`LocalReviewIdentity` requires a `defaultBranch`** — `listBranches` already knows it.
+- **A two-daemon deployment will want `PRAGMA busy_timeout` or `BEGIN IMMEDIATE`** on the mint: two WAL
+  connections with an interleaved commit throw `database is locked` *before* `ON CONFLICT` can matter. Final
+  state is correct and a retry idempotent, but a duplicate create surfaces as a write failure, not success.
+- **`bun-env.d.ts` under-declares `db.transaction` as returning `void`**; the runtime forwards the callback's
+  result. Deliberately not widened as a side effect.
+
+**For M8.11 (conformance):** the two mock-vs-sink divergences above, plus a structural one — the mock resolves
+threads off its *record* so it can find a thread with no snapshot, where the sink returns `not_found`
+(unreachable in practice, since a submit refuses without a snapshot).
+
+**For the owner, deliberately not decided here:** `direct-router.ts:187` maps `StoreWriteError` **and**
+`StoreUnreadableError` to the same `persist_failed` (500), by design per its docstring — so a client cannot tell a
+retryable persist failure from a corrupt row. Making that distinction real end-to-end needs a separate wire code
+and is **a ticket of its own**; it was not smuggled into a store unit.
+
+**A latent defect left in place, deliberately:** `%aI` carries the author's UTC offset while `draft.createdAt` is
+always `Z`, and **three call sites compare them as strings** (`reconcile.ts:96`, `mock/adapter.ts:686`,
+`files.tsx:370`). M8.3.5 emits the UTC spelling so it cannot trip them, but **the three sites remain fragile for
+any other producer.** Worth its own ticket.
+
+### Still unruled, and not this session's to decide
+
+**M8.12 OQ1** (a server-authoritative delete force has nowhere to live in the frozen route set) and **M8.10 OQ4**
+(what `deleteLocalReview` must prove it removes). Both bite at M8.10. R-B removes OQ4's grip on M8.2 but does not
+close it.
+
+### What the measurements bought — the argument for keeping this discipline
+
+**Sixteen ban/pin lists measured, twelve contained a dead member**, and the session found **five new shapes** of
+guard that asserts nothing (all now in `memories/known-landmines.md`): an argv pin for a flag that is already the
+tool's **default**; a **fixture whose fields already agree**, which made *nine of twelve* derivations untestable;
+a coverage loop over a version constant that cannot fail until the constant moves; an **optional interface member
+no factory sets**, invisible to compiler and key-sweep alike; and the finding that a **whole-object comparison
+beat named field assertions 16 mutants to none**. Two live defects in code predating M8 were found as a side
+effect — `putSnapshot`'s pre-read outside the durability wrapper, and the NUL byte.
+
+---
+
 ## 2026-08-17 — Session 3 (the app, finished) — **M8.7 COMPLETE and in review on #72**
 
 > **Read this section and the _Standing rulings_ in the 2026-08-14 entry below; both are live.** Nothing is in
