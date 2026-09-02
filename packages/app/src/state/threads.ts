@@ -3,6 +3,8 @@ import type { UseMutationResult } from '@tanstack/react-query'
 import { api } from '@/api'
 import type { ApiError, GhUser, ReactionKey, ReactionRollup, ReviewComment, ReviewThread, Session, Snapshot } from '@revu/shared'
 import { prefixBody } from '@revu/shared'
+import type { ReviewMode } from '@/lib/review-mode'
+import { reviewMode } from '@/lib/review-mode'
 import { qk, useSnapshot } from './queries'
 import { useSession } from './session'
 
@@ -123,19 +125,139 @@ function nextSyntheticId(): number {
   return syntheticSeq--
 }
 
-function brokerUser(login: string): GhUser {
-  return { login, id: 0, node_id: '', avatar_url: '', html_url: '', type: 'Bot' }
+/**
+ * An author on the github.com side, as much of one as an optimistic comment can
+ * know. The login is certain — it is the account the write authenticates as —
+ * while the numeric id, node id and URLs are minted by github.com and arrive
+ * with the stored comment. They are left empty rather than guessed: an empty
+ * avatar already means "no avatar" to every renderer, and nothing downstream
+ * reads a comment author's ids.
+ */
+function pendingGithubUser(login: string, type: GhUser['type']): GhUser {
+  return { login, id: 0, node_id: '', avatar_url: '', html_url: '', type }
 }
 
 /**
- * Builds the reply exactly as the server would return it: authored by the
- * broker bot, with the human identity smuggled into the body prefix — so the
- * render pipeline (identity parsing included) treats the optimistic comment
- * identically to the real one that replaces it.
+ * The sentinel author a local write records. The display name rides in `login`,
+ * the only name-shaped field a GitHub user has; `id: 0` sits outside every real
+ * band (GitHub ids are positive and nothing local mints them); `type: 'Bot'`
+ * marks it as not a genuine GitHub account; the URLs are empty because there is
+ * nothing on github.com to link to. The email never appears — it is a storage
+ * key, not something to render.
+ */
+function localReviewer(name: string): GhUser {
+  return {
+    login: name,
+    id: 0,
+    node_id: 'local:user',
+    avatar_url: '',
+    html_url: '',
+    type: 'Bot',
+  }
+}
+
+/**
+ * Whether writes from this session go out as one shared bot — which decides
+ * both who authors a mediated comment and whether its body carries the human's
+ * smuggled `**Name** (role)` prefix.
+ *
+ * `brokerLogin` is the fact: it is the empty "no bot" sentinel when the session
+ * writes as a real GitHub user or has no write identity at all, and the bot's
+ * login when one shared account fronts many humans. That is the same fact the
+ * write path branches on, so reading it here keeps the optimistic comment and
+ * the stored one derived from one condition instead of two that can drift
+ * apart.
+ */
+function stampsWrites(session: Session): boolean {
+  return session.brokerLogin !== ''
+}
+
+/**
+ * The body an optimistic reply should carry: stamped only when the session
+ * stamps AND the reply lands on a pull request.
+ *
+ * A stamp exists solely to distinguish humans who share one account. Applying
+ * it where nothing is shared puts `**Name** (role)` into the rendered comment
+ * as literal markdown until the unstamped stored comment replaces it, because
+ * the identity parser only strips a prefix off a comment authored by the bot.
+ *
+ * Both halves of the condition are real. A session with no bot never stamps
+ * anything. A local review is never stamped even under a session that carries
+ * a bot, because a local write is never mediated by an account at all: it is
+ * stored verbatim beside a record of who wrote it, so the identity a stamp
+ * would smuggle is already held structurally.
+ */
+export function optimisticBody(session: Session, mode: ReviewMode, body: string): string {
+  if (mode === 'local' || !stampsWrites(session)) return body
+  return prefixBody(session.human, body)
+}
+
+/**
+ * Who an optimistic resolve is attributed to: the identity the write records,
+ * which is a different identity on a local review than on a pull request.
+ *
+ * A local resolution names the reviewer's display name, because there is no
+ * account behind it to name and an email is never rendered. On a pull request
+ * the session's own login is what lands: with a shared bot it IS the bot login,
+ * and without one it is the real authenticated user. The display name is also
+ * the last resort for a session carrying no login at all — that shape cannot
+ * write, but a derivation that can return an empty login is one an empty login
+ * can reach the screen through, and the resolved-by line renders whatever it is
+ * given.
+ */
+export function optimisticResolvedBy(session: Session, mode: ReviewMode): { login: string } {
+  if (mode === 'local') return { login: session.human.name }
+  if (session.viewerLogin !== undefined && session.viewerLogin !== '') {
+    return { login: session.viewerLogin }
+  }
+  if (session.brokerLogin !== '') return { login: session.brokerLogin }
+  return { login: session.human.name }
+}
+
+/**
+ * Who an optimistic reply is authored by: the identity the write path records,
+ * which is a different identity on a local review, under a shared bot, and
+ * under a session that reaches GitHub as itself.
+ *
+ * The optimistic comment is replaced by the stored one on success, so an author
+ * that disagrees is a visible change of face under the reader — and the widest
+ * disagreement available is an author with no login at all, which is what a
+ * session carrying no shared account holds.
+ *
+ * A local reply is authored by the sentinel local reviewer under EVERY session,
+ * because a local write is never mediated by an account: the local branch of
+ * the write path is taken above the account it would otherwise write through,
+ * so a bot the session happens to carry never reaches the stored comment. On a
+ * pull request the shared bot is the author wherever one exists, since every
+ * mediated write really is posted by that one account; without one the session
+ * writes to GitHub as the authenticated viewer, and that login is what lands.
+ *
+ * The last branch is a session with no write identity at all — a shape whose
+ * writes are refused before they reach GitHub. It converges on nothing because
+ * nothing is ever stored; it only has to be total and nameable, and a display
+ * name is the one name such a session holds. It is kept separate from the local
+ * branch whose login it coincides with: the two carry the same name for
+ * unrelated reasons, and folding them together would read as a rule.
+ */
+export function optimisticAuthor(session: Session, mode: ReviewMode): GhUser {
+  if (mode === 'local') return localReviewer(session.human.name)
+  if (stampsWrites(session)) return pendingGithubUser(session.brokerLogin, 'Bot')
+  if (session.viewerLogin !== undefined && session.viewerLogin !== '') {
+    return pendingGithubUser(session.viewerLogin, 'User')
+  }
+  return pendingGithubUser(session.human.name, 'Bot')
+}
+
+/**
+ * Builds the reply exactly as the write path would return it: authored by the
+ * identity that write records, and stamped only where that write path stamps —
+ * so the render pipeline (identity parsing included) treats the optimistic
+ * comment identically to the real one that replaces it.
  */
 function syntheticReply(
   thread: ReviewThread,
   session: Session,
+  mode: ReviewMode,
   body: string,
   id: number,
 ): ReviewComment {
@@ -157,8 +279,8 @@ function syntheticReply(
     side: thread.diffSide,
     start_side: null,
     subject_type: thread.subjectType === 'FILE' ? 'file' : 'line',
-    user: brokerUser(session.brokerLogin),
-    body: prefixBody(session.human, body),
+    user: optimisticAuthor(session, mode),
+    body: optimisticBody(session, mode, body),
     created_at: at,
     updated_at: at,
     reactions: emptyRollup(),
@@ -211,7 +333,7 @@ export function useReplyToThread(
       if (previousSnapshot) {
         const thread = previousSnapshot.mutable.threads.find((t) => t.id === threadId)
         if (thread) {
-          const synthetic = syntheticReply(thread, session, body, syntheticId)
+          const synthetic = syntheticReply(thread, session, reviewMode(prNumber), body, syntheticId)
           const withReply = withThread(previousSnapshot, threadId, (t) => ({
             ...t,
             comments: [...t.comments, synthetic],
@@ -288,8 +410,10 @@ export function useResolveThread(
           withThread(previousSnapshot, threadId, (t) => ({
             ...t,
             isResolved: resolved,
-            // GitHub records the resolver as the shared bot — mirror that.
-            resolvedBy: resolved ? { login: session.brokerLogin } : null,
+            // Attribute to the acting identity, which is what the write records
+            // — an optimistic resolver that disagrees swaps under the reader on
+            // success, because `onSuccess` copies `resolvedBy` from the response.
+            resolvedBy: resolved ? optimisticResolvedBy(session, reviewMode(prNumber)) : null,
           })),
         )
       }

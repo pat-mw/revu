@@ -17,6 +17,8 @@ import { Spinner } from '@/components/ui/spinner'
 import { useToast } from '@/components/ui/toast'
 import { cn } from '@/lib/cn'
 import { blobLines } from '@/lib/diff'
+import { reconcileFailureCopy, reconcileSuccessCopy } from '@/lib/mode-copy'
+import { reviewMode } from '@/lib/review-mode'
 import { relativeTime, shortSha } from '@/lib/time'
 import { useDraft, useDraftActions, useReconcile, useSubmitReview } from '@/state/drafts'
 import { qk, useBlob, useSnapshot, useSyncPull } from '@/state/queries'
@@ -116,6 +118,9 @@ export function ReconcileDialog({
   const sync = useSyncPull(prNumber)
   const reconcile = useReconcile(prNumber)
   const { toast } = useToast()
+  // Derived from the number this dialog is already about, so what it reports
+  // after a submit cannot disagree with the bar that opened it.
+  const mode = reviewMode(prNumber)
 
   const [live, setLive] = useState<ReconcileReport>(report)
   const [decisions, setDecisions] = useState<Record<string, ReconcileDecision | undefined>>(
@@ -229,11 +234,7 @@ export function ReconcileDialog({
         comments: updated,
       })
       if (outcome.status === 'ok') {
-        toast({
-          kind: 'success',
-          title: 'Review posted after reconcile',
-          detail: `${kept} kept, ${dropped} dropped — one API call.`,
-        })
+        toast({ kind: 'success', ...reconcileSuccessCopy(mode, kept, dropped) })
         onOpenChange(false)
       } else if (outcome.status === 'head_moved') {
         toast({
@@ -253,7 +254,7 @@ export function ReconcileDialog({
       toast({
         kind: 'error',
         title: describeApiError(error),
-        detail: 'Your reconciled draft is saved on the broker — nothing was lost.',
+        ...reconcileFailureCopy(mode),
       })
     } finally {
       setBusy(false)
