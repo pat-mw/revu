@@ -59,6 +59,39 @@ Malformed pulled rows are rejected individually with field-naming,
 value-free reasons — never silently dropped, never allowed to block valid rows
 (`host-store.ts:validateAuditEntry`).
 
+### Local reviews: no client to reach GitHub with, and no journal row
+
+A local review — two branches compared inside the workspace, with no pull
+request behind it — has its own write path, and **that path has no GitHub
+client in scope.** Not a client it declines to call: the seam is absent from the
+module (`packages/revud/src/direct/local-writes.ts`), along with the
+body-stamping/journalling write decorator and the subprocess runner, so there is
+no socket a later change could quietly repoint at a remote. The absence is
+enforced rather than asserted in prose — a source scan walks the local write
+path's import graph and fails on an import of a GitHub client, a write
+decorator, a command runner, or any network or subprocess vocabulary, at import
+depth zero and at every depth below, with the scanned file set and the ban list
+each separately proved non-vacuous
+(`packages/revud/src/direct/local-write-isolation.test.ts`).
+
+Local reviews are also **not journaled.** Nothing on the local path appends to
+`audit_log`, and no locally minted identifier is ever written to
+`snapshots.pr_number`, `audit_log.pr`, or `pr_author.pr` — local reviews live in
+their own `local_*` tables. The port the local write sink is handed is a
+written-out member list carrying neither `appendAudit` nor `putSnapshot`, and
+that absence is checked against a store proved to really carry both, so it
+cannot pass vacuously (`direct/local-surface.ts:buildLocalWriteDeps`,
+`direct/local-surface.test.ts`).
+
+That is what keeps `PR #N` meaning what it says. The host collector and the
+out-of-band-write detector read those columns as real GitHub pull request
+numbers; a sentinel among them would have the journal describing artifacts that
+exist on nobody's repository. **Local reviews are deliberately invisible to the
+audit trail because they are deliberately invisible to the client.** The
+journal's subject is writes that reached the client repository, and a local
+review reaches nothing — no comment, no verdict, no artifact of any kind — so
+there is nothing for the journal to be silent about.
+
 ## Workspace isolation
 
 A draft belongs to one human and is unreachable from any other workspace.
@@ -113,7 +146,11 @@ What a hostile workspace **can** do:
   PATCH edits (a mediated review's body can be rewritten out-of-band with no
   detectable trace: reviews expose no `updated_at`), PR title/body edits, and
   `contents: write` — plus point-in-time gaps, all documented in
-  `out-of-band-writes.ts`.
+  `out-of-band-writes.ts`;
+- review branches locally with no journal row anywhere — local reviews sit
+  outside the audit trail by design. That is not a way to conceal anything: the
+  writes a local review produces reach no repository at all, so there is no
+  GitHub artifact whose missing journal row could cover one.
 
 What a hostile workspace **cannot** do:
 
@@ -126,7 +163,10 @@ What a hostile workspace **cannot** do:
 - make revu serialize, log, or mint a credential (revu holds no credential of
   its own to mint, and the injected one never crosses the HTTP boundary);
 - rewrite or delete landed audit rows (append-only journal; offboarding
-  retains it).
+  retains it);
+- reach the client repository through a local review (the local write path
+  holds no client to reach it with, and mints no pull-request-shaped identifier
+  the collector could mistake for one).
 
 **Bottom line:** revu's guarantees are custody (no new credential, no token
 serialization), integrity (append-only, host-keyed attribution), and isolation

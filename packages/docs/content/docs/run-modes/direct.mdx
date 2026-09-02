@@ -148,6 +148,41 @@ responses.
 
 ![Checks — check runs and mergeability refetch on every sync, unconditionally, shown here with a failing check run and a log excerpt](/assets/screenshots/checks.png)
 
+## Reviewing a branch with no pull request
+
+Direct mode also reviews **local branches**. Pick a base and a head from the
+branches in your workspace and review the diff between them with no pull
+request, no push, and no token — it is the same pipeline (same snapshot, same
+drafts, same reconcile) pointed at a branch pair instead of a pull request, and
+it needs no network at all.
+
+Start one from the inbox header's **New local review** control, with `g` `l`, or
+from the command palette's **Go** group.
+
+Three things differ from a pull-request review, and each is deliberate:
+
+- **Committed content only.** The diff is the merge base of the pair against the
+  head tip, built from commit SHAs, so uncommitted edits in your working tree
+  are not in it. When the tree was dirty at the last sync, the review says so in
+  a banner under its header.
+- **The merge base is computed against the live base tip.** `git merge-base` is
+  run against wherever the base branch is right now, so a local review's
+  [compare key](/docs/concepts/compare-key) can change on a base advance with
+  zero new head commits. A pull request cannot do that: GitHub only refreshes a
+  pull request's base SHA when it records a `synchronize` event. The two paths
+  genuinely disagree about what changed, and the local answer is the one taken
+  here.
+- **Nothing is ever published.** The local write path holds no GitHub client at
+  all — the capability is structurally absent from the module rather than
+  declined by a branch inside it — so a local comment cannot reach GitHub, and
+  no publish or export action exists. When a pull request later covers the same
+  branch pair the local review goes read-only and keeps everything, and nothing
+  in it is copied across.
+
+Local reviews persist to the same SQLite file as everything else, in their own
+tables. Full walkthrough:
+[Reviewing a local branch](/docs/guides/local-review).
+
 ## Environment variables
 
 Direct mode's environment variables:

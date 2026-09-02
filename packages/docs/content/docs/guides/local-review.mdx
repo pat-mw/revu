@@ -1,0 +1,178 @@
+---
+title: Reviewing a local branch
+description: Review a branch against a base with no pull request, no push, and no token — and nothing in it ever reaches GitHub.
+---
+
+Not every review should start by publishing the work. A **local review**
+compares two branches that live in your workspace: no pull request is opened,
+nothing is pushed, no token is used, and the review — every inline comment,
+every reply, every verdict — stays on the machine that created it.
+
+Everything else is the review loop you already know. Same diff surface, same
+[drafts](/docs/concepts/drafts), same [snapshot](/docs/concepts/snapshot) seal,
+same [reconcile](/docs/concepts/reconcile) when the branch moves under you. The
+only thing that changes is what is being named: a branch pair instead of a pull
+request.
+
+Local reviews are a capability of [direct mode](/docs/run-modes/direct), not a
+run mode of their own. Follow along in mock mode — the demo workspace already
+holds one, **Pre-tag review of release/0.41** (`main ← release/0.41`).
+
+## 1. Create the review
+
+Three doorways, all raising the same dialog:
+
+- **New local review** in the inbox header row, beside the List/Tree control.
+- `g` `l` from any screen.
+- **New local review** in the command palette's **Go** group (`⌘K`).
+
+The dialog is titled **Review a branch**, and says what it is doing: *Compare
+two branches in this workspace. Nothing is pushed and no pull request is
+opened.*
+
+| Field | What it takes |
+|---|---|
+| **Base** | What the work is compared against. Remote-tracking branches count — comparing against `origin/main` is ordinary. |
+| **Head** | The work under review. Local branches only. |
+| **Title** | Defaults to the head branch name. |
+
+Both pickers filter as you type, and both key on the fully qualified ref rather
+than the short name — a remote-tracking `origin/main` and a local branch
+literally named `origin/main` are different branches that read identically.
+
+<Callout type="warn" title="The title is set once">
+A local review cannot be renamed. The dialog says so under the field: *Set
+once. A local review cannot be renamed later — only deleted and remade, which
+discards its drafts and threads.* Pick a title you can live with.
+</Callout>
+
+**Create review** lands you on the review. Asking for the same two branches
+again is not an error — it resolves onto the review that already exists, so a
+second attempt lands exactly where the first did.
+
+Nothing here needs a network. There is no remote to reach, no token to resolve,
+and no rate budget to spend.
+
+## 2. Find it again in the inbox
+
+Local reviews get their own **Local reviews** section in the inbox. It sits at
+the top while any of them is open — work in hand outranks pull requests — and
+drops below every other section once they are all closed, present as a reminder
+rather than as something to act on. A workspace that has never made one is not
+shown the section at all.
+
+Rows are named by the branch pair (`main ← release/0.41`), not by a number.
+There is no pull request number to show, and the internal key a local review is
+routed by means nothing to anyone reading the screen, so it is never drawn.
+
+The Tree arrangement holds local reviews back into their own group. A stack is a
+chain of pull requests each opened against the one below it, and a branch pair
+that was never pushed is in no such chain.
+
+## 3. Only committed content is reviewed
+
+The diff is built from commits: the merge base of the pair against the tip of
+the head branch. Edits still sitting in your working tree are in none of it.
+
+That gap is invisible from the screen — the files are listed by the same paths
+you have open in an editor beside them — so when the working tree was dirty at
+the last sync, the review carries a banner under its header:
+
+> **Uncommitted changes are not in this review.** This review covers committed
+> content only. Commit the rest and re-sync to bring it in.
+
+This is deliberate rather than a limitation to route around. Content-addressed
+blobs stay honest, comment anchoring stays well defined, and "sync" keeps its
+one meaning: the branch got new commits. A review of a file being edited
+underneath it could promise none of that.
+
+## 4. What the review offers
+
+Three sections: **Conversation**, **Files**, and **Commits**.
+
+**Checks** and **Description** are absent, and absent rather than empty. No
+continuous integration runs against a branch nobody pushed, and there is no
+body somebody typed into a form — each of those screens would render as a claim
+about a service this workspace is not talking to. The Conversation tab is
+threads alone for the same reason.
+
+The state chip beside the title reads **in review** rather than *open*: open is
+a state a pull request is in, and a branch pair is simply under review until
+something ends that.
+
+Approve and Request changes are live. There is no self-review rule to enforce
+and no org member to defer to, so the verdicts work as training verdicts on
+your own work.
+
+## 5. Syncing is the same reconcile you already use
+
+New commits, an amend, or a rebase all move the head. Re-sync (`⇧` `R`) and the
+review picks up the new content — and your pending comments go through
+**exactly the same** re-anchoring the pull-request path uses. There is no
+second flow to learn, because there is no second flow: the engine that decides
+what happened to each pending comment never sees where a snapshot came from.
+
+- [Reconcile](/docs/concepts/reconcile) — how a pending comment is re-anchored,
+  and what *drifted* and *lost* mean.
+- [Reconcile a moved head](/docs/guides/reconcile-a-moved-head) — walking each
+  comment through the decision.
+
+Your draft survives all of it. A rewritten branch is the loudest case — an
+amend or a rebase makes every commit the draft was written against unreachable
+at once — and it is the case the design is built around: the objects the review
+was anchored to are pinned as the review syncs, so they stay readable and your
+comments stay anchorable rather than being classified as lost because git
+collected them.
+
+Two things a local review does that a pull request does not:
+
+- **A sync costs nothing shared.** It reads the whole branch pair off this
+  machine in one pass. No API requests, no
+  [rate budget](/docs/concepts/rate-budget), no network.
+- **The base advancing is enough to change the review.** The merge base is
+  computed against the live tip of the base branch, so the review can go stale —
+  and its [compare key](/docs/concepts/compare-key) can move — with zero new
+  commits on the head. A pull request cannot do that: GitHub only refreshes a
+  pull request's base SHA when it records a synchronize event.
+
+## 6. Nothing here reaches GitHub
+
+Submitting a local review saves it. The toast says **Review saved** — *N
+comments on this branch* — not *posted*, because nothing was posted anywhere and
+no request was made. The draft whisper reads **saved · workspace**: drafts are
+kept beside the review, invisible to GitHub and to everyone else, and they
+survive reloads and tomorrow.
+
+This is structural, not a setting. The code that writes a local comment holds no
+GitHub client at all — the capability is absent from the module rather than
+declined by a branch inside it — so there is nothing there that could be
+configured, mistaken, or later repointed into publishing your training feedback
+to a client's repository.
+
+## 7. When a pull request appears
+
+A branch reviewed locally is often pushed later. When a pull request comes to
+cover the same pair, the local review is **superseded**: it goes read-only, its
+state chip changes to **archived**, and it keeps everything — every thread,
+every draft, all of its history.
+
+**Nothing in it is copied to the pull request. Not ever.** There is no publish
+action, no export, and no code path that would carry a local comment to GitHub.
+That is the whole point of reviewing locally: the feedback that exists to be
+thrown away — the wrong first approach, the misread requirement — never becomes
+part of the record on someone else's repository.
+
+<Callout title="Read-only, never destructive">
+Supersession is recorded on the review itself. A superseded review is archived,
+not deleted, and a pull request later closed without merging does not un-archive
+it — create a new local review for the pair instead.
+</Callout>
+
+## Where to go next
+
+- [Direct mode](/docs/run-modes/direct) — the daemon that serves local reviews,
+  and the rest of its environment.
+- [Compare key](/docs/concepts/compare-key) — why a base advance changes the
+  diff at all.
+- [Submitting a review](/docs/guides/submitting) — the review bar and the three
+  verdicts.

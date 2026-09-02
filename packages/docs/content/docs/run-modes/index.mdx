@@ -26,6 +26,26 @@ operator runbook, but there is no `REVU_MODE=broker` boot you can rely on
 shipping yet.
 </Callout>
 
+## Local reviews are not a fourth mode
+
+A **local review** — two branches in your workspace compared with no pull
+request behind them — is a capability *inside* direct and broker mode, not a
+mode of its own, which is why the table above has three rows and not four.
+`REVU_MODE` is a credential-custody and bind axis: it decides where the GitHub
+token comes from and what the daemon listens on. Where a review's content came
+from is a different question, and one the shared core is already indifferent to
+— it sees a snapshot, not a provenance. Mock mode carries a local review as a
+fixture, so the flow is demonstrable with no daemon at all.
+
+One behavioural difference is deliberate and worth stating plainly: a local
+review's merge base is computed against the **live tip** of the base branch, so
+its [compare key](/docs/concepts/compare-key) can move with zero new commits on
+the head. A pull request's base SHA only refreshes when GitHub records a
+`synchronize` event. The two paths genuinely disagree about what changed, and
+the local one is chosen on purpose.
+
+See [Reviewing a local branch](/docs/guides/local-review) for the whole flow.
+
 ## How the mode is selected
 
 The daemon, `revud`, reads its mode from the `REVU_MODE` environment variable.
