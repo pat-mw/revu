@@ -110,6 +110,37 @@ export function rowIdentity(item: PullListItem): RowIdentity {
   return { kind: 'github', text: `#${item.pull.number}` }
 }
 
+/**
+ * Where the pull request that superseded a local review can be read, or `null`
+ * when this workspace's repository identity cannot name one.
+ *
+ * DERIVED, never stored. A URL written down at the moment of archiving would
+ * be a second record of where the repository lives, kept beside the identity
+ * the store already holds and able to disagree with it forever after.
+ *
+ * The identity is only usable here when it is exactly `owner/name`, and the
+ * refusals are the whole point of the function rather than defensive noise. A
+ * workspace with no remote to push to records an ABSOLUTE PATH as its
+ * repository identity — so an unguarded template produces a link to a host the
+ * reader may never have visited, spelled out of their own home directory,
+ * which looks real, is not, and can never be. Anything that is not one
+ * separator with two non-empty halves is that case or an unknown one, and both
+ * are answered the same way: no link, and the number rendered as plain text.
+ *
+ * The number is checked for what a pull request number is, because it reaches
+ * a path segment. Nothing else needs escaping: the two halves are known to
+ * contain no separator, and the scheme and host are literals here rather than
+ * anything read from the workspace.
+ */
+export function archivedPrUrl(repoIdentity: string, prNumber: number): string | null {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return null
+  const halves = repoIdentity.split('/')
+  if (halves.length !== 2) return null
+  const [owner, name] = halves
+  if (owner === '' || name === '') return null
+  return `https://github.com/${owner}/${name}/pull/${prNumber}`
+}
+
 /** The two refs a create request is built from, as the picker holds them. */
 export interface ReviewBranchPair {
   base: string

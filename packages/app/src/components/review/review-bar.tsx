@@ -16,7 +16,7 @@ import { CommentComposer } from '@/components/threads/composer'
 import { cn } from '@/lib/cn'
 import { useShortcut } from '@/lib/keyboard'
 import { draftSavedCopy, submitFailureCopy, submitSuccessCopy } from '@/lib/mode-copy'
-import { reviewMode, showSelfReviewLock } from '@/lib/review-mode'
+import { reviewComposerHidden, reviewMode, showSelfReviewLock } from '@/lib/review-mode'
 import { relativeTime } from '@/lib/time'
 import { useDraft, useDraftActions, useDraftDirty, useSubmitReview } from '@/state/drafts'
 import { useFilesView } from '@/state/files-view'
@@ -41,6 +41,14 @@ import { ReconcileDialog } from './reconcile-dialog'
  * but here. Those sentences come from one copy module so the bar and its tests
  * cannot end up reading different words, and the verdict picker's lock is
  * decided the same way rather than from the approval flag alone.
+ *
+ * A review that has gone read-only keeps its draft and loses every way of
+ * adding to it: the roster and Discard stay, the composer, the verdict and
+ * Submit are withheld, and with no draft to keep the strip is not drawn at
+ * all. That is the screen agreeing with a refusal made where the review is
+ * held, not the thing enforcing it — the far end declines the write whatever
+ * this bar draws, which is why an unread row leaves the controls up rather
+ * than blinking them out of every review on every load.
  *
  * Keyboard: `s` expands/focuses the summary composer; `mod+enter` submits
  * when pressed outside a text field (inside the composer, the composer's own
@@ -75,6 +83,14 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
     mode,
     canApprove: item?.broker.canApprove ?? false,
   })
+  // A review that a pull request has come to cover is read-only. Where the
+  // review is held, the four write verbs are refused outright — that refusal is
+  // the backstop and this is the screen agreeing with it, not the thing
+  // enforcing it. Which is why an unread row leaves every control up: a
+  // composer that vanished on first paint would be a worse screen than one
+  // offered on a review that then declines the write, and declining is exactly
+  // what the far end does.
+  const writesHidden = reviewComposerHidden({ mode, state: item?.pull.state })
   const pendingCount = draft?.comments.length ?? 0
   // A cached-but-empty draft (never typed into) does not count as a review in
   // progress; it is also never persisted, so nothing is at stake.
@@ -159,12 +175,19 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
     })
   }
 
-  useShortcut('s', expandBody, { enabled: snapshot !== null && !dialogOpen })
+  useShortcut('s', expandBody, {
+    enabled: snapshot !== null && !dialogOpen && !writesHidden,
+  })
   useShortcut('mod+enter', () => void handleSubmit(), {
-    enabled: snapshot !== null && submittable && !submit.isPending && !dialogOpen,
+    enabled:
+      snapshot !== null && submittable && !submit.isPending && !dialogOpen && !writesHidden,
   })
 
   if (!snapshot) return null
+  // Nothing left to draw: no way in, and no draft to keep. Drawn, the strip
+  // would say no review is in progress and offer to start one on a review that
+  // would refuse it.
+  if (writesHidden && !active) return null
 
   const composer = (
     <div
@@ -222,29 +245,38 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
               </PopoverContent>
             </Popover>
 
-            {bodyExpanded ? (
-              composer
-            ) : (
-              <button
-                type="button"
-                onClick={expandBody}
-                className="h-7 min-w-0 flex-1 truncate rounded-(--radius-sm) border border-line bg-canvas px-2 text-left text-sm hover:border-line-strong"
-              >
-                {draft.body.trim() !== '' ? (
-                  <span className="text-ink">{firstBodyLine(draft.body)}</span>
-                ) : (
-                  <span className="text-ink-faint">Add a summary comment…</span>
-                )}
-              </button>
+            {/* An archived review keeps its draft and every way of reading it,
+                and offers no way to add to it or to send it. The three
+                withheld surfaces are the summary composer, the verdict and
+                Submit; the roster above and Discard below stay, because a
+                draft nobody can send is still a draft its author may want to
+                read and then let go. */}
+            {!writesHidden &&
+              (bodyExpanded ? (
+                composer
+              ) : (
+                <button
+                  type="button"
+                  onClick={expandBody}
+                  className="h-7 min-w-0 flex-1 truncate rounded-(--radius-sm) border border-line bg-canvas px-2 text-left text-sm hover:border-line-strong"
+                >
+                  {draft.body.trim() !== '' ? (
+                    <span className="text-ink">{firstBodyLine(draft.body)}</span>
+                  ) : (
+                    <span className="text-ink-faint">Add a summary comment…</span>
+                  )}
+                </button>
+              ))}
+
+            {!writesHidden && (
+              <EventPicker
+                value={draft.event}
+                selfReviewLocked={selfReviewLocked}
+                onChange={(event) => actions.setEvent(event)}
+              />
             )}
 
-            <EventPicker
-              value={draft.event}
-              selfReviewLocked={selfReviewLocked}
-              onChange={(event) => actions.setEvent(event)}
-            />
-
-            <div className="flex shrink-0 items-center gap-2">
+            <div className={cn('flex shrink-0 items-center gap-2', writesHidden && 'ml-auto')}>
               {dirty ? (
                 <span className="text-2xs text-stale">not saved — retrying</span>
               ) : (
@@ -275,35 +307,36 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
                   Discard
                 </Button>
               )}
-              {submittable ? (
-                <Button
-                  variant="primary"
-                  size="sm"
-                  disabled={submit.isPending}
-                  onClick={() => void handleSubmit()}
-                >
-                  {submit.isPending && <Spinner size={12} label="Submitting review" />}
-                  Submit review · {pendingCount}
-                </Button>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span tabIndex={0}>
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        disabled
-                        className="pointer-events-none"
-                      >
-                        Submit review · {pendingCount}
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    A review needs at least a comment or a summary.
-                  </TooltipContent>
-                </Tooltip>
-              )}
+              {!writesHidden &&
+                (submittable ? (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    disabled={submit.isPending}
+                    onClick={() => void handleSubmit()}
+                  >
+                    {submit.isPending && <Spinner size={12} label="Submitting review" />}
+                    Submit review · {pendingCount}
+                  </Button>
+                ) : (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span tabIndex={0}>
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          disabled
+                          className="pointer-events-none"
+                        >
+                          Submit review · {pendingCount}
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">
+                      A review needs at least a comment or a summary.
+                    </TooltipContent>
+                  </Tooltip>
+                ))}
             </div>
           </>
         ) : bodyExpanded ? (

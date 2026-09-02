@@ -8,6 +8,7 @@ import {
 } from '@tanstack/react-query'
 import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query'
 import { api } from '@/api'
+import { reviewMode } from '@/lib/review-mode'
 import type { FileBlob, PullListItem, PullListResponse, RateLimitInfo, Snapshot, StalenessInfo } from '@revu/shared'
 import { ApiError } from '@revu/shared'
 /**
@@ -101,6 +102,32 @@ export function useSnapshot(prNumber: number): UseQueryResult<Snapshot | null, A
 }
 
 /**
+ * Refresh the two list caches after a local review's sync has landed.
+ *
+ * A sync is the one moment a local review's row and its annotations can
+ * change without a create or a delete: the sync that finds a pull request
+ * covering the same branch pair archives the review, so the row's state
+ * closes and the annotation gains the pull request number; any sync can flip
+ * the dirty flag. Neither cache would learn that on its own — the pull list
+ * polls, but a background tab pauses the poll, and the annotation query has
+ * no interval at all — so the sync mutation refreshes both, the same way a
+ * create does and with the same `refetchType: 'all'` (a client with no
+ * mounted observer would otherwise mark the entries stale and fetch nothing).
+ *
+ * A pull request's sync moves nothing in either list, so it resolves without
+ * touching them: the transport is asked for exactly what it can have changed.
+ *
+ * A non-hook so the behavior can be driven and asserted without a renderer.
+ */
+export async function refreshAfterLocalReviewSync(qc: QueryClient, prNumber: number): Promise<void> {
+  if (reviewMode(prNumber) !== 'local') return
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: qk.pulls, refetchType: 'all' }),
+    qc.invalidateQueries({ queryKey: qk.localReviews, refetchType: 'all' }),
+  ])
+}
+
+/**
  * The sync burst — the one expensive read. On success the fresh snapshot is
  * written straight into the cache, and the per-PR caches whose meaning depends
  * on the snapshot (draft anchors, viewed-blob SHAs, the spent rate budget) are
@@ -117,6 +144,7 @@ export function useSyncPull(prNumber: number): UseMutationResult<Snapshot, ApiEr
       void qc.invalidateQueries({ queryKey: qk.draft(prNumber) })
       void qc.invalidateQueries({ queryKey: qk.viewed(prNumber) })
       void qc.invalidateQueries({ queryKey: qk.rate })
+      void refreshAfterLocalReviewSync(qc, prNumber)
     },
     onError: (error) => {
       if (error.code === 'network') {

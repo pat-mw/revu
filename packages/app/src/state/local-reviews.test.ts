@@ -16,11 +16,11 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { QueryClient } from '@tanstack/react-query'
-import type { PullListResponse } from '@revu/shared'
+import type { LocalReviewSummary, PullListResponse } from '@revu/shared'
 import { isLocalReviewId } from '@revu/shared'
 import { createMockApi } from '@/api/mock/adapter'
 import { mockDev } from '@/api/mock/devtools'
-import { qk } from './queries'
+import { qk, refreshAfterLocalReviewSync } from './queries'
 import { hasAnyLocalReview, refreshAfterLocalReviewCreate } from './local-reviews'
 
 const api = createMockApi()
@@ -166,6 +166,76 @@ describe('hasAnyLocalReview', () => {
     expect(qc.getQueryData<PullListResponse>(qk.pulls)).toBeUndefined()
     expect(hasAnyLocalReview(summaries)).toBe(true)
     expect(hasAnyLocalReview([summaries[0]!])).toBe(true)
+    qc.clear()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// 5 — A sync can change what the two caches say about a local review: it can
+//     archive it (the row closes, the annotation gains the pull request number)
+//     or flip its dirty flag. The sync mutation therefore refreshes both, the
+//     same way a create does — and only for a local review, because a pull
+//     request's sync moves nothing in either list.
+// ————————————————————————————————————————————————————————————————
+
+function cachedRowState(qc: QueryClient, id: number): string {
+  const cached = qc.getQueryData<PullListResponse>(qk.pulls)
+  const row = cached?.items.find((i) => i.pull.number === id)
+  if (!row) throw new Error(`Review ${id} was expected in the cached pull list and was not there.`)
+  return row.pull.state
+}
+
+function cachedArchivedPr(qc: QueryClient, id: number): number | null {
+  const cached = qc.getQueryData<LocalReviewSummary[]>(qk.localReviews)
+  const summary = cached?.find((s) => s.id === id)
+  if (!summary) throw new Error(`Review ${id} was expected in the cached annotations and was not there.`)
+  return summary.archivedPr
+}
+
+function updateCounts(qc: QueryClient): number[] {
+  return [qk.pulls, qk.localReviews].map(
+    (key) => qc.getQueryCache().find({ queryKey: key })?.state.dataUpdateCount ?? -1,
+  )
+}
+
+describe('refreshAfterLocalReviewSync', () => {
+  test('lands the archived state a sync just produced in both caches', async () => {
+    const qc = newQueryClient()
+    // A pair an open fixture pull request covers, so the mock archives the
+    // review on its first sync — the one sync outcome both caches must learn.
+    const review = await api.createLocalReview({ baseRef: BASE, headRef: HEAD_REFRESH })
+    await qc.fetchQuery({ queryKey: qk.pulls, queryFn: () => api.listPulls() })
+    await qc.fetchQuery({ queryKey: qk.localReviews, queryFn: () => api.listLocalReviews() })
+    expect(cachedRowState(qc, review.id)).toBe('open')
+    expect(cachedArchivedPr(qc, review.id)).toBeNull()
+
+    const snapshot = await api.syncPull(review.id)
+    expect(snapshot.mutable.pull.state).toBe('closed')
+
+    // The precondition that makes the assertion sensitive: the transport has
+    // moved on and both caches still describe a live review.
+    expect(cachedRowState(qc, review.id)).toBe('open')
+    expect(cachedArchivedPr(qc, review.id)).toBeNull()
+    expect(qc.getQueryCache().find({ queryKey: qk.pulls })?.getObserversCount()).toBe(0)
+
+    await refreshAfterLocalReviewSync(qc, review.id)
+
+    expect(cachedRowState(qc, review.id)).toBe('closed')
+    expect(cachedArchivedPr(qc, review.id)).toBe(101)
+    qc.clear()
+  })
+
+  test('a pull request sync leaves both caches untouched — the control', async () => {
+    const qc = newQueryClient()
+    await qc.fetchQuery({ queryKey: qk.pulls, queryFn: () => api.listPulls() })
+    await qc.fetchQuery({ queryKey: qk.localReviews, queryFn: () => api.listLocalReviews() })
+    const before = updateCounts(qc)
+    expect(before.every((n) => n === 1)).toBe(true)
+
+    await refreshAfterLocalReviewSync(qc, 101)
+
+    expect(updateCounts(qc)).toEqual(before)
+    expect(qc.getQueryCache().find({ queryKey: qk.pulls })?.state.isInvalidated).toBe(false)
     qc.clear()
   })
 })

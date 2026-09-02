@@ -40,6 +40,10 @@
  */
 import { useLocation } from 'react-router'
 import { isLocal } from './local-reviews'
+// A type, and only a type: the state vocabulary is defined beside the chip
+// that words it, and importing the shape here keeps one spelling of it. The
+// import is erased, so the modules stay a one-way dependency at runtime.
+import type { ReviewState } from './mode-copy'
 
 /** Which kind of review a number, a route or a rendered page is about. */
 export type ReviewMode = 'github' | 'local'
@@ -226,6 +230,91 @@ export interface SelfReviewLockInput {
  */
 export function showSelfReviewLock({ mode, canApprove }: SelfReviewLockInput): boolean {
   return mode === 'github' && !canApprove
+}
+
+/**
+ * What the archived gates read: which kind of review it is, and the state its
+ * listed row reports.
+ *
+ * The state is `undefined` while that row has not been read — every review's
+ * state on first paint, and any review's state for good after a list error.
+ * Each gate below decides that case for itself rather than sharing an answer,
+ * because the cost of guessing wrong is not the same for all of them.
+ */
+export interface ReviewArchivedInput {
+  mode: ReviewMode
+  /**
+   * The state on the review's row. Typed as the header's three-way reading so
+   * either a row's own `open`/`closed` or a derived state can be passed; the
+   * type is imported for its shape alone and nothing at runtime crosses back.
+   */
+  state: ReviewState | undefined
+}
+
+/**
+ * Whether this review has been superseded and is now read-only.
+ *
+ * A review of two local branches ends exactly one way: a pull request appears
+ * covering the same branch pair, and the review is archived rather than
+ * deleted — frozen at its last sync, every thread and draft kept. Its row
+ * reports that as a closed state, which is the same word a pull request uses
+ * for something else entirely, so the mode is half the question and not a
+ * formality.
+ *
+ * "Not known yet" is not evidence of supersession, so an unread row reads as
+ * live. Nothing here is a security boundary: the four write verbs are refused
+ * where the review is held, and this decides what the screen SAYS.
+ */
+export function reviewArchived({ mode, state }: ReviewArchivedInput): boolean {
+  return mode === 'local' && state === 'closed'
+}
+
+/**
+ * Whether the review bar withholds every way of starting or sending a review.
+ *
+ * The same truth as `reviewArchived` today, under its own name because the two
+ * answer different questions and can stop agreeing: one is a fact about the
+ * review, the other is what a control does about it. Folding them into one
+ * gate would mean the first surface that needs to draw an archived review with
+ * some control still live has to unpick which of the two meanings each call
+ * site wanted.
+ *
+ * An unread row leaves the controls up. A composer that vanished on every
+ * first paint would be a worse screen than one offered on a review that then
+ * refuses the write — and the refusal at the far end is what makes the
+ * permissive reading safe rather than optimistic.
+ */
+export function reviewComposerHidden({ mode, state }: ReviewArchivedInput): boolean {
+  return reviewArchived({ mode, state })
+}
+
+/** What a row knows when it decides whether to name what superseded it. */
+export interface SupersededBadgeInput {
+  mode: ReviewMode
+  /**
+   * The pull request that came to cover this review's branch pair, `null` while
+   * it is live, and `undefined` while the annotations carrying it are unread.
+   */
+  archivedPr: number | null | undefined
+}
+
+/**
+ * Whether a row names the pull request that superseded it.
+ *
+ * The mode is checked as well as the number, and that is the load-bearing
+ * half: the annotation this reads is local-only, so a pull request should
+ * never carry one — and a gate that trusted the number alone would start
+ * labelling pull requests as superseded the moment anything upstream began
+ * sending that field.
+ *
+ * Written as a type predicate so the one state it admits carries its number
+ * out to whatever renders it, rather than leaving a cast behind that could
+ * outlive the check it came from.
+ */
+export function supersededBadgeShown(
+  input: SupersededBadgeInput,
+): input is SupersededBadgeInput & { archivedPr: number } {
+  return input.mode === 'local' && typeof input.archivedPr === 'number'
 }
 
 /** What the topbar knows about the shared read budget when it decides. */
