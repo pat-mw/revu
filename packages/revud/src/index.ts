@@ -13,7 +13,10 @@ import { createDirectApi } from './direct/direct-api'
 import { discoverRepoRoot, repoIdentity } from './direct/local-git'
 import { createLocalReviewSurface } from './direct/local-surface'
 import { resolveBotLogin } from './direct/session'
+import type { SupersedingPullClient } from './direct/github-client'
 import { createGithubClient } from './direct/github-client'
+import type { SupersedingPullSource } from './direct/local-archive'
+import type { RepoRef } from './direct/repo'
 import { openDirectStore, resolveDirectDataDir } from './direct/store'
 import { createBrokerWriteDecorator } from './direct/write-decorator'
 import { createFileCredentialTokenSource } from './broker/token-source'
@@ -331,6 +334,24 @@ async function mainMock(env: Record<string, string | undefined>): Promise<void> 
  * appear in the startup line. The store lives under
  * `${XDG_DATA_HOME:-~/.local/share}/revu`, so a restart loses no draft.
  */
+/**
+ * Bind a branch-pair listing client to one repository, giving the api the
+ * one-method seam its local sync path consults.
+ *
+ * The repository is closed over HERE, at boot, because it is a property of the
+ * daemon rather than of a review: a local review's own `repo` string is what the
+ * predicate compares against, and letting a caller choose which repository to
+ * ask about would make "the repository this daemon serves" a per-call argument.
+ */
+function pairListingFor(
+  client: SupersedingPullClient,
+  repo: RepoRef,
+): SupersedingPullSource {
+  return {
+    listOpenPullsForPair: (pair) => client.listOpenPullsForPair(repo.owner, repo.repo, pair),
+  }
+}
+
 async function mainDirect(env: Record<string, string | undefined>): Promise<void> {
   const argv = process.argv.slice(2)
   const port = resolvePort(env)
@@ -380,10 +401,18 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   // downstream needs a stand-in repository to interpolate into a request path.
   const github = context.github
   const repo = context.repo
+  // Absent together with the rest of the GitHub half, which is what a
+  // `--local-only` boot and a workspace with no origin both produce: the archive
+  // check then has nothing to consult, asks nothing, and every local review
+  // stays live.
+  const supersedingPulls = context.supersedingPulls
 
   const directApi = createDirectApi({
     session: context.session,
     ...(github !== undefined && repo !== undefined ? { github, repo } : {}),
+    ...(supersedingPulls !== undefined && repo !== undefined
+      ? { supersedingPulls: pairListingFor(supersedingPulls, repo) }
+      : {}),
     store,
     // The local-first blob provider reads the git clone via the same runner and
     // directory startup validated, so blob bytes come free from local git.
@@ -540,6 +569,12 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
     cwd: context.cwd,
     // Serve `/v1/pulls` LIVE from the poll cache.
     pullList: pollLoop,
+    // The archive check reads through the poll loop's OWN client rather than a
+    // third one: this daemon already holds a client over the injected
+    // credential for exactly this repository, and one more would multiply the
+    // connection behaviour behind a single credential without adding a
+    // capability.
+    supersedingPulls: pairListingFor(pollClient, context.repo),
     ...(botLogin !== null
       ? { writeDecorator: createBrokerWriteDecorator(context.session, store) }
       : {}),

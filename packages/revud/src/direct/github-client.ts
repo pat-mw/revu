@@ -171,6 +171,41 @@ export interface PullListClient {
   ): Promise<Record<number, PullFacts>>
 }
 
+/**
+ * The narrow client the local-review archive check depends on: one targeted
+ * listing of the open pull requests over a single branch pair.
+ *
+ * SEPARATE FROM `PullListClient` for the same reason that one is separate from
+ * `GithubClient` — the archive check makes exactly one call, and a fake standing
+ * in for it should have to implement exactly that call. `createGithubClient`
+ * returns a value satisfying all three interfaces.
+ */
+export interface SupersedingPullClient {
+  /**
+   * `GET /repos/{o}/{r}/pulls?state=open&head={o}:{headRef}&base={baseRef}&per_page=100`,
+   * mapped to list rows.
+   *
+   * `state=open` is deliberate: a closed pull request on a branch name that was
+   * later reused must not be reported as superseding a review that has nothing
+   * to do with it.
+   *
+   * The `head` filter names THIS repository's owner, so it matches same-repo
+   * pull requests only. A fork's identically named branch is excluded by the
+   * query; the predicate rejects it a second time, because the filter is a
+   * request parameter and the predicate is the thing that decides.
+   *
+   * ONE page, and NO conditional caching. An archive check runs once per sync of
+   * one review over a filter that can only ever match a handful of pull
+   * requests — it is not a poll, so there is no cadence for an ETag to make
+   * cheap, and a stored tag would be one more thing to invalidate.
+   */
+  listOpenPullsForPair(
+    owner: string,
+    repo: string,
+    pair: { headRef: string; baseRef: string },
+  ): Promise<PullSummary[]>
+}
+
 /** Raw item from `GET /repos/{o}/{r}/git/trees/{sha}?recursive=1`. */
 export interface GhTreeEntry {
   path: string
@@ -921,7 +956,9 @@ function contentEtagForItems(items: PullSummary[]): string {
  * JSON `Accept`, and a `User-Agent` (GitHub rejects requests without one). The
  * token is read fresh per call and confined to the header.
  */
-export function createGithubClient(opts: GithubClientOptions): GithubClient & PullListClient {
+export function createGithubClient(
+  opts: GithubClientOptions,
+): GithubClient & PullListClient & SupersedingPullClient {
   const fetchImpl = opts.fetchImpl ?? fetch
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
   const graphqlUrl = opts.graphqlUrl ?? DEFAULT_GRAPHQL_URL
@@ -1093,6 +1130,25 @@ export function createGithubClient(opts: GithubClientOptions): GithubClient & Pu
         notModified: false,
         rateLimit,
       }
+    },
+
+    async listOpenPullsForPair(
+      owner: string,
+      repo: string,
+      pair: { headRef: string; baseRef: string },
+    ): Promise<PullSummary[]> {
+      // Every interpolated piece goes through `encodeURIComponent`, exactly as
+      // the path pieces do, so a branch name containing `/` (or anything else
+      // with meaning in a URL) reaches GitHub as one value rather than as
+      // structure. The `:` between owner and branch is the filter's own
+      // separator and is left literal, which is how GitHub documents it.
+      const head = `${enc(owner)}:${enc(pair.headRef)}`
+      const path =
+        `/repos/${enc(owner)}/${enc(repo)}/pulls` +
+        `?state=open&head=${head}&base=${enc(pair.baseRef)}&per_page=100`
+      const body = await getJson(path)
+      const rows = Array.isArray(body) ? (body as unknown[]) : []
+      return rows.map(mapPullSummaryRow)
     },
 
     async getPullFacts(

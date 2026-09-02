@@ -89,6 +89,17 @@ export interface LocalReviewSurface {
   listLocalReviews(): LocalReviewSummary[]
 
   /**
+   * One review row, owned by this repository, or the typed not-found an absent
+   * id answers. The row is what says whether a pull request has superseded the
+   * review, and a caller deciding whether to ask the hosted repository about
+   * a review must read it HERE rather than off the store: the store reads by id
+   * alone, so a row belonging to another repository would come back with its
+   * own branch pair, and that pair would then be asked about against this
+   * repository's pull requests.
+   */
+  getLocalReview(localId: number): LocalReviewSummary
+
+  /**
    * The branches the repository can offer as either side of a new review —
    * local branches and remote-tracking refs both, since a base is often tracked
    * rather than checked out.
@@ -215,11 +226,34 @@ export interface LocalPinOutcome {
   readonly reason?: PinFailureReason
 }
 
-/** A completed local sync: the stored snapshot, and the pin it attempted. */
-export interface LocalSyncOutcome {
+/** A sync that read the repository: the snapshot it stored, and the pin it attempted. */
+export interface LocalSyncPerformed {
+  readonly frozen: false
   readonly snapshot: Snapshot
   readonly pin: LocalPinOutcome
 }
+
+/**
+ * A sync that read nothing, because the review is archived and already holds
+ * the snapshot it froze at. The snapshot is the stored one, byte for byte; no
+ * pin was attempted, so none is reported — `null` rather than a vacuous
+ * success, because the objects behind a frozen snapshot were pinned, or not, by
+ * the sync that stored it, and that outcome was reported then.
+ */
+export interface LocalSyncFrozen {
+  readonly frozen: true
+  readonly snapshot: Snapshot
+  readonly pin: null
+}
+
+/**
+ * A completed local sync, discriminated on whether it read the repository.
+ *
+ * `frozen` is what a caller that prunes after a sync reads: a frozen sync
+ * stranded no half and minted no compare key, so there is nothing new to
+ * reclaim and a prune keyed on it would sweep for no reason.
+ */
+export type LocalSyncOutcome = LocalSyncPerformed | LocalSyncFrozen
 
 export interface LocalReviewSurfaceDeps {
   store: DirectStore
@@ -396,6 +430,12 @@ export function buildLocalWriteDeps(
     // that point, and a reader told nothing was found resubmits and gets both a
     // second time.
     getLocalSnapshot: (id) => rebuildable(id, () => store.getLocalSnapshot(id)),
+    // Untranslated: the row is not content a re-sync rebuilds, and the sink
+    // reads it for one field — whether a pull request has superseded the
+    // review — ahead of every mutation. Ownership was settled by the guard
+    // that let the verb reach the sink at all, so the id here names a row this
+    // repository owns.
+    getLocalReview: (id) => store.getLocalReview(id),
     putLocalSnapshot: (snapshot) => {
       store.putLocalSnapshot(snapshot)
     },
@@ -638,6 +678,22 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
   const now = clockOf(deps)
 
   /**
+   * The stored snapshot, or null when there is none OR when the store cannot
+   * read the one it has. Used by the freeze alone, which is the one reader for
+   * whom an unreadable snapshot and a missing one call for the same move — a
+   * full sync that rebuilds it — rather than for the not-found that every
+   * other snapshot read translates the corruption into.
+   */
+  const storedIfReadable = (localId: number): Snapshot | null => {
+    try {
+      return store.getLocalSnapshot(localId)
+    } catch (cause) {
+      if (cause instanceof StoreUnreadableError) return null
+      throw cause
+    }
+  }
+
+  /**
    * Reconcile's three reads, re-pointed at the local keyspace.
    *
    * The classification itself is NOT reimplemented here. It is the same module a
@@ -707,6 +763,10 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       return store.listLocalReviews(deps.repo)
     },
 
+    getLocalReview(localId: number): LocalReviewSummary {
+      return requireReview(deps, localId)
+    },
+
     async listBranches(): Promise<BranchRef[]> {
       // A git read, never a store read: the store records reviews, and a branch
       // that has never been reviewed still has to be offerable as a side.
@@ -739,6 +799,37 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
 
     async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
       const review = requireReview(deps, localId)
+
+      // THE FREEZE. A review a pull request has superseded stands at its last
+      // sync: the stored snapshot is answered as it is, no git is run, no half
+      // is minted, no pin is written and the row is not re-stamped. What a
+      // reader sees is the branch pair as it stood when the pull request was
+      // found, not as it stands now.
+      //
+      // The freeze keys on the stored snapshot AGREEING with the row — an
+      // envelope whose synthesized pull already reads `closed` — and not on
+      // the row alone. The pull's state is derived from the archive number at
+      // the moment the envelope is built, so `closed` says precisely that the
+      // snapshot postdates the archive. A row marked while the stored snapshot
+      // still reads `open` has therefore been archived SINCE its last sync —
+      // by the detection that runs ahead of this call, by another daemon over
+      // the same data directory, or by hand — and gets exactly one more full
+      // sync so that the snapshot it freezes at describes the review as the
+      // row does; the sync after that is frozen. Keying on the row alone would
+      // freeze such a review onto a snapshot still claiming `open`, with
+      // nothing left to ever rewrite it.
+      //
+      // A stored snapshot that cannot be read counts as absent here for the
+      // same reason an absent one does: the repair every snapshot read names
+      // is re-syncing, and a freeze that served nothing readable would take
+      // that repair away from exactly the reviews that can never be re-synced
+      // by hand.
+      if (review.archivedPr !== null) {
+        const stored = storedIfReadable(localId)
+        if (stored !== null && stored.mutable.pull.state === 'closed') {
+          return { frozen: true, snapshot: stored, pin: null }
+        }
+      }
 
       const resolved = await resolveLocalRange(deps.runner, deps.toplevel, {
         baseRef: review.baseRef,
@@ -874,7 +965,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
         dirty: worktree === 'dirty',
         lastSyncedAt: syncedAt,
       })
-      return { snapshot, pin }
+      return { frozen: false, snapshot, pin }
     },
 
     getSnapshot(localId: number): Snapshot | null {

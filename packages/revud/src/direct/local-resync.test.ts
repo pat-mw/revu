@@ -28,17 +28,23 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ApiError } from '@revu/shared'
-import type { PendingComment, ReviewDraft, ReviewThread, Session } from '@revu/shared'
+import type {
+  LocalReviewSummary,
+  PendingComment,
+  ReviewDraft,
+  ReviewThread,
+  Session,
+} from '@revu/shared'
 import { createBunCommandRunner } from './command-runner'
 import type { CommandResult, CommandRunner } from './command-runner'
 import { createFixtureRepo, type FixtureRepo } from './local-fixture-repo'
 import { createLocalReviewSurface } from './local-surface'
-import type { LocalReviewSurface } from './local-surface'
+import type { LocalReviewSurface, LocalSyncOutcome } from './local-surface'
 import type { DirectStore } from './store'
 import { openDirectStore } from './store'
 
@@ -120,12 +126,20 @@ interface Harness {
 /**
  * A synced local review carrying a draft with three comments and one published
  * thread — the artifacts whose survival is the point of this file.
+ *
+ * The runner and the clock are both overridable: a recording runner is how a
+ * case observes whether git was asked anything at all, and a moving clock is
+ * what makes "this timestamp did not change" an observation rather than a
+ * comparison of two reads of one constant.
  */
-async function seed(runnerOverride?: CommandRunner): Promise<Harness> {
+async function seed(
+  overrides: { runner?: CommandRunner; now?: () => string } = {},
+): Promise<Harness> {
   const fixture = await createFixtureRepo()
   const dataDir = mkdtempSync(join(tmpdir(), 'revu-resync-'))
   const real = openDirectStore({ dataDir })
-  const runner: CommandRunner = runnerOverride ?? createBunCommandRunner()
+  const runner: CommandRunner = overrides.runner ?? createBunCommandRunner()
+  const now = overrides.now ?? ((): string => NOW)
   const surfaceOver = (store: DirectStore): LocalReviewSurface =>
     createLocalReviewSurface({
       store,
@@ -133,7 +147,7 @@ async function seed(runnerOverride?: CommandRunner): Promise<Harness> {
       toplevel: fixture.dir,
       repo: REPO,
       session: SESSION,
-      now: () => NOW,
+      now,
     })
   const surface = surfaceOver(real)
 
@@ -515,7 +529,7 @@ describe('without the pin, the same objects are collected — the control', () =
   let storedHead = ''
 
   beforeAll(async () => {
-    h = await seed(unpinnedRunner())
+    h = await seed({ runner: unpinnedRunner() })
     const stored = h.surface.getSnapshot(h.localId)
     if (stored === null) throw new Error('the seed did not store a snapshot')
     storedHead = stored.immutable.headSha
@@ -634,5 +648,335 @@ describe('the product-level claim: comments survive a rewrite plus a collection'
     // and none is reported gone — which is the answer a reader would have
     // acted on by discarding text the rewrite never actually removed.
     expect(results.filter((kind) => kind === 'lost')).toEqual([])
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// An archived review freezes at its last sync.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * A runner that records every argv it is handed and delegates to real git.
+ * Recording is the whole instrument here: the claim under test is that a
+ * frozen sync asks git NOTHING, and only a list of what was asked can show an
+ * empty stretch.
+ */
+function recordingRunner(sink: string[][]): CommandRunner {
+  const real = createBunCommandRunner()
+  return {
+    run(args: string[], opts?: { cwd?: string }): Promise<CommandResult> {
+      sink.push([...args])
+      return real.run(args, opts)
+    },
+  }
+}
+
+/**
+ * A clock a case moves by hand between two syncs. A timestamp that must stand
+ * still is then measured against a clock that demonstrably did not, which a
+ * fixed clock cannot show — two reads of one constant agree whatever happened.
+ */
+function movingClock(): { now: () => string; tick: () => void } {
+  let ticks = 0
+  return {
+    now: () => `2026-01-02T03:04:${String(5 + ticks).padStart(2, '0')}.000Z`,
+    tick: () => {
+      ticks += 1
+    },
+  }
+}
+
+/** The tip of one branch, read from git rather than remembered. */
+async function tipOf(fixture: FixtureRepo, branch: string): Promise<string> {
+  const runner = createBunCommandRunner()
+  const result = await runner.run(['git', 'rev-parse', '--verify', branch], { cwd: fixture.dir })
+  if (!result.ok) throw new Error(`fixture git failed: rev-parse ${branch} — ${result.stderr}`)
+  return result.stdout.trim()
+}
+
+/** One more commit on the head branch, so a sync that read git would see a moved head. */
+async function advanceHead(fixture: FixtureRepo): Promise<void> {
+  await git(fixture, ['checkout', '-q', fixture.headBranch])
+  writeFileSync(join(fixture.dir, 'advanced.txt'), 'work done after the pull request appeared\n')
+  await git(fixture, ['add', '-A'])
+  await git(fixture, [
+    '-c',
+    'user.email=head-advance@revu.invalid',
+    '-c',
+    'user.name=Head Advance',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+    'commit',
+    '-q',
+    '-m',
+    'advance the head after the archive',
+  ])
+}
+
+/** The pull request the archived cases below are archived against. */
+const SUPERSEDING_PR = 77
+
+/**
+ * Everything a frozen sync must leave where it was, read from the store and
+ * the outcome in one comparable record.
+ */
+interface SyncEvidence {
+  readonly outcome: LocalSyncOutcome
+  readonly stored: string
+  readonly row: LocalReviewSummary
+  readonly immutables: number
+  /** How many argv the runner had recorded when the sync began. */
+  readonly gitCallsBefore: number
+  /** How many it had recorded when the sync returned. */
+  readonly gitCallsAfter: number
+}
+
+async function syncWithEvidence(h: Harness, sink: string[][]): Promise<SyncEvidence> {
+  const gitCallsBefore = sink.length
+  const outcome = await h.surface.syncLocalReview(h.localId)
+  const row = h.store.getLocalReview(h.localId)
+  if (row === null) throw new Error('the review row vanished during a sync')
+  return {
+    outcome,
+    stored: JSON.stringify(h.store.getLocalSnapshot(h.localId)),
+    row,
+    immutables: h.store.listImmutableKeys().length,
+    gitCallsBefore,
+    gitCallsAfter: sink.length,
+  }
+}
+
+describe('an archived review freezes at its last sync', () => {
+  let h: Harness
+  let clock: ReturnType<typeof movingClock>
+  const sink: string[][] = []
+  /** The first sync after the mark: git once more, so the snapshot catches up with the row. */
+  let catchUp: SyncEvidence
+  /** The sync after that, with the head moved in between. */
+  let frozen: SyncEvidence
+  let headBeforeMove = ''
+  let headAfterMove = ''
+
+  beforeAll(async () => {
+    clock = movingClock()
+    h = await seed({ runner: recordingRunner(sink), now: clock.now })
+    h.store.markLocalReviewArchived(h.localId, SUPERSEDING_PR)
+
+    clock.tick()
+    catchUp = await syncWithEvidence(h, sink)
+
+    headBeforeMove = await tipOf(h.fixture, h.fixture.headBranch)
+    await advanceHead(h.fixture)
+    headAfterMove = await tipOf(h.fixture, h.fixture.headBranch)
+
+    clock.tick()
+    frozen = await syncWithEvidence(h, sink)
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('the sync that first sees the mark is not frozen, and stores a snapshot that says closed', () => {
+    // The row and the snapshot agree from this sync on: the pull is synthesized
+    // from the row's number, so the stored envelope now presents the review as
+    // closed, and nothing later has to rewrite it.
+    expect(catchUp.outcome.frozen).toBe(false)
+    expect(catchUp.outcome.snapshot.mutable.pull.state).toBe('closed')
+    expect(JSON.stringify(catchUp.outcome.snapshot)).toBe(catchUp.stored)
+    expect(catchUp.gitCallsAfter).toBeGreaterThan(catchUp.gitCallsBefore)
+  })
+
+  test('the head really moved between the two syncs', () => {
+    // The control for every "unchanged" below: had the second sync read git, it
+    // would have found a different tip than the one the stored snapshot names.
+    expect(headAfterMove).not.toBe(headBeforeMove)
+    expect(catchUp.outcome.snapshot.immutable.headSha).toBe(headBeforeMove)
+  })
+
+  test('the next sync is frozen', () => {
+    expect(frozen.outcome.frozen).toBe(true)
+  })
+
+  test('a frozen sync answers the stored snapshot byte for byte, and stores nothing new', () => {
+    expect(JSON.stringify(frozen.outcome.snapshot)).toBe(catchUp.stored)
+    expect(frozen.stored).toBe(catchUp.stored)
+  })
+
+  test('the compare key did not follow the head', () => {
+    expect(frozen.outcome.snapshot.immutable.compareKey).toBe(
+      catchUp.outcome.snapshot.immutable.compareKey,
+    )
+    expect(frozen.outcome.snapshot.immutable.headSha).toBe(headBeforeMove)
+  })
+
+  test('the row was not re-stamped: lastSyncedAt stands although the clock moved', () => {
+    expect(frozen.row.lastSyncedAt).toBe(catchUp.row.lastSyncedAt)
+    expect(frozen.row.headSha).toBe(catchUp.row.headSha)
+    expect(frozen.row.updatedAt).toBe(catchUp.row.updatedAt)
+    // The clock a re-stamp would have used reads differently from the stamp
+    // that stands, so equality above is not two reads of one constant.
+    expect(clock.now()).not.toBe(catchUp.row.lastSyncedAt)
+  })
+
+  test('no immutable half was minted', () => {
+    expect(frozen.immutables).toBe(catchUp.immutables)
+  })
+
+  test('git was not run at all for the frozen sync', () => {
+    expect(frozen.gitCallsAfter).toBe(frozen.gitCallsBefore)
+  })
+
+  test('a frozen sync attempted no pin, and says so rather than claiming one', () => {
+    expect(frozen.outcome.pin).toBeNull()
+  })
+})
+
+describe('the control: the same sequence with no mark keeps syncing', () => {
+  let h: Harness
+  let clock: ReturnType<typeof movingClock>
+  const sink: string[][] = []
+  let first: SyncEvidence
+  let second: SyncEvidence
+  let headAfterMove = ''
+
+  beforeAll(async () => {
+    clock = movingClock()
+    h = await seed({ runner: recordingRunner(sink), now: clock.now })
+    // No mark. Everything else is the archived sequence above, step for step.
+    clock.tick()
+    first = await syncWithEvidence(h, sink)
+    await advanceHead(h.fixture)
+    headAfterMove = await tipOf(h.fixture, h.fixture.headBranch)
+    clock.tick()
+    second = await syncWithEvidence(h, sink)
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('a live review is never frozen', () => {
+    expect(first.outcome.frozen).toBe(false)
+    expect(second.outcome.frozen).toBe(false)
+  })
+
+  test('the second sync read git, followed the head, and re-stamped the row', () => {
+    // Every quantity the frozen case holds still moves here, so each of those
+    // assertions is known to be capable of failing.
+    expect(second.gitCallsAfter).toBeGreaterThan(second.gitCallsBefore)
+    expect(second.outcome.snapshot.immutable.headSha).toBe(headAfterMove)
+    expect(second.outcome.snapshot.immutable.compareKey).not.toBe(
+      first.outcome.snapshot.immutable.compareKey,
+    )
+    expect(second.stored).not.toBe(first.stored)
+    expect(second.row.lastSyncedAt).not.toBe(first.row.lastSyncedAt)
+    expect(second.immutables).toBe(first.immutables + 1)
+    expect(second.outcome.snapshot.mutable.pull.state).toBe('open')
+  })
+})
+
+describe('an archived review with no stored snapshot syncs once, then freezes', () => {
+  // Unreachable through the daemon — a review is only ever archived by a sync
+  // that goes on to store a snapshot — but reachable through a hand-edited
+  // store, and a review with nothing to serve is worse than a frozen one.
+  let fixture: FixtureRepo
+  let store: DirectStore
+  let localId = 0
+  const sink: string[][] = []
+  let first: LocalSyncOutcome
+  let second: LocalSyncOutcome
+  let storedAfterFirst = ''
+  let gitCallsDuringSecond = 0
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    store = openDirectStore({ dataDir: ':memory:' })
+    const surface = createLocalReviewSurface({
+      store,
+      runner: recordingRunner(sink),
+      toplevel: fixture.dir,
+      repo: REPO,
+      session: SESSION,
+      now: () => NOW,
+    })
+    localId = (
+      await surface.createLocalReview({ baseRef: fixture.baseBranch, headRef: fixture.headBranch })
+    ).id
+    store.markLocalReviewArchived(localId, SUPERSEDING_PR)
+
+    first = await surface.syncLocalReview(localId)
+    storedAfterFirst = JSON.stringify(store.getLocalSnapshot(localId))
+    const before = sink.length
+    second = await surface.syncLocalReview(localId)
+    gitCallsDuringSecond = sink.length - before
+  }, 120_000)
+
+  afterAll(() => {
+    store.close()
+    fixture.dispose()
+  })
+
+  test('the review really was archived with nothing stored', () => {
+    expect(store.getLocalReview(localId)?.archivedPr).toBe(SUPERSEDING_PR)
+    // Read off the outcome rather than the store, which now holds the first
+    // sync's envelope: the first sync could only have been a full one.
+    expect(first.frozen).toBe(false)
+  })
+
+  test('the first sync stores a snapshot that already says closed', () => {
+    expect(first.snapshot.mutable.pull.state).toBe('closed')
+    expect(JSON.stringify(first.snapshot)).toBe(storedAfterFirst)
+  })
+
+  test('the second sync is frozen on what the first stored, and asks git nothing', () => {
+    expect(second.frozen).toBe(true)
+    expect(JSON.stringify(second.snapshot)).toBe(storedAfterFirst)
+    expect(gitCallsDuringSecond).toBe(0)
+  })
+})
+
+describe('an archived review whose stored content was lost syncs once to rebuild it, then freezes', () => {
+  // The repair every snapshot read names — re-sync to rebuild — has to work on
+  // an archived review too, or a lost immutable half would leave it permanently
+  // unopenable behind a freeze that has nothing readable to serve.
+  let h: Harness
+  let lostRefusal = ''
+  let rebuilt: LocalSyncOutcome
+  let afterRebuild: LocalSyncOutcome
+
+  beforeAll(async () => {
+    h = await seed()
+    h.store.markLocalReviewArchived(h.localId, SUPERSEDING_PR)
+    await h.surface.syncLocalReview(h.localId)
+
+    const raw = new Database(join(h.dataDir, 'direct.sqlite'))
+    raw.run('DELETE FROM immutables')
+    raw.close()
+
+    try {
+      h.surface.getSnapshot(h.localId)
+    } catch (error) {
+      lostRefusal = error instanceof ApiError ? error.code : 'untyped'
+    }
+    rebuilt = await h.surface.syncLocalReview(h.localId)
+    afterRebuild = await h.surface.syncLocalReview(h.localId)
+  }, 120_000)
+
+  afterAll(() => h.dispose())
+
+  test('the content really was lost: the snapshot read refused before the rebuild', () => {
+    expect(lostRefusal).toBe('not_found')
+  })
+
+  test('the rebuild was a full sync that stored a closed snapshot the read now opens', () => {
+    expect(rebuilt.frozen).toBe(false)
+    expect(rebuilt.snapshot.mutable.pull.state).toBe('closed')
+    expect(h.surface.getSnapshot(h.localId)?.immutable.compareKey).toBe(
+      rebuilt.snapshot.immutable.compareKey,
+    )
+  })
+
+  test('and the sync after the rebuild is frozen on it', () => {
+    expect(afterRebuild.frozen).toBe(true)
+    expect(JSON.stringify(afterRebuild.snapshot)).toBe(JSON.stringify(rebuilt.snapshot))
   })
 })
