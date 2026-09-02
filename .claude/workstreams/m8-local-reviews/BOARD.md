@@ -10,12 +10,29 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing is running.** Two tickets are In Review, both gated and pushed.
+**Nothing is running.** Three tickets are In Review, all gated, reviewed and pushed.
 
 | ticket | state | branch / PR | gate |
 | --- | --- | --- | --- |
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
 | **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
+| **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI building at hand-off** (docs-build green) |
+
+**M8.11 closes the milestone's proof** (in review on #80): the local-review conformance suite, written once,
+runs as three **required** matrix legs (E mock in-process · F revud-mock over HTTP · G the direct engine over a
+remote-less seeded repo under a `fetch` tripwire); a browser e2e creates and submits a local review against a
+direct daemon with a preload that records and refuses every non-loopback `fetch`, its netlog opening with the
+guard's own marker; the docs describe the flow, the switch and the audit boundary, with two guards putting those
+surfaces in the gate. **Every one of the six exit criteria now has a green run on the stack tip** (the walk is
+at the ticket's Verify 7); the boxes in `MILESTONE.md` tick when the chain merges. Two things worth reading
+before building on it: leg G was the first runner to execute the suite's `'changes'` branch and **found the
+suite wrong** (binary blobs are stored collapsed, as the mock's own fixtures store them — the suite was fixed,
+not the engine); and the adversarial review found four holes (a duplicate reply id accepted, a reaction rollup
+never re-read, a mock restart over the same memory, a guide describing an archive detector that does not
+exist), each fixed with its own control. **Follow-ups, recorded here rather than as tickets:** `scripts/` is
+still outside `tsc -b` (the smoke rot found this session is the measured cost — `parseCommentIdentity` had
+grown a required parameter and two identity checks were asserting against the bot); `Bun.fetch` is a distinct
+reference the netlog guard does not wrap (inert today).
 
 **M8.10 is now genuinely done**, not merely at full unit count. `M8.10.8` closed the gap that 7/7 had
 hidden: the owner's ruling 1 was unimplemented in **both** transports, and the mock and direct disagreed
@@ -74,9 +91,10 @@ unreachable, so M8.10 may start.
 Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
-**The stack, bottom-up — eleven PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+**The stack, bottom-up — twelve PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
 (M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8) →
-[#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 4/7). `main` is untouched at `177068a`.
+[#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 8/8) → [#80](https://github.com/pat-mw/revu/pull/80)
+(M8.11, 8/8). `main` is untouched at `177068a`.
 
 ### What M8.5 delivered (in review on #76)
 
@@ -109,7 +127,7 @@ is derived from it, never the other way round.**
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8, `Verify` green) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
-| [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
+| [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | **In Review** (8/8, `Verify` green) | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | [#80](https://github.com/pat-mw/revu/pull/80) |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
 
 ## Dependency graph
@@ -154,7 +172,8 @@ constraint it must satisfy.
 ## Exit criteria coverage
 
 Which ticket's `Verify` proves each milestone exit criterion. An exit criterion with no proving ticket is a
-gap in the plan, not a gap in the work.
+gap in the plan, not a gap in the work. **As of 2026-09-02 every row below has a green run on the stack tip
+(#80)** — the walk is recorded at M8.11's Verify 7; the milestone closes when the chain merges.
 
 | exit criterion | proved by |
 | --- | --- |

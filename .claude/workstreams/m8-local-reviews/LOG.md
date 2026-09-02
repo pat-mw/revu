@@ -573,3 +573,39 @@ signature moved. Splitting it into its own contract commit is one command if the
 
 **Next.** **M8.9** — independent and unblocked. Then **M8.11, the real critical path**: it gates **3 of the
 6 exit criteria** and has not started.
+
+**update — 2026-09-02**
+
+**Done.** **M8.11 — 8/8, `Verify` green, adversarial pass done, PR [#80](https://github.com/pat-mw/revu/pull/80)**
+(base `m8.10/retention-and-gc`; ten commits, one per unit plus two review fix-ups). Gate under `env -u GH_TOKEN
+-u GITHUB_TOKEN TZ=UTC`: 2998 pass · 1 skip · 0 fail · 111 files.
+- **M8.11.8** (`dc9ede6`) `tsconfig.tools.json` brings `e2e/` + `test/` into `tsc -b`; the control redded in both.
+- **M8.11.5** (`61dd0c8`) `resolveHarnessOptions()` pure and tested first; happy path unchanged by a byte.
+- **M8.11.7** (`d103c9f`, `2fa60db`) the guide, run-modes, compare-key and security-review pages; `docs-nav` and
+  `security-review-claims` guards, both seen red first.
+- **M8.11.1** (`75c0025`) the shared local-review suite + leg E; helpers shared with the delete block moved to
+  `local-common.ts`; two reds on the mock.
+- **M8.11.6** (`d3c1342`) the netlog preload + the local-review e2e; a planted `fetch` failed the run naming the URL.
+- **M8.11.2** (`f283358`) leg F over HTTP through the extracted daemon helper; the smoke script gated and its
+  four pre-existing rotten checks reconciled by pinning identity.
+- **M8.11.3** (`2242f59`) leg G over the real engine, zero remotes, on-disk restart, `fetch` tripwire — **and it
+  found the suite wrong on binary blobs**; the suite was corrected.
+- **M8.11.4** (`b7bb0b9`) E/F/G required in the matrix; seen to exit 1 naming them.
+- **Review fixes** (`025a8a0`) duplicate reply id, reaction re-read, `store.reload()` for both mock restarts,
+  token scrub, teardown guard.
+
+**Decisions.**
+- **Started M8.11 before M8.9** on the handover's instruction (it gates three criteria; M8.9 gates none). The
+  docs describe archiving as designed-not-yet-wired; M8.9 flips two paragraphs to present tense.
+- **The runner declares its compare shape** (`'empty' | 'changes'`): the mock's local sync is deliberately the
+  empty compare and the mock is the spec, so "non-empty files" cannot be a shared assertion. Real assertions
+  in both branches.
+- **No adapter for the direct leg**: the suite's mapped api type accepts synchronous answers (the delete
+  block's shape); `tsc -b` is the bridge.
+- **A binary blob is stored collapsed** (`binary: true`, true `size`, `content: ''`) — now pinned by the suite.
+- **The mock store has `reload()`** so a mock restart proves persistence rather than a second handle.
+
+**Blockers.** None.
+
+**Next.** **M8.9** (archive on PR appearance — independent, ruling 2 settled the trigger, OQ1/OQ8/OQ9 open),
+then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` unwrapped by the netlog guard.
