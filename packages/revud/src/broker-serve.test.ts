@@ -104,6 +104,9 @@ function stubApi(): DirectApi {
     listLocalReviews: () => {
       throw new Error('not used')
     },
+    deleteLocalReview: async () => {
+      throw new Error('not used')
+    },
     submitReview: async () => {
       throw new Error('not used')
     },

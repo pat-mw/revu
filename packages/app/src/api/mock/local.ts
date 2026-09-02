@@ -1,5 +1,5 @@
 import type { BranchRef, BrokerPullMeta, CreateLocalReviewInput, GhRef, GhUser, Human, LocalReviewSummary, PullDetail, ReactionKey, ReactionRollup, ReviewComment, ReviewSummary, ReviewThread, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
-import { ApiError, isValidRefName, normalizeRefName } from '@revu/shared'
+import { ApiError, draftHoldsText, isValidRefName, normalizeRefName } from '@revu/shared'
 import type { FixtureDB } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import { fakeSha } from '@/fixtures/helpers'
@@ -368,14 +368,40 @@ export function getLocalReview(id: number): LocalReviewSummary | null {
 
 /**
  * Delete a local review: the record, its materialized threads and submitted
- * reviews, and its cached snapshot all go. Per-human drafts and viewed state
- * are deliberately left in place — user-written text is never destroyed,
- * only orphaned, and the id is never minted again so nothing can inherit it.
- * Pruning shared content-addressed blobs is a retention concern, not a
- * delete concern: blobs may be referenced by other snapshots.
+ * reviews, its cached snapshot, and every human's draft and viewed state on
+ * it all go, and the id is never minted again so nothing can inherit it.
+ *
+ * The delete is REFUSED outright, as `unprocessable`, while any human's draft
+ * on the review holds text — a pending comment, or a body with anything in it.
+ * A delete is server-authoritative and has no flag to force it, so the only
+ * way past the refusal is the one the message names: discard the draft, then
+ * delete. That is what keeps "drafts survive everything" true for a
+ * user-initiated delete as well as for a submit — text a human wrote leaves
+ * this store only by that human's own discard or by a confirmed submit, and
+ * the delete can therefore only ever take drafts that hold nothing. The
+ * check spans EVERY human's draft, not the caller's alone, because two
+ * reviewers of one branch pair hold two drafts and the delete would take
+ * both; and it is the empty, editor-created draft that is allowed through,
+ * because a check that counted an untouched draft as text would make every
+ * review a human had merely opened undeletable.
+ *
+ * `unprocessable` is the exact code: the review exists (so not `not_found`),
+ * nothing moved underneath the caller (so not `conflict`), and the caller can
+ * put the review into a state that honors the identical request. It is a
+ * precondition checked before the record is touched, so a refusal never
+ * leaves the review half removed.
+ *
+ * Pruning shared content-addressed blobs is a retention concern, not a delete
+ * concern: blobs may be referenced by other snapshots.
  */
 export function deleteLocalReview(id: number): void {
   requireLocalReview(id)
+  if (store.listDraftsFor(id).some(draftHoldsText)) {
+    throw new ApiError(
+      'unprocessable',
+      `Local review ${id} still holds an unsubmitted draft with text in it — discard that draft, then delete the review.`,
+    )
+  }
   store.deleteLocalReview(id)
 }
 

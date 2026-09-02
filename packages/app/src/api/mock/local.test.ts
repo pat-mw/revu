@@ -7,8 +7,10 @@
  * carries an email, minted ids stay inside their reserved bands, comment
  * bodies are stored verbatim (no identity stamp — with a positive control so
  * a broken matcher cannot pass vacuously), submitted reviews never enter the
- * snapshot's `mutable.reviews`, creation is idempotent per branch pair, and
- * deletion removes the record without recycling its id or destroying drafts.
+ * snapshot's `mutable.reviews`, creation is idempotent per branch pair, and a
+ * delete is refused outright while any human's draft on the review holds text
+ * — once it goes it takes the empty drafts and viewed marks with it, and never
+ * recycles its id.
  *
  * Some of them pin behavior that reads like an accident and is not, so nothing
  * downstream "corrects" it into a divergence: the reaction rollup is shared
@@ -68,6 +70,16 @@ beforeAll(() => {
 afterAll(() => {
   mockDev.reset()
 })
+
+/** The ApiError a call throws, or null when it does not throw or throws something else. */
+function thrownError(fn: () => unknown): ApiError | null {
+  try {
+    fn()
+    return null
+  } catch (e) {
+    return e instanceof ApiError ? e : null
+  }
+}
 
 /** The ApiError code a call throws, or null when it does not throw. */
 function thrownCode(fn: () => unknown): string | null {
@@ -510,29 +522,111 @@ describe('reactions', () => {
 })
 
 describe('deletion', () => {
-  test('removes the record and its snapshot, keeps drafts, and never recycles the id', () => {
+  test('is refused whole while a draft holds text, and removes everything once it is discarded', () => {
     const humanId = mockDev.get().humanId
     const created = createLocalReview({ baseRef: 'main', headRef: 'feature/doomed' })
     const snap = syncLocalReview(created.id)
-    store.putDraft(draftFor(humanId, created.id, snap))
+    const draft = draftFor(humanId, created.id, snap)
+    store.putDraft(draft)
+    store.setViewed(humanId, created.id, {
+      'src/index.ts': { viewed: true, blobSha: null, at: new Date().toISOString() },
+    })
 
+    // The positive control for every "still there" below: all four pieces
+    // demonstrably exist before the refusal, and the draft demonstrably holds
+    // text — an empty one would be let through.
+    expect(getLocalReview(created.id)).not.toBeNull()
+    expect(store.getSnapshot(created.id)).not.toBeNull()
+    expect(store.getDraft(humanId, created.id)?.body).toBe(draft.body)
+    expect(draft.body).not.toBe('')
+    expect(Object.keys(store.getViewed(humanId, created.id))).toHaveLength(1)
+
+    // Refused as `unprocessable`: the review exists, nothing moved under the
+    // caller, and the caller can put it in a state that honors the identical
+    // request — which is what the message has to tell them.
+    const refused = thrownError(() => deleteLocalReview(created.id))
+    expect(refused?.code).toBe('unprocessable')
+    expect(refused?.message).toMatch(/discard/i)
+    // A precondition, not a partial delete: the record, the snapshot, the
+    // draft and the viewed marks are all exactly where they were.
+    expect(getLocalReview(created.id)).not.toBeNull()
+    expect(listLocalReviews().some((r) => r.id === created.id)).toBe(true)
+    expect(store.getSnapshot(created.id)).not.toBeNull()
+    expect(store.getDraft(humanId, created.id)).toStrictEqual(draft)
+    expect(Object.keys(store.getViewed(humanId, created.id))).toHaveLength(1)
+
+    // A draft whose body is empty but which carries a pending comment holds
+    // text just the same: either half on its own is enough to refuse.
+    store.putDraft({ ...draft, body: '', comments: [pending('An inline note.', 12)] })
+    expect(thrownCode(() => deleteLocalReview(created.id))).toBe('unprocessable')
+
+    // The remedy the message names, followed exactly: discard the draft, then
+    // the identical delete succeeds. A message naming a remedy is a promise,
+    // and this is the line that tests the promise.
+    store.deleteDraft(humanId, created.id)
     deleteLocalReview(created.id)
 
     expect(getLocalReview(created.id)).toBeNull()
     expect(listLocalReviews().some((r) => r.id === created.id)).toBe(false)
     expect(store.getSnapshot(created.id)).toBeNull()
-    // The draft is orphaned, never destroyed — deletion must not be the one
-    // path that discards user-written text.
-    expect(store.getDraft(humanId, created.id)).not.toBeNull()
+    // The viewed marks went WITH the review. This line once asserted the
+    // opposite — that per-human state was orphaned rather than removed. The
+    // rule moved deliberately: a draft holding text now blocks the delete
+    // outright, so the only per-human rows a delete can ever take are ones
+    // holding nothing, and taking them beats leaving unlistable rows behind
+    // under an id nothing will mint again.
+    expect(store.getViewed(humanId, created.id)).toEqual({})
 
-    // Recreating the same branch pair mints a fresh id: the dead id's drafts,
-    // viewed state, and client caches can never be inherited.
+    // Recreating the same branch pair mints a fresh id: the dead id's client
+    // caches can never be inherited.
     const again = createLocalReview({ baseRef: 'main', headRef: 'feature/doomed' })
     expect(again.id).not.toBe(created.id)
     expect(again.id).toBeGreaterThan(created.id)
 
-    // Deleting a review that does not exist is a typed not_found.
+    // Deleting a review that no longer exists is the same typed not_found a
+    // review that never existed gets.
     expect(thrownCode(() => deleteLocalReview(created.id))).toBe('not_found')
+  })
+
+  test('an empty draft — the one an editor creates on open — never blocks, and goes with the review', () => {
+    const humanId = mockDev.get().humanId
+    const created = createLocalReview({ baseRef: 'main', headRef: 'feature/opened-only' })
+    const snap = syncLocalReview(created.id)
+    store.putDraft({ ...draftFor(humanId, created.id, snap), body: '', comments: [] })
+    // The control: a draft row really is there to be refused on, so the
+    // success below is the empty draft being let through and not a review
+    // nobody had touched.
+    expect(store.getDraft(humanId, created.id)).not.toBeNull()
+
+    deleteLocalReview(created.id)
+
+    expect(getLocalReview(created.id)).toBeNull()
+    // Removed, not orphaned: an empty draft destroys no text, and a row left
+    // under a dead id would be unlistable forever.
+    expect(store.getDraft(humanId, created.id)).toBeNull()
+  })
+
+  test("another human's text blocks the delete exactly as the caller's own would", () => {
+    const firstHumanId = mockDev.get().humanId
+    const second = mockDev.listHumans().find((h) => h.id !== firstHumanId)
+    expect(second).toBeDefined()
+    if (!second) return
+    const created = createLocalReview({ baseRef: 'main', headRef: 'feature/shared-pair' })
+    const snap = syncLocalReview(created.id)
+    store.putDraft(draftFor(second.id, created.id, snap))
+    // The caller holds nothing on this review; only the other reviewer does.
+    expect(store.getDraft(firstHumanId, created.id)).toBeNull()
+
+    // The check spans every human's draft, because the delete would take
+    // every human's draft.
+    expect(thrownCode(() => deleteLocalReview(created.id))).toBe('unprocessable')
+    expect(store.getDraft(second.id, created.id)).not.toBeNull()
+
+    // The control that the refusal was theirs: once their draft is discarded
+    // the same delete goes through.
+    store.deleteDraft(second.id, created.id)
+    deleteLocalReview(created.id)
+    expect(getLocalReview(created.id)).toBeNull()
   })
 })
 
@@ -546,6 +640,16 @@ describe('the four local-review methods on the API surface', () => {
       return null
     } catch (e) {
       return e instanceof ApiError ? e.code : `not an ApiError: ${String(e)}`
+    }
+  }
+
+  /** The ApiError a rejected call carries, or null when it resolves or rejects with something else. */
+  async function rejectedError(p: Promise<unknown>): Promise<ApiError | null> {
+    try {
+      await p
+      return null
+    } catch (e) {
+      return e instanceof ApiError ? e : null
     }
   }
 
@@ -619,7 +723,7 @@ describe('the four local-review methods on the API surface', () => {
     expect((await api.listLocalReviews()).filter((r) => r.id === created.id)).toHaveLength(1)
   })
 
-  test('deleteLocalReview removes the whole record and answers not_found for an unknown id', async () => {
+  test('deleteLocalReview refuses while the draft holds text, and the remedy it names removes the whole record', async () => {
     const humanId = mockDev.get().humanId
     const created = await api.createLocalReview({
       baseRef: 'main',
@@ -628,9 +732,23 @@ describe('the four local-review methods on the API surface', () => {
     // Synthesizing the snapshot is engine work; the deletion boundary being
     // asserted is what the API surface does to it.
     const snap = syncLocalReview(created.id)
-    store.putDraft(draftFor(humanId, created.id, snap))
+    const draft = await api.saveDraft(draftFor(humanId, created.id, snap))
+    expect(draft.body).not.toBe('')
     expect((await api.listLocalReviews()).some((r) => r.id === created.id)).toBe(true)
 
+    // Refused through the adapter with the same typed answer the engine
+    // gives, and the review is still listed, still synced, and its draft
+    // still readable: the refusal is a precondition, not a partial delete.
+    const refused = await rejectedError(api.deleteLocalReview(created.id))
+    expect(refused?.code).toBe('unprocessable')
+    expect(refused?.message).toMatch(/discard/i)
+    expect((await api.listLocalReviews()).some((r) => r.id === created.id)).toBe(true)
+    expect(store.getSnapshot(created.id)).not.toBeNull()
+    expect((await api.getDraft(created.id))?.body).toBe(draft.body)
+
+    // The remedy the message names, followed through the surface a client
+    // would use: discard, then the identical call succeeds.
+    await api.discardDraft(created.id)
     await api.deleteLocalReview(created.id)
 
     // The settled boundary is the FULL record: the review is gone from the
@@ -638,9 +756,12 @@ describe('the four local-review methods on the API surface', () => {
     expect((await api.listLocalReviews()).some((r) => r.id === created.id)).toBe(false)
     expect(getLocalReview(created.id)).toBeNull()
     expect(store.getSnapshot(created.id)).toBeNull()
-    // The other half of that boundary: per-human text is orphaned, never
-    // destroyed, and the id is never minted again so nothing inherits it.
-    expect(store.getDraft(humanId, created.id)).not.toBeNull()
+    // This line once asserted the draft was orphaned rather than destroyed.
+    // The rule moved deliberately: text now blocks the delete outright, so
+    // nothing holding text can reach this point, and what a delete does take
+    // — the empty per-human rows — it removes rather than strands under an id
+    // that is never minted again.
+    expect(store.getDraft(humanId, created.id)).toBeNull()
 
     expect(await rejectedCode(api.deleteLocalReview(created.id))).toBe('not_found')
     // An invalid branch pair is a typed rejection through the adapter too,
@@ -968,6 +1089,7 @@ describe('every id-taking method serves a local review id', () => {
     const ghost = LOCAL_REVIEW_ID_BASE + 987_654
     expect(isLocalReviewId(ghost)).toBe(true)
     expect(await apiErrorCode(api.syncPull(ghost))).toBe('not_found')
+    expect(await apiErrorCode(api.deleteLocalReview(ghost))).toBe('not_found')
     expect(await apiErrorCode(api.replyToThread(ghost, 'local:1:1', 'x'))).toBe('not_found')
     expect(await apiErrorCode(api.resolveThread(ghost, 'local:1:1', true))).toBe('not_found')
     expect(await apiErrorCode(api.addReaction(ghost, 1, 'heart'))).toBe('not_found')

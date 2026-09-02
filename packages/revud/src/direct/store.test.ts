@@ -57,7 +57,18 @@ function open(): DirectStore {
   return openDirectStore({ dataDir: dir })
 }
 
-function immutable(compareKey: string): SnapshotImmutable {
+/**
+ * The immutable half of one comparison. `blobIndex` is a parameter because the
+ * blob-reference reads are entirely about which SHAs an index names: a fixture
+ * that hard-coded one index could not express two comparisons sharing a blob,
+ * which is the case those reads exist to get right.
+ */
+function immutable(
+  compareKey: string,
+  blobIndex: SnapshotImmutable['blobIndex'] = {
+    'a.ts': { base: 'baseblob', head: 'headblob' },
+  },
+): SnapshotImmutable {
   return {
     compareKey,
     mergeBaseSha: 'base',
@@ -73,7 +84,7 @@ function immutable(compareKey: string): SnapshotImmutable {
         patch: '@@ -1 +1 @@',
       },
     ],
-    blobIndex: { 'a.ts': { base: 'baseblob', head: 'headblob' } },
+    blobIndex,
     commits: [],
   }
 }
@@ -1230,6 +1241,15 @@ describe('the local entity id allocator', () => {
     expect(first).toBe(LOCAL_ENTITY_ID_BASE)
   })
 
+  // A thousand durable allocations, each its own `UPDATE ... RETURNING` against a
+  // store opened with `synchronous = FULL`, so the wall time is a thousand real
+  // fsyncs and is set by the disk rather than by the code under test. On a fast
+  // local SSD that is a few hundred milliseconds; on a slower or network-backed
+  // volume it is an order of magnitude more, which overruns the default per-test
+  // limit while nothing is wrong. The explicit budget is what keeps the failure
+  // meaning "the allocator stopped working" instead of "this disk is slow" — it
+  // is deliberately far above the observed worst case, because a timeout tuned
+  // close to the measurement just moves the flake.
   test('a thousand successive calls are strictly increasing safe integers', () => {
     const store = open()
     const issued: number[] = []
@@ -1249,7 +1269,7 @@ describe('the local entity id allocator', () => {
     // that returned a constant satisfies neither, but a subtler one might satisfy
     // only one.
     expect(new Set(issued).size).toBe(1000)
-  })
+  }, 30_000)
 
   test('a reopen continues above the last issued value rather than restarting at the base', () => {
     const store = open()
@@ -2409,6 +2429,1098 @@ describe('local submitted reviews: recorded per review, ids kept exact', () => {
   })
 })
 
+/**
+ * The six tables a local review's rows live in, each with the column that names
+ * the review, spelled out rather than derived from the store's own statements.
+ *
+ * A count taken through the same list the delete loops over would agree with the
+ * delete however wrong the delete became — a table dropped from both would read
+ * as an empty table nobody had to clean. These are literals, so a table the
+ * delete stops naming still gets counted here and still has to come back zero.
+ */
+const LOCAL_TABLES_BY_REVIEW: readonly { table: string; column: string }[] = [
+  { table: 'local_reviews', column: 'id' },
+  { table: 'local_snapshots', column: 'local_id' },
+  { table: 'local_threads', column: 'local_id' },
+  { table: 'local_reviews_submitted', column: 'local_id' },
+  { table: 'local_drafts', column: 'local_id' },
+  { table: 'local_viewed', column: 'local_id' },
+]
+
+/**
+ * Raw per-table row counts for one local review id, read through a handle of its
+ * own rather than through the store.
+ *
+ * Raw on purpose. Every store read is keyed through the review row, so once that
+ * row is gone the store cannot see a leftover envelope or a leftover thread at
+ * all — asking it would return the same empty answer whether the rows were
+ * removed or merely orphaned. Only a direct count distinguishes the two, and
+ * "orphaned" is exactly the failure a single delete statement produces.
+ */
+function localRowCounts(id: number): Record<string, number> {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const counts: Record<string, number> = {}
+  for (const { table, column } of LOCAL_TABLES_BY_REVIEW) {
+    const row = raw
+      .query(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} = ?`)
+      .get(id) as { n: number }
+    counts[table] = row.n
+  }
+  raw.close()
+  return counts
+}
+
+/**
+ * Populate every one of the six local tables for one branch pair and return the
+ * review's id. Two humans hold a draft and viewed state, because the drafts and
+ * viewed rows are keyed by the human as well as the review and a delete narrowed
+ * to one human would still look complete with only one human present.
+ */
+function seedEveryLocalTable(store: DirectStore, over: Partial<NewLocalReview> = {}): number {
+  const id = store.createLocalReview(newLocalReview(over)).id
+  store.putLocalSnapshot(snapshot(id, `base...head-${id}`))
+  store.putLocalThread(id, localThread('t-a'))
+  store.putLocalThread(id, localThread('t-b'))
+  store.putLocalSubmittedReview(id, submittedReview(LOCAL_ENTITY_ID_BASE + id))
+  store.putLocalDraft(draft('h1', id, 'unsubmitted text belonging to h1'))
+  store.putLocalDraft(draft('h2', id, 'unsubmitted text belonging to h2'))
+  store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+  store.setLocalViewed('h2', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+  return id
+}
+
+/**
+ * Arm a single aborting trigger on one local table's DELETE and return a freshly
+ * opened store, so a removal fails partway through its transaction while the
+ * statements before it have already run.
+ *
+ * This is the negative control for atomicity. "All six tables emptied together"
+ * is only worth something while a delete that emptied five of them would be
+ * observably rolled back, and nothing a caller can pass makes one of the six
+ * statements fail on its own.
+ */
+function armLocalDeleteTripwire(store: DirectStore, table: string): DirectStore {
+  store.close()
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run(
+    `CREATE TRIGGER refuse_delete_${table} BEFORE DELETE ON ${table} ` +
+      `BEGIN SELECT RAISE(ABORT, 'refused: DELETE on ${table}'); END`,
+  )
+  raw.close()
+  return open()
+}
+
+describe("listing every human's draft on one local review", () => {
+  test('answers both humans, ordered by human id, and nothing from another review', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const other = seedEveryLocalTable(store, { headRef: 'refs/heads/feature/y', title: 'y' })
+
+    // Two humans, as the seed writes them, and only this review's — the other
+    // review's rows are keyed to a different id and must not bleed in.
+    expect(store.listLocalDrafts(id).map((d) => [d.humanId, d.prNumber])).toEqual([
+      ['h1', id],
+      ['h2', id],
+    ])
+    expect(store.listLocalDrafts(other).map((d) => d.prNumber)).toEqual([other, other])
+    store.close()
+  })
+
+  test('a review nobody has drafted on, and an id that names no review, both read back empty', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    expect(store.listLocalDrafts(id)).toEqual([])
+    expect(store.listLocalDrafts(LOCAL_REVIEW_ID_BASE + 9999)).toEqual([])
+    store.close()
+  })
+
+  test('a draft row that cannot be parsed fails the whole listing rather than being left out', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    store.close()
+
+    // One of the two rows corrupted in place. A listing that skipped it would
+    // report one draft where two exist, and a caller deciding whether the
+    // review still holds text would decide on the wrong count.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run('UPDATE local_drafts SET data = ? WHERE human_id = ? AND local_id = ?', [
+      'not json',
+      'h2',
+      id,
+    ])
+    raw.close()
+
+    const reopened = open()
+    expect(() => reopened.listLocalDrafts(id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+})
+
+describe('removing a local review takes all six of its tables, or none of them', () => {
+  test('every one of the six local tables gives up its rows for that review', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+
+    // Pinned before the delete, so the assertion after it is against rows that
+    // demonstrably existed rather than against a table that was empty all along.
+    expect(localRowCounts(id)).toEqual({
+      local_reviews: 1,
+      local_snapshots: 1,
+      local_threads: 2,
+      local_reviews_submitted: 1,
+      local_drafts: 2,
+      local_viewed: 2,
+    })
+
+    store.deleteLocalReview(id)
+    store.close()
+
+    expect(localRowCounts(id)).toEqual({
+      local_reviews: 0,
+      local_snapshots: 0,
+      local_threads: 0,
+      local_reviews_submitted: 0,
+      local_drafts: 0,
+      local_viewed: 0,
+    })
+  })
+
+  test('the returned counts equal the rows that existed', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const removed = store.deleteLocalReview(id)
+    store.close()
+
+    // The counts are the evidence a caller has that the delete reached every
+    // table, so they are asserted as an exact record and not merely as
+    // "something was removed". Two threads, two humans' drafts and two humans'
+    // viewed rows, so a count that silently collapsed to one-per-table is red.
+    expect(removed).toEqual({
+      reviewsDeleted: 1,
+      snapshotsDeleted: 1,
+      threadsDeleted: 2,
+      submittedReviewsDeleted: 1,
+      draftsDeleted: 2,
+      viewedDeleted: 2,
+    })
+  })
+
+  test('every read of the removed review answers empty-or-null, for both humans', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    store.deleteLocalReview(id)
+
+    expect(store.getLocalReview(id)).toBeNull()
+    expect(store.getLocalSnapshot(id)).toBeNull()
+    expect(store.getLocalDraft('h1', id)).toBeNull()
+    expect(store.getLocalDraft('h2', id)).toBeNull()
+    expect(store.getLocalViewed('h1', id)).toEqual({})
+    expect(store.getLocalViewed('h2', id)).toEqual({})
+    expect(store.listLocalThreads(id)).toEqual([])
+    expect(store.getLocalThread(id, 't-a')).toBeNull()
+    expect(store.listLocalSubmittedReviews(id)).toEqual([])
+    expect(store.getLocalCommentAuthors(id)).toEqual({})
+    expect(store.listLocalReviews('acme/widgets')).toEqual([])
+    store.close()
+  })
+
+  test('a second, unrelated local review keeps every one of its rows', () => {
+    const store = open()
+    const doomed = seedEveryLocalTable(store)
+    const kept = seedEveryLocalTable(store, { headRef: 'refs/heads/feature/y', title: 'y' })
+
+    store.deleteLocalReview(doomed)
+
+    expect(localRowCounts(kept)).toEqual({
+      local_reviews: 1,
+      local_snapshots: 1,
+      local_threads: 2,
+      local_reviews_submitted: 1,
+      local_drafts: 2,
+      local_viewed: 2,
+    })
+    expect(store.getLocalReview(kept)!.headRef).toBe('refs/heads/feature/y')
+    expect(store.getLocalDraft('h1', kept)!.body).toBe('unsubmitted text belonging to h1')
+    expect(store.getLocalDraft('h2', kept)!.body).toBe('unsubmitted text belonging to h2')
+    expect(store.listLocalThreads(kept).map((t) => t.id)).toEqual(['t-a', 't-b'])
+    expect(store.listLocalSubmittedReviews(kept)).toHaveLength(1)
+    expect(store.getLocalViewed('h1', kept)['a.ts']!.viewed).toBe(true)
+    expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([kept])
+    store.close()
+  })
+
+  test('deleting an id that was never created is a no-op returning all-zero counts', () => {
+    const store = open()
+    const kept = seedEveryLocalTable(store)
+
+    // Never minted, and deliberately inside the reserved local band so the id is
+    // the shape a caller would really pass rather than a value the statement
+    // could reject on sight.
+    const removed = store.deleteLocalReview(LOCAL_REVIEW_ID_BASE + 9999)
+
+    expect(removed).toEqual({
+      reviewsDeleted: 0,
+      snapshotsDeleted: 0,
+      threadsDeleted: 0,
+      submittedReviewsDeleted: 0,
+      draftsDeleted: 0,
+      viewedDeleted: 0,
+    })
+    // Idempotent rather than an error: a retried removal has to be safe, and
+    // "already gone" is the outcome the caller wanted. Nothing else moved.
+    expect(store.getLocalReview(kept)!.id).toBe(kept)
+    store.close()
+  })
+
+  test('deleting the same review twice is safe: the second call removes nothing', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    expect(store.deleteLocalReview(id).reviewsDeleted).toBe(1)
+    expect(store.deleteLocalReview(id)).toEqual({
+      reviewsDeleted: 0,
+      snapshotsDeleted: 0,
+      threadsDeleted: 0,
+      submittedReviewsDeleted: 0,
+      draftsDeleted: 0,
+      viewedDeleted: 0,
+    })
+    store.close()
+  })
+
+  test('the removed id is never minted again, so no row can be adopted by a later review', () => {
+    const store = open()
+    const removed = seedEveryLocalTable(store)
+    store.deleteLocalReview(removed)
+
+    // The high-water mark only moves up, so the next review gets a fresh id even
+    // though the previous one is free. That is what makes a delete that missed a
+    // row a leak rather than a corruption: an orphan can never be adopted.
+    const next = store.createLocalReview(newLocalReview({ headRef: 'refs/heads/feature/z' }))
+    expect(next.id).toBeGreaterThan(removed)
+    store.close()
+  })
+
+  test('the shared immutable half and the blobs are left alone: no cascade from a review', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const compareKey = `base...head-${id}`
+    store.putBlobs([{ sha: 'headblob', path: 'a.ts', content: 'v1', size: 2, binary: false }])
+
+    store.deleteLocalReview(id)
+
+    // Content-addressed and shared — the same compare key can back a pull
+    // request and other local reviews — so removing one here would be a cascade
+    // into storage this review does not own. Whether a cached half is still
+    // needed is a question about references across the whole store.
+    expect(store.getImmutable(compareKey)).not.toBeNull()
+    expect(store.hasBlob('headblob')).toBe(true)
+    store.close()
+  })
+
+  test('deleteLocalReview against a closed database throws StoreWriteError', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    store.close()
+    // A removal that cannot reach disk must surface as a typed persist failure,
+    // never as a success reporting counts nothing wrote.
+    expect(() => store.deleteLocalReview(id)).toThrow(StoreWriteError)
+  })
+
+  test('a refused statement rolls the whole removal back: five tables do not go alone', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const before = localRowCounts(id)
+
+    // `local_viewed` is the LAST of the six statements, so every other delete has
+    // already run inside the transaction when this one aborts. Anything less than
+    // a full rollback leaves five emptied tables behind.
+    const armed = armLocalDeleteTripwire(store, 'local_viewed')
+    const err = writeErrorFrom(() => {
+      armed.deleteLocalReview(id)
+    })
+    armed.close()
+
+    expect(err.table).toBe('local_reviews+dependents')
+    expect(err.message).toContain('refused: DELETE on local_viewed')
+    // Byte for byte what it was: a removal that failed removed nothing.
+    expect(localRowCounts(id)).toEqual(before)
+  })
+})
+
+/**
+ * Run `fn` and return the `StoreUnreadableError` it threw.
+ *
+ * The CLASS is the assertion, not the fact of throwing, and the two are easy to
+ * confuse here because both failures throw. A row this store cannot read
+ * honestly is a `StoreUnreadableError`, which the daemon answers as a failed
+ * persist; a raw driver error escaping the same read reaches the router as an
+ * unrecognised throw and is reported as something else entirely. Catching the
+ * error and checking its type is the only shape that tells those apart —
+ * `toThrow(StoreUnreadableError)` would too, but not the row it names, and the
+ * error's own message promises a row can be repaired or removed.
+ */
+function unreadableErrorFrom(fn: () => unknown): StoreUnreadableError {
+  try {
+    fn()
+  } catch (err) {
+    if (err instanceof StoreUnreadableError) return err
+    throw err
+  }
+  throw new Error('expected a StoreUnreadableError; the read returned instead')
+}
+
+/** Overwrite one snapshot table's stored envelope with arbitrary bytes. */
+function corruptEnvelope(table: string, column: string, key: number, data: string): void {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run(`UPDATE ${table} SET data = ? WHERE ${column} = ?`, [data, key])
+  raw.close()
+}
+
+describe('the live compareKey set, computed fail-closed', () => {
+  test('a snapshot whose envelope is not JSON aborts the read as StoreUnreadableError', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.close()
+
+    corruptEnvelope('snapshots', 'pr_number', 204, 'not json')
+
+    // The class carries the whole meaning. An unreadable row is a condition the
+    // daemon reports as a failed persist; a driver error leaking out of the same
+    // read arrives as an unrecognised throw and is reported as something else. So
+    // "it threw" is not the assertion — both do.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.table).toBe('snapshots')
+    // The row, not merely the table. The error tells a human to repair or remove
+    // the row, and an error that cannot say which row makes that unactionable.
+    expect(err.rowKey).toBe('204')
+  })
+
+  test('a local snapshot whose envelope is not JSON aborts the read too', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+    store.close()
+
+    corruptEnvelope('local_snapshots', 'local_id', id, '{not valid json')
+
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.table).toBe('local_snapshots')
+    expect(err.rowKey).toBe(String(id))
+  })
+
+  test('a valid envelope with no compareKey at all throws rather than returning a short set', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putSnapshot(snapshot(205, 'other...head'))
+    store.close()
+
+    // Valid JSON, and every field a snapshot envelope carries except the one
+    // that names its immutable half. Nothing about reading it fails; the value
+    // is simply not there.
+    corruptEnvelope('snapshots', 'pr_number', 204, JSON.stringify({ prNumber: 204, mutable: {} }))
+
+    // Returning `['other...head']` here would be the catastrophe: a shorter set
+    // is not a smaller answer, it is a claim that `pr...head` is referenced by
+    // nothing — and the caller of this read removes what nothing references.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.table).toBe('snapshots')
+    expect(err.rowKey).toBe('204')
+  })
+
+  test('a compareKey of the empty string throws: empty is not a key, it is a missing one', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.close()
+
+    corruptEnvelope(
+      'snapshots',
+      'pr_number',
+      204,
+      JSON.stringify({ prNumber: 204, compareKey: '', mutable: {} }),
+    )
+
+    // An empty string is present where a key should be, so a check for absence
+    // alone waves it through — and it can match no `immutables` row, which makes
+    // it exactly as dangerous as a missing one and harder to notice.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.rowKey).toBe('204')
+  })
+
+  test('a compareKey that is not a string throws: it can name no immutables row', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+    store.close()
+
+    corruptEnvelope(
+      'local_snapshots',
+      'local_id',
+      id,
+      JSON.stringify({ prNumber: id, compareKey: 17, mutable: {} }),
+    )
+
+    // `immutables.compare_key` is TEXT, so a number can match no row there. It
+    // is neither absent nor empty, which is precisely why a guard written as two
+    // equality checks lets it through and a type check does not.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listLiveCompareKeys())
+    reopened.close()
+    expect(err.rowKey).toBe(String(id))
+  })
+
+  test('one PR snapshot and one local snapshot on distinct compares return both keys', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    // Both tables, because the immutable half is content-addressed by SHAs git
+    // produced and does not know which kind of review asked for it. A set built
+    // from one table would report the other's keys as referenced by nothing.
+    expect(store.listLiveCompareKeys()).toEqual(['local...head', 'pr...head'])
+    store.close()
+  })
+
+  test('two snapshots sharing one compareKey return it once', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'shared...head'))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'shared...head'))
+
+    // One stored copy of the expensive half backs both reviews, so the set is a
+    // set: the answer is which halves are needed, not how many times each is
+    // asked for.
+    expect(store.listLiveCompareKeys()).toEqual(['shared...head'])
+    store.close()
+  })
+
+  test('an empty store references nothing, and says so without failing', () => {
+    const store = open()
+    // Empty is an ordinary answer, distinct from the refusal an unreadable row
+    // produces — a store nobody has synced yet references no immutable half.
+    expect(store.listLiveCompareKeys()).toEqual([])
+    expect(store.listImmutableKeys()).toEqual([])
+    store.close()
+  })
+
+  test('removing a local review drops its compareKey from the live set, not from the cache', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    store.deleteLocalReview(id)
+
+    // The two reads answer different questions, and this is where that shows.
+    // The envelope is gone so nothing references `local...head` any more, while
+    // the cached half is still on disk — reclaiming it is a separate decision
+    // taken against the whole reference set, never a cascade from one delete.
+    expect(store.listLiveCompareKeys()).toEqual(['pr...head'])
+    expect(store.listImmutableKeys()).toEqual(['local...head', 'pr...head'])
+    store.close()
+  })
+})
+
+describe('the immutable cache reports everything it holds, orphans included', () => {
+  test('listImmutableKeys returns keys no snapshot names', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    // A half cached by a sync whose comparison nothing references any more —
+    // exactly what a rebased branch leaves behind on every sync, since a fresh
+    // merge base mints a fresh key and the previous one is never named again.
+    store.putImmutable(immutable('orphan...head'))
+
+    // The orphans are the point. Without them this read answers with the
+    // question: a reclamation decided by comparing the stored set against the
+    // referenced set has nothing to compare if the stored set is pre-filtered.
+    expect(store.listImmutableKeys()).toEqual(['orphan...head', 'pr...head'])
+    expect(store.listLiveCompareKeys()).toEqual(['pr...head'])
+    store.close()
+  })
+
+  test('the two reads are what an unreferenced half is defined by, and nothing else', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan-a...head'))
+    store.putImmutable(immutable('orphan-b...head'))
+
+    const live = new Set(store.listLiveCompareKeys())
+    const unreferenced = store.listImmutableKeys().filter((key) => !live.has(key))
+
+    // Reference-based, never age-based. Nothing in the `immutables` schema
+    // records when a row was written, so there is no timestamp to sweep on even
+    // if one were wanted — the constraint is made physical by the table itself.
+    expect(unreferenced).toEqual(['orphan-a...head', 'orphan-b...head'])
+    store.close()
+  })
+
+  test('neither read is a write: both are refused nothing under the PR-keyed tripwires', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    const armed = armPrKeyedTripwires(store)
+    const id = armed.createLocalReview(newLocalReview({})).id
+    armed.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    // Reads, and the tripwires guard UPDATE and DELETE as well as INSERT — so a
+    // reclamation read that "helpfully" tidied a row as it went would abort here
+    // rather than quietly discard a pull request's snapshot.
+    expect(armed.listLiveCompareKeys()).toEqual(['local...head', 'pr...head'])
+    expect(armed.listImmutableKeys()).toEqual(['local...head', 'pr...head'])
+    armed.close()
+  })
+})
+
+/** How many rows the immutable cache holds, counted through a handle of its own. */
+function immutableRowCount(): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM immutables').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+describe('removing cached halves removes only what nothing references', () => {
+  test('a key no snapshot names gives up its row, and the row is really gone', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    expect(immutableRowCount()).toBe(2)
+
+    expect(store.deleteImmutables(['orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+
+    expect(immutableRowCount()).toBe(1)
+    expect(store.getImmutable('orphan...head')).toBeNull()
+    store.close()
+  })
+
+  test('a key a pull-request snapshot still names is left exactly where it is', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+
+    // The caller asked for a live key, which is what a caller that read its two
+    // sets before a concurrent sync landed will do. The answer is to leave the
+    // row alone, not to remove it and not to refuse the whole call: the race is
+    // the ordinary shape of a reclamation, not a mistake to report.
+    expect(store.deleteImmutables(['pr...head'])).toEqual({ count: 0, removed: [] })
+
+    expect(immutableRowCount()).toBe(1)
+    // The consequence the refusal exists to prevent, asserted as a consequence:
+    // the snapshot still opens.
+    expect(store.getSnapshot(204)).not.toBeNull()
+    store.close()
+  })
+
+  test('a key a local snapshot still names is left where it is too', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+
+    // Both tables, because one compare key can back either kind of review and
+    // the cached half knows nothing about which asked for it. A recheck reading
+    // one table would report the other's live halves as referenced by nothing.
+    expect(store.deleteImmutables(['local...head'])).toEqual({ count: 0, removed: [] })
+
+    expect(store.getLocalSnapshot(id)).not.toBeNull()
+    store.close()
+  })
+
+  test('a live key and an orphan named together: only the orphan goes', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+
+    // The mixed batch is the one that separates "refuses live keys" from
+    // "refuses batches containing one" — the orphan still has to go.
+    expect(store.deleteImmutables(['pr...head', 'orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+
+    expect(store.listImmutableKeys()).toEqual(['pr...head'])
+    store.close()
+  })
+
+  test('an unreadable envelope aborts the removal with every row still present', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    store.close()
+
+    corruptEnvelope('snapshots', 'pr_number', 204, 'not json')
+
+    // The recheck runs INSIDE the deleting transaction, so a row it cannot
+    // parse aborts the transaction rather than the read that preceded it. A row
+    // skipped instead would read as "this snapshot references nothing", and
+    // `pr...head` would become a candidate on the strength of it.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.deleteImmutables(['orphan...head']))
+    expect(err.table).toBe('snapshots')
+    expect(err.rowKey).toBe('204')
+    reopened.close()
+
+    // Nothing removed, not even the orphan that really was one: an unknown
+    // reference set makes every deletion built on it a guess.
+    expect(immutableRowCount()).toBe(2)
+  })
+
+  test('a key that names no row removes nothing and does not fail', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+
+    // Counted from the statement rather than from the request, so a repeat over
+    // an already-reclaimed cache reports zero instead of claiming a removal.
+    expect(store.deleteImmutables(['never...stored'])).toEqual({ count: 0, removed: [] })
+
+    expect(immutableRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('one key named twice is one row and one entry in the report', () => {
+    const store = open()
+    store.putImmutable(immutable('orphan...head'))
+
+    // A count taken from the request would say two here, over a table that only
+    // ever held one matching row.
+    expect(store.deleteImmutables(['orphan...head', 'orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+
+    expect(immutableRowCount()).toBe(0)
+    store.close()
+  })
+
+  test('an empty request is a clean no-op', () => {
+    const store = open()
+    store.putImmutable(immutable('orphan...head'))
+    expect(store.deleteImmutables([])).toEqual({ count: 0, removed: [] })
+    // Named nothing, removed nothing: the empty list is not "everything
+    // unreferenced", which is the reading that would empty the cache.
+    expect(immutableRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('neither a blob nor a draft is reachable from a cached-half removal', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    store.putBlobs([
+      { sha: 'headblob', path: 'a.ts', content: 'text', size: 4, binary: false },
+    ])
+    store.putDraft(draft('h1', 204, 'unsubmitted text'))
+
+    store.deleteImmutables(['orphan...head'])
+
+    // `blobs` is keyed by git blob SHA and shares no key space with a
+    // comparison; a draft is irreplaceable local work. Neither is derivable from
+    // a compare key, so neither may travel with one.
+    expect(store.getBlob('headblob')).not.toBeNull()
+    expect(store.getDraft('h1', 204)?.body).toBe('unsubmitted text')
+    store.close()
+  })
+
+  test('removing a cached half touches no PR-keyed table', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('orphan...head'))
+    const armed = armPrKeyedTripwires(store)
+
+    // The live set is READ from `snapshots`, which is required — and the
+    // tripwires guard UPDATE and DELETE as well as INSERT, so a recheck that
+    // "helpfully" tidied a row as it went would abort here.
+    expect(armed.deleteImmutables(['orphan...head'])).toEqual({
+      count: 1,
+      removed: ['orphan...head'],
+    })
+    armed.close()
+  })
+
+  test('deleteImmutables against a closed database throws StoreWriteError', () => {
+    const store = open()
+    store.putImmutable(immutable('orphan...head'))
+    store.close()
+    // Never a silent success: a reclamation that could not persist must not
+    // report rows as removed that are still on disk.
+    const err = writeErrorFrom(() => {
+      store.deleteImmutables(['orphan...head'])
+    })
+    expect(err.table).toBe('immutables')
+  })
+})
+
+/** How many rows the blob table holds, counted through a handle of its own. */
+function blobRowCount(): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw.query('SELECT COUNT(*) AS n FROM blobs').get() as { n: number }
+  raw.close()
+  return row.n
+}
+
+/** Overwrite one cached half's stored bytes with arbitrary ones. */
+function corruptImmutable(compareKey: string, data: string): void {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  raw.run('UPDATE immutables SET data = ? WHERE compare_key = ?', [data, compareKey])
+  raw.close()
+}
+
+/** One blob row, shaped as the provisioning path writes it. */
+function blob(sha: string): FileBlob {
+  return { sha, path: 'a.ts', content: `bytes of ${sha}\n`, size: 16, binary: false }
+}
+
+describe('the blob table reports everything it holds, unreferenced rows included', () => {
+  test('listBlobShas returns SHAs no stored comparison names', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+
+    // The unreferenced ones are the point. A reclamation decided by comparing
+    // the stored set against the referenced set has nothing to compare if the
+    // stored set is pre-filtered.
+    expect(store.listBlobShas()).toEqual(['live', 'stranded'])
+    expect(store.listReferencedBlobShas()).toEqual(['live'])
+    store.close()
+  })
+
+  test('the two reads are what an unreferenced blob is defined by, and nothing else', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded-a'), blob('stranded-b')])
+
+    const referenced = new Set(store.listReferencedBlobShas())
+    const unreferenced = store.listBlobShas().filter((sha) => !referenced.has(sha))
+
+    // Reference-based, never age-based. Nothing in the `blobs` schema records
+    // when a row was written, so there is no timestamp to sweep on even if one
+    // were wanted — the constraint is made physical by the table itself.
+    expect(unreferenced).toEqual(['stranded-a', 'stranded-b'])
+    store.close()
+  })
+
+  test('neither read is a write: both are refused nothing under the PR-keyed tripwires', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putBlobs([blob('baseblob'), blob('headblob')])
+    const armed = armPrKeyedTripwires(store)
+
+    // Reads, and the tripwires guard UPDATE and DELETE as well as INSERT — so a
+    // reclamation read that "helpfully" tidied a row as it went would abort here.
+    expect(armed.listBlobShas()).toEqual(['baseblob', 'headblob'])
+    expect(armed.listReferencedBlobShas()).toEqual(['baseblob', 'headblob'])
+    armed.close()
+  })
+})
+
+describe('the referenced blob set, computed fail-closed', () => {
+  test('both sides of a path are referenced, never the head alone', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: 'old', head: 'new' } }))
+
+    // The base side is what a comment anchored to the left of a diff resolves
+    // through. A head-only walk reports every unchanged base blob as referenced
+    // by nothing, which is a proposal to delete the content half the diff is
+    // rendered from.
+    expect(store.listReferencedBlobShas()).toEqual(['new', 'old'])
+    store.close()
+  })
+
+  test('a null side is ordinary and contributes no reference', () => {
+    const store = open()
+    store.putImmutable(
+      immutable('pr...head', {
+        'added.ts': { base: null, head: 'fresh' },
+        'gone.ts': { base: 'was-there', head: null },
+      }),
+    )
+
+    // An added file has no base and a removed one has no head. Neither is a
+    // malformed row, and neither names a blob.
+    expect(store.listReferencedBlobShas()).toEqual(['fresh', 'was-there'])
+    store.close()
+  })
+
+  test('a SHA carried by two paths is reported once', () => {
+    const store = open()
+    store.putImmutable(
+      immutable('pr...head', {
+        'a.ts': { base: null, head: 'same' },
+        'copy.ts': { base: null, head: 'same' },
+      }),
+    )
+
+    // Content-addressed: an unchanged-content rename puts one SHA on two paths,
+    // and the question is which bytes are needed rather than how many
+    // references each has.
+    expect(store.listReferencedBlobShas()).toEqual(['same'])
+    store.close()
+  })
+
+  test('the set spans every stored comparison, not the ones one kind of review names', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'pr-only' } }))
+    const id = store.createLocalReview(newLocalReview({})).id
+    store.putLocalSnapshot(snapshot(id, 'local...head'))
+    store.putImmutable(
+      immutable('local...head', { 'a.ts': { base: null, head: 'local-only' } }),
+    )
+    // A half no snapshot names any more still holds a claim on its bytes: it is
+    // a cache entry a warm re-sync of that comparison reuses.
+    store.putImmutable(immutable('old...head', { 'a.ts': { base: null, head: 'cached' } }))
+
+    // A set built from one kind of review's halves proposes every other kind's
+    // blobs for deletion — and because the table is content-addressed, those are
+    // frequently the same bytes.
+    expect(store.listReferencedBlobShas()).toEqual(['cached', 'local-only', 'pr-only'])
+    store.close()
+  })
+
+  test('a cached half whose stored bytes are not JSON aborts the read, naming the row', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable('pr...head', 'not json')
+
+    // The class carries the whole meaning: a row that cannot be parsed names no
+    // SHAs, and a read that treated it as naming none would turn every blob it
+    // really referenced into a candidate.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+  })
+
+  test('a comparison whose blob index is not an object aborts the read', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable(
+      'pr...head',
+      JSON.stringify({ compareKey: 'pr...head', immutable: { blobIndex: 'a.ts' } }),
+    )
+
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.table).toBe('immutables')
+    reopened.close()
+  })
+
+  test('a side that is neither absent nor a string aborts the read', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable(
+      'pr...head',
+      JSON.stringify({
+        compareKey: 'pr...head',
+        immutable: { blobIndex: { 'a.ts': { base: null, head: 7 } } },
+      }),
+    )
+
+    // A number can match no row in a TEXT-keyed table, so it is as unusable as
+    // an absent SHA and harder to notice — which is why the guard is a type
+    // check rather than a pair of equality tests.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+  })
+
+  test('an empty-string side aborts the read on the same terms', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head'))
+    store.close()
+
+    corruptImmutable(
+      'pr...head',
+      JSON.stringify({
+        compareKey: 'pr...head',
+        immutable: { blobIndex: { 'a.ts': { base: '', head: 'fine' } } },
+      }),
+    )
+
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.listReferencedBlobShas())
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+  })
+})
+
+describe('removing blobs removes only what nothing references', () => {
+  test('a SHA no comparison names gives up its row, and the row is really gone', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+    expect(blobRowCount()).toBe(2)
+
+    expect(store.deleteBlobs(['stranded'])).toEqual({ count: 1, removed: ['stranded'] })
+
+    expect(blobRowCount()).toBe(1)
+    expect(store.getBlob('stranded')).toBeNull()
+    store.close()
+  })
+
+  test('a SHA a stored comparison still names is left exactly where it is', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live')])
+
+    // The caller asked for a referenced SHA, which is what a caller that read
+    // its two sets before a concurrent sync landed will do. The answer is to
+    // leave the row alone, not to remove it and not to refuse the whole call.
+    expect(store.deleteBlobs(['live'])).toEqual({ count: 0, removed: [] })
+
+    expect(blobRowCount()).toBe(1)
+    // The consequence the refusal exists to prevent, asserted as a consequence:
+    // the bytes a pending comment's anchor is resolved through are still there.
+    expect(store.getBlob('live')).not.toBeNull()
+    store.close()
+  })
+
+  test('a SHA named by a half nothing references is still left where it is', () => {
+    const store = open()
+    // No snapshot names this comparison, so the half is reclaimable — but until
+    // it IS reclaimed it is a cache entry a warm re-sync reuses, and a reuse
+    // that found its bytes gone would assemble a snapshot with no content.
+    store.putImmutable(immutable('orphan...head', { 'a.ts': { base: null, head: 'cached' } }))
+    store.putBlobs([blob('cached')])
+
+    expect(store.deleteBlobs(['cached'])).toEqual({ count: 0, removed: [] })
+
+    expect(store.getBlob('cached')).not.toBeNull()
+    store.close()
+  })
+
+  test('a referenced SHA and an unreferenced one named together: only the loose one goes', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+
+    // The mixed batch separates "refuses referenced SHAs" from "refuses batches
+    // containing one" — the unreferenced row still has to go.
+    expect(store.deleteBlobs(['live', 'stranded'])).toEqual({
+      count: 1,
+      removed: ['stranded'],
+    })
+
+    expect(store.listBlobShas()).toEqual(['live'])
+    store.close()
+  })
+
+  test('a comparison that will not parse aborts the removal with every row present', () => {
+    const store = open()
+    store.putImmutable(immutable('pr...head', { 'a.ts': { base: null, head: 'live' } }))
+    store.putBlobs([blob('live'), blob('stranded')])
+    store.close()
+
+    corruptImmutable('pr...head', 'not json')
+
+    // The recheck runs INSIDE the deleting transaction, so a row it cannot parse
+    // aborts the transaction rather than the read that preceded it. A row
+    // skipped instead would read as "this comparison names no content", and
+    // `live` would become a candidate on the strength of it.
+    const reopened = open()
+    const err = unreadableErrorFrom(() => reopened.deleteBlobs(['stranded']))
+    expect(err.rowKey).toBe('pr...head')
+    reopened.close()
+
+    // Nothing removed, not even the row that really was loose: an unknown
+    // reference set makes every deletion built on it a guess.
+    expect(blobRowCount()).toBe(2)
+  })
+
+  test('a SHA that names no row removes nothing and does not fail', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+
+    // Counted from the statement rather than from the request, so a repeat over
+    // an already-reclaimed table reports zero instead of claiming a removal.
+    expect(store.deleteBlobs(['never...stored'])).toEqual({ count: 0, removed: [] })
+
+    expect(blobRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('one SHA named twice is one row and one entry in the report', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+
+    // A count taken from the request would say two here, over a table that only
+    // ever held one matching row.
+    expect(store.deleteBlobs(['stranded', 'stranded'])).toEqual({
+      count: 1,
+      removed: ['stranded'],
+    })
+
+    expect(blobRowCount()).toBe(0)
+    store.close()
+  })
+
+  test('an empty request is a clean no-op', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+    expect(store.deleteBlobs([])).toEqual({ count: 0, removed: [] })
+    // Named nothing, removed nothing: the empty list is not "everything
+    // unreferenced", which is the reading that would empty the table.
+    expect(blobRowCount()).toBe(1)
+    store.close()
+  })
+
+  test('neither a cached half nor a draft is reachable from a blob removal', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putBlobs([blob('stranded')])
+    store.putDraft(draft('h1', 204, 'unsubmitted text'))
+
+    store.deleteBlobs(['stranded'])
+
+    // The half is READ to build the reference set and never written; a draft is
+    // irreplaceable local work. Neither is derivable from a blob SHA, so neither
+    // may travel with one.
+    expect(store.getImmutable('pr...head')).not.toBeNull()
+    expect(store.getDraft('h1', 204)?.body).toBe('unsubmitted text')
+    store.close()
+  })
+
+  test('removing a blob touches no PR-keyed table', () => {
+    const store = open()
+    store.putSnapshot(snapshot(204, 'pr...head'))
+    store.putBlobs([blob('stranded')])
+    const armed = armPrKeyedTripwires(store)
+
+    // Nothing in the reference set is read from the pull-request keyspace at
+    // all, and the tripwires guard UPDATE and DELETE as well as INSERT — so a
+    // recheck that reached sideways would abort here.
+    expect(armed.deleteBlobs(['stranded'])).toEqual({ count: 1, removed: ['stranded'] })
+    armed.close()
+  })
+
+  test('deleteBlobs against a closed database throws StoreWriteError', () => {
+    const store = open()
+    store.putBlobs([blob('stranded')])
+    store.close()
+    // Never a silent success: a reclamation that could not persist must not
+    // report rows as removed that are still on disk.
+    const err = writeErrorFrom(() => {
+      store.deleteBlobs(['stranded'])
+    })
+    expect(err.table).toBe('blobs')
+  })
+})
+
 describe('the append-only audit journal', () => {
   test('appendAudit persists a row that survives a reopen, fields intact', () => {
     const store = open()
@@ -2686,6 +3798,7 @@ const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
   getLocalDraft: true,
   putLocalDraft: true,
   deleteLocalDraft: true,
+  listLocalDrafts: true,
   getLocalViewed: true,
   setLocalViewed: true,
   listLocalThreads: true,
@@ -2693,6 +3806,7 @@ const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
   putLocalThread: true,
   listLocalSubmittedReviews: true,
   putLocalSubmittedReview: true,
+  deleteLocalReview: true,
 }
 
 /** The local method names, sorted, as the interface declares them. */
@@ -2937,12 +4051,27 @@ describe('local writes never touch a PR-keyed table', () => {
    * and its control fail in the same run or neither is worth anything.
    */
   test('every local method runs end to end without firing one tripwire', () => {
-    const armed = armPrKeyedTripwires(open())
+    const seeded = open()
+    // One row per guarded table, stored BEFORE the tripwires go up, keyed to the
+    // number the first local review will be minted at.
+    //
+    // Load-bearing rather than scene-setting. SQLite runs a BEFORE UPDATE or
+    // BEFORE DELETE trigger once per MATCHED row, so against empty guarded
+    // tables a local statement mis-aimed at `snapshots` would match nothing, fire
+    // nothing, and pass — the absence this test asserts would hold for the wrong
+    // reason. These rows are what a mis-aimed statement can hit.
+    seeded.putSnapshot(snapshot(LOCAL_REVIEW_ID_BASE, 'pr...head'))
+    seeded.appendAudit(auditEntry({ githubId: 1, pr: LOCAL_REVIEW_ID_BASE }))
+    seeded.recordPrAuthor(LOCAL_REVIEW_ID_BASE, 'h-priya')
+    const armed = armPrKeyedTripwires(seeded)
     const { store, driven } = recordingStore(armed)
 
     const review = store.createLocalReview(newLocalReview({}))
     const id = review.id
-    expect(id).toBeGreaterThanOrEqual(LOCAL_REVIEW_ID_BASE)
+    // Pinned to the exact number, not merely to the band: the seeded rows above
+    // are keyed to that number, and a mint that started elsewhere would leave
+    // them unreachable and the guard decorative.
+    expect(id).toBe(LOCAL_REVIEW_ID_BASE)
     expect(store.getLocalReview(id)!.headRef).toBe('refs/heads/feature/x')
     expect(store.listLocalReviews('acme/widgets').map((r) => r.id)).toEqual([id])
 
@@ -2958,6 +4087,7 @@ describe('local writes never touch a PR-keyed table', () => {
 
     store.putLocalDraft(draft('h1', id, 'unsubmitted text on a local review'))
     expect(store.getLocalDraft('h1', id)!.body).toBe('unsubmitted text on a local review')
+    expect(store.listLocalDrafts(id).map((d) => d.humanId)).toEqual(['h1'])
 
     store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
     expect(store.getLocalViewed('h1', id)['a.ts']!.viewed).toBe(true)
@@ -2974,6 +4104,24 @@ describe('local writes never touch a PR-keyed table', () => {
 
     store.deleteLocalDraft('h1', id)
     expect(store.getLocalDraft('h1', id)).toBeNull()
+
+    // The keyspace's only multi-table delete, driven LAST because it removes the
+    // review everything above was written against. Six DELETE statements in one
+    // transaction is the widest reach anything here has, and the tripwires are
+    // what say it reaches no further: a DELETE that named `snapshots` instead of
+    // `local_snapshots` would abort here rather than quietly discard a pull
+    // request's cached snapshot.
+    store.putLocalDraft(draft('h2', id, 'a second human, so the delete spans humans'))
+    store.setLocalViewed('h2', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
+    expect(store.deleteLocalReview(id)).toEqual({
+      reviewsDeleted: 1,
+      snapshotsDeleted: 1,
+      threadsDeleted: 1,
+      submittedReviewsDeleted: 1,
+      draftsDeleted: 1,
+      viewedDeleted: 2,
+    })
+    expect(store.getLocalReview(id)).toBeNull()
 
     armed.close()
 
@@ -2994,12 +4142,12 @@ describe('local writes never touch a PR-keyed table', () => {
     expect(onTheStore).toEqual(declaredLocalMethods())
   })
 
-  test('the local surface is eighteen methods', () => {
+  test('the local surface is twenty methods', () => {
     // An independent literal, not another expression over the same map. Every
     // other coverage check here compares two derived sets, and derived sets stay
     // in agreement through a method deleted from the interface, the map and the
     // sweep together — a hardcoded count is the only one of these that notices
     // the swept surface silently shrinking. Changing it is a deliberate act.
-    expect(declaredLocalMethods()).toHaveLength(18)
+    expect(declaredLocalMethods()).toHaveLength(20)
   })
 })
