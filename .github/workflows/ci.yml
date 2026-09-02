@@ -88,8 +88,9 @@ jobs:
   # `channel: 'chrome'`) drives two flows: the pull-request happy path against
   # the mock daemon, and a local-branch review against a direct daemon booted
   # inside a git repository seeded with zero remotes, with a preload that records
-  # and refuses every non-loopback `fetch` so the run proves nothing left the
-  # process. No browser download step.
+  # and refuses every non-loopback `fetch` the daemon makes; git subprocesses go
+  # around that guard, which is why the driver asserts the repository has no
+  # remote to reach. No browser download step.
   e2e:
     name: e2e
     needs: check

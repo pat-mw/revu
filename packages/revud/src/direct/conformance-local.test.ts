@@ -160,9 +160,14 @@ beforeAll(async () => {
 
 afterAll(() => {
   globalThis.fetch = realFetch
-  store.close()
-  rmSync(storeDir, { recursive: true, force: true })
-  fixture.dispose()
+  // Each step runs even when an earlier one has nothing to do or throws: a
+  // setup that failed before the store opened must still remove the fixture.
+  try {
+    if (store !== undefined) store.close()
+  } finally {
+    if (storeDir !== undefined) rmSync(storeDir, { recursive: true, force: true })
+    if (fixture !== undefined) fixture.dispose()
+  }
 })
 
 describe('the repository under review has nowhere to reach', () => {

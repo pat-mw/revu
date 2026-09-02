@@ -427,18 +427,32 @@ export function runLocalReviewConformanceSuite(config: LocalReviewConformanceCon
       it('replyToThread answers a complete comment and the thread grew by exactly one', async () => {
         const before = (await threadsOf(review.id)).find((t) => t.id === threadId)
         expect(before?.comments).toHaveLength(1)
+        const root = before?.comments[0]
+        expect(root).toBeDefined()
+        if (!root) return
 
         const reply = await api.replyToThread(review.id, threadId, REPLY_BODY)
 
         expect(reply.id).toBeGreaterThan(0)
         expect(reply.id).toBeGreaterThanOrEqual(LOCAL_ENTITY_ID_BASE)
+        // A NEW id, never one the thread already held: the client re-keys its
+        // author map by comment id, and a duplicate would orphan that entry.
+        expect(reply.id).not.toBe(root.id)
         expect(reply.body).toBe(REPLY_BODY)
         expect(reply.path).toBe(anchor.path)
         expect(reply.line).toBe(anchor.line)
+        // The shape the app copies back into the thread: who wrote it, when,
+        // and which comment it answers.
+        expect(reply.user.login.length).toBeGreaterThan(0)
+        expect(reply.created_at.length).toBeGreaterThan(0)
+        expect(reply.in_reply_to_id).toBe(root.id)
 
         const after = (await threadsOf(review.id)).find((t) => t.id === threadId)
         expect(after?.comments).toHaveLength(2)
         expect(after?.comments.at(-1)?.id).toBe(reply.id)
+        // Every id on the thread is distinct from every other one on it.
+        const ids = after?.comments.map((c) => c.id) ?? []
+        expect(new Set(ids).size).toBe(ids.length)
       })
     })
 
@@ -451,15 +465,19 @@ export function runLocalReviewConformanceSuite(config: LocalReviewConformanceCon
         // Someone is named, because a resolution nobody owns cannot be
         // rendered or argued with.
         expect((resolved.resolvedBy?.login ?? '').length).toBeGreaterThan(0)
+        // The app copies `isOutdated` back off this answer; an absent key
+        // would land as `undefined` where a boolean is rendered.
+        expect(typeof resolved.isOutdated).toBe('boolean')
 
         const stored = (await threadsOf(review.id)).find((t) => t.id === threadId)
         expect(stored?.isResolved).toBe(true)
         expect((stored?.resolvedBy?.login ?? '').length).toBeGreaterThan(0)
+        expect(typeof stored?.isOutdated).toBe('boolean')
       })
     })
 
     describe('a reaction bumps exactly its own key and the total', () => {
-      it('addReaction answers a rollup one greater than the value the snapshot held', async () => {
+      it('addReaction answers a rollup one greater than the value the snapshot held, and the snapshot agrees', async () => {
         const thread = (await threadsOf(review.id)).find((t) => t.id === threadId)
         const comment = thread?.comments[0]
         expect(comment).toBeDefined()
@@ -472,6 +490,14 @@ export function runLocalReviewConformanceSuite(config: LocalReviewConformanceCon
 
         expect(rollup[key]).toBe(before + 1)
         expect(rollup.total_count).toBe(beforeTotal + 1)
+
+        // The rollup the call answered is the rollup the snapshot now holds,
+        // so the read that follows the optimistic update lands on the same
+        // numbers rather than reverting to the old ones.
+        const stored = (await threadsOf(review.id))
+          .find((t) => t.id === threadId)
+          ?.comments.find((c) => c.id === comment.id)
+        expect(stored?.reactions).toEqual(rollup)
       })
     })
 

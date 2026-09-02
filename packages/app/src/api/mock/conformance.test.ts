@@ -43,10 +43,12 @@ describe('mock adapter conformance', () => {
       reconcile: 389,
     },
     restart: () => {
-      // Persist the whole broker document, then rebuild the adapter. The store
-      // singleton survives the rebuild, so a saved draft is still readable —
-      // the in-process analogue of the daemon reloading from disk.
+      // Persist the whole broker document, re-read it from storage, then
+      // rebuild the adapter: a saved draft is readable afterwards only if the
+      // write reached `localStorage` — the in-process analogue of the daemon
+      // reloading from disk, rather than a second handle over the same memory.
       store.flush()
+      store.reload()
       return createMockApi()
     },
     // The mock owns the simulated drop, so it writes the partial snapshot and

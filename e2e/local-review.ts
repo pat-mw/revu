@@ -238,6 +238,10 @@ async function pickBranch(page: Page, filterLabel: string, branch: string): Prom
 // ————————————————————————————————————————————————————————————————
 
 async function drive(repoDir: string, absentConfigDir: string, netlogPath: string): Promise<void> {
+  // A repository override in the developer's shell would hand the daemon a
+  // GitHub repository to resolve, and with one resolved it would go looking for
+  // a token; the run must never depend on that variable being absent by luck.
+  delete process.env.REVU_REPO
   const h = await startHarness({
     mode: 'direct',
     cwd: repoDir,
@@ -252,6 +256,10 @@ async function drive(repoDir: string, absentConfigDir: string, netlogPath: strin
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_GLOBAL: join(absentConfigDir, 'absent-global-gitconfig'),
       GIT_CONFIG_SYSTEM: join(absentConfigDir, 'absent-system-gitconfig'),
+      // The `gh` CLI reads its stored token from this directory; pointed at
+      // one that does not exist, a keychain token is as unreachable as the
+      // emptied variables above.
+      GH_CONFIG_DIR: join(absentConfigDir, 'absent-gh-config'),
     },
   })
   const { page, base } = h

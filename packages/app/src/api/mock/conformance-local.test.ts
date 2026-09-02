@@ -51,10 +51,12 @@ describe('mock adapter local review conformance', () => {
     anchor: { path: 'src/index.ts', line: 12, lineText: 'const x = compute()' },
     compare: 'empty',
     restart: () => {
-      // Persist the whole broker document, then rebuild the adapter. The store
-      // singleton survives the rebuild, so a saved draft is still readable —
-      // the in-process analogue of the daemon reloading from disk.
+      // Persist the whole broker document, re-read it from storage, then
+      // rebuild the adapter: a saved draft is readable afterwards only if the
+      // write reached `localStorage` — the in-process analogue of the daemon
+      // reloading from disk, rather than a second handle over the same memory.
       store.flush()
+      store.reload()
       return createMockApi()
     },
   })

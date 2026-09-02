@@ -1,5 +1,6 @@
 /**
- * Every file the security review points at is a file that exists.
+ * Every file the security review points at by path — a directory and an
+ * extension, the form a reader can open — is a file that exists.
  *
  * The review is written to one rule: each claim names the code that enforces
  * it, so a reader can go and check rather than take the sentence on trust. That
