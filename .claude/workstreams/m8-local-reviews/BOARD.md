@@ -133,7 +133,7 @@ unreachable, so M8.10 may start.
 Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
-**The stack, bottom-up — fourteen PRs, none merged** (#82 M8.9 and #83 M8.12 now sit above #80): `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+**The stack, bottom-up — fifteen PRs, none merged** (#82 M8.9 and #83 M8.12 sit above #80; [#84](https://github.com/pat-mw/revu/pull/84) is the board-only record of M8.9's scratch-repo proof, on top of #83): `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
 (M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8) →
 [#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 8/8) → [#80](https://github.com/pat-mw/revu/pull/80)
 (M8.11, 8/8). `main` is untouched at `177068a`.

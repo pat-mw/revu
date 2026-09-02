@@ -1,8 +1,9 @@
 ## 2026-09-02 (later) — M8.9's scratch-repo proof is done; every M8 Verify line has now run
 
 ### Orient
-1. `git checkout board/m8.9-scratch-proof` — stack tip for the *record* (board-only, no code), base
-   `m8.12/delete-confirm` ([PR #83](https://github.com/pat-mw/revu/pull/83)). Code tip is still `m8.12/delete-confirm`.
+1. `git checkout board/m8.9-scratch-proof` — stack tip, [PR #84](https://github.com/pat-mw/revu/pull/84) (board-only, no
+   code), base `m8.12/delete-confirm` ([PR #83](https://github.com/pat-mw/revu/pull/83)). The code tip is still
+   `m8.12/delete-confirm`; branch the next code change off `board/m8.9-scratch-proof` so the chain stays linear.
 2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3348 pass · 1 skip · 0 fail · 117 files**
    (re-run on the tip this session, before anything else).
 3. CI was green on #82 and #83 at the start of this session (`gh pr checks 82` / `83`). **No base in the chain
@@ -10,7 +11,8 @@
 4. Read `BOARD.md` → this entry → whatever the owner asks for.
 
 ### State
-`main` untouched. **Fifteen PRs once this board PR opens, one linear chain, none merged.** Every M8 ticket is
+`main` untouched. **Fifteen PRs, one linear chain, none merged:** … → #80 (M8.11) → #82 (M8.9) → #83 (M8.12) →
+#84 (this record). Every M8 ticket is
 In Review; **every `Verify` line in M8 has now actually run**, the last being M8.9's scratch-repo both-halves
 proof. No Todo ticket remains. **Stacked PRs are the protocol. Never merge, never commit to `main`, never
 retarget ahead of a merge.**
