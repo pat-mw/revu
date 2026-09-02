@@ -161,16 +161,27 @@ Nothing is removed on a timer. There is no TTL anywhere in the store: what a
 table holds is judged against what still references it, or against an explicit
 act of removal, and never against how old a row is.
 
-**Deleting a local review** (`DELETE /api/local-reviews/:n`) removes, in one
-transaction, that review's row and every row keyed to it — its snapshot
-envelope, its threads, its submitted review summaries, and the drafts and
-viewed marks **every** human holds on it. That is the only path that removes
-any draft: unsubmitted text is irreplaceable, so no reclamation running on its
-own may reach one. The delete then drops the git refs pinning the objects that
-review's snapshot was read from, and finally prunes whatever the removal has
-just left unreferenced — in that order, because dropping refs after a prune
-leaves the object database pinned for data that no longer exists, and pruning
-before the rows are gone reads the doomed review's comparison as still live.
+**Deleting a local review** (`DELETE /api/local-reviews/:n`) is **refused
+outright** — a `422 unprocessable` whose message names the remedy — while any
+human's draft on that review holds text: a pending comment, or a body with
+anything in it. There is no flag to force it; the draft's own human discards
+it, then the identical delete goes through. The empty draft an editor creates
+the moment a review is opened does not block. Once it proceeds, the delete
+removes, in one transaction, that review's row and every row keyed to it — its
+snapshot envelope, its threads, its submitted review summaries, and the (by
+then empty) drafts and viewed marks **every** human holds on it. That is the
+only path that removes a draft row by anyone other than its own human, and the
+refusal is what keeps it from ever removing text: unsubmitted text is
+irreplaceable, so no reclamation running on its own may reach one. The delete
+then drops the git refs pinning the objects that review's snapshot was read
+from, and finally prunes whatever the removal has just left unreferenced — in
+that order, because dropping refs after a prune leaves the object database
+pinned for data that no longer exists, and pruning before the rows are gone
+reads the doomed review's comparison as still live. An id that names no review
+this daemon serves — never created, already deleted, or belonging to another
+repository sharing the data directory — is a `404 not_found`, in the same
+words for all three, and a refusal of either kind touches nothing: no row, no
+ref, no prune.
 
 **Never removed.** The write audit journal (`audit_log`) is append-only and has
 no delete counterpart by design, so it stays ground truth for "who wrote this"

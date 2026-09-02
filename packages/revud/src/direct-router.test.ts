@@ -1298,12 +1298,13 @@ describe('handleDirectApi: local reviews', () => {
     h.close()
   })
 
-  test('deleting an id that was never created is a clean answer, not a 404', async () => {
+  test('deleting an id that was never created is a 404, and spawns nothing', async () => {
     const h = localHarness()
     const neverCreated = LOCAL_REVIEW_ID_BASE + 4242
     // The control for the answer below: this id really does name nothing, so
-    // the success is idempotence rather than a delete of something else.
+    // the refusal is about the review's absence and not about the id's shape.
     expect(h.store.getLocalReview(neverCreated)).toBeNull()
+    const spawnedBefore = h.runner.argvs.length
 
     const res = await handleDirectApi(
       req('DELETE', `/api/local-reviews/${neverCreated}`),
@@ -1311,11 +1312,51 @@ describe('handleDirectApi: local reviews', () => {
       h.api,
     )
 
-    // A retried removal whose first answer was lost has to be safe: "already
-    // gone" is the outcome the caller asked for, and a 404 would report a
-    // failure for the state the first call produced.
-    expect(res?.status).toBe(200)
-    expect(await res?.json()).toEqual({ ok: true })
+    // A removal is a named act on a review that exists, so an absent one is a
+    // missing resource — the same typed answer a review deleted a moment ago
+    // gets, and the same one a review of some other repository sharing the
+    // data directory gets, so the answer confirms nothing about the id.
+    expect(res?.status).toBe(404)
+    const body = (await res?.json()) as { code: string; message: string }
+    expect(body.code).toBe('not_found')
+    expect(body.message).toContain('this workspace')
+    // An answer of "not found" has no side effect: no ref was discovered, let
+    // alone dropped, on the strength of an id that names nothing here.
+    expect(h.runner.argvs.length).toBe(spawnedBefore)
+    h.close()
+  })
+
+  test('a review whose draft holds text is refused 422 through the route, with every row in place', async () => {
+    const h = localHarness()
+    const created = (await (
+      await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    ).json()) as LocalReviewSummary
+    const text = 'unsubmitted text the route must refuse to destroy'
+    h.store.putLocalDraft({ ...noGithubDraft(created.id), body: text })
+    // The controls: the row is there, the draft really holds text, and the
+    // success case above proves this same harness DOES reach git on a delete
+    // that goes through — so a spawn count that stands still below is the
+    // refusal's doing.
+    expect(h.store.getLocalReview(created.id)).not.toBeNull()
+    expect(h.store.getLocalDraft(SESSION.human.id, created.id)?.body).toBe(text)
+    const spawnedBefore = h.runner.argvs.length
+
+    const res = await handleDirectApi(
+      req('DELETE', `/api/local-reviews/${created.id}`),
+      SESSION,
+      h.api,
+    )
+
+    // The surface's typed refusal, at its own status, with the remedy named.
+    expect(res?.status).toBe(422)
+    const body = (await res?.json()) as { code: string; message: string }
+    expect(body.code).toBe('unprocessable')
+    expect(body.message).toMatch(/discard/i)
+    // A precondition, not a partial delete: the row and the text both stand,
+    // and nothing reached git.
+    expect(h.store.getLocalReview(created.id)).not.toBeNull()
+    expect(h.store.getLocalDraft(SESSION.human.id, created.id)?.body).toBe(text)
+    expect(h.runner.argvs.length).toBe(spawnedBefore)
     h.close()
   })
 

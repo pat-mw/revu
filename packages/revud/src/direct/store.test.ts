@@ -2510,6 +2510,52 @@ function armLocalDeleteTripwire(store: DirectStore, table: string): DirectStore 
   return open()
 }
 
+describe("listing every human's draft on one local review", () => {
+  test('answers both humans, ordered by human id, and nothing from another review', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    const other = seedEveryLocalTable(store, { headRef: 'refs/heads/feature/y', title: 'y' })
+
+    // Two humans, as the seed writes them, and only this review's — the other
+    // review's rows are keyed to a different id and must not bleed in.
+    expect(store.listLocalDrafts(id).map((d) => [d.humanId, d.prNumber])).toEqual([
+      ['h1', id],
+      ['h2', id],
+    ])
+    expect(store.listLocalDrafts(other).map((d) => d.prNumber)).toEqual([other, other])
+    store.close()
+  })
+
+  test('a review nobody has drafted on, and an id that names no review, both read back empty', () => {
+    const store = open()
+    const id = store.createLocalReview(newLocalReview({})).id
+    expect(store.listLocalDrafts(id)).toEqual([])
+    expect(store.listLocalDrafts(LOCAL_REVIEW_ID_BASE + 9999)).toEqual([])
+    store.close()
+  })
+
+  test('a draft row that cannot be parsed fails the whole listing rather than being left out', () => {
+    const store = open()
+    const id = seedEveryLocalTable(store)
+    store.close()
+
+    // One of the two rows corrupted in place. A listing that skipped it would
+    // report one draft where two exist, and a caller deciding whether the
+    // review still holds text would decide on the wrong count.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run('UPDATE local_drafts SET data = ? WHERE human_id = ? AND local_id = ?', [
+      'not json',
+      'h2',
+      id,
+    ])
+    raw.close()
+
+    const reopened = open()
+    expect(() => reopened.listLocalDrafts(id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+})
+
 describe('removing a local review takes all six of its tables, or none of them', () => {
   test('every one of the six local tables gives up its rows for that review', () => {
     const store = open()
@@ -3752,6 +3798,7 @@ const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
   getLocalDraft: true,
   putLocalDraft: true,
   deleteLocalDraft: true,
+  listLocalDrafts: true,
   getLocalViewed: true,
   setLocalViewed: true,
   listLocalThreads: true,
@@ -4040,6 +4087,7 @@ describe('local writes never touch a PR-keyed table', () => {
 
     store.putLocalDraft(draft('h1', id, 'unsubmitted text on a local review'))
     expect(store.getLocalDraft('h1', id)!.body).toBe('unsubmitted text on a local review')
+    expect(store.listLocalDrafts(id).map((d) => d.humanId)).toEqual(['h1'])
 
     store.setLocalViewed('h1', id, { 'a.ts': { viewed: true, blobSha: 'headblob', at: 'now' } })
     expect(store.getLocalViewed('h1', id)['a.ts']!.viewed).toBe(true)
@@ -4094,12 +4142,12 @@ describe('local writes never touch a PR-keyed table', () => {
     expect(onTheStore).toEqual(declaredLocalMethods())
   })
 
-  test('the local surface is nineteen methods', () => {
+  test('the local surface is twenty methods', () => {
     // An independent literal, not another expression over the same map. Every
     // other coverage check here compares two derived sets, and derived sets stay
     // in agreement through a method deleted from the interface, the map and the
     // sweep together — a hardcoded count is the only one of these that notices
     // the swept surface silently shrinking. Changing it is a deliberate act.
-    expect(declaredLocalMethods()).toHaveLength(19)
+    expect(declaredLocalMethods()).toHaveLength(20)
   })
 })

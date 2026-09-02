@@ -20,7 +20,7 @@ import type {
   SubmitResult,
   SubmitReviewInput,
 } from '@revu/shared'
-import { ApiError, isLocalReviewId } from '@revu/shared'
+import { ApiError, draftHoldsText, isLocalReviewId } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import type { GithubClient } from './github-client'
 import type { LocalReviewSurface } from './local-surface'
@@ -213,15 +213,33 @@ export interface DirectApi {
    * success for one would report a pull request removed as a review of a branch
    * pair — and would hide the mistake instead of naming it.
    *
-   * Idempotent inside that band: an id that carries no review removes nothing
-   * and still resolves. A removal whose answer was lost has to be safe to
-   * repeat, and "already gone" is the outcome the caller asked for, so an absent
-   * row is never reported as a missing resource.
+   * REFUSED, as a typed `unprocessable`, while any human's draft on the review
+   * holds text — a pending comment, or a body with anything in it. The route
+   * carries no flag to force it, so the refusal is the whole answer and the
+   * message names the only way past it: discard the draft, then delete. That
+   * is what keeps "drafts survive everything" true for a delete as well as
+   * for a submit — text leaves this store only by its own human's discard or a
+   * confirmed submit, so the drafts a delete can take are exactly the empty
+   * ones, which destroy nothing. The check spans EVERY human's draft, because
+   * the removal would take every human's draft; and it lets the empty draft an
+   * editor creates on open straight through, because counting that as text
+   * would make every review a human had merely looked at undeletable. It is a
+   * precondition, checked before a row is touched, so a refusal never leaves a
+   * review half removed.
    *
-   * Deleting a review deletes every human's drafts on it. That is an explicit
-   * act of removal rather than a reclamation, and it is the only way
-   * unsubmitted text is ever removed here — nothing that runs on its own may
-   * reach a draft.
+   * An id inside the band that names no review this daemon serves — never
+   * created, already deleted, or belonging to a repository sharing the data
+   * directory — answers a typed `not_found` scoped to this workspace, and
+   * every one of those cases answers in the same words: a distinguishable
+   * answer would confirm to one repository's client that an id exists
+   * somewhere else. A retry of a removal whose answer was lost therefore meets
+   * `not_found`, which tells the caller the review is gone; nothing is at
+   * risk in that retry, because a refusal touches nothing.
+   *
+   * Deleting a review deletes every human's drafts on it, which the refusal
+   * above guarantees are empty. That is an explicit act of removal rather than
+   * a reclamation, and it is the only way a draft row is ever removed here by
+   * anyone but its own human — nothing that runs on its own may reach one.
    */
   deleteLocalReview(reviewId: number): Promise<void>
 
@@ -850,11 +868,51 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       // the row delete is keyed by the id alone — so an id can name a review
       // belonging to a repository this daemon knows nothing about, with
       // branches, a worktree and a clock that are not its own. Such an id gets
-      // the same clean, idempotent answer an id carrying no review at all gets:
-      // this daemon removed what it had, which was nothing. Any distinguishable
-      // answer would confirm to one repository's client that the id exists
-      // somewhere else.
-      const mine = local.listLocalReviews().some((review) => review.id === reviewId)
+      // EXACTLY the answer an id carrying no review at all gets — the same
+      // typed `not_found`, scoped to this workspace, in the same words —
+      // because any distinguishable answer would confirm to one repository's
+      // client that the id exists somewhere else. A review deleted a moment
+      // ago is the third member of that set and answers the same way: a
+      // removal is a named act on a review that exists, so an absent one is a
+      // missing resource, never a success to report twice.
+      //
+      // Thrown before anything is touched, the refs included. A drop over this
+      // id's namespace would be idempotent, and would tidy up after a drop that
+      // once failed part-way — but an answer of "not found" must have no side
+      // effect at all, so that clean-up belongs to an explicit operator action
+      // rather than to a refusal.
+      if (!local.listLocalReviews().some((review) => review.id === reviewId)) {
+        throw new ApiError(
+          'not_found',
+          `No local review with id ${reviewId} exists in this workspace.`,
+        )
+      }
+
+      // REFUSED while any human's draft on the review holds text. The rows
+      // below go together, every human's draft among them, and text a human
+      // has not submitted leaves this store only by that human's own discard
+      // or a confirmed submit — so the delete has to turn away rather than be
+      // the one path that takes it. Every human's draft, not the session's:
+      // two reviewers of one branch pair hold two rows and the removal would
+      // take both. The empty draft an editor creates the moment a review is
+      // opened passes, because a check that counted it as text would make
+      // every review a human had merely looked at undeletable.
+      //
+      // `unprocessable` is the exact code: the review exists, nothing moved
+      // underneath the caller, and the caller can put the review into a state
+      // that honors the identical request — the message says how.
+      //
+      // Read and acted on with no await between this check and the row removal
+      // below. Nothing else on this surface can write a draft in that gap, so
+      // the precondition cannot hold here and have stopped holding by the time
+      // the rows go.
+      if (deps.store.listLocalDrafts(reviewId).some(draftHoldsText)) {
+        throw new ApiError(
+          'unprocessable',
+          `Local review ${reviewId} still holds an unsubmitted draft with text in it — ` +
+            'discard that draft, then delete the review.',
+        )
+      }
 
       // ——— The order below is the correctness, not a preference. ———
       //
@@ -873,12 +931,10 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       //
       // The prune last, when the rows are gone and the halves they were the
       // only reference to have finally become unreferenced.
-      if (mine) deps.store.deleteLocalReview(reviewId)
+      deps.store.deleteLocalReview(reviewId)
 
-      // Attempted for any id in the band, including one this daemon did not
-      // carry a row for: a drop is idempotent and discovers its refs rather
-      // than reconstructing them, so a repeat over an emptied namespace costs
-      // one listing and clears up after a drop that failed part-way last time.
+      // A drop discovers its refs rather than reconstructing them, so a review
+      // whose pins were never written costs one listing here and nothing more.
       const dropped = await dropPinnedRefs(repository, reviewId)
       if (!dropped.ok) {
         // A value, not a throw, and the rows are already gone — so this is

@@ -696,10 +696,12 @@ export async function handleDirectApi(
     // holds no rule of its own about which reviews may be removed — the same
     // dispatch every id-keyed surface goes through decides that.
     //
-    // An id that carries no review answers `{ ok: true }`, never a 404: the
-    // surface treats "already gone" as the outcome the caller asked for, and a
-    // client retrying a delete whose first answer was lost must not be told the
-    // second attempt failed. An unparseable `:n` is a different thing — nothing
+    // Every refusal is the surface's typed answer, serialized to its own
+    // status by the catch below: a review still holding a draft with text is
+    // a 422 `unprocessable` whose message names the remedy, and an id that
+    // carries no review this daemon serves is a 404 `not_found`. There is no
+    // body and no query parameter on this route, so nothing here can force
+    // its way past either. An unparseable `:n` is a different thing — nothing
     // was named at all — and is refused before the surface is reached.
     if (method === ROUTES.deleteLocalReview.method) {
       const params = matchRoute(ROUTES.deleteLocalReview.path, path)

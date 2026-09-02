@@ -23,7 +23,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Subprocess } from 'bun'
-import { expectPartialSyncThrows, runConformanceSuite } from '@revu/shared/conformance'
+import {
+  expectPartialSyncThrows,
+  runConformanceSuite,
+  runLocalReviewDeleteConformance,
+} from '@revu/shared/conformance'
 import { createHttpApi } from './adapter'
 
 const REVUD_ENTRY = join(import.meta.dir, '..', '..', '..', '..', 'revud', 'src', 'index.ts')
@@ -155,5 +159,20 @@ describe('revud-mock over HTTP conformance', () => {
     // as the `network` error envelope and the client adapter rethrows it as an
     // ApiError. Asserting the code here proves the envelope survives HTTP.
     partialSyncSurfacing: expectPartialSyncThrows('network'),
+  })
+
+  // The same delete block the in-process runner drives, over the wire: what
+  // this leg adds is that the refusal's `unprocessable` and the absent id's
+  // `not_found` each survive the HTTP envelope and come back as the typed
+  // error a client catches. The daemon's store is in another process, so no
+  // storage witness is handed in; every contract-level assertion stands.
+  runLocalReviewDeleteConformance({
+    label: 'revud-mock over HTTP',
+    makeApi: () => createHttpApi(daemon.base),
+    // The daemon's own answer, so the drafts written here are keyed exactly
+    // as its session keys them.
+    humanId: async () => (await createHttpApi(daemon.base).getSession()).human.id,
+    pair: { baseRef: 'main', headRef: 'feature/delete-conformance' },
+    anchor: { path: 'src/index.ts', line: 12, lineText: 'const x = compute()' },
   })
 })

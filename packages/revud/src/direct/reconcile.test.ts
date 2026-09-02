@@ -132,6 +132,7 @@ function fakeStore(opts: {
     getLocalDraft: unexpected('getLocalDraft'),
     putLocalDraft: unexpected('putLocalDraft'),
     deleteLocalDraft: unexpected('deleteLocalDraft'),
+    listLocalDrafts: unexpected('listLocalDrafts'),
     getLocalViewed: unexpected('getLocalViewed'),
     setLocalViewed: unexpected('setLocalViewed'),
     listLocalThreads: unexpected('listLocalThreads'),

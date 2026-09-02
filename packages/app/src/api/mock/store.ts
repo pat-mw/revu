@@ -128,8 +128,8 @@ interface StoreShape {
   /**
    * Persisted high-water marks for the two reserved local id bands. Counters,
    * never a max-scan over live records: a deleted review's id must never be
-   * minted again, or the new review would inherit the old one's drafts, viewed
-   * state, and client-side caches.
+   * minted again, or the new review would inherit the old one's client-side
+   * caches and whatever row a removal that failed part-way left behind.
    */
   localCounters: { review: number; entity: number }
 }
@@ -387,7 +387,7 @@ export function migrateStoreDocument(input: unknown): StoreShape | null {
   // The repair only ever raises a counter (`max(stored, derived)`), because a
   // counter above the live high-water mark is CORRECT: deletion never frees an
   // id for reuse, so recomputing from live records would drag it back down and
-  // let a new review inherit a dead one's drafts, viewed state, and caches.
+  // let a new review inherit a dead one's client caches and leftover rows.
   const stored = parsed.localCounters
   const { reviewIds, entityIds } = localIdsInDocument(parsed.localReviews)
   parsed.localCounters = {
@@ -678,6 +678,23 @@ export const store = {
     }
   },
 
+  /**
+   * Every human's draft on one review — the read a decision about the REVIEW
+   * needs, where every other draft read is scoped to the one human asking.
+   * Drafts are the most private thing this store holds, so this is a listing
+   * for a precondition, never a surface a caller renders: nothing here is
+   * keyed to the session, and nothing downstream may hand one human another's
+   * text.
+   */
+  listDraftsFor(prNumber: number): ReviewDraft[] {
+    const drafts: ReviewDraft[] = []
+    for (const perHuman of Object.values(state.drafts)) {
+      const d = perHuman[prNumber]
+      if (d) drafts.push(clone(d))
+    }
+    return drafts
+  },
+
   // ——— per-human viewed state ———
 
   getViewed(humanId: string, prNumber: number): FileViewedState {
@@ -761,16 +778,25 @@ export const store = {
   },
 
   /**
-   * Remove a local review record AND its cached snapshot — both live in this
-   * document and neither has meaning without the other. Per-human drafts and
-   * viewed state keyed to the id are deliberately left in place: user-written
-   * text is never destroyed by a delete, only orphaned (and the id is never
-   * minted again, so nothing can ever inherit it).
+   * Remove a local review record, its cached snapshot, and every human's draft
+   * and viewed state keyed to it — all of it lives in this document and none
+   * of it has meaning without the record. The id is never minted again, so
+   * nothing can ever inherit whatever a partial removal might have left.
+   *
+   * This is the ONE place a draft is removed by anything other than its own
+   * human's discard or a confirmed submit, and it is safe only because the
+   * caller refuses the whole delete while any human's draft on the review
+   * holds text. That precondition is the engine's, not this document's — the
+   * store removes exactly what it is told to — so a caller reaching this
+   * without it would destroy text. Deleting a review nothing holds a draft on
+   * removes nothing from the draft map at all.
    */
   deleteLocalReview(id: number): void {
     if (id in state.localReviews) {
       delete state.localReviews[id]
       delete state.snapshots[id]
+      for (const perHuman of Object.values(state.drafts)) delete perHuman[id]
+      for (const perHuman of Object.values(state.viewed)) delete perHuman[id]
       schedulePersist()
     }
   },
@@ -778,8 +804,8 @@ export const store = {
   /**
    * Mint the next local review id from the reserved band. A persisted
    * high-water mark, exactly like `nextId` — deletion never frees an id for
-   * reuse, so a recycled id can never collide with the drafts, viewed state,
-   * or client caches of a review that no longer exists.
+   * reuse, so a recycled id can never collide with the client-side caches, or
+   * with any row a removal left behind, of a review that no longer exists.
    */
   nextLocalReviewId(): number {
     state.localCounters.review += 1

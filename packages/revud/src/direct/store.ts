@@ -570,6 +570,22 @@ export interface DirectStore {
    */
   deleteLocalDraft(humanId: string, localId: number): void
   /**
+   * Every human's draft on one local review, ordered by human id so the
+   * answer is stable between calls.
+   *
+   * The one draft read that is not scoped to a human, and it exists for a
+   * decision about the REVIEW: whether removing it would take text somebody
+   * has not submitted. It is a listing for a precondition, never a surface a
+   * caller renders — a draft is the most private thing this store holds, and
+   * nothing downstream may hand one human another's text. A review nobody
+   * has drafted on, or one that does not exist, reads back as an empty list.
+   *
+   * Throws `StoreUnreadableError` when any row cannot be parsed, rather than
+   * leaving it out: a draft dropped from this answer reads as "nothing here
+   * holds text", which is the one direction that destroys data.
+   */
+  listLocalDrafts(localId: number): ReviewDraft[]
+  /**
    * One human's per-file viewed state on one local review. An absent row reads
    * back as an empty record — nothing viewed yet is the ordinary state, not an
    * error — while a present-but-unparseable row throws `StoreUnreadableError`.
@@ -1943,6 +1959,15 @@ export function openDirectStore(
         // anyone else.
         db.run('DELETE FROM local_drafts WHERE human_id = ? AND local_id = ?', [humanId, localId])
       })
+    },
+
+    listLocalDrafts(localId: number): ReviewDraft[] {
+      const rows = db
+        .query('SELECT human_id, data FROM local_drafts WHERE local_id = ? ORDER BY human_id ASC')
+        .all(localId) as { human_id: string; data: string }[]
+      return rows.map((row) =>
+        parseRow<ReviewDraft>('local_drafts', `${row.human_id}/${localId}`, row.data),
+      )
     },
 
     getLocalViewed(humanId: string, localId: number): FileViewedState {

@@ -2524,18 +2524,27 @@ describe('removing a local review, end to end', () => {
     const { surface } = worldOver(store, createSyncGate())
     const humanId = CONFORMANCE_SESSION.human.id
 
+    // Review one's draft is EMPTY and review two's holds text, and the
+    // difference is load-bearing. A removal is refused outright while any
+    // draft on the review holds text, so review one — the one every case
+    // below removes — can only carry the empty draft an editor creates on
+    // open, which is the draft a removal is allowed to take with the review.
+    // Review two's text is the one thing no reclamation running beside that
+    // removal may ever reach.
     const rows = [
       {
         input: { baseRef: fixture.baseBranch, headRef: fixture.headBranch },
         live: { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headSha },
         orphan: { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headCommitShas[1] },
         thread: 'LOCALTHREAD_one',
+        draftBody: (): string => '',
       },
       {
         input: { baseRef: fixture.baseBranch, headRef: SECOND_HEAD },
         live: { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headCommitShas[0] },
         orphan: { mergeBaseSha: fixture.baseSha, headSha: fixture.headCommitShas[0] },
         thread: 'LOCALTHREAD_two',
+        draftBody: (id: number): string => `pending on ${id}`,
       },
     ]
 
@@ -2549,7 +2558,7 @@ describe('removing a local review, end to end', () => {
       store.putLocalSnapshot(storedSnapshot(review.id, live))
       store.putImmutable(immutableHalf(orphan))
       store.putLocalThread(review.id, storedThread(row.thread))
-      store.putLocalDraft(unsubmittedDraft(humanId, review.id, `pending on ${review.id}`))
+      store.putLocalDraft(unsubmittedDraft(humanId, review.id, row.draftBody(review.id)))
       store.setLocalViewed(humanId, review.id, {
         'a.ts': { viewed: true, blobSha: null, at: LONG_AGO },
       })
@@ -2646,25 +2655,67 @@ describe('removing a local review, end to end', () => {
     armed.close()
   }, 60_000)
 
-  test('an id that carries no review is a clean no-op, and removes nothing else', async () => {
+  test('an id that carries no review is refused as not_found, and removes nothing else', async () => {
     const store = openStore()
     const { one, two } = await seedTwoReviews(store)
     const { api } = worldOver(store, createSyncGate())
     const neverCreated = two.id + 500
+    const immutablesBefore = immutableRowCount()
 
-    // The control: this id really does name nothing, so the resolution below is
-    // idempotence rather than a removal of something that happened to be absent.
+    // The control: this id really does name nothing, so the refusal below is
+    // about the review's absence rather than about anything else it holds.
     expect(store.getLocalReview(neverCreated)).toBeNull()
 
-    await api.deleteLocalReview(neverCreated)
+    await expect(api.deleteLocalReview(neverCreated)).rejects.toThrow(/this workspace/)
 
-    // A removal whose answer was lost has to be safe to repeat, and "already
-    // gone" is the outcome the caller asked for — but it must not become a
-    // licence to reclaim on behalf of a review nobody named.
+    // A refusal has no side effect. It must not become a licence to reclaim
+    // on behalf of a review nobody named: both reviews keep their rows and
+    // their refs, and the cache is exactly as large as it was — no prune ran
+    // on the way to the answer.
     expect(store.getLocalReview(one.id)).not.toBeNull()
     expect(store.getLocalReview(two.id)).not.toBeNull()
     expect(await listing(one.id)).toHaveLength(4)
     expect(await listing(two.id)).toHaveLength(4)
+    expect(immutableRowCount()).toBe(immutablesBefore)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  }, 60_000)
+
+  test('a review holding a draft with text is refused whole, and goes once the draft is discarded', async () => {
+    const store = openStore()
+    const { one, two } = await seedTwoReviews(store)
+    const humanId = CONFORMANCE_SESSION.human.id
+    const { api } = worldOver(store, createSyncGate())
+    const immutablesBefore = immutableRowCount()
+    const twoRefsBefore = await listing(two.id)
+
+    // Review two is the one seeded with text; the control is that text.
+    expect(store.getLocalDraft(humanId, two.id)?.body).toBe(`pending on ${two.id}`)
+
+    await expect(api.deleteLocalReview(two.id)).rejects.toThrow(/discard that draft/)
+
+    // A precondition, not a partial removal: every row, every ref, and the
+    // whole cache are exactly where they were — including the orphan half a
+    // removal that went through would have reclaimed.
+    expect(store.getLocalReview(two.id)).not.toBeNull()
+    expect(store.getLocalSnapshot(two.id)).not.toBeNull()
+    expect(store.listLocalThreads(two.id).map((thread) => thread.id)).toEqual(['LOCALTHREAD_two'])
+    expect(store.getLocalDraft(humanId, two.id)?.body).toBe(`pending on ${two.id}`)
+    expect(store.getLocalViewed(humanId, two.id)['a.ts']?.viewed).toBe(true)
+    expect(await listing(two.id)).toEqual(twoRefsBefore)
+    expect(immutableRowCount()).toBe(immutablesBefore)
+    // Nor did the refusal reach the other review.
+    expect(store.getLocalReview(one.id)).not.toBeNull()
+    expect(await listing(one.id)).toHaveLength(4)
+
+    // The remedy the refusal names, followed: discard, then the identical
+    // call succeeds and does everything a removal does — rows, refs, prune.
+    api.discardDraft(two.id)
+    await api.deleteLocalReview(two.id)
+
+    expect(store.getLocalReview(two.id)).toBeNull()
+    expect(await listing(two.id)).toEqual([])
+    expect(immutableRowCount()).toBeLessThan(immutablesBefore)
     expectEverySnapshotStillReadable(store)
     store.close()
   }, 60_000)
@@ -2695,11 +2746,13 @@ describe('removing a local review, end to end', () => {
     // The reclamation really ran — the control for the draft assertion below,
     // which would otherwise be satisfied by a removal that did nothing at all.
     expect(immutableRowCount()).toBeLessThan(before)
-    // Review one's draft went WITH its review, which is an explicit act of
-    // removal. Review two's draft is the one no reclamation may reach: the
-    // sweep that followed the removal walked the whole store and left it alone.
+    // Review one's draft — the empty one, which is the only kind a removal is
+    // let through on — went WITH its review, an explicit act of removal.
+    // Review two's draft holds text and is the one no reclamation may reach:
+    // the sweep that followed the removal walked the whole store and left it,
+    // text and all, exactly where it was.
     expect(store.getLocalDraft(humanId, one.id)).toBeNull()
-    expect(store.getLocalDraft(humanId, two.id)).not.toBeNull()
+    expect(store.getLocalDraft(humanId, two.id)?.body).toBe(`pending on ${two.id}`)
     store.close()
   }, 60_000)
 })
