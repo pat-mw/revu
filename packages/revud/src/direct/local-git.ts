@@ -121,6 +121,13 @@ export interface GitCommand {
   readonly revs?: readonly string[]
   /** Pathspec operands. Emitted behind `--`. */
   readonly pathspecs?: readonly string[]
+  /**
+   * Bytes for the command's standard input. Git's batch plumbing reads its work
+   * from there, which keeps values out of the argv entirely — the strongest
+   * form of the option-injection defense this seam exists for, since a value
+   * that never reaches an argument cannot be read as one.
+   */
+  readonly stdin?: string
 }
 
 /**
@@ -147,7 +154,7 @@ export async function runGit(
   if (pathspecs.length > 0) argv.push('--', ...pathspecs)
   const verdict = isHardenedArgv(argv)
   if (!verdict.ok) return blocked(verdict.reason)
-  return runner.run(argv, { cwd })
+  return runner.run(argv, { cwd, ...(command.stdin !== undefined ? { stdin: command.stdin } : {}) })
 }
 
 /**

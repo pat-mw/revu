@@ -31,7 +31,7 @@
  * so the suite resets it before and after itself.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import type { BranchRef, FileBlob, Human, LocalReviewSummary, PendingComment, PullListResponse, ReviewDraft, ReviewThread, Snapshot, SubmitReviewInput } from '@revu/shared'
+import type { BranchRef, CommitInfo, FileBlob, Human, LocalReviewSummary, PendingComment, PullListResponse, ReviewDraft, ReviewThread, Snapshot, SubmitReviewInput } from '@revu/shared'
 import {
   ApiError,
   LOCAL_ENTITY_ID_BASE,
@@ -892,6 +892,55 @@ describe('every id-taking method serves a local review id', () => {
     expect(report.draftHeadSha).toBe(headSha)
     expect(report.results).toHaveLength(1)
 
+    await api.discardDraft(localId)
+  })
+
+  test('a rebase reports every commit as new, because the draft head is gone', async () => {
+    // The case an author-date comparison cannot answer. A rebase rewrites
+    // committer dates and PRESERVES author dates, so every rewritten commit
+    // keeps a date older than the draft — and a filter for "authored after the
+    // draft" therefore returns NOTHING, on precisely the rewrite that changed
+    // the most. When the draft's head is absent from the compare entirely there
+    // is no commit to slice after, so every commit in the range is new relative
+    // to a head that no longer exists.
+    const snap = (await api.getSnapshot(localId)) as Snapshot
+    await api.saveDraft({
+      ...draftFor(humanId, localId, snap),
+      comments: [pending('Written before the rebase.', 12)],
+    })
+    const draft = (await api.getDraft(localId)) as ReviewDraft
+
+    const rewritten: CommitInfo[] = ['X0', 'X1', 'X2'].map((sha, i) => ({
+      sha,
+      commit: {
+        message: `rewritten ${sha}`,
+        // Authored long before the draft was written, which is exactly what a
+        // rebase preserves and what makes the old heuristic report zero.
+        author: {
+          name: 'Rebase Author',
+          email: 'rebase@revu.invalid',
+          date: `2020-01-0${i + 1}T00:00:00Z`,
+        },
+      },
+      author: null,
+      parents: [],
+    }))
+    store.putSnapshot({
+      ...snap,
+      immutable: { ...snap.immutable, commits: rewritten },
+    })
+
+    const report = await api.reconcileDraft(localId)
+    expect(report.newCommits.map((c) => c.sha)).toEqual(['X0', 'X1', 'X2'])
+
+    // The old heuristic, computed here and asserted to be strictly worse. This
+    // one line is the regression guard: restoring the author-date fallback
+    // makes it red, whereas the count assertion above could be satisfied by
+    // changing the fixture.
+    const byAuthorDate = rewritten.filter((c) => c.commit.author.date > draft.createdAt)
+    expect(byAuthorDate.length).toBeLessThan(report.newCommits.length)
+
+    store.putSnapshot(snap)
     await api.discardDraft(localId)
   })
 

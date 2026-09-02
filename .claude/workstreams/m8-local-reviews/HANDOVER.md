@@ -3,6 +3,151 @@
 Cross-session handover. **Newest at the top** — the first entry is the live one. Written so a cold agent can
 act from it alone.
 
+## 2026-08-19 — Session 6 (the interview, and six of M8.8) — **M8.8 is 6/8, on PR #78**
+
+> All four blocking questions were put to the owner and **answered**. Six of M8.8's eight units landed on
+> `m8.8/resync-and-pinning`. `main` is untouched at `177068a`. Nothing is in flight and no worktree is in use.
+>
+> ⚠️ **CI had never run on this branch until the PR opened.** `ci.yml` triggers on `pull_request` and on
+> pushes to `main` only, so a pushed branch with no PR gets **no runner at all**. The PR was opened at 6/8 to
+> close that gap — **check its result before trusting the local gate**, which reproduces CI by design only
+> under `TZ=UTC`.
+>
+> **Correction carried forward:** an earlier draft of this entry justified withholding the PR by §8. That was
+> wrong. **Stacked PRs are the repo's protocol, opened every session and every milestone; merging is what
+> stays out of bounds.** §8 orders the adversarial review *before the PR opens* — it does not require the
+> ticket to be complete. See `.claude/skills/revu/memories/pr-cadence.md`.
+
+### Start here
+
+1. `git checkout m8.8/resync-and-pinning` — the tip, eight commits above `prefs/lost-update`.
+2. `TZ=UTC bun run check` — expect **2702 pass · 1 skip · 0 fail · 98 files**. The 1 skip is pre-existing.
+3. Read `BOARD.md` → this entry → `tickets/M8.8-resync-and-pinning.md`'s `## Log`, which carries a detailed
+   entry per unit including what went wrong.
+4. **Finish M8.8**: only **M8.8.6** and **M8.8.7** remain. Both are app-side, both edit
+   `reconcile-dialog.tsx`, so they run **in sequence, 6 then 7** — never concurrently.
+
+### The owner's four rulings — settled, recorded, do not re-ask
+
+Each is written in full at the Open question it closes; `BOARD.md` indexes them.
+
+1. **Delete + draft: the server refuses.** Server-authoritative. **No contract change** — a `force` parameter
+   on the frozen `DELETE /api/local-reviews/:n` was put as the §5.2 stop it is, and **declined**.
+   (M8.10 OQ3 · M8.12 OQ1)
+2. **Archive detection fires on each sync of that review.** No direct-mode timer, no GitHub work on an inbox
+   poll. (M8.9 OQ2)
+3. **The blob prune is off by default**, behind an explicit policy flag. (M8.10 OQ1)
+4. **Every pin is kept** — explicitly conditional on **M8.10 landing in the same session as M8.8**. (M8.8 OQ4)
+
+**Ruling 4 is a scope fact, not a preference.** The pin set is allowed to be unbounded *only* because the
+garbage collector arrives right behind it. **M8.8 shipping without M8.10 is not what was sanctioned** — this
+session ran out of room before starting M8.10, so the next one owes it.
+
+**Ruling 2 accepts a real gap and moves it into copy:** a branch nobody re-syncs stays un-archived, so a user
+can keep writing local comments while a PR is already open. That is M8.9.6's banner problem and **not** a
+licence to add a background tick.
+
+**Still open, deliberately not asked** — each belongs to the session that needs it: M8.9 OQ1, OQ8, OQ9;
+M8.8 OQ5. **M8.10 OQ2 — when the prune runs — is narrowed by ruling 3 but not answered by it** and must be
+settled before M8.10.6 wires a call site.
+
+### What landed, and the two findings worth reading
+
+| unit | commit | what it is |
+| --- | --- | --- |
+| M8.8.1 | `9522087` | `local-pins.ts` — one atomic `update-ref --stdin` batch |
+| M8.8.2 | `4d73d69` | pin before the first object read; outcome on `syncLocalReview` |
+| M8.8.3 | `7ed601d` | rewrite detection replaces the author-date fallback |
+| M8.8.4 | `048ea90` | missing objects reported honestly, both halves |
+| M8.8.5 | `b52f181` | deleted/renamed branch survival + deletion tripwire |
+| M8.8.8 | `cb2c5a0` | the pinned/unpinned prune-survival pair |
+
+**Finding 1 — the fallback did not under-report, it reported *zero*.** M8.8.3's ticket text describes the
+author-date heuristic as approximate. On a faithful rebase fixture it returns the **empty list**: a rebase
+rewrites committer dates and *preserves* author dates, so every rewritten commit keeps a date older than the
+draft and the filter removes all of them. The user was told "no new commits" on precisely the rewrite that
+moved the most work. Both transports now answer the whole list, the mock moved first per D6, and the old
+heuristic is computed inline in the tests and asserted **strictly worse** so restoring it is red.
+
+**Finding 2 — an actionable message that could not be acted on.** M8.8.4's Check specifies that the edge
+answers "re-sync to rebuild" and that the store still throws. Both passed. A **fourth assertion the ticket did
+not ask for** — *does the advice actually work?* — failed: `syncLocalReview` read the whole snapshot to carry
+the authorship map forward, and that read is the one that throws in this state. The daemon was telling every
+reader to re-sync while re-syncing threw. Fixed with a narrow store read (`getLocalCommentAuthors`) that a
+missing immutable half cannot block, because `commentAuthors` lives in the envelope and parses fine —
+degrading to `{}` would have made the documented repair destroy the one field it cannot rebuild.
+**The lesson: when a message tells the user to do something, assert that doing it works.**
+
+### Decisions not to relitigate
+
+- **The pin ref name is not the compare key.** Git rejects any ref containing `..`, and a compare key carries
+  three dots — verified against git 2.50.1, exit 1. The separator is substituted in exactly one place and the
+  encoding is **never inverted**: callers list refs, they do not parse them.
+- **`<localId>` and the pin key stay in directory position.** A ref *at* `refs/revu/reviews/<id>` makes the
+  whole subtree unwritable (verified). This is also what makes M8.10.2's prefix discovery correct.
+- **Both refs are written by one `update-ref --stdin` batch.** Verified in both directions: a batch with one
+  bad entry writes **neither** ref; two separate invocations leave **one**. That asymmetry is a permanent
+  test, so unrolling the batch is red rather than merely different.
+- **`CommandRunner` gained an optional `stdin`.** Additive, no fake broke. It is a security improvement, not
+  plumbing: **no object name occupies an argv slot at all**, and that is asserted.
+- **Validation is `isLocalReviewId`, not "a positive integer".** A pull request number is a positive integer;
+  pinning under one would attach local retention state to forge-keyed data.
+- **`syncPull` stays contract-shaped.** The pin outcome could not ride `Snapshot` (frozen, shared with the
+  hosted path), so `syncLocalReview` carries it and `syncPull` delegates. A test asserts the object `syncPull`
+  returns has no `pin` key. This is where M8.8 OQ3 should read from when it is answered.
+- **The pin outcome is deliberately NOT `partial`.** `partial` means content is missing; an unpinned snapshot
+  is complete. Held apart by comparison, not by prose: a pinned and a pin-blind run must agree on `partial`
+  and `immutable` and differ only on `pin.ok`.
+- **`local-pins.ts` exports no delete.** Eviction is wholly M8.10.2's, per the unit and ruling 4.
+
+### Hazards — the old ones still bite, plus three new
+
+1. **No CI on a branch without a PR** (new). `ci.yml` is `pull_request` + push-to-`main`. Local `TZ=UTC` runs
+   are the only evidence this branch is green. Opening M8.8's PR is what buys the runner.
+2. **The gate flake is real and I hit it once** — one run went red at **5008 ms** on a pin test, with the test
+   **count intact**. Diagnosed rather than waved through: M8.8.2's six new tests each drive a *real sync
+   against the fixture repo* and are legitimately slow, so they carry explicit `30_000` timeouts now, the
+   idiom already in that file. If a future red is a timing shape, check whether the test is genuinely slow
+   before calling it noise.
+3. **Interface changes ripple into test doubles, and that is the guards working** (new). `syncLocalReview`
+   broke four `LocalReviewSurface` doubles; `getLocalCommentAuthors` broke `store.test.ts`'s
+   `Record<LocalStoreMethod, true>` **and** its independent literal (17 → 18, changed deliberately);
+   `local-pins.ts` tripped M8.3.1's `process.cwd()` coverage guard; `syncLocalReview` tripped the foreign-id
+   sweep. **Every one was satisfied properly rather than silenced** — the new verb joined `FOREIGN_CALLS`, not
+   the exemption list.
+4. **A prescription can be wrong, including the ticket's.** M8.8.2's `Files` names `local-sync.ts`; the
+   sequence it constrains lives in `local-surface.ts`. M8.8.4 needed `ReconcileStore.hasBlob`, which the unit
+   never mentions. Read the seam before trusting the file list.
+5. **NEVER `git add -A`.** Unchanged, and still the rule. Every commit here staged explicit paths.
+6. **Re-gate after every rebase.** The stack was re-linearized this session (below) and re-gated rather than
+   trusted.
+
+### The stack — ten branches, nine PRs, none merged
+
+`main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76 (M8.5) → #77 (a store fix) →
+**[#78](https://github.com/pat-mw/revu/pull/78) — `m8.8/resync-and-pinning`, M8.8 at 6/8**.
+
+**#77 was re-linearized.** It had forked at `0b32368` and never picked up `048638c`, so what the last handover
+called a chain was a fork. Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 · 1 · 0 · 95)**,
+force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
+
+**Never merge, never commit to `main`, never retarget.**
+
+### Next
+
+1. **M8.8.6 then M8.8.7** — app-side, sequential on `reconcile-dialog.tsx`. They land on the existing branch
+   and update #78. Then M8.8's `Verify`, then the full-diff adversarial pass, which is still owed.
+2. **M8.10 in the same session** — ruling 4 was given on that condition. Its OQ2 (prune cadence) needs the
+   owner before M8.10.6 wires a call site.
+3. **M8.9** is independent and unblocked; ruling 2 settles its trigger.
+4. **A note for M8.10.2:** its Check specifies the `for-each-ref` argv **without** `--end-of-options`, which
+   `isHardenedArgv` rejects outright — the spawn is blocked before git sees it. Route it through `runGit` with
+   the prefix as a rev, as `listPins` does, or that leg cannot pass.
+5. **A note for M8.11:** `oracleResults` (`reconcile.test.ts:289`) replays only the mock's *classification*,
+   not its `newCommits` computation, so the two transports agree on that field by two independent tests rather
+   than by one oracle. And M8.8.4's pre-flight was deliberately **not** mirrored into the mock: the mock seeds
+   its own blobs alongside every snapshot, so the state is unreachable there rather than merely untested.
+
 ## 2026-08-19 — Session 5 (the join) — **M8.5 COMPLETE and in review on #76**
 
 > Every branch is pushed, `main` is untouched at `177068a`, and no §5 stop condition was hit. **CI is green on

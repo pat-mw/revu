@@ -150,6 +150,47 @@ export function useDraftDirty(prNumber: number): boolean {
   )
 }
 
+/**
+ * The head a draft is anchored to, as ONE value.
+ *
+ * `headSha` is the commit every pending comment's anchor was captured against.
+ * `compareKey` is `mergeBaseSha...headSha` — the key the immutable half of that
+ * compare's content is cached under. They are two spellings of a single fact,
+ * and a document carrying a `headSha` from one compare beside a `compareKey`
+ * from another describes a state that never existed: whichever consumer reads
+ * one of the two contradicts every consumer that reads the other, and no later
+ * sync repairs it, because nothing can tell which half is the lie.
+ *
+ * Hence one argument rather than two fields that could each be set alone. There
+ * is no signature anywhere that accepts one without the other, so the
+ * inconsistent pair is not something a caller can produce by forgetting an
+ * argument — it has to be constructed deliberately.
+ */
+export interface DraftHead {
+  /** The commit the draft's comment anchors were captured against. */
+  headSha: string
+  /** `mergeBaseSha...headSha`, in the one spelling every producer of it uses. */
+  compareKey: string
+}
+
+/**
+ * A draft re-anchored to `head` — the two head fields replaced, and every other
+ * field carried across untouched: the comments, the summary body, the review
+ * event, and `createdAt`.
+ *
+ * Split out from the action that commits it so the transform is checkable on
+ * its own: moving a head is exactly this rewrite of two fields, and the
+ * property worth pinning is that it is only those two. `updatedAt` is
+ * deliberately NOT stamped here — the caller that writes the result into the
+ * cache owns that stamp, the same way it does for every other draft edit, which
+ * leaves this a pure rewrite with nothing time-dependent in it.
+ *
+ * Returns a new document; the input is never mutated.
+ */
+export function withDraftHead(draft: ReviewDraft, head: DraftHead): ReviewDraft {
+  return { ...draft, headSha: head.headSha, compareKey: head.compareKey }
+}
+
 export interface DraftActions {
   /** Returns the existing draft, or creates + caches an empty one to edit into. */
   ensureDraft(init: { headSha: string; compareKey: string }): ReviewDraft
@@ -158,6 +199,28 @@ export interface DraftActions {
   removeComment(key: string): void
   setBody(body: string): void
   setEvent(event: ReviewDraft['event']): void
+  /**
+   * Re-anchor the draft to a different head, moving `headSha` and `compareKey`
+   * together and changing nothing else. No comment is dropped, rewritten or
+   * re-ordered by this call, and no draft is ever removed by it.
+   *
+   * Needed because a draft's head is otherwise written exactly once, when the
+   * draft is created. A reconcile that re-anchors the pending comments against
+   * a NEW head without moving it leaves a document whose comments and whose
+   * recorded head describe different commits — and the recorded head is what
+   * the next reconcile computes its commit delta from. When that head is not in
+   * the current compare at all (a rebase, an amend, any force-push that
+   * replaced it), every commit in the range is reported as new, so a stale head
+   * does not under-report quietly: it claims the whole branch landed since the
+   * draft was written.
+   *
+   * So the head moves whenever the comments do, and it must move BEFORE the
+   * submit that may be refused. A draft that survives a refused submit has to
+   * survive it coherent.
+   *
+   * Goes through the ordinary debounced save, so the durable copy follows.
+   */
+  setHead(head: DraftHead): void
   /** Delete the draft broker-side and locally. Rejects if the broker refused. */
   discard(): Promise<void>
   /** Persist any pending edits immediately, skipping the debounce. */
@@ -243,6 +306,9 @@ export function useDraftActions(prNumber: number): DraftActions {
       },
       setEvent(event) {
         mutate((d) => ({ ...d, event }))
+      },
+      setHead(head) {
+        mutate((d) => withDraftHead(d, head))
       },
       async discard() {
         // Cancel pending saves first so a timer can't re-create the draft

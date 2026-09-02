@@ -674,16 +674,22 @@ export function createMockApi(): RevuApi {
         }),
       )
 
-      // Commits that landed after the draft was written. Preferred: slice the
-      // snapshot's base→head commit list after the draft's head SHA. When the
-      // draft's head predates the whole list (it fell out of the compare),
-      // approximate by author date newer than the draft's creation — honest
-      // enough for a prototype, and the count is what the UI communicates.
+      // Commits that landed after the draft was written.
+      //
+      // When the draft's head is still in the range, the answer is exact: slice
+      // the base→head list after it.
+      //
+      // When it is absent, the branch was rewritten and the head the draft was
+      // written against no longer exists anywhere in the compare. Every commit
+      // now in the range is therefore new relative to it, and the whole list is
+      // the honest answer. Comparing author dates instead under-reports by
+      // construction: a rebase rewrites committer dates and PRESERVES author
+      // dates, so every rewritten commit keeps a date older than the draft and
+      // the filter returns nothing at all — reporting "no new commits" on
+      // exactly the rewrite that changed the most.
       const draftHeadIndex = commits.findIndex((c) => c.sha === draft.headSha)
       const newCommits: CommitInfo[] =
-        draftHeadIndex >= 0
-          ? commits.slice(draftHeadIndex + 1)
-          : commits.filter((c) => c.commit.author.date > draft.createdAt)
+        draftHeadIndex >= 0 ? commits.slice(draftHeadIndex + 1) : [...commits]
 
       return {
         prNumber,
