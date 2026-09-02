@@ -4,8 +4,8 @@
 1. `git checkout m8.11/conformance-e2e-docs` — stack tip, PR #80, base `m8.10/retention-and-gc`.
 2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **2998 pass · 1 skip · 0 fail · 111 files**.
    The 1 skip is pre-existing.
-3. **Check CI on #80 first.** `docs-build` was green and `check` was still running at hand-off; the board
-   commit re-triggered it. #78 and #79 are fully green.
+3. **CI on #80 was fully green at hand-off** (check · conformance-matrix · e2e · docs-build), as are #78 and
+   #79. Re-check before building on it anyway — it is one command.
 4. `bun run conformance:matrix` → A/B/E/F/G `PASS` required, C/D `SKIP`. `bun run test:e2e` → two
    `ALL CHECKS PASSED`.
 5. Read `BOARD.md` → this entry → the ticket you pick up.

@@ -16,7 +16,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 | --- | --- | --- | --- |
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
 | **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
-| **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI building at hand-off** (docs-build green) |
+| **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI green** (check · conformance-matrix · e2e · docs-build) |
 
 **M8.11 closes the milestone's proof** (in review on #80): the local-review conformance suite, written once,
 runs as three **required** matrix legs (E mock in-process · F revud-mock over HTTP · G the direct engine over a
