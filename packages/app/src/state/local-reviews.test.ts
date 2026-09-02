@@ -22,6 +22,7 @@ import { createMockApi } from '@/api/mock/adapter'
 import { mockDev } from '@/api/mock/devtools'
 import { qk, refreshAfterLocalReviewSync } from './queries'
 import {
+  applyLocalReviewDeleteToCache,
   hasAnyLocalReview,
   performLocalReviewDelete,
   refreshAfterLocalReviewCreate,
@@ -264,6 +265,10 @@ const CONTROL_BASE = 'refs/remotes/origin/release/0.41'
 const HEAD_DELETE_DRAFT = 'refs/heads/marcus/strict-null-checks'
 const HEAD_DELETE_CLEAN = 'refs/heads/chore/node-22'
 const HEAD_DELETE_CACHE = 'refs/heads/feat/gateway-rate-limiting'
+const HEAD_DELETE_HALTED = 'refs/heads/fix/cache-ttl-jitter'
+/** The pair the draft-cache rule is driven over, distinct from every pair above. */
+const UNSAVED_BASE = 'refs/remotes/origin/metering/usage-rollups'
+const HEAD_UNSAVED_EDIT = 'refs/heads/marcus/strict-null-checks'
 
 /** A draft with text in it, anchored to the compare the review was synced at. */
 function draftWithText(reviewId: number, snapshot: Snapshot): ReviewDraft {
@@ -282,26 +287,33 @@ function draftWithText(reviewId: number, snapshot: Snapshot): ReviewDraft {
 }
 
 /**
- * The two calls a delete can make, wrapped so the test can see WHICH were made.
+ * The two calls a delete can make, wrapped so the test can see WHICH were made
+ * and IN WHICH ORDER.
  *
  * A delete that discards a draft nobody asked it to discard destroys text
  * silently, and the outcome of both paths is the same word — so the only thing
- * that can tell them apart is whether the discard was called at all.
+ * that can tell them apart is whether the discard was called at all. The order
+ * matters for the same reason: a delete sent before the discard is refused on
+ * the draft the discard was about to remove.
  */
 function spyingApi(): {
-  api: Pick<RevuApi, 'discardDraft' | 'deleteLocalReview'>
-  discarded: number[]
+  api: Pick<RevuApi, 'deleteLocalReview'>
+  discard: (reviewId: number) => () => Promise<void>
+  calls: string[]
 } {
-  const discarded: number[] = []
+  const calls: string[] = []
   return {
     api: {
-      discardDraft: async (reviewId: number) => {
-        discarded.push(reviewId)
-        await api.discardDraft(reviewId)
+      deleteLocalReview: async (reviewId: number) => {
+        calls.push(`delete ${reviewId}`)
+        await api.deleteLocalReview(reviewId)
       },
-      deleteLocalReview: (reviewId: number) => api.deleteLocalReview(reviewId),
     },
-    discarded,
+    discard: (reviewId: number) => async () => {
+      calls.push(`discard ${reviewId}`)
+      await api.discardDraft(reviewId)
+    },
+    calls,
   }
 }
 
@@ -324,17 +336,20 @@ describe('performLocalReviewDelete on a review holding unsubmitted text', () => 
     const result = await performLocalReviewDelete({
       api: spy.api,
       reviewId: review.id,
-      discardOwnDraft: false,
+      discard: null,
     })
 
     expect(result.outcome).toBe('refused')
     // The sentence names its own remedy, and the dialog shows it verbatim —
     // so a refusal that stopped naming one would leave a reader stuck.
     expect(result.outcome === 'refused' ? result.reason : '').toMatch(/discard/i)
+    // And it reports what it did NOT do to the reader's text, which is what
+    // decides whether the frame drawn over it may blame anybody else.
+    expect(result.discarded).toBe(false)
 
     // A refusal is a precondition, not a partial delete: nothing was discarded
     // on the way to it, the review is still listed, and the text is still there.
-    expect(spy.discarded).toEqual([])
+    expect(spy.calls).toEqual([`delete ${review.id}`])
     expect(await stillListed(review.id)).toBe(true)
     expect((await api.getDraft(review.id))?.body).toBe(saved.body)
   })
@@ -352,14 +367,15 @@ describe('performLocalReviewDelete on a review holding unsubmitted text', () => 
     const result = await performLocalReviewDelete({
       api: spy.api,
       reviewId: review.id,
-      discardOwnDraft: true,
+      discard: spy.discard(review.id),
     })
 
-    expect(result).toEqual({ outcome: 'deleted' })
-    expect(spy.discarded).toEqual([review.id])
+    expect(result).toEqual({ outcome: 'deleted', discarded: true })
+    // The order is the correctness: a delete sent first is refused on the very
+    // draft the discard was about to remove.
+    expect(spy.calls).toEqual([`discard ${review.id}`, `delete ${review.id}`])
     expect(await stillListed(review.id)).toBe(false)
     expect((await api.listLocalReviews()).some((r) => r.id === review.id)).toBe(false)
-    expect(await api.getDraft(review.id)).toBeNull()
   })
 
   test('a review holding no text is deleted without any discard at all', async () => {
@@ -373,13 +389,13 @@ describe('performLocalReviewDelete on a review holding unsubmitted text', () => 
       await performLocalReviewDelete({
         api: spy.api,
         reviewId: clean.id,
-        discardOwnDraft: false,
+        discard: null,
       }),
-    ).toEqual({ outcome: 'deleted' })
+    ).toEqual({ outcome: 'deleted', discarded: false })
 
-    // The positive control, through the SAME spy: a delete that is asked to
-    // discard does call through, so the absence above is a decision this
-    // function made rather than a spy that records nothing.
+    // The positive control, through the SAME spy: a delete that is handed a
+    // discard does call it, and calls it first — so the absence above is a
+    // decision this function made rather than a spy that records nothing.
     const other = await api.createLocalReview({
       baseRef: CONTROL_BASE,
       headRef: HEAD_DELETE_CLEAN,
@@ -388,30 +404,69 @@ describe('performLocalReviewDelete on a review holding unsubmitted text', () => 
       await performLocalReviewDelete({
         api: spy.api,
         reviewId: other.id,
-        discardOwnDraft: true,
+        discard: spy.discard(other.id),
       }),
-    ).toEqual({ outcome: 'deleted' })
+    ).toEqual({ outcome: 'deleted', discarded: true })
 
-    expect(spy.discarded).toEqual([other.id])
+    expect(spy.calls).toEqual([
+      `delete ${clean.id}`,
+      `discard ${other.id}`,
+      `delete ${other.id}`,
+    ])
   })
 
-  test('a failure that is not the draft refusal is not swallowed', async () => {
-    // Only the one refusal is turned into an outcome the dialog can act on.
-    // Anything else — a review that is not there, a transport that did not
-    // answer — has no remedy this screen can offer, so it propagates and is
-    // reported as the failure it is rather than as a polite sentence.
+  test('a failure that is not the draft refusal comes back as a value, not a throw', async () => {
+    // Only the one refusal has a remedy a reader can act on, and only it gets
+    // the refusal wording. Anything else — a review that is not there, a
+    // transport that did not answer — is carried out as a `failed` result
+    // instead of being raised, because the caller's cache holds the only copy
+    // of the reader's text and what it must decide is not "did this fail" but
+    // "did the discard go through before it failed".
     const spy = spyingApi()
-    let code: string | null = null
-    try {
+    const result = await performLocalReviewDelete({
+      api: spy.api,
+      reviewId: 1_000_000_999,
+      discard: null,
+    })
+
+    expect(result.outcome).toBe('failed')
+    const error = result.outcome === 'failed' ? result.error : null
+    expect(error instanceof ApiError ? error.code : 'not an ApiError').toBe('not_found')
+    expect(result.discarded).toBe(false)
+  })
+
+  test('a discard that failed stops the attempt where it stands', async () => {
+    // The delete after a failed discard would be refused on the very draft the
+    // discard did not remove, and that refusal would replace an accurate report
+    // of the failed discard with a sentence about somebody else's text.
+    //
+    // The control is in the same body: the identical spy, with a discard that
+    // resolves, does go on to send the delete.
+    const review = await api.createLocalReview({
+      baseRef: CONTROL_BASE,
+      headRef: HEAD_DELETE_HALTED,
+    })
+    const spy = spyingApi()
+    const refused = await performLocalReviewDelete({
+      api: spy.api,
+      reviewId: review.id,
+      discard: () => Promise.reject(new ApiError('network', 'The workspace did not answer.')),
+    })
+
+    expect(refused.outcome).toBe('failed')
+    // Nothing was discarded, and the caller is told so — the cache it holds is
+    // the only copy of whatever the discard failed to remove.
+    expect(refused.discarded).toBe(false)
+    expect(spy.calls).toEqual([])
+
+    expect(
       await performLocalReviewDelete({
         api: spy.api,
-        reviewId: 1_000_000_999,
-        discardOwnDraft: false,
-      })
-    } catch (error) {
-      code = error instanceof ApiError ? error.code : 'not an ApiError'
-    }
-    expect(code).toBe('not_found')
+        reviewId: review.id,
+        discard: () => Promise.resolve(),
+      }),
+    ).toEqual({ outcome: 'deleted', discarded: true })
+    expect(spy.calls).toEqual([`delete ${review.id}`])
   })
 })
 
@@ -422,7 +477,7 @@ describe('performLocalReviewDelete on a review holding unsubmitted text', () => 
 // ————————————————————————————————————————————————————————————————
 
 describe('refreshAfterLocalReviewDelete', () => {
-  test('takes the review out of both lists, and its snapshot and draft with it', async () => {
+  test('takes the review out of both lists, and every entry keyed by it with them', async () => {
     const qc = newQueryClient()
     const review = await api.createLocalReview({
       baseRef: DELETE_BASE,
@@ -433,15 +488,20 @@ describe('refreshAfterLocalReviewDelete', () => {
     await qc.fetchQuery({ queryKey: qk.localReviews, queryFn: () => api.listLocalReviews() })
     qc.setQueryData(qk.snapshot(review.id), snapshot)
     qc.setQueryData(qk.draft(review.id), null)
+    // The per-file viewed marks are the third thing keyed by a review id, and
+    // the one a reader never thinks about — which is exactly why it was the one
+    // left behind.
+    qc.setQueryData(qk.viewed(review.id), {})
 
     await api.deleteLocalReview(review.id)
 
-    // The preconditions that make the assertions below sensitive: both caches
-    // still describe a review that is gone, and this client holds no mounted
-    // observer — the exact condition under which a plain invalidation
+    // The preconditions that make the assertions below sensitive: all three
+    // caches still describe a review that is gone, and this client holds no
+    // mounted observer — the exact condition under which a plain invalidation
     // refetches nothing at all.
     expect(cachedPullNumbers(qc)).toContain(review.id)
     expect(qc.getQueryData(qk.snapshot(review.id))).toBeDefined()
+    expect(qc.getQueryCache().find({ queryKey: qk.viewed(review.id) })).toBeDefined()
     expect(qc.getQueryCache().find({ queryKey: qk.pulls })?.getObserversCount()).toBe(0)
 
     await refreshAfterLocalReviewDelete(qc, review.id)
@@ -451,6 +511,100 @@ describe('refreshAfterLocalReviewDelete', () => {
       qc.getQueryData<LocalReviewSummary[]>(qk.localReviews)?.some((r) => r.id === review.id),
     ).toBe(false)
     expect(qc.getQueryData(qk.snapshot(review.id))).toBeUndefined()
+    expect(qc.getQueryCache().find({ queryKey: qk.draft(review.id) })).toBeUndefined()
+    expect(qc.getQueryCache().find({ queryKey: qk.viewed(review.id) })).toBeUndefined()
+    qc.clear()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// 8 — What one delete attempt is allowed to do to the draft cache. That cache
+//     entry IS the editing surface: the characters live in it whatever the far
+//     end answered, so dropping it on an attempt whose discard failed deletes
+//     the only copy of an edit that was never saved.
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The state a reader is in when this matters: a draft the far end has stored,
+ * plus one more edit that only the cache has.
+ *
+ * Returned as JSON so the assertion is over the bytes rather than over an
+ * object the test still holds a reference to — a cache that handed back the
+ * very object written into it would satisfy an identity check while having
+ * lost every property worth having.
+ */
+function cacheOnlyEdit(saved: ReviewDraft): { draft: ReviewDraft; json: string } {
+  const draft: ReviewDraft = {
+    ...saved,
+    body: `${saved.body} And one more sentence whose save never landed.`,
+    updatedAt: new Date().toISOString(),
+  }
+  return { draft, json: JSON.stringify(draft) }
+}
+
+describe('applyLocalReviewDeleteToCache when the discard never went through', () => {
+  test('leaves the unsaved edit exactly where it was, byte for byte', async () => {
+    const qc = newQueryClient()
+    const review = await api.createLocalReview({
+      baseRef: UNSAVED_BASE,
+      headRef: HEAD_UNSAVED_EDIT,
+    })
+    const snapshot = await api.syncPull(review.id)
+    const saved = await api.saveDraft(draftWithText(review.id, snapshot))
+    const edited = cacheOnlyEdit(saved)
+    qc.setQueryData(qk.draft(review.id), edited.draft)
+
+    // The condition that makes the discard fail is the same one that leaves the
+    // edit unsaved in the first place: writes are not getting through.
+    mockDev.setFailureMode('writes')
+    try {
+      const result = await performLocalReviewDelete({
+        api,
+        reviewId: review.id,
+        discard: () => api.discardDraft(review.id),
+      })
+
+      // The precondition: the attempt really did try to discard, and really did
+      // fail — this is not a run where no discard was ever asked for.
+      expect(result.outcome).toBe('failed')
+      expect(result.discarded).toBe(false)
+
+      await applyLocalReviewDeleteToCache(qc, review.id, result)
+    } finally {
+      mockDev.setFailureMode('none')
+    }
+
+    // The edit exists nowhere else. The far end holds the last text it managed
+    // to store, and every mutator on the editing surface is a no-op over an
+    // empty entry, so a cache dropped here is text destroyed.
+    expect(JSON.stringify(qc.getQueryData(qk.draft(review.id)))).toBe(edited.json)
+    expect((await api.getDraft(review.id))?.body).toBe(saved.body)
+    qc.clear()
+  })
+
+  test('and drops it when the discard really did happen — the control', async () => {
+    // The same helper, the same key, the same review: what separates this run
+    // from the one above is that the discard succeeded, so the entry describes
+    // a draft that is genuinely gone.
+    const qc = newQueryClient()
+    const review = await api.createLocalReview({
+      baseRef: UNSAVED_BASE,
+      headRef: HEAD_UNSAVED_EDIT,
+    })
+    const snapshot = await api.syncPull(review.id)
+    const saved = await api.saveDraft(draftWithText(review.id, snapshot))
+    qc.setQueryData(qk.draft(review.id), cacheOnlyEdit(saved).draft)
+    expect(qc.getQueryCache().find({ queryKey: qk.draft(review.id) })).toBeDefined()
+
+    const result = await performLocalReviewDelete({
+      api,
+      reviewId: review.id,
+      discard: () => api.discardDraft(review.id),
+    })
+
+    expect(result).toEqual({ outcome: 'deleted', discarded: true })
+    await applyLocalReviewDeleteToCache(qc, review.id, result)
+
     expect(qc.getQueryCache().find({ queryKey: qk.draft(review.id) })).toBeUndefined()
     qc.clear()
   })

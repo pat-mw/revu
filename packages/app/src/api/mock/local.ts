@@ -404,6 +404,24 @@ export function getLocalReview(id: number): LocalReviewSummary | null {
 }
 
 /**
+ * Refuse, as `not_found`, any verb aimed at a local id that carries no review.
+ *
+ * Drafts are keyed by `(humanId, prNumber)` and a local id is just another
+ * prNumber, so the draft verbs would otherwise serve an id whose review is
+ * gone: a read answering `null` as if the review were merely draftless, and a
+ * WRITE creating a row under an id that is never minted again. The second is
+ * the one that matters. A delete cannot outrun the editing surface's debounced
+ * save — a save in flight when the review goes lands after it — and a store
+ * that accepted it would hold text nothing can ever list, reach or discard.
+ *
+ * The refusal is the same one every other id-keyed verb here answers with, in
+ * the same words, because a client cannot be made to care which verb it asked.
+ */
+export function requireLocalReviewForDraft(id: number): void {
+  requireLocalReview(id)
+}
+
+/**
  * Delete a local review: the record, its materialized threads and submitted
  * reviews, its cached snapshot, and every human's draft and viewed state on
  * it all go, and the id is never minted again so nothing can inherit it.
@@ -428,6 +446,12 @@ export function getLocalReview(id: number): LocalReviewSummary | null {
  * precondition checked before the record is touched, so a refusal never
  * leaves the review half removed.
  *
+ * The refusal names no id. A reading surface shows this sentence verbatim —
+ * only this side knows what is in the way — and a local review's id is a
+ * synthetic key minted so routes and cache keys can stay plain numbers. It
+ * names nothing a reader could look up, so it must not reach a screen, and the
+ * one sentence that travels to one is where that rule is easiest to break.
+ *
  * Pruning shared content-addressed blobs is a retention concern, not a delete
  * concern: blobs may be referenced by other snapshots.
  */
@@ -436,7 +460,7 @@ export function deleteLocalReview(id: number): void {
   if (store.listDraftsFor(id).some(draftHoldsText)) {
     throw new ApiError(
       'unprocessable',
-      `Local review ${id} still holds an unsubmitted draft with text in it — discard that draft, then delete the review.`,
+      'This local review still holds an unsubmitted draft with text in it — discard that draft, then delete the review.',
     )
   }
   store.deleteLocalReview(id)

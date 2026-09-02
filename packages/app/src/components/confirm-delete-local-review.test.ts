@@ -10,9 +10,10 @@
  * That is the reason the body is its own component at all.
  *
  * Absences here are the load-bearing assertions — the discard promise must not
- * appear over a review that has no draft to discard, and the review's synthetic
- * key must never reach a screen — so each one carries a positive control in the
- * same test body, from the same component and the same harness.
+ * appear over a review that has no draft to discard, a refusal must not blame
+ * an absent third party for text that may be the reader's own, and the review's
+ * synthetic key must never reach a screen — so each one carries a positive
+ * control in the same test body, from the same component and the same harness.
  */
 import { describe, expect, test } from 'bun:test'
 import { createElement } from 'react'
@@ -21,10 +22,16 @@ import { fixtureDB } from '@/fixtures'
 import { buttonVariants } from '@/components/ui/button'
 import { localReviewLabel } from '@/lib/local-reviews'
 import type { RowIdentity } from '@/lib/local-reviews'
-import { deleteLocalReviewCopy, deleteLocalReviewRefusedCopy } from '@/lib/mode-copy'
+import {
+  deleteLocalReviewCopy,
+  deleteLocalReviewDraftUnreadableCopy,
+  deleteLocalReviewFailedCopy,
+  deleteLocalReviewRefusedCopy,
+} from '@/lib/mode-copy'
 import type { DeleteDraftSummary } from '@/lib/mode-copy'
 import { renderStatic } from '@/lib/render-test'
 import { ConfirmDeleteLocalReviewBody } from './confirm-delete-local-review'
+import type { DeleteAttemptAnswer, DeleteDraftRead } from './confirm-delete-local-review'
 
 /**
  * A real seeded local review rather than one assembled here. What is under test
@@ -44,15 +51,17 @@ const FULL_DRAFT: DeleteDraftSummary = { pendingCount: 3, hasBody: true }
 function body(options: {
   identity?: RowIdentity
   draft?: DeleteDraftSummary | null
-  pending?: boolean
-  refusal?: string | null
+  draftRead?: DeleteDraftRead
+  busy?: boolean
+  attempt?: DeleteAttemptAnswer | null
 }): string {
   return renderStatic(
     createElement(ConfirmDeleteLocalReviewBody, {
       identity: options.identity ?? LOCAL_IDENTITY,
       draft: options.draft ?? null,
-      pending: options.pending ?? false,
-      refusal: options.refusal ?? null,
+      draftRead: options.draftRead ?? 'read',
+      busy: options.busy ?? false,
+      attempt: options.attempt ?? null,
       onConfirm: () => {},
       onCancel: () => {},
     }),
@@ -81,12 +90,22 @@ function buttonLabelled(markup: string, label: string): string {
   return found[0]
 }
 
+/** How many `<button>` elements the body drew whose text is `label`. */
+function buttonsLabelled(markup: string, label: string): number {
+  return [...markup.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)]
+    .map((m) => m[0])
+    .filter((el) => visibleText(el).includes(label)).length
+}
+
 const WITH_DRAFT = body({ draft: FULL_DRAFT })
 const WITHOUT_DRAFT = body({ draft: null })
 
 /** The copy this surface is required to be drawing, read from its one source. */
 const DRAFT_COPY = deleteLocalReviewCopy('local', FULL_DRAFT)
 const PLAIN_COPY = deleteLocalReviewCopy('local', null)
+
+/** The label on the way out, read from the same place the component reads it. */
+const CANCEL = PLAIN_COPY?.cancel ?? 'no copy'
 
 describe('what the confirmation says about an unsubmitted draft', () => {
   test('a review holding one is told the draft is discarded first', () => {
@@ -140,7 +159,13 @@ describe('the confirm control is drawn as the destructive act it is', () => {
 
   test('and the cancel button wears none of them', () => {
     // Red means destructive in this app, so the way out must not be wearing it.
-    const cancel = buttonLabelled(WITH_DRAFT, PLAIN_COPY?.cancel ?? 'no copy')
+    //
+    // The confirm is the positive control, in this body: without it the absence
+    // is satisfied by a variant table whose two entries differ in classes this
+    // render puts on nothing at all.
+    const confirm = buttonLabelled(WITH_DRAFT, 'Discard draft and delete')
+    expect(DANGER_ONLY.filter((cls) => !confirm.includes(cls))).toEqual([])
+    const cancel = buttonLabelled(WITH_DRAFT, CANCEL)
     expect(DANGER_ONLY.filter((cls) => cancel.includes(cls))).toEqual([])
   })
 })
@@ -150,7 +175,7 @@ describe('where the keyboard lands when the confirmation opens', () => {
     // A confirmation whose destructive button is focused is a confirmation that
     // Enter answers "yes" to. The default focus is the cancel, so the reflex
     // keystroke keeps the review.
-    expect(buttonLabelled(WITH_DRAFT, PLAIN_COPY?.cancel ?? 'no copy')).toContain('autofocus')
+    expect(buttonLabelled(WITH_DRAFT, CANCEL)).toContain('autofocus')
     expect(buttonLabelled(WITH_DRAFT, 'Discard draft and delete')).not.toContain('autofocus')
   })
 
@@ -161,9 +186,7 @@ describe('where the keyboard lands when the confirmation opens', () => {
     expect(buttonLabelled(WITH_DRAFT, 'Discard draft and delete')).toMatch(
       /^<button\b[^>]*type="button"/,
     )
-    expect(buttonLabelled(WITH_DRAFT, PLAIN_COPY?.cancel ?? 'no copy')).toMatch(
-      /^<button\b[^>]*type="button"/,
-    )
+    expect(buttonLabelled(WITH_DRAFT, CANCEL)).toMatch(/^<button\b[^>]*type="button"/)
   })
 })
 
@@ -172,15 +195,68 @@ describe('while a delete is in flight', () => {
     // Matched as the ATTRIBUTE, not as the word: every button in this app
     // carries `disabled:` utility classes whatever state it is in, so a
     // substring search for the bare word is satisfied by a live control.
-    const busy = body({ draft: FULL_DRAFT, pending: true })
+    const busy = body({ draft: FULL_DRAFT, busy: true })
     expect(buttonLabelled(busy, 'Discard draft and delete')).toMatch(/\sdisabled=""/)
-    expect(buttonLabelled(busy, PLAIN_COPY?.cancel ?? 'no copy')).toMatch(/\sdisabled=""/)
+    expect(buttonLabelled(busy, CANCEL)).toMatch(/\sdisabled=""/)
   })
 
   test('and are pressable when nothing is', () => {
-    // The positive control: disabled is a state this render can be in and can
-    // leave, rather than an attribute the markup happens never to carry.
+    // The positive control for the absence above, in the same body: disabled is
+    // a state this render can be in and can leave, rather than an attribute the
+    // markup happens never to carry.
+    const busy = body({ draft: FULL_DRAFT, busy: true })
+    expect(buttonLabelled(busy, CANCEL)).toMatch(/\sdisabled=""/)
     expect(buttonLabelled(WITH_DRAFT, 'Discard draft and delete')).not.toMatch(/\sdisabled=""/)
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// The draft read the confirm is decided from
+// ————————————————————————————————————————————————————————————————
+
+describe('while this reader’s own draft is still being read', () => {
+  test('the confirm decides nothing, because what it would do is not known yet', () => {
+    // Whether the delete discards a draft is read off that query. Offering the
+    // confirm before it answers sends a delete that leaves the reader's own
+    // text in the way — and the refusal that comes back is then explained as
+    // somebody else's.
+    const reading = body({ draft: null, draftRead: 'reading' })
+    expect(buttonLabelled(reading, 'Delete review')).toMatch(/\sdisabled=""/)
+  })
+
+  test('but the way out is still a way out', () => {
+    // The half a single `pending` flag got wrong: a dialog inert while a draft
+    // merely loads cannot be dismissed by its own cancel, and a slow read
+    // therefore traps a reader who opened it by accident.
+    //
+    // The confirm is the positive control here: this render does disable
+    // something, so the cancel being live is a decision rather than a body that
+    // disables nothing at all.
+    const reading = body({ draft: null, draftRead: 'reading' })
+    expect(buttonLabelled(reading, 'Delete review')).toMatch(/\sdisabled=""/)
+    expect(buttonLabelled(reading, CANCEL)).not.toMatch(/\sdisabled=""/)
+  })
+})
+
+describe('when this reader’s own draft could not be read at all', () => {
+  const UNREADABLE = body({ draft: null, draftRead: 'unreadable' })
+
+  test('the offer is withdrawn and the reason given', () => {
+    expect(visibleText(UNREADABLE)).toContain(
+      deleteLocalReviewDraftUnreadableCopy('local') ?? 'no copy',
+    )
+  })
+
+  test('and no delete is offered beside a question nothing here can answer', () => {
+    // The absence, with the ordinary render as its control: a confirm button IS
+    // something this component draws, so its absence here is a decision rather
+    // than a component that draws no buttons.
+    expect(buttonsLabelled(WITHOUT_DRAFT, 'Delete review')).toBe(1)
+    expect(buttonsLabelled(UNREADABLE, 'Delete review')).toBe(0)
+  })
+
+  test('while the way out stays where it was', () => {
+    expect(buttonLabelled(UNREADABLE, CANCEL)).not.toMatch(/\sdisabled=""/)
   })
 })
 
@@ -216,30 +292,121 @@ describe('what the confirmation calls the review', () => {
 })
 
 // ————————————————————————————————————————————————————————————————
-// A refusal that outlived the discard
+// A delete the workspace would not do
 // ————————————————————————————————————————————————————————————————
 
-/** A refusal worded the way the workspace words one, naming its own remedy. */
+/**
+ * A refusal worded the way the workspace words one, naming its own remedy and
+ * naming no review.
+ *
+ * Copied from the producers rather than paraphrased, because it is rendered
+ * verbatim: this fixture is the app-side statement of what a refusal is allowed
+ * to contain, and the id it must not.
+ */
 const REFUSAL =
-  'Local review 1000000001 still holds an unsubmitted draft with text in it — discard that draft, then delete the review.'
+  'This local review still holds an unsubmitted draft with text in it — discard that draft, then delete the review.'
+
+/** A refusal that outlived the reader's own discard. */
+const AFTER_DISCARD: DeleteAttemptAnswer = {
+  kind: 'refused',
+  detail: REFUSAL,
+  discarded: true,
+}
+
+/** The same refusal, met with no discard behind it. */
+const WITHOUT_DISCARD: DeleteAttemptAnswer = {
+  kind: 'refused',
+  detail: REFUSAL,
+  discarded: false,
+}
 
 describe('a delete the workspace refused', () => {
   test('shows the workspace’s own sentence, unedited', () => {
     // Passed through rather than reworded here. Only the side that refused
     // knows which review and whose draft, and a sentence invented on this side
     // could only be vaguer — or wrong, once that one is reworded.
-    expect(visibleText(body({ refusal: REFUSAL }))).toContain(REFUSAL)
+    expect(visibleText(body({ attempt: AFTER_DISCARD }))).toContain(REFUSAL)
   })
 
   test('under a line saying what a reader can do about it', () => {
-    expect(visibleText(body({ refusal: REFUSAL }))).toContain(
-      deleteLocalReviewRefusedCopy('local') ?? 'no copy',
+    expect(visibleText(body({ attempt: AFTER_DISCARD }))).toContain(
+      deleteLocalReviewRefusedCopy('local', { discarded: true }) ?? 'no copy',
     )
   })
 
   test('and says nothing of the kind when nothing was refused', () => {
-    expect(visibleText(body({ refusal: REFUSAL }))).toContain(REFUSAL)
+    expect(visibleText(body({ attempt: AFTER_DISCARD }))).toContain(REFUSAL)
     expect(visibleText(WITH_DRAFT)).not.toContain(REFUSAL)
+  })
+
+  test('and the sentence it passes through names no review number', () => {
+    // The identity rule, over the one string on this screen that is written
+    // somewhere else. A refusal that went back to naming the review's key would
+    // put it on a screen through a component that never touches it.
+    //
+    // The refusal's own text is the positive control: it proves the box was
+    // drawn, so the absence is about what the sentence says rather than about a
+    // render that drew no sentence.
+    const refused = body({ attempt: AFTER_DISCARD })
+    expect(visibleText(refused)).toContain(REFUSAL)
+    expect(refused).not.toContain(String(LOCAL_PULL.number))
+  })
+})
+
+describe('who the refusal says is in the way', () => {
+  test('somebody else, once the reader’s own draft is provably gone', () => {
+    expect(visibleText(body({ draft: null, attempt: AFTER_DISCARD }))).toMatch(/someone else/i)
+  })
+
+  test('and nobody in particular when no draft of the reader’s was discarded', () => {
+    // The false sentence this pair exists to keep out. With no discard behind
+    // the attempt, the draft in the way may be the reader's OWN — a draft read
+    // that failed answers with the same emptiness as a review nobody drafted on
+    // — so blaming an absent third party sends them to ask somebody who does
+    // not exist.
+    //
+    // The discarded reading is the control, from the same component and the
+    // same harness: the phrase is one this body can draw, and does.
+    expect(visibleText(body({ draft: null, attempt: AFTER_DISCARD }))).toMatch(/someone else/i)
+    expect(visibleText(body({ draft: null, attempt: WITHOUT_DISCARD }))).not.toMatch(
+      /someone else/i,
+    )
+  })
+})
+
+describe('a delete that failed for a reason no draft explains', () => {
+  const FAILED_AFTER_DISCARD: DeleteAttemptAnswer = {
+    kind: 'failed',
+    detail: 'Network unreachable — the workspace has no route right now.',
+    discarded: true,
+  }
+
+  test('says the draft is gone even though the review is not', () => {
+    // The arrangement the plain wording hid. The discard went through, the
+    // delete did not, and the confirmation's own body silently reverted to the
+    // sentence for a review with no draft — which reads as though nothing at
+    // all had happened.
+    expect(visibleText(body({ draft: null, attempt: FAILED_AFTER_DISCARD }))).toContain(
+      deleteLocalReviewFailedCopy('local', { discarded: true }) ?? 'no copy',
+    )
+  })
+
+  test('and shows the failure itself under it', () => {
+    expect(visibleText(body({ draft: null, attempt: FAILED_AFTER_DISCARD }))).toContain(
+      FAILED_AFTER_DISCARD.detail,
+    )
+  })
+
+  test('and does not dress a transport fault up as a refusal about drafts', () => {
+    // The frames are chosen by the KIND of answer. The refused frame is the
+    // control, in this body: it is a sentence this component draws, for the
+    // other kind of answer.
+    expect(visibleText(body({ draft: null, attempt: AFTER_DISCARD }))).toContain(
+      deleteLocalReviewRefusedCopy('local', { discarded: true }) ?? 'no copy',
+    )
+    expect(visibleText(body({ draft: null, attempt: FAILED_AFTER_DISCARD }))).not.toContain(
+      deleteLocalReviewRefusedCopy('local', { discarded: true }) ?? 'no copy',
+    )
   })
 })
 

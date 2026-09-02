@@ -57,6 +57,8 @@ import {
   authorBannerCopy,
   conversationEmptyCopy,
   deleteLocalReviewCopy,
+  deleteLocalReviewDraftUnreadableCopy,
+  deleteLocalReviewFailedCopy,
   deleteLocalReviewRefusedCopy,
   dirtyWorktreeCopy,
   draftSavedCopy,
@@ -683,6 +685,120 @@ describe('the delete confirmation is drawn where it can be read, and says what i
   })
 })
 
+/**
+ * How many times a fragment appears in one scanned file's flattened source.
+ *
+ * Every wiring pin below is an equality against ONE, which is unsatisfiable in
+ * both directions and therefore carries its own positive control: a wire that
+ * was cut reports 0, and a second, contradicting copy of it reports 2. A
+ * `toContain` would report the first as a failure and the second as a pass.
+ */
+function occurrences(relative: string, fragment: string): number {
+  return source(relative).split(fragment).length - 1
+}
+
+describe('the header wires the confirmation to the facts it cannot invent', () => {
+  // Every pin here is over an expression a pure-function assertion is blind to.
+  // The confirmation's own suite renders it from props and proves what each set
+  // of props draws; NOTHING in that suite can see which props the header
+  // actually passes. Each of these wires can be cut — the draft summary forced
+  // to null, the busy flag widened to a constant, the dismissal gate dropped,
+  // the navigation deleted — without a single behavioural assertion anywhere in
+  // this package going red, which is what these exist to end.
+  //
+  // PRESENCE, not execution: none of this proves a delete ever runs. What it
+  // turns red is the wire going away.
+  test('the draft the confirmation summarises is the one the draft query answered with', () => {
+    // A `held` hard-coded to null makes every confirmation the plain one — no
+    // discard promised, no discard sent — and the delete then comes back
+    // refused on the reader's own text.
+    expect(occurrences('pages/pr-layout.tsx', 'const held = heldText(draft.data ?? null)')).toBe(1)
+  })
+
+  test('and the confirm is offered only once that query has SUCCEEDED', () => {
+    // The distinction the whole gate rests on: a query that failed and a review
+    // with no draft both answer with no data, so a gate written on the data
+    // alone treats an unreadable draft as an absent one.
+    expect(
+      occurrences(
+        'pages/pr-layout.tsx',
+        "const draftRead: DeleteDraftRead = draft.isSuccess ? 'read' : draft.isError ? 'unreadable' : 'reading'",
+      ),
+    ).toBe(1)
+  })
+
+  test('and the screen is left only for a review that is actually gone', () => {
+    // A navigation on any other outcome walks the reader away from a review
+    // that is still there, and away from the sentence explaining why.
+    expect(
+      occurrences(
+        'pages/pr-layout.tsx',
+        "if (result.outcome === 'deleted') { setOpen(false) navigate('/') return }",
+      ),
+    ).toBe(1)
+  })
+
+  test('and what makes the controls inert is the delete being in flight', () => {
+    // The busy flag is the one thing that must not be widened back out to the
+    // draft read: a dialog inert while a draft merely loads cannot be dismissed
+    // by Escape, by the overlay or by its own cancel.
+    expect(occurrences('pages/pr-layout.tsx', 'busy={remove.isPending}')).toBe(1)
+  })
+
+  test('and the header control takes its red on keyboard focus as well as hover', () => {
+    // A control that is red under the mouse and colourless under the keyboard
+    // tells one kind of reader that this is the destructive thing on the header
+    // and the other kind nothing at all. Read as the whole class list, so a
+    // hover treatment that grew without its focus twin is reported.
+    expect(
+      occurrences(
+        'pages/pr-layout.tsx',
+        'className="shrink-0 hover:bg-danger/12 hover:text-danger focus-visible:bg-danger/12 focus-visible:text-danger"',
+      ),
+    ).toBe(1)
+  })
+
+  test('and only a delete in flight can refuse to let the dialog close', () => {
+    // The shell's dismissal gate, which no render can reach: a dialog renders
+    // through a portal and serialises to nothing at all. Widening this back out
+    // to the draft read is what made Escape, the overlay and the cancel inert
+    // while a draft merely loaded.
+    expect(
+      occurrences(
+        'components/confirm-delete-local-review.tsx',
+        'if (!next && bodyProps.busy) return',
+      ),
+    ).toBe(1)
+  })
+
+  test('and an answer that keeps the dialog open puts the keyboard back on the way out', () => {
+    // Both controls are disabled and re-enabled around every attempt, and a
+    // control disabled while it held focus drops focus to the document body —
+    // from where the next Tab starts at the top of the page. Presence, not
+    // execution: an effect does not run under static rendering, so this is the
+    // only place the wire can be seen at all.
+    expect(
+      occurrences(
+        'components/confirm-delete-local-review.tsx',
+        'if (attempt !== null) cancelRef.current?.focus()',
+      ),
+    ).toBe(1)
+  })
+
+  test('and the discard it sends is the editing surface’s own', () => {
+    // Not a bare request. That surface holds a debounced save and a single
+    // retry behind it, and a discard that skipped them races a timer which
+    // re-creates the draft between the discard and the delete — coming back as
+    // a refusal blaming a draft the reader has already discarded.
+    expect(
+      occurrences(
+        'pages/pr-layout.tsx',
+        'discard: held === null ? null : draftActions.discard',
+      ),
+    ).toBe(1)
+  })
+})
+
 describe('the topbar consults the rate-chip gate', () => {
   test('the shell imports the gate by name', () => {
     // The rate chip is the one surface in this sweep whose regression adds NO
@@ -757,7 +873,24 @@ const SWEPT: SweptCopy[] = [
     name: 'deleteLocalReviewCopy',
     text: flatten(deleteLocalReviewCopy('local', { pendingCount: 3, hasBody: true })),
   },
-  { name: 'deleteLocalReviewRefusedCopy', text: flatten(deleteLocalReviewRefusedCopy('local')) },
+  {
+    name: 'deleteLocalReviewRefusedCopy',
+    text: [
+      flatten(deleteLocalReviewRefusedCopy('local', { discarded: true })),
+      flatten(deleteLocalReviewRefusedCopy('local', { discarded: false })),
+    ].join(' '),
+  },
+  {
+    name: 'deleteLocalReviewFailedCopy',
+    text: [
+      flatten(deleteLocalReviewFailedCopy('local', { discarded: true })),
+      flatten(deleteLocalReviewFailedCopy('local', { discarded: false })),
+    ].join(' '),
+  },
+  {
+    name: 'deleteLocalReviewDraftUnreadableCopy',
+    text: flatten(deleteLocalReviewDraftUnreadableCopy('local')),
+  },
 ]
 
 describe('the copy sweep covers the module it is sweeping', () => {

@@ -13,14 +13,21 @@ import type {
 } from '@revu/shared'
 import { draftHoldsText, identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
-import { useDraft } from '@/state/drafts'
+import { useDraft, useDraftActions } from '@/state/drafts'
 import { useDeleteLocalReview } from '@/state/local-reviews'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
 import type { CheckCounts } from '@/lib/checks-rollup'
 import { rowIdentity } from '@/lib/local-reviews'
 import type { RowIdentity } from '@/lib/local-reviews'
-import { deleteLocalReviewCopy, notFoundCopy, stateChipCopy, stateChipVariant, syncCostCopy } from '@/lib/mode-copy'
+import {
+  deleteLocalReviewCopy,
+  deleteLocalReviewFailedCopy,
+  notFoundCopy,
+  stateChipCopy,
+  stateChipVariant,
+  syncCostCopy,
+} from '@/lib/mode-copy'
 import type { DeleteDraftSummary, ReviewState } from '@/lib/mode-copy'
 import { reviewMode, reviewTabs } from '@/lib/review-mode'
 import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
@@ -37,6 +44,10 @@ import { Spinner } from '@/components/ui/spinner'
 import { useToast } from '@/components/ui/toast'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ConfirmDeleteLocalReviewDialog } from '@/components/confirm-delete-local-review'
+import type {
+  DeleteAttemptAnswer,
+  DeleteDraftRead,
+} from '@/components/confirm-delete-local-review'
 import { describeApiError } from '@/components/review/error-copy'
 import { ReviewBar } from '@/components/review/review-bar'
 import { ReviewDirtyBanner } from '@/components/review/dirty-banner'
@@ -477,15 +488,22 @@ function heldText(draft: ReviewDraft | null): DeleteDraftSummary | null {
  * go at all.
  *
  * Quiet until it is reached — a bare control in the header, taking its red only
- * on hover and focus — because the header is somewhere a reader passes through
- * constantly and this is the one thing on it that cannot be undone. The
+ * on hover and keyboard focus — because the header is somewhere a reader passes
+ * through constantly and this is the one thing on it that cannot be undone. The
  * confirmation behind it is where the act is spelled out.
  *
- * The control waits for the draft read before it will confirm anything, and
- * that is a correctness matter rather than polish: whether this reader's own
- * draft is discarded on the way is decided from that read, and deciding it from
- * an unresolved one would send a delete that leaves their own text in the way
- * and then explain the refusal as somebody else's.
+ * The control waits for the draft read to SUCCEED before it will confirm
+ * anything, and that is a correctness matter rather than polish: whether this
+ * reader's own draft is discarded on the way is decided from that read, and
+ * deciding it from a read that is still in flight — or from one that failed,
+ * which answers with the same empty-looking absence — would send a delete that
+ * leaves their own text in the way and then explain the refusal as somebody
+ * else's.
+ *
+ * The discard itself is the editing surface's own, not a bare request. That
+ * surface holds a debounced save and a retry behind it, and a discard that
+ * skipped them would race a timer that re-creates the draft between the discard
+ * and the delete.
  */
 function DeleteLocalReviewAction({
   prNumber,
@@ -496,12 +514,18 @@ function DeleteLocalReviewAction({
 }) {
   const navigate = useNavigate()
   const draft = useDraft(prNumber)
+  const draftActions = useDraftActions(prNumber)
   const remove = useDeleteLocalReview()
   const { toast } = useToast()
   const [open, setOpen] = useState(false)
-  const [refusal, setRefusal] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState<DeleteAttemptAnswer | null>(null)
 
   const held = heldText(draft.data ?? null)
+  const draftRead: DeleteDraftRead = draft.isSuccess
+    ? 'read'
+    : draft.isError
+      ? 'unreadable'
+      : 'reading'
   // The trigger says exactly what the plain confirmation's own control says,
   // read from the one place either sentence is decided. It stays the plain
   // wording whatever the draft holds: the escalation belongs in the
@@ -509,9 +533,9 @@ function DeleteLocalReviewAction({
   const label = deleteLocalReviewCopy('local', null)?.confirm ?? ''
 
   const confirm = () => {
-    setRefusal(null)
+    setAttempt(null)
     remove.mutate(
-      { reviewId: prNumber, discardOwnDraft: held !== null },
+      { reviewId: prNumber, discard: held === null ? null : draftActions.discard },
       {
         onSuccess: (result) => {
           if (result.outcome === 'deleted') {
@@ -519,21 +543,22 @@ function DeleteLocalReviewAction({
             navigate('/')
             return
           }
-          // Kept open, holding the sentence the workspace refused it with:
-          // there is nothing this reader can do about it here, and closing
-          // onto an unchanged header would say nothing happened at all.
-          setRefusal(result.reason)
-        },
-        // A fault with no remedy this screen can offer. Reported as the
-        // failure it is rather than in the refusal slot, whose framing is
-        // about drafts and would be a lie about a transport that did not
-        // answer.
-        onError: (error) => {
-          toast({
-            kind: 'error',
-            title: "Couldn't delete this review",
-            detail: describeApiError(error),
-          })
+          // Kept open, holding whatever the far end answered: there is nothing
+          // this reader can do about it here, and closing onto an unchanged
+          // header would say nothing happened at all. A failure is reported in
+          // the toast as well, because the dialog can be dismissed and the fact
+          // that a draft was discarded on the way must outlive it.
+          if (result.outcome === 'failed') {
+            const detail = describeApiError(result.error)
+            setAttempt({ kind: 'failed', detail, discarded: result.discarded })
+            toast({
+              kind: 'error',
+              title: deleteLocalReviewFailedCopy('local', result) ?? '',
+              detail,
+            })
+            return
+          }
+          setAttempt({ kind: 'refused', detail: result.reason, discarded: result.discarded })
         },
       },
     )
@@ -544,9 +569,9 @@ function DeleteLocalReviewAction({
       <Button
         variant="ghost"
         size="sm"
-        className="shrink-0 hover:bg-danger/12 hover:text-danger"
+        className="shrink-0 hover:bg-danger/12 hover:text-danger focus-visible:bg-danger/12 focus-visible:text-danger"
         onClick={() => {
-          setRefusal(null)
+          setAttempt(null)
           setOpen(true)
         }}
       >
@@ -558,8 +583,9 @@ function DeleteLocalReviewAction({
         onOpenChange={setOpen}
         identity={identity}
         draft={held}
-        pending={remove.isPending || draft.isPending}
-        refusal={refusal}
+        draftRead={draftRead}
+        busy={remove.isPending}
+        attempt={attempt}
         onConfirm={confirm}
         onCancel={() => setOpen(false)}
       />

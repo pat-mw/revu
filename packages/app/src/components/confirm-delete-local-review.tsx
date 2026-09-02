@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -9,7 +10,12 @@ import {
 import { ErrorState } from '@/components/ui/error-state'
 import { Spinner } from '@/components/ui/spinner'
 import type { RowIdentity } from '@/lib/local-reviews'
-import { deleteLocalReviewCopy, deleteLocalReviewRefusedCopy } from '@/lib/mode-copy'
+import {
+  deleteLocalReviewCopy,
+  deleteLocalReviewDraftUnreadableCopy,
+  deleteLocalReviewFailedCopy,
+  deleteLocalReviewRefusedCopy,
+} from '@/lib/mode-copy'
 import type { DeleteDraftSummary } from '@/lib/mode-copy'
 
 /**
@@ -38,8 +44,9 @@ import type { DeleteDraftSummary } from '@/lib/mode-copy'
  * observable part is separated from the shell that cannot be observed:
  *
  * - `ConfirmDeleteLocalReviewBody` is the portal-free body. It owns no query
- *   and no mutation — the identity, the draft summary, the pending flag and any
- *   refusal all arrive as props — so its markup is a pure function of them.
+ *   and no mutation — the identity, the draft summary, the busy flag and any
+ *   answer the attempt came back with all arrive as props — so its markup is a
+ *   pure function of them.
  * - `ConfirmDeleteLocalReviewDialog` is the shell around it, thin enough that
  *   what it adds is a title and a modal.
  *
@@ -49,6 +56,42 @@ import type { DeleteDraftSummary } from '@/lib/mode-copy'
  * sentence here.
  */
 
+/**
+ * How the read of this reader's own draft has answered.
+ *
+ * Three states rather than a nullable summary, because "no draft with text in
+ * it" and "the read has not said" are different facts with different
+ * consequences, and collapsing them is how a confirmation ends up promising a
+ * delete that discards nothing while the reader's own text is what blocks it.
+ */
+export type DeleteDraftRead =
+  /** The read is still in flight; what the confirm would do is not yet known. */
+  | 'reading'
+  /** The read answered, and `draft` is what it said. */
+  | 'read'
+  /** The read failed; nothing here can say whether a draft is in the way. */
+  | 'unreadable'
+
+/**
+ * What the last delete attempt came back with, when it did not delete.
+ *
+ * `discarded` travels with both readings because it is the one irreversible
+ * thing an unsuccessful attempt can have done: a discard the reader asked for
+ * and cannot take back. A frame blind to it either says nothing about text
+ * that is already gone, or implies text was destroyed when none was.
+ */
+export interface DeleteAttemptAnswer {
+  /** Whether the workspace refused the delete, or the attempt simply failed. */
+  kind: 'refused' | 'failed'
+  /**
+   * The sentence the far end answered with, rendered verbatim: only that side
+   * knows which review and whose draft is in the way.
+   */
+  detail: string
+  /** Whether this reader's own draft was discarded on the way to this answer. */
+  discarded: boolean
+}
+
 export interface ConfirmDeleteLocalReviewBodyProps {
   /**
    * What the review is called. A local review is named by its branch pair; the
@@ -57,13 +100,12 @@ export interface ConfirmDeleteLocalReviewBodyProps {
   identity: RowIdentity
   /** The reader's own unsubmitted draft, or `null` when it holds no text. */
   draft: DeleteDraftSummary | null
-  /** A delete is in flight, so neither control decides anything more. */
-  pending: boolean
-  /**
-   * The refusal exactly as the workspace worded it, or `null`. Rendered
-   * verbatim: only that side knows which review and whose draft is in the way.
-   */
-  refusal: string | null
+  /** Whether the draft above was actually read, and what happened if not. */
+  draftRead: DeleteDraftRead
+  /** A delete is in flight, so no control here decides anything more. */
+  busy: boolean
+  /** What the last attempt answered, or `null` while none has been made. */
+  attempt: DeleteAttemptAnswer | null
   onConfirm: () => void
   onCancel: () => void
 }
@@ -83,15 +125,34 @@ export interface ConfirmDeleteLocalReviewBodyProps {
 export function ConfirmDeleteLocalReviewBody({
   identity,
   draft,
-  pending,
-  refusal,
+  draftRead,
+  busy,
+  attempt,
   onConfirm,
   onCancel,
 }: ConfirmDeleteLocalReviewBodyProps) {
+  const cancelRef = useRef<HTMLButtonElement>(null)
+
+  // An answer that keeps the dialog open arrives after both controls have been
+  // disabled and re-enabled, and a control disabled while it held focus drops
+  // focus to the document body — from where the next Tab starts at the top of
+  // the page and the reader has no way back into the dialog but the mouse. So
+  // the way out is re-focused whenever an answer lands, which is also where a
+  // screen reader should be: beside the sentence explaining what happened.
+  useEffect(() => {
+    if (attempt !== null) cancelRef.current?.focus()
+  }, [attempt])
+
   if (identity.kind !== 'local') return null
   const copy = deleteLocalReviewCopy('local', draft)
   if (copy === null) return null
-  const frame = deleteLocalReviewRefusedCopy('local')
+  const unreadable = deleteLocalReviewDraftUnreadableCopy('local')
+  const frame =
+    attempt === null
+      ? null
+      : attempt.kind === 'refused'
+        ? deleteLocalReviewRefusedCopy('local', attempt)
+        : deleteLocalReviewFailedCopy('local', attempt)
 
   return (
     <div className="flex flex-col gap-3">
@@ -103,22 +164,37 @@ export function ConfirmDeleteLocalReviewBody({
 
       <p className="text-sm leading-relaxed text-ink-mut">{copy.body}</p>
 
-      {refusal !== null && frame !== null && <ErrorState title={frame} detail={refusal} />}
+      {attempt !== null && frame !== null && (
+        <ErrorState title={frame} detail={attempt.detail} />
+      )}
+
+      {draftRead === 'unreadable' && unreadable !== null && (
+        <p className="text-sm leading-relaxed text-ink-mut">{unreadable}</p>
+      )}
 
       <div className="flex items-center justify-end gap-2 pt-1">
         {/* Focused on open, and first in the tab order, so the way out is what
             a keystroke aimed at nothing in particular reaches. */}
-        <Button autoFocus variant="ghost" onClick={onCancel} disabled={pending}>
+        <Button ref={cancelRef} autoFocus variant="ghost" onClick={onCancel} disabled={busy}>
           {copy.cancel}
         </Button>
-        <Button variant="danger" onClick={onConfirm} disabled={pending}>
-          {pending ? (
-            <Spinner size={12} label="Deleting the review" />
-          ) : (
-            <Trash2 strokeWidth={1.5} aria-hidden />
-          )}
-          {copy.confirm}
-        </Button>
+        {/* Withdrawn entirely when the draft could not be read: what the button
+            would do is decided from that read, so a labelled offer beside an
+            unanswered one is a promise nothing here can keep. */}
+        {draftRead !== 'unreadable' && (
+          <Button
+            variant="danger"
+            onClick={onConfirm}
+            disabled={busy || draftRead !== 'read'}
+          >
+            {busy ? (
+              <Spinner size={12} label="Deleting the review" />
+            ) : (
+              <Trash2 strokeWidth={1.5} aria-hidden />
+            )}
+            {copy.confirm}
+          </Button>
+        )}
       </div>
     </div>
   )
@@ -134,9 +210,12 @@ export interface ConfirmDeleteLocalReviewDialogProps
 /**
  * The body in a modal.
  *
- * Dismissal is blocked while a delete is in flight — the request cannot be
- * recalled, and a dialog that vanished mid-delete would leave the reader unsure
- * whether the review is going. Everything else the shell does is structural.
+ * Dismissal is blocked while a delete is IN FLIGHT and at no other time — the
+ * request cannot be recalled, and a dialog that vanished mid-delete would leave
+ * the reader unsure whether the review is going. A draft read that has not
+ * answered yet blocks nothing: it disables the confirm, because what the
+ * confirm would do is unknown, but Escape must still close a dialog the reader
+ * opened by accident. Everything else the shell does is structural.
  */
 export function ConfirmDeleteLocalReviewDialog({
   open,
@@ -151,7 +230,7 @@ export function ConfirmDeleteLocalReviewDialog({
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next && bodyProps.pending) return
+        if (!next && bodyProps.busy) return
         onOpenChange(next)
       }}
     >

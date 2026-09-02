@@ -588,6 +588,25 @@ describe('deletion', () => {
     expect(thrownCode(() => deleteLocalReview(created.id))).toBe('not_found')
   })
 
+  test('and the refusal it answers with names no review id', () => {
+    // The sentence travels to a screen verbatim — only this side knows what is
+    // in the way — and a local review's id is a synthetic key minted so routes
+    // and cache keys can stay plain numbers. It names nothing a reader could
+    // look up, so it must not reach one.
+    //
+    // The remedy the message names is the positive control, in this body: it
+    // proves a real refusal sentence was read, rather than an absence
+    // satisfied by an empty message or by no refusal at all.
+    const humanId = mockDev.get().humanId
+    const created = createLocalReview({ baseRef: 'main', headRef: 'feature/unnamed-refusal' })
+    const snap = syncLocalReview(created.id)
+    store.putDraft(draftFor(humanId, created.id, snap))
+
+    const refused = thrownError(() => deleteLocalReview(created.id))
+    expect(refused?.message).toMatch(/discard/i)
+    expect(refused?.message ?? '').not.toContain(String(created.id))
+  })
+
   test('an empty draft — the one an editor creates on open — never blocks, and goes with the review', () => {
     const humanId = mockDev.get().humanId
     const created = createLocalReview({ baseRef: 'main', headRef: 'feature/opened-only' })
@@ -769,6 +788,52 @@ describe('the four local-review methods on the API surface', () => {
     expect(
       await rejectedCode(api.createLocalReview({ baseRef: 'main', headRef: 'main' })),
     ).toBe('unprocessable')
+  })
+
+  test('a draft write aimed at a review that is gone is refused, not stranded', async () => {
+    // The race a delete cannot outrun. The editing surface saves on a debounce
+    // with one retry behind it, so a save in flight when the review goes lands
+    // AFTER it — and a store that took it would hold a draft under an id that
+    // is never minted again: unlistable, unreachable and undiscardable for as
+    // long as the store survives.
+    //
+    // The same save before the delete is the positive control, in this body: it
+    // proves the write is one this surface performs, so the refusal afterwards
+    // is about the review's absence rather than about a draft verb that never
+    // works on a local id.
+    const humanId = mockDev.get().humanId
+    const created = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/adapter-late-save',
+    })
+    const snap = syncLocalReview(created.id)
+    const late = draftFor(humanId, created.id, snap)
+    expect((await api.saveDraft({ ...late, body: '', comments: [] })).prNumber).toBe(created.id)
+
+    await api.discardDraft(created.id)
+    await api.deleteLocalReview(created.id)
+
+    expect(await rejectedCode(api.saveDraft(late))).toBe('not_found')
+  })
+
+  test('and so is a read or a discard aimed at one', async () => {
+    // The read answers `not_found` rather than `null`, because `null` is the
+    // answer for a review that exists and has no draft — a different fact, and
+    // one a client acts on differently. The discard answers the same way for
+    // the same reason: deleting an absent DRAFT stays a no-op, but an absent
+    // REVIEW is not a thing this surface serves at all.
+    const created = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'feature/adapter-late-read',
+    })
+    // The control: both verbs answer normally while the review is there.
+    expect(await api.getDraft(created.id)).toBeNull()
+    await api.discardDraft(created.id)
+
+    await api.deleteLocalReview(created.id)
+
+    expect(await rejectedCode(api.getDraft(created.id))).toBe('not_found')
+    expect(await rejectedCode(api.discardDraft(created.id))).toBe('not_found')
   })
 
   test('no local-review call spends the shared rate bucket', async () => {
