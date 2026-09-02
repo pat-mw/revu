@@ -42,14 +42,18 @@ jobs:
       - name: Gate (oxlint + tsc -b + bun test + vite build)
         run: bun run check
 
-  # Runs the RevuApi conformance suite across every transport leg as a matrix.
-  # The two required legs run in-gate here: the in-process mock (A) and revud
-  # serving the mock store over real HTTP (B), held to the same shared
-  # assertions. The two live legs — direct mode vs the scratch repo (C) and
-  # broker mode vs the scratch org (D) — run only when their secret/env is
-  # present; without secrets they log a visible skipped-pending-secrets line and
-  # do not fail the matrix. No repository secrets are wired into this job, so on
-  # a public fork or a secret-less run it is legs A+B green with C+D skipped.
+  # Runs the RevuApi conformance suites across every transport leg as a matrix.
+  # Five required legs run in-gate here: the pull-request suite over the
+  # in-process mock (A) and over revud serving the mock store via real HTTP (B),
+  # and the local-review suite over the in-process mock (E), over revud-mock via
+  # HTTP (F), and over the direct engine against a git repository the runner
+  # seeds with zero remotes (G) — a local review needs no token and no network,
+  # so G is required where C is not. The two live legs — direct mode vs the
+  # scratch repo (C) and broker mode vs the scratch org (D) — run only when
+  # their secret/env is present; without secrets they log a visible
+  # skipped-pending-secrets line and do not fail the matrix. No repository
+  # secrets are wired into this job, so on a public fork or a secret-less run it
+  # is legs A+B+E+F+G green with C+D skipped.
   conformance-matrix:
     name: conformance-matrix
     needs: check
@@ -75,13 +79,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Conformance matrix (mock + revud-mock HTTP required; live legs skipped-pending-secrets)
+      - name: Conformance matrix (A+B pull-request and E+F+G local-review legs required; live legs skipped-pending-secrets)
         run: bun run conformance:matrix
 
-  # Runs the browser-driven end-to-end flow after the gate passes. The app is
+  # Runs the browser-driven end-to-end flows after the gate passes. The app is
   # built in HTTP mode, revud serves it on an ephemeral port, and a headless
   # system Chrome (preinstalled on ubuntu-latest, resolved via
-  # `channel: 'chrome'`) drives the happy path. No browser download step.
+  # `channel: 'chrome'`) drives two flows: the pull-request happy path against
+  # the mock daemon, and a local-branch review against a direct daemon booted
+  # inside a git repository seeded with zero remotes, with a preload that records
+  # and refuses every non-loopback `fetch` so the run proves nothing left the
+  # process. No browser download step.
   e2e:
     name: e2e
     needs: check
