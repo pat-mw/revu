@@ -1,39 +1,63 @@
-## 2026-09-02 — M8.9 is In Review on #82; M8.12 is next
+## 2026-09-02 — M8.9 (#82) and M8.12 (#83) are In Review; no Todo ticket remains in M8
 
 ### Orient
-1. `git checkout m8.9/archive-on-pr` — stack tip, [PR #82](https://github.com/pat-mw/revu/pull/82), base
-   `m8.11/conformance-e2e-docs`.
-2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3276 pass · 1 skip · 0 fail · 116 files**.
-3. **CI on #82 was pending at hand-off** — check `gh pr checks 82` before building on it (check ·
-   conformance-matrix · e2e · docs-build). #78, #79, #80 were green.
+1. `git checkout m8.12/delete-confirm` — stack tip, [PR #83](https://github.com/pat-mw/revu/pull/83), base
+   `m8.9/archive-on-pr` ([PR #82](https://github.com/pat-mw/revu/pull/82), base `m8.11/conformance-e2e-docs`).
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3348 pass · 1 skip · 0 fail · 117 files**.
+3. **CI is green on #82** (check · conformance-matrix · e2e · docs-build) **and on #83** (check ·
+   conformance-matrix · e2e; docs-build is path-filtered and did not run), as on #78–#80. Re-check with
+   `gh pr checks <n>` before building on either — it is one command.
 4. `bun run conformance:matrix` → A/B/E/F/G `PASS`, C/D `SKIP`. `bun run test:e2e` → two `ALL CHECKS PASSED`.
 5. Read `BOARD.md` → this entry → the ticket you pick up.
 
 ### State
-`main` untouched at `177068a`. **Thirteen PRs, one linear chain, none merged:** … → #80 (M8.11) → #82 (M8.9).
-Tree clean, branch pushed. M8.8, M8.10, M8.11, M8.9 In Review. 99 units. **Stacked PRs are the protocol —
+`main` untouched at `177068a`. **Fourteen PRs, one linear chain, none merged:** … → #80 (M8.11) → #82 (M8.9)
+→ #83 (M8.12). Tree clean, both branches pushed. M8.8, M8.10, M8.11, M8.9, M8.12 In Review. **Every M8
+ticket is now In Review or Done-pending-merge; no Todo remains.** 99 units. **Stacked PRs are the protocol —
 open one every session. Never merge, never commit to `main`, never retarget.** (PR number 81 does not exist
 on this repository; nothing is missing from the chain.)
 
 ### Next, in order
-1. **M8.12 — delete confirmation for a review holding a draft.** Branch `m8.12/delete-confirm` off the `m8.9`
-   tip. **Greenfield on the app side:** `deleteLocalReview` has zero call sites in `packages/app/src` outside
-   the transport adapters — there is no delete affordance, no mutation hook, no dialog. The ruling (2026-08-19)
-   is that there is **no force flag**: the daemon refuses (`unprocessable`, message names the remedy) while any
-   human's draft holds text; the client discards its own draft explicitly, then repeats the delete unchanged.
-   So the unit texts saying "retry with force" are superseded: confirm = discard the current human's draft
-   (`api.deleteDraft`) then delete. Copy must be honest that the *discard* destroys that text by the user's
-   choice (say "discard", never "lost"); another human's blocking draft cannot be discarded from here — surface
-   the daemon's sentence. Dialog precedents: `head-moved-dialog.tsx`, `reconcile-dialog.tsx`,
-   `CreateLocalReviewDialog` (`create-local-review.tsx`, body/wrapper split); there is no `AlertDialog`
-   primitive; `discard-confirm.tsx` is a two-step *button* hook, not a dialog. After a delete invalidate
-   `qk.pulls` + `qk.localReviews` (`refetchType: 'all'`) and navigate to the inbox. Affordance: a local-mode
-   action in the review header. The `?mock=1` dev server config is `.claude/launch.json` → `app-dev`.
+0. **Run M8.9's both-halves proof against the real scratch repository** — the one Verify line not run this
+   session, and it is runnable here: `tmp/revu-sandbox` is a clone of `pat-mw/revu-sandbox` (seeded by
+   `scripts/seed-scratch.ts`, fixture branches `fixture/*`, PRs #1–#5), `gh` is logged in as `pat-mw`
+   (keyring; no `GH_TOKEN` in the shell, so direct mode's `gh auth token` path is the one exercised), and
+   `scripts/smoke-direct.ts` shows how a live direct-mode run is set up. Plan: `git fetch origin` there,
+   branch `proof/archive-<date>` off `origin/main` with one small commit, push it; run revud `--direct` from
+   that clone (a temp `REVU_DATA_DIR`, `REVU_DIST_DIR` at a `build:e2e` dist — read `packages/revud/src/index.ts`
+   for the flags); in the served app create `main ← proof/archive-…`, sync, leave an inline comment, submit
+   (`Review saved`), and create a **second** local review of the same head against a different base
+   (`fixture/base-advances-target ← proof/archive-…`); `gh pr create --repo pat-mw/revu-sandbox --base main
+   --head proof/archive-…`; sync the first review → chip `archived`, banner `superseded by pull request #N`,
+   link to `https://github.com/pat-mw/revu-sandbox/pull/N`, threads and the submitted review still render,
+   no composer; the second review stays live (OQ8). Then the observation that is D1:
+   `gh api repos/pat-mw/revu-sandbox/pulls/N/comments` → `[]`, `…/pulls/N/reviews` → `[]`, `gh pr view N
+   --comments` → nothing, no reactions. `gh pr close N` → re-sync → still archived (sticky). Record the PR
+   URL and each observation in M8.9's `## Log` and tick its Verify line, naming the in-gate assertions it
+   corroborates (`local-write-isolation.test.ts`, the netlog guard, `local-archive-sync.test.ts`). Bonus:
+   `GH_TOKEN=$(gh auth token) bun run conformance:matrix` runs leg C live against the same scratch repo.
+   Cleanup: delete the proof branch (`git push origin --delete proof/archive-…`); the seeded fixtures are
+   allowlist-protected and untouched. The fork case cannot be produced without a fork — it stays in-gate.
+1. **Nothing else in M8 is left to build.** The owner merges the chain bottom-up; each exit criterion in
+   `MILESTONE.md` ticks against the run that proves it (the walk is at M8.11's Verify 7). If a base merges,
+   rebase the rest of the stack and retarget its PR — never retarget ahead of a merge.
 2. **Follow-ups on the board, not tickets:** `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
-   stored PR URL column when an Enterprise host matters; 52 stale `.claude/worktrees/agent-*` directories
-   (gitignored, disk only — `git worktree prune` after removing them is the owner's call).
+   stored PR URL column when an Enterprise host matters; a shared conformance case for draft verbs aimed at a
+   deleted review (today pinned per implementation only); 52 stale `.claude/worktrees/agent-*` directories
+   (gitignored, disk only — the owner's call).
+3. **M8.12 specifics a follow-up session should know:** the confirm dialog shows for every delete; the discard
+   runs through the draft store's own path (`dropPersistState` first); `performLocalReviewDelete` never throws
+   and reports `discarded` on every outcome; the cached draft is dropped only after a discard that succeeded;
+   the refusal sentence in both producers is `This local review still holds an unsubmitted draft with text in
+   it — discard that draft, then delete the review.` (no id). The `?mock=1` dev server config is
+   `.claude/launch.json` → `app-dev`; a hidden preview tab throttles the mock's latency timers, so a create
+   can take ten seconds there — that is the tab, not a hang.
 
 ### What this session learned — apply before calling anything done
+- **A guard the tests cannot see: the cache is the editing surface.** M8.12's blocker was invisible to every
+  unit test because none seeded a cached edit whose save had failed; dropping the cache on a *failed* discard
+  destroyed text nobody could type back. Any flow that removes a per-review query must do so only after the
+  transport confirmed the removal.
 - **A mutation must refresh every cache its result can change.** The unit tests were all green and the
   archived review never showed on the page: `useSyncPull` refreshed nothing the archive changes, the list poll
   pauses in a hidden tab, the annotation query has no interval. Only the `?mock=1` walk saw it. Memory:

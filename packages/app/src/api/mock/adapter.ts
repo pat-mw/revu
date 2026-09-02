@@ -702,6 +702,11 @@ export function createMockApi(): RevuApi {
 
     async getDraft(prNumber: number): Promise<ReviewDraft | null> {
       await localDelay()
+      // A local id whose review is gone is refused rather than answered with
+      // `null`: the draft keyspace is shared with pull requests, so nothing
+      // else here would notice the review's absence, and "no draft" is a
+      // different fact from "no review".
+      if (isLocalReviewId(prNumber)) local.requireLocalReviewForDraft(prNumber)
       return store.getDraft(currentHuman().id, prNumber)
     },
 
@@ -710,6 +715,11 @@ export function createMockApi(): RevuApi {
       failWrites(
         'The broker did not answer — your draft was not saved. Your text is still in the editor; retry when the broker is reachable.',
       )
+      // The write this guard exists for. A debounced save in flight when a
+      // local review is deleted lands after it, and a store that took it would
+      // hold a draft under an id that is never minted again — unlistable,
+      // unreachable and undiscardable for as long as the store survives.
+      if (isLocalReviewId(draft.prNumber)) local.requireLocalReviewForDraft(draft.prNumber)
       const stored: ReviewDraft = { ...clone(draft), updatedAt: nowISO() }
       store.putDraft(stored)
       return stored
@@ -718,6 +728,7 @@ export function createMockApi(): RevuApi {
     async discardDraft(prNumber: number): Promise<void> {
       await delay('write')
       failWrites('The broker did not answer — the draft was not discarded.')
+      if (isLocalReviewId(prNumber)) local.requireLocalReviewForDraft(prNumber)
       store.deleteDraft(currentHuman().id, prNumber)
     },
 
