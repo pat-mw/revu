@@ -60,6 +60,12 @@ function stubApi(): DirectApi {
     // No broker write decorator behind this stub, so it honestly lacks the
     // broker write capability; these serve tests exercise reads only.
     brokerWritesEnabled: false,
+    // No poll loop and no local reviews behind it either, so it serves no
+    // review list and `GET /api/pulls` keeps its honest 501.
+    pullListEnabled: false,
+    // A broker always mediates a repository, so this stub reports one: the
+    // no-repository degradation is not what these serve tests exercise.
+    githubEnabled: true,
     getRateLimit: async () => ({
       limit: 5000,
       remaining: 4999,
@@ -86,6 +92,18 @@ function stubApi(): DirectApi {
     setFileViewed: () => ({}),
     getPreferences: () => ({ ...DEFAULT_PREFERENCES }),
     setPreferences: () => ({ ...DEFAULT_PREFERENCES }),
+    // A broker serves no local reviews: it has no repository on disk to read
+    // branches from. The three local operations are wired to throw so a serve
+    // test that reached one would fail rather than answer plausibly.
+    listBranches: async () => {
+      throw new Error('not used')
+    },
+    createLocalReview: async () => {
+      throw new Error('not used')
+    },
+    listLocalReviews: () => {
+      throw new Error('not used')
+    },
     submitReview: async () => {
       throw new Error('not used')
     },

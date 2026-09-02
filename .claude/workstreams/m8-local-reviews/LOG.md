@@ -368,3 +368,43 @@ exhaustiveness guard is red-first.
 **Next**
 - **M8.5 (daemon wiring)** is unblocked and needs all four of M8.1–M8.4. **Read the five findings addressed to it
   in the handover before dispatching** — three are traps.
+
+**update — 2026-08-19**
+
+**Done.** M8.5 (daemon wiring) complete and in review on [#76](https://github.com/pat-mw/revu/pull/76) — ten
+units, gate **2635 pass · 1 skip · 0 fail · 95 files** under `TZ=UTC`, `Verify` green, the frozen contract and
+the four GitHub-path suites byte-unchanged from the branch point. The milestone's headline exit criterion is
+reachable and was observed directly: `revud --direct --local-only` starts in a repository with no remotes,
+creates a review on the reserved band, syncs from local git, and serves the snapshot, while GitHub-bound routes
+answer a typed refusal. **CI green on all eight PRs.**
+
+Two units were **appended rather than absorbed**: M8.5.9 (the two-daemon mint, a finding handed to this ticket)
+and M8.5.10 (the local surface factory, which had **no owner** — the boot unit assembles the surface but all
+four of its checks test boot seams).
+
+**Decisions.** OQ5 settled as a single `LocalReviewSurface` assembled from store + runner + discovered toplevel
++ repo identity + session. OQ1 settled as an **explicit** `--local-only` / `REVU_LOCAL_ONLY` switch, never
+automatic — a transient credential failure inside a real clone would otherwise boot a daemon showing an empty
+inbox, which reads as data loss. OQ3: rate-limit degrades to the router's existing raw-501 convention, since
+`not_implemented` is not an `ApiErrorCode` and adding it would be a frozen-contract change. OQ4: the merged
+ETag hashes both halves. OQ6: `bin/revu` gains no local path; the criterion is proven against `revud` directly.
+
+**Blockers found and fixed.** Two adversarial reviews of the full diff plus a focused third pass. **Four
+blockers, every one reproduced before being treated as real**, and three of them contradicted by docstrings the
+same diff introduced: a local-only boot in a GitHub *clone* served GitHub routes with no viewer identity and
+**posted duplicate reviews to a real pull request**; a local review id was actionable from **any** repository
+sharing the data directory, landing a durable thread anchored to a file in another repo; the snapshot persist
+was a deferred read-then-write the busy handler cannot rescue; and the list ETag hashed compare keys alone, so
+a submit or resolve left the inbox 304ing on a stale count. The first fix then **over-corrected** — local-only
+began requiring the network and a valid token — and that repair is included, with the required path proven
+byte-for-byte unchanged by mutation.
+
+**CI was red on #74 and #75** before this session touched them. One test, whose control asserted git prints a
+numeric offset for UTC; it prints `Z`. The fixture pinned commit identity because a runner has none, but never
+pinned the timezone. Fixed at the root on `m8.3` so the stack inherits it by rebase, then `m8.4` and `m8.5`
+rebased and **re-gated under `TZ=UTC`**.
+
+**Blockers.** None for the daemon track. **M8.9, M8.10 and M8.12 carry open questions that block the next
+session** and need the owner — see the handover's interview list.
+
+**Next.** M8.8, M8.9 and M8.10 are mutually independent and all unblocked by M8.5; M8.11 closes the milestone.

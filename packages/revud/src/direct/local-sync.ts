@@ -1254,7 +1254,7 @@ const REF_DISPLAY_PREFIXES = ['refs/heads/', 'refs/remotes/'] as const
  * remote, because that is the part that tells it apart from the local branch of
  * the same name.
  */
-function shortRefName(ref: string): string {
+export function shortRefName(ref: string): string {
   for (const prefix of REF_DISPLAY_PREFIXES) {
     if (ref.startsWith(prefix)) return ref.slice(prefix.length)
   }

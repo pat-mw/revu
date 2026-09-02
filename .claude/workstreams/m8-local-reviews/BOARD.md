@@ -10,25 +10,58 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing. The daemon track is COMPLETE.** All three tickets landed their full unit sets, ran `Verify` green,
-took a fable-tier adversarial review of the full diff, fixed what it found, and opened a PR. No unit is
-dispatched, no agent is running, no worktree is in use, every branch is pushed, and `main` is untouched at
-`177068a`.
+**M8.5 is COMPLETE and in review on [#76](https://github.com/pat-mw/revu/pull/76).** All ten units landed,
+`Verify` green, two full adversarial reviews of the diff plus a focused third pass on the riskiest change, and
+every blocker they found fixed before the PR opened. **CI is green on all eight PRs.**
 
 | ticket | units | gate at its tip | PR |
 | --- | --- | --- | --- |
-| **M8.2** store v4 | 7/7 | 1702 pass · 1 skip · 0 fail | [#73](https://github.com/pat-mw/revu/pull/73) base `m8.7` |
-| **M8.3** git builder | 9/9 | 2209 pass · 1 skip · 0 fail | [#74](https://github.com/pat-mw/revu/pull/74) base `m8.2` |
-| **M8.4** write sink | 9/9 | **2445 pass · 1 skip · 0 fail · 91 files** | [#75](https://github.com/pat-mw/revu/pull/75) base `m8.3` |
+| **M8.5** daemon wiring | 10/10 | **2635 pass · 1 skip · 0 fail · 95 files** (under `TZ=UTC`) | [#76](https://github.com/pat-mw/revu/pull/76) base `m8.4` |
 
-**The stack, bottom-up — seven PRs, none merged:** `main` → [#69](https://github.com/pat-mw/revu/pull/69) →
-[#70](https://github.com/pat-mw/revu/pull/70) → [#71](https://github.com/pat-mw/revu/pull/71) →
-[#72](https://github.com/pat-mw/revu/pull/72) → [#73](https://github.com/pat-mw/revu/pull/73) →
-[#74](https://github.com/pat-mw/revu/pull/74) → [#75](https://github.com/pat-mw/revu/pull/75).
+**The stack, bottom-up — eight PRs, none merged, all green:** `main` → #69 → #70 → #71 → #72 → #73 → #74 →
+#75 → **#76**. `main` is untouched at `177068a`.
 
-**This file now lives at the chain tip**, not on `m8.2`. It was maintained on the base while three lanes ran
-concurrently, because one file on three branches conflicts at every rebase; the lanes have converged, so a cold
-session reads it from `m8.4/local-write-sink`.
+### What M8.5 actually delivers
+
+`revud --direct --local-only` starts in a repository with **no remotes at all**, lists its branches, creates a
+review on the reserved id band, syncs it from local git, and serves the snapshot — while every GitHub-bound
+route answers a typed refusal naming the missing repository. That is the milestone's headline exit criterion,
+proven durably by a new HTTP suite under a network tripwire **and** observed by hand.
+
+### The unit ledger
+
+| unit | commit | gate |
+| --- | --- | --- |
+| M8.5.4 — boot relaxation | `5bfdf38` | 2453 · 1 · 0 · 91 |
+| M8.5.1 — band dispatch | `369af01` | 2458 · 1 · 0 · 92 |
+| M8.5.9 — two daemons on one data dir | `6a837ae` | 2460 · 1 · 0 · 92 |
+| M8.5.2 — create / list / branches routes | `4a281ba` | 2474 · 1 · 0 · 92 |
+| M8.5.10 — the local surface factory | `d239db6` | 2528 · 1 · 0 · 93 |
+| M8.5.5 — boot assembly | `eb1eb5c` | 2563 · 1 · 0 · 94 |
+| M8.5.3 — `listPulls`, local merged | `fd5aca1` | 2568 · 1 · 0 · 94 |
+| M8.5.8 — router band handling | `c462105` | 2571 · 1 · 0 · 94 |
+| M8.5.6 — honest degradation + the exit-criterion unblock | `5b7057c` | 2577 · 1 · 0 · 94 |
+| M8.5.7 — the offline HTTP proof | `6f52c96` | 2605 · 1 · 0 · 95 |
+| review fixes — snapshot lock · repo scoping · half + etag | `6b0b047` `e167923` `b605ac3` | 2625 · 1 · 0 · 95 |
+| the over-correction, and two guards made real | `96d0240` `ee91a6e` | **2635 · 1 · 0 · 95** |
+
+**Two units were appended, not absorbed:** M8.5.9 (the two-daemon mint, handed to this ticket as a finding)
+and M8.5.10 (the surface factory, which had **no owner** — the ticket's boot unit assembles the surface but
+all four of its checks test boot seams).
+
+### 🔴 CI was red on #74 and #75 — fixed at the root
+
+`check` was failing on both, which skipped `conformance-matrix` and `e2e`. **One test**, whose control asserted
+git prints a numeric offset for UTC. It prints `Z`. The fixture pinned commit **identity** because a runner has
+none, but never pinned the **timezone**, so a developer machine passed and a UTC runner failed — and the local
+gate could never have caught it. **`m8.5` would have failed CI identically the moment its PR opened.**
+
+Fixed on **`m8.3`** (`2044c62`) so the stack inherits it by rebase, then `m8.4` and `m8.5` rebased and
+**re-gated under `TZ=UTC`** rather than trusting a clean rebase. Relaxing the pattern to accept `Z` would have
+been the wrong repair — it makes the control vacuous on exactly the machine where it was failing.
+
+**Standing practice from this: run the gate with `TZ=UTC` before pushing anything that touches dates or git
+output.** The default local run reproduces CI only by accident.
 
 ### ⚠️ The three blockers the pre-merge reviews found — none was visible to any suite
 
@@ -120,9 +153,9 @@ from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-1
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
 | [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | **In Review** | 7 | revud | M8.1 | `m8.2/store-v4` | [#73](https://github.com/pat-mw/revu/pull/73) |
-| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Progress** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
-| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Progress** | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
-| [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
+| [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | **In Review** | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | [#74](https://github.com/pat-mw/revu/pull/74) |
+| [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | **In Review** | 9 | revud | M8.1 | `m8.4/local-write-sink` | [#75](https://github.com/pat-mw/revu/pull/75) |
+| [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Review** | 10 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | [#76](https://github.com/pat-mw/revu/pull/76) |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
