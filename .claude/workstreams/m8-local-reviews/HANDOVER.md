@@ -18,7 +18,27 @@ open one every session. Never merge, never commit to `main`, never retarget.** (
 on this repository; nothing is missing from the chain.)
 
 ### Next, in order
-1. **Nothing in M8 is left to build.** The owner merges the chain bottom-up; each exit criterion in
+0. **Run M8.9's both-halves proof against the real scratch repository** — the one Verify line not run this
+   session, and it is runnable here: `tmp/revu-sandbox` is a clone of `pat-mw/revu-sandbox` (seeded by
+   `scripts/seed-scratch.ts`, fixture branches `fixture/*`, PRs #1–#5), `gh` is logged in as `pat-mw`
+   (keyring; no `GH_TOKEN` in the shell, so direct mode's `gh auth token` path is the one exercised), and
+   `scripts/smoke-direct.ts` shows how a live direct-mode run is set up. Plan: `git fetch origin` there,
+   branch `proof/archive-<date>` off `origin/main` with one small commit, push it; run revud `--direct` from
+   that clone (a temp `REVU_DATA_DIR`, `REVU_DIST_DIR` at a `build:e2e` dist — read `packages/revud/src/index.ts`
+   for the flags); in the served app create `main ← proof/archive-…`, sync, leave an inline comment, submit
+   (`Review saved`), and create a **second** local review of the same head against a different base
+   (`fixture/base-advances-target ← proof/archive-…`); `gh pr create --repo pat-mw/revu-sandbox --base main
+   --head proof/archive-…`; sync the first review → chip `archived`, banner `superseded by pull request #N`,
+   link to `https://github.com/pat-mw/revu-sandbox/pull/N`, threads and the submitted review still render,
+   no composer; the second review stays live (OQ8). Then the observation that is D1:
+   `gh api repos/pat-mw/revu-sandbox/pulls/N/comments` → `[]`, `…/pulls/N/reviews` → `[]`, `gh pr view N
+   --comments` → nothing, no reactions. `gh pr close N` → re-sync → still archived (sticky). Record the PR
+   URL and each observation in M8.9's `## Log` and tick its Verify line, naming the in-gate assertions it
+   corroborates (`local-write-isolation.test.ts`, the netlog guard, `local-archive-sync.test.ts`). Bonus:
+   `GH_TOKEN=$(gh auth token) bun run conformance:matrix` runs leg C live against the same scratch repo.
+   Cleanup: delete the proof branch (`git push origin --delete proof/archive-…`); the seeded fixtures are
+   allowlist-protected and untouched. The fork case cannot be produced without a fork — it stays in-gate.
+1. **Nothing else in M8 is left to build.** The owner merges the chain bottom-up; each exit criterion in
    `MILESTONE.md` ticks against the run that proves it (the walk is at M8.11's Verify 7). If a base merges,
    rebase the rest of the stack and retarget its PR — never retarget ahead of a merge.
 2. **Follow-ups on the board, not tickets:** `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
