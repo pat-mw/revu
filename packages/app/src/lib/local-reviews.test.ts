@@ -196,6 +196,42 @@ describe('the link to the pull request that superseded a review', () => {
     expect(archivedPrUrl('owner/', 101)).toBeNull()
   })
 
+  test('a dot-segment where a half belongs is refused', () => {
+    // Why the halves are checked for what they are made of and not merely
+    // counted. `owner/..` is one separator with two non-empty halves, so a rule
+    // that counted them builds `https://github.com/owner/../pull/101` — which
+    // every browser resolves one level up, sending the reader to a pull request
+    // in a repository this workspace never named. The shape reads the same
+    // whichever half it lands in.
+    expect(archivedPrUrl('owner/..', 101)).toBeNull()
+    expect(archivedPrUrl('../name', 101)).toBeNull()
+  })
+
+  test('and a single dot, which is the same trick one level shorter', () => {
+    expect(archivedPrUrl('owner/.', 101)).toBeNull()
+  })
+
+  test('and a half holding a character no repository identity holds', () => {
+    // A space is not part of any owner or repository name. A percent-escape is
+    // worse than that: `na%2Fme` is `na/me` to the site that receives it, so a
+    // half waved through on the grounds that it contains no separator would
+    // carry one to GitHub regardless.
+    expect(archivedPrUrl('own er/name', 101)).toBeNull()
+    expect(archivedPrUrl('owner/na%2Fme', 101)).toBeNull()
+  })
+
+  test('and the ordinary punctuation real identities carry still links', () => {
+    // The control for the refusals above, and the reason the rule is a
+    // character set with an anchored first character rather than a ban on the
+    // dot: dots, dashes and underscores are what owners and repositories are
+    // actually spelled with. A rule that took `..` by refusing every dot would
+    // pass all four cases above and quietly drop the link from a large share of
+    // real workspaces.
+    expect(archivedPrUrl('my-org.io/re.po_1', 101)).toBe(
+      'https://github.com/my-org.io/re.po_1/pull/101',
+    )
+  })
+
   test('and a number no pull request could have is refused', () => {
     // The number reaches the path segment, so it is checked for what a pull
     // request number is rather than assumed to be one.

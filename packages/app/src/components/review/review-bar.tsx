@@ -16,7 +16,12 @@ import { CommentComposer } from '@/components/threads/composer'
 import { cn } from '@/lib/cn'
 import { useShortcut } from '@/lib/keyboard'
 import { draftSavedCopy, submitFailureCopy, submitSuccessCopy } from '@/lib/mode-copy'
-import { reviewComposerHidden, reviewMode, showSelfReviewLock } from '@/lib/review-mode'
+import {
+  forbiddenSubmitRerouteAllowed,
+  reviewComposerHidden,
+  reviewMode,
+  showSelfReviewLock,
+} from '@/lib/review-mode'
 import { relativeTime } from '@/lib/time'
 import { useDraft, useDraftActions, useDraftDirty, useSubmitReview } from '@/state/drafts'
 import { useFilesView } from '@/state/files-view'
@@ -32,8 +37,11 @@ import { ReconcileDialog } from './reconcile-dialog'
  * one-liner while no review is in progress; once a draft holds a comment or a
  * summary it grows the violet rail, the pending roster, the verdict picker,
  * the persistence whisper, and the atomic Submit. Submit routes its three
- * non-throwing outcomes explicitly: accepted, forbidden (self-review), or
- * head-moved into the reconcile flow.
+ * non-throwing outcomes explicitly: accepted, refused, or head-moved into the
+ * reconcile flow. Two different reviews reach the refusal — one whose author
+ * cannot approve it, one a pull request has come to cover — so the verdict is
+ * moved to Comment only where that is the remedy, and the refusal's sentence
+ * is shown as the body of a toast rather than as its title.
  *
  * What the strip SAYS about two of those — where a submitted review went, and
  * where the draft behind it lives — depends on which kind of review is open,
@@ -142,8 +150,17 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
         setBodyExpanded(false)
         toast({ kind: 'success', ...submitSuccessCopy(mode, pendingCount) })
       } else if (result.status === 'forbidden') {
-        actions.setEvent('COMMENT')
-        toast({ kind: 'error', title: result.reason })
+        // The reroute is the self-review remedy applied for the reader, and it
+        // is asked for rather than assumed: it writes the draft, and the other
+        // review this branch is reached on — one a pull request has come to
+        // cover — is refused for a reason no verdict would have got past, so
+        // rewriting the verdict there would silently replace what its author
+        // chose with something they did not.
+        if (forbiddenSubmitRerouteAllowed(mode)) actions.setEvent('COMMENT')
+        // The reason is a whole sentence, so it goes where a sentence is
+        // legible: the title carries the short statement of what happened, and
+        // the body carries why.
+        toast({ kind: 'error', title: 'Review not accepted', detail: result.reason })
       } else {
         setHeadMoved({
           currentHeadSha: result.currentHeadSha,

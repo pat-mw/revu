@@ -233,6 +233,35 @@ export function showSelfReviewLock({ mode, canApprove }: SelfReviewLockInput): b
 }
 
 /**
+ * Whether a submit the far end refused may move the draft's verdict to
+ * Comment on the way to reporting the refusal.
+ *
+ * The rewrite is a REMEDY, and it only remedies one refusal. A pull request
+ * opened by the single shared identity every contractor writes through cannot
+ * be approved by that identity, so an approving verdict is one the far end
+ * will refuse again on every retry; moving it to the verdict that can go
+ * through is what the refusal's own sentence tells the reader to do, done for
+ * them.
+ *
+ * A review of two local branches is refused for one reason and it is not that
+ * one: a pull request came to cover its branch pair, so the review is
+ * read-only and no verdict at all would have been accepted. Rewriting the
+ * verdict there fixes nothing and costs something real — the rewrite is
+ * persisted, so an author who chose "request changes" would find "comment"
+ * saved in its place, with nothing on the screen having said so and no way
+ * back to what they wrote. Drafts survive everything else; they survive this.
+ *
+ * Deliberately narrower than a general "is this refusal about the verdict"
+ * question, which the result gives no way to ask: the refusal arrives as one
+ * sentence with no machine-readable cause, and sniffing that sentence for
+ * wording would tie a persisted edit to a string written to be read by a
+ * person and rephrased whenever it reads badly.
+ */
+export function forbiddenSubmitRerouteAllowed(mode: ReviewMode): boolean {
+  return mode === 'github'
+}
+
+/**
  * What the archived gates read: which kind of review it is, and the state its
  * listed row reports.
  *

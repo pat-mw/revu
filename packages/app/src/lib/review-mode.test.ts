@@ -45,6 +45,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { StaticRouter } from 'react-router'
 import {
   conversationSections,
+  forbiddenSubmitRerouteAllowed,
   matchPrNumber,
   prPaletteCommands,
   redirectTargetFor,
@@ -271,6 +272,26 @@ describe('whether the review bar offers a way to write', () => {
   })
 })
 
+describe('whether a refused submit may rewrite the verdict the draft holds', () => {
+  test('a refused pull request review is moved to Comment', () => {
+    // What the reroute was written for. A pull request opened by the shared
+    // identity cannot be approved by it, so the verdict the draft holds is one
+    // the far end will refuse again on every retry; moving it to the verdict
+    // that can go through is the remedy the refusal itself names, applied.
+    expect(forbiddenSubmitRerouteAllowed('github')).toBe(true)
+  })
+
+  test('and a refused local review keeps whatever verdict it holds', () => {
+    // A local review is refused for one reason only — a pull request came to
+    // cover its branch pair, so it is read-only — and no verdict would have
+    // been accepted. Rewriting the draft's here would be the refusal quietly
+    // editing the one thing that survives everything else: an author who asked
+    // for changes would find a comment in its place, with nothing on the
+    // screen having said so and nothing to undo it with.
+    expect(forbiddenSubmitRerouteAllowed('local')).toBe(false)
+  })
+})
+
 describe('whether a row says which pull request superseded it', () => {
   test('a local review carrying a number says so', () => {
     expect(supersededBadgeShown({ mode: 'local', archivedPr: 101 })).toBe(true)
@@ -392,6 +413,50 @@ describe('the review bar consults the archived gate', () => {
     // The other half of the same rule. Left in, the strip would say a review is
     // not in progress and offer to start one, on a review that would refuse it.
     expect(REVIEW_BAR_SOURCE).toContain('if (writesHidden && !active) return null')
+  })
+})
+
+/** The review bar's source with runs of whitespace flattened to single spaces. */
+const REVIEW_BAR_FLAT = REVIEW_BAR_SOURCE.replace(/\s+/g, ' ')
+
+describe('what the review bar does with a submit the far end refused', () => {
+  test('the bar imports the reroute gate by name', () => {
+    // PRESENCE, not execution. The predicate is asserted directly above; what
+    // this turns red is the gate tidied away and the verdict rewritten on
+    // every refusal again, which no behavioural test in this file can see
+    // because none of them renders the bar.
+    //
+    // Anchored to the import STATEMENT and the module it comes from, so a
+    // mention of the name in a comment or a leftover local does not satisfy it.
+    const imported =
+      /import\s*\{[^}]*\bforbiddenSubmitRerouteAllowed\b[^}]*\}\s*from\s*'@\/lib\/review-mode'/
+    expect(imported.test(REVIEW_BAR_SOURCE)).toBe(true)
+  })
+
+  test('and the one verdict rewrite in it happens only behind that gate', () => {
+    // The rewrite is persisted into the draft, so an ungated one is a silent
+    // edit to a document the author never touched. The count is what makes the
+    // guard above mean anything: a second rewrite somewhere else in the file
+    // would restore the behaviour the gate replaced while the gate itself
+    // stayed green beside it.
+    expect(REVIEW_BAR_FLAT).toContain(
+      "if (forbiddenSubmitRerouteAllowed(mode)) actions.setEvent('COMMENT')",
+    )
+    const rewrites = REVIEW_BAR_SOURCE.match(/setEvent\('COMMENT'\)/g) ?? []
+    expect(rewrites.length).toBe(1)
+  })
+
+  test('and the refusal sentence is the toast body, never its title', () => {
+    // The refusals this branch renders are whole sentences — one names the
+    // pull request that superseded the review, its branch pair, and what did
+    // not reach it. A title is set in medium weight and given no room to wrap
+    // to; the body below it is where a sentence that long is legible.
+    //
+    // The control sits in this body rather than another, because "no sentence
+    // in the title" is equally what a branch that dropped the reason entirely
+    // would produce, and the two have to be told apart by one reading.
+    expect(REVIEW_BAR_FLAT).toContain('detail: result.reason')
+    expect(/title:\s*result\.reason/.test(REVIEW_BAR_SOURCE)).toBe(false)
   })
 })
 
