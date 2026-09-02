@@ -26,7 +26,16 @@ import type { GithubClient } from './github-client'
 import type { LocalReviewSurface } from './local-surface'
 import { shortRefName, synthesizeLocalUser } from './local-sync'
 import { reconcileDraft as runReconcileDraft } from './reconcile'
-import { createSyncGate, withSyncInFlight, type SyncGate } from './retention'
+import {
+  createSyncGate,
+  dropPinnedRefs,
+  pruneBlobs,
+  pruneImmutables,
+  withSyncInFlight,
+  type BlobRetentionPolicy,
+  type RetentionContext,
+  type SyncGate,
+} from './retention'
 import type { RepoRef } from './repo'
 import type { DirectStore } from './store'
 import { syncPull as runSyncPull } from './sync'
@@ -193,6 +202,29 @@ export interface DirectApi {
    */
   listLocalReviews(): LocalReviewSummary[]
 
+  /**
+   * Remove one local review, and everything the store and the object database
+   * were holding on its behalf: its rows, the refs pinning the git objects its
+   * snapshot was read from, and whatever cached half the removal has just left
+   * referenced by nothing.
+   *
+   * Scoped to the local band, and an id outside it is refused BY NAME rather
+   * than absorbed. A pull request number is a positive integer too, so a clean
+   * success for one would report a pull request removed as a review of a branch
+   * pair — and would hide the mistake instead of naming it.
+   *
+   * Idempotent inside that band: an id that carries no review removes nothing
+   * and still resolves. A removal whose answer was lost has to be safe to
+   * repeat, and "already gone" is the outcome the caller asked for, so an absent
+   * row is never reported as a missing resource.
+   *
+   * Deleting a review deletes every human's drafts on it. That is an explicit
+   * act of removal rather than a reclamation, and it is the only way
+   * unsubmitted text is ever removed here — nothing that runs on its own may
+   * reach a draft.
+   */
+  deleteLocalReview(reviewId: number): Promise<void>
+
   /** Run the burst sync and persist; may resolve a `partial` snapshot. */
   syncPull(prNumber: number): Promise<Snapshot>
   /** The cached snapshot, or `null` when the PR was never synced (not an error). */
@@ -313,15 +345,32 @@ export interface DirectApiDeps {
    * The in-flight counter this daemon's syncs are entered into, so a retention
    * sweep running for another request can tell that a review is mid-write.
    *
-   * Injected rather than minted here whenever a sweep is also wired, because the
-   * gate only guards anything while the sync path and the sweep hold the SAME
-   * one: two gates over one data directory each report a count the other's work
-   * never moves, and both read a clean zero while the window they exist to close
-   * stands wide open. Absent, this surface keeps a private gate — correct for a
-   * daemon that never sweeps, and the reason no existing caller has to grow an
-   * argument to keep working.
+   * Optional because the pairing that matters is made HERE and cannot come
+   * apart by omission: this surface resolves one gate, enters every sync into
+   * it, and hands that same binding to every prune it runs. A gate only guards
+   * anything while the sync path and the sweep hold the SAME one — two gates
+   * over one data directory each report a count the other's work never moves,
+   * and both read a clean zero while the window they exist to close stands wide
+   * open — so an absent field means a private gate on both sides rather than a
+   * missing half.
+   *
+   * Inject one only to share that window with a sweep running OUTSIDE this
+   * surface, and then it must be the identical instance for the same reason.
    */
   syncGate?: SyncGate
+
+  /**
+   * Whether this daemon reclaims file bytes as well as cached snapshot halves
+   * when it prunes. OFF unless a deployment writes it down.
+   *
+   * The question is a deployment's to answer and not this surface's to infer:
+   * nothing readable here distinguishes a workspace whose reviews are all
+   * backed by a remote from one whose local reviews are the only copy of what
+   * they were read from. Absent, the halves are reclaimed and the bytes are
+   * kept — which grows the largest table in the store monotonically, and is the
+   * accepted cost of never removing bytes that had no second source.
+   */
+  blobRetention?: BlobRetentionPolicy
 }
 
 /**
@@ -490,6 +539,72 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
   const writeDecorator =
     deps.writeDecorator ?? createDirectWriteDecorator(deps.session.human)
   const syncGate = deps.syncGate ?? createSyncGate()
+
+  /**
+   * The repository a pin drop acts in, or a refusal.
+   *
+   * A local review's pins are refs in a git object database, so dropping them
+   * needs a command seam and a directory to run it in. Both arrive at assembly
+   * or neither does, and a surface that serves local reviews without them could
+   * not drop a ref at any point in its life. So this refuses BEFORE a removal
+   * begins rather than part-way through one: a delete that removed the rows and
+   * then discovered it had no way to reach git would leave the objects pinned
+   * under an id nothing names any more, which no later call can find again.
+   *
+   * A plain error on purpose. Every boot that serves local reviews wires both,
+   * so this is an invariant guard rather than a contract answer, and a typed
+   * `ApiError` would serialize into a plausible-looking refusal and let an
+   * assembly fault pass for a considered one.
+   */
+  const pinRepository = (): RetentionContext => {
+    if (deps.runner === undefined || deps.cwd === undefined) {
+      throw new Error(
+        'This surface serves local reviews but was assembled without a command ' +
+          'runner and a repository directory, so a review’s pinned refs could ' +
+          'never be dropped; assemble it with both.',
+      )
+    }
+    return { runner: deps.runner, cwd: deps.cwd }
+  }
+
+  /**
+   * Reclaim whatever the store is now holding for nothing: the cached snapshot
+   * halves no stored snapshot names, and — when a deployment has asked for it —
+   * the file bytes no stored comparison names.
+   *
+   * The ONE place either prune is reached from, and it hands both the gate. A
+   * call site that reached a prune directly would be a sweep with no opinion
+   * about the syncs running beside it, and the window it would then run inside
+   * is exactly the one where a review's fresh rows are referenced by nothing
+   * YET. Routing every call through here closes that window by construction
+   * instead of by each caller remembering to.
+   *
+   * Nothing here decides the outcome of the act that triggered it. A prune
+   * reports what it removed as a value, and both refusals it can answer — a
+   * sync in flight, a policy left off — are ordinary. What is not ordinary is a
+   * store that cannot be read or written, and that arrives as a throw. Letting
+   * it out would turn a sync whose snapshot is already on disk, or a removal
+   * whose rows are already gone, into a reported failure for work that
+   * succeeded — and would do it on the strength of a corrupt row belonging to
+   * some unrelated review. Under-removal is the direction this whole path
+   * prefers: it costs disk until the next attempt and loses nothing. So the
+   * failure is logged rather than raised, and the corruption still surfaces,
+   * loudly and in its own terms, at the next read of the row that is broken.
+   */
+  const reclaimUnreferenced = (): void => {
+    try {
+      pruneImmutables(deps.store, syncGate)
+      pruneBlobs(deps.store, syncGate, deps.blobRetention)
+    } catch (err) {
+      // Sanitized: the error's NAME only. Stored documents carry review
+      // content, and a reclamation failure is not a reason to print any of it.
+      console.warn(
+        'revu: could not reclaim unreferenced rows ' +
+          `(${err instanceof Error ? err.name : 'unknown error'}); nothing was ` +
+          'removed, and the store keeps every row it already held.',
+      )
+    }
+  }
 
   /**
    * The local surface to serve this review id from, or `null` when the id names
@@ -711,6 +826,75 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       return localSurface().listLocalReviews()
     },
 
+    async deleteLocalReview(reviewId: number): Promise<void> {
+      // The same band dispatch every other id-keyed method opens with, so this
+      // route carries no rule of its own about which reviews it may remove. A
+      // local id with no local surface wired refuses inside it; a pull request
+      // number falls out as `null` and is refused here, because a delete has no
+      // GitHub-backed twin to fall through to and a clean success would report
+      // a pull request removed as a review of a branch pair.
+      const local = localFor(reviewId)
+      if (local === null) {
+        throw new ApiError(
+          'not_found',
+          `Review #${reviewId} is not in the local-review band; this removes reviews of local branch pairs alone.`,
+        )
+      }
+
+      // Resolved with every row still in place, so an assembly that could never
+      // reach git refuses before it has removed anything.
+      const repository = pinRepository()
+
+      // Scoped to the reviews THIS daemon serves. Ids are minted from one
+      // monotonic mark shared by every repository using the data directory, and
+      // the row delete is keyed by the id alone — so an id can name a review
+      // belonging to a repository this daemon knows nothing about, with
+      // branches, a worktree and a clock that are not its own. Such an id gets
+      // the same clean, idempotent answer an id carrying no review at all gets:
+      // this daemon removed what it had, which was nothing. Any distinguishable
+      // answer would confirm to one repository's client that the id exists
+      // somewhere else.
+      const mine = local.listLocalReviews().some((review) => review.id === reviewId)
+
+      // ——— The order below is the correctness, not a preference. ———
+      //
+      // Rows first. A prune run before them still reads the doomed review's
+      // snapshot envelope, so its compare key is LIVE and the half about to
+      // become an orphan is proposed by nothing — and no later sweep has any
+      // reason to look at that review again, because the row that named it is
+      // gone. Pruning early therefore does not merely miss the reclamation, it
+      // strands the half permanently.
+      //
+      // Refs second, and never after the prune. A pin holds git objects
+      // reachable on behalf of data the store still has; between a prune and a
+      // drop that followed it, the object database is pinned for a review that
+      // no longer exists, and a drop that then fails leaves it that way with
+      // nothing left to say what the pins were for.
+      //
+      // The prune last, when the rows are gone and the halves they were the
+      // only reference to have finally become unreferenced.
+      if (mine) deps.store.deleteLocalReview(reviewId)
+
+      // Attempted for any id in the band, including one this daemon did not
+      // carry a row for: a drop is idempotent and discovers its refs rather
+      // than reconstructing them, so a repeat over an emptied namespace costs
+      // one listing and clears up after a drop that failed part-way last time.
+      const dropped = await dropPinnedRefs(repository, reviewId)
+      if (!dropped.ok) {
+        // A value, not a throw, and the rows are already gone — so this is
+        // reported rather than raised. Objects left pinned cost disk and lose
+        // nothing, whereas answering a failure for a removal that succeeded
+        // would invite a retry that finds the review already absent.
+        console.warn(
+          `revu: dropped ${dropped.count} of review #${reviewId}'s pinned refs ` +
+            `before failing (${dropped.reason}: ${dropped.detail}); the objects ` +
+            'behind the rest stay reachable until the refs are removed.',
+        )
+      }
+
+      reclaimUnreferenced()
+    },
+
     async syncPull(prNumber: number): Promise<Snapshot> {
       // BOTH branches are inside the gate, and the dispatch that chooses between
       // them is inside it too. Each one leaves a different piece of a review
@@ -724,9 +908,18 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       // The wrapper holds the try/finally, so a refusal raised by the dispatch
       // itself — an id from the local band on a daemon that serves no local
       // reviews — releases the count on its way out like any other failure.
-      return withSyncInFlight(syncGate, async () => {
+      let syncedLocally = false
+      const snapshot = await withSyncInFlight(syncGate, async () => {
         const local = localFor(prNumber)
-        if (local !== null) return local.syncPull(prNumber)
+        if (local !== null) {
+          const built = await local.syncPull(prNumber)
+          // Set only once the sync has RETURNED. A sync that rejects never
+          // reaches this line, and the rejection travels out of the wrapper and
+          // past everything below it — so a failed or refused sync reclaims
+          // nothing, twice over.
+          syncedLocally = true
+          return built
+        }
         return runSyncPull(
           {
             ...githubTarget(),
@@ -738,6 +931,23 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
           prNumber,
         )
       })
+
+      // The cadence: a successful sync of a local review is what triggers a
+      // reclamation. Not a boot, not a timer — a re-synced branch pair is the
+      // event that STRANDS a half, because a rebased branch mints a fresh
+      // compare key and the envelope that lands stops naming the old one. The
+      // moment there is something new to reclaim is the moment to reclaim it,
+      // and nothing has to remember to ask later.
+      //
+      // OUTSIDE the wrapper, and that placement is the whole of it. The gate
+      // holds a sweep off while any sync is in flight, so a prune called from
+      // inside the wrapper would read its own sync's raised count, stand aside
+      // every single time, and never remove a row — which from the outside is
+      // indistinguishable from a prune that keeps finding nothing to do. Here
+      // the wrapper has already returned, its `finally` has already lowered the
+      // count, and the prune reads the store the sync finished writing.
+      if (syncedLocally) reclaimUnreferenced()
+      return snapshot
     },
 
     async getRateLimit(): Promise<RateLimitInfo> {

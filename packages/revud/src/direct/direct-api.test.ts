@@ -443,6 +443,7 @@ function build(opts: { local: boolean }): Harness {
  */
 const DISPATCHING = [
   'syncPull',
+  'deleteLocalReview',
   'getSnapshot',
   'getDraft',
   'saveDraft',

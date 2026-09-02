@@ -95,7 +95,13 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
-import type { FileBlob, ReviewDraft, Snapshot, SnapshotImmutable } from '@revu/shared'
+import type {
+  FileBlob,
+  ReviewDraft,
+  ReviewThread,
+  Snapshot,
+  SnapshotImmutable,
+} from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import { createBunCommandRunner } from './command-runner'
 import {
@@ -104,9 +110,10 @@ import {
   MOVING_BASE_PR,
   movingBaseClient,
 } from './conformance-fakes'
-import { createDirectApi } from './direct-api'
+import { createDirectApi, type DirectApi } from './direct-api'
 import type { GithubClient } from './github-client'
-import type { LocalReviewSurface } from './local-surface'
+import { createFixtureRepo, type FixtureRepo } from './local-fixture-repo'
+import { createLocalReviewSurface, type LocalReviewSurface } from './local-surface'
 import { pinRefsFor, pinSnapshotObjects } from './local-pins'
 import {
   createSyncGate,
@@ -328,6 +335,12 @@ const LIVE_LOCAL_KEY = 'C...D'
 const ORPHAN_PR_KEY = 'A...old'
 /** The half left behind by the local review's previous comparison. */
 const ORPHAN_LOCAL_KEY = 'C...old'
+/**
+ * A half stranded after a sync has already finished and already reclaimed. It
+ * exists so "the sweep runs once the gate reopens" can be asserted against a row
+ * the sync itself never had the chance to remove.
+ */
+const STRANDED_AFTER_SYNC_KEY = 'G...old'
 
 /**
  * A timestamp years before every other date in this file, used wherever a test
@@ -1126,8 +1139,19 @@ describe('a sweep stands aside while a sync is still writing', () => {
     held.resolve()
     await syncing
 
+    // The falsification of the skip, half one: the orphan the refusal protected
+    // is gone the moment the sync's promise settles, because a successful local
+    // sync ends by reclaiming. A guard that skipped forever and a guard that
+    // skips only while a sync runs are the same green test without this.
+    expect(store.listImmutableKeys()).not.toContain(ORPHAN_LOCAL_KEY)
+
+    // Half two, and independent of that cadence: a half stranded AFTER the gate
+    // reopened is removed by the same sweep that stood aside a moment ago —
+    // over the same store, through the same gate, with only the sync's exit
+    // between the two calls.
+    store.putImmutable(immutableHalf(STRANDED_AFTER_SYNC_KEY))
     const swept = sweep(store, gate)
-    expect(swept.removed).toEqual([ORPHAN_LOCAL_KEY])
+    expect(swept.removed).toEqual([STRANDED_AFTER_SYNC_KEY])
     expect(store.hasBlob(FRESH_BLOB_SHA)).toBe(true)
     expectEverySnapshotStillReadable(store)
     store.close()
@@ -2340,5 +2364,561 @@ describe('against a real repository', () => {
     await collect()
 
     expect((await git(['cat-file', '-e', doomed])).code).not.toBe(0)
+  }, 60_000)
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// Removing a review, and reclaiming after a sync, over a real repository
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * The repository identity every review below is scoped to. A string rather than
+ * the fixture's path, because the store is told its identity and derives none:
+ * what matters here is that the surface and the rows agree on one value.
+ */
+const REMOVAL_REPO = 'acme/widgets'
+
+/** The comparison a pin and a stored half must agree on to name one comparison. */
+function compareKeyOf(mergeBaseSha: string, headSha: string): string {
+  return `${mergeBaseSha}...${headSha}`
+}
+
+/** One thread on a local review, with just enough shape to be stored and read back. */
+function storedThread(id: string): ReviewThread {
+  return {
+    id,
+    isResolved: false,
+    isOutdated: false,
+    path: 'a.ts',
+    line: 1,
+    originalLine: 1,
+    startLine: null,
+    originalStartLine: null,
+    diffSide: 'RIGHT',
+    startDiffSide: null,
+    subjectType: 'LINE',
+    resolvedBy: null,
+    comments: [],
+  }
+}
+
+/**
+ * The store, wrapped so the two deleting statements record the in-flight count
+ * they were reached with — and record nothing at all when they are not reached.
+ *
+ * This is what turns "the prune runs after the sync, not inside it" into an
+ * assertion. A prune called from inside the in-flight wrapper reads its own
+ * sync's raised count, stands aside before it reaches the store, and leaves this
+ * sink EMPTY; a prune called after the wrapper has exited reaches the store with
+ * the count already back at zero. The two are indistinguishable from the outside
+ * — both leave a store nobody removed anything from — and only the count the
+ * statement was reached with tells them apart.
+ *
+ * `Object.create` rather than a copy, so every method this file does not name
+ * still works and no assertion depends on the store's full surface being
+ * written out a second time.
+ */
+function pruneWitness(
+  inner: DirectStore,
+  gate: SyncGate,
+): { store: DirectStore; reached: string[] } {
+  const reached: string[] = []
+  const store: DirectStore = Object.create(inner) as DirectStore
+  store.deleteImmutables = (keys: string[]): ImmutableDeletion => {
+    reached.push(`immutables@${gate.inFlight}`)
+    return inner.deleteImmutables(keys)
+  }
+  store.deleteBlobs = (shas: string[]): BlobDeletion => {
+    reached.push(`blobs@${gate.inFlight}`)
+    return inner.deleteBlobs(shas)
+  }
+  return { store, reached }
+}
+
+describe('removing a local review, end to end', () => {
+  let fixture: FixtureRepo
+  const runner = createBunCommandRunner()
+
+  /** The branch review two is recorded against, so the two reviews are distinct pairs. */
+  const SECOND_HEAD = 'review-two-head'
+
+  /** Runs one git command inside the fixture. Never against the working clone. */
+  async function git(args: readonly string[]): Promise<CommandResult> {
+    return runner.run(['git', ...args], { cwd: fixture.dir })
+  }
+
+  /** Every ref currently under one review's prefix, sorted. */
+  async function listing(localId: number): Promise<string[]> {
+    const result = await git([
+      'for-each-ref',
+      '--format=%(refname)',
+      `refs/revu/reviews/${localId}/`,
+    ])
+    return result.stdout
+      .split('\n')
+      .filter((line) => line.length > 0)
+      .sort()
+  }
+
+  /** The api under test, over one store and one gate, against the fixture repository. */
+  function worldOver(
+    store: DirectStore,
+    gate: SyncGate,
+  ): { api: DirectApi; surface: LocalReviewSurface } {
+    const surface = createLocalReviewSurface({
+      store,
+      runner,
+      toplevel: fixture.dir,
+      repo: REMOVAL_REPO,
+      session: CONFORMANCE_SESSION,
+    })
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      store,
+      // The git seam and the repository, wired as a boot serving local reviews
+      // wires them. A removal has to reach the object database to drop the refs
+      // pinning what the review was read from.
+      runner,
+      cwd: fixture.dir,
+      localReviews: surface,
+      syncGate: gate,
+    })
+    return { api, surface }
+  }
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+    const branched = await git(['branch', SECOND_HEAD, fixture.headCommitShas[0]])
+    if (!branched.ok) {
+      throw new Error(`the removal fixture could not branch: ${branched.stderr.trim()}`)
+    }
+  }, 120_000)
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-removal-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  /**
+   * Two local reviews of two real branch pairs, each with a live comparison and
+   * one superseded by it, each pinned for both, plus threads, drafts and viewed
+   * marks — and a pull request's snapshot alongside.
+   *
+   * Two comparisons apiece rather than one, because a review with only a live
+   * half cannot say whether a reclamation removed the orphan it should or simply
+   * removed nothing. The pull request is there because the immutable cache is
+   * shared between the two kinds of review: a sweep consulting one snapshot
+   * table would report the other's live halves as referenced by nothing.
+   */
+  async function seedTwoReviews(store: DirectStore): Promise<{
+    one: { id: number; live: string; orphan: string }
+    two: { id: number; live: string; orphan: string }
+  }> {
+    const { surface } = worldOver(store, createSyncGate())
+    const humanId = CONFORMANCE_SESSION.human.id
+
+    const rows = [
+      {
+        input: { baseRef: fixture.baseBranch, headRef: fixture.headBranch },
+        live: { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headSha },
+        orphan: { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headCommitShas[1] },
+        thread: 'LOCALTHREAD_one',
+      },
+      {
+        input: { baseRef: fixture.baseBranch, headRef: SECOND_HEAD },
+        live: { mergeBaseSha: fixture.mergeBaseSha, headSha: fixture.headCommitShas[0] },
+        orphan: { mergeBaseSha: fixture.baseSha, headSha: fixture.headCommitShas[0] },
+        thread: 'LOCALTHREAD_two',
+      },
+    ]
+
+    const seeded: { id: number; live: string; orphan: string }[] = []
+    for (const row of rows) {
+      const review = await surface.createLocalReview(row.input)
+      const live = compareKeyOf(row.live.mergeBaseSha, row.live.headSha)
+      const orphan = compareKeyOf(row.orphan.mergeBaseSha, row.orphan.headSha)
+      // Sync-shaped: the envelope names the live comparison, and the superseded
+      // one is left in the cache exactly as a re-synced rebase leaves it.
+      store.putLocalSnapshot(storedSnapshot(review.id, live))
+      store.putImmutable(immutableHalf(orphan))
+      store.putLocalThread(review.id, storedThread(row.thread))
+      store.putLocalDraft(unsubmittedDraft(humanId, review.id, `pending on ${review.id}`))
+      store.setLocalViewed(humanId, review.id, {
+        'a.ts': { viewed: true, blobSha: null, at: LONG_AGO },
+      })
+      // Written by the pin module rather than by hand: the drop discovers refs
+      // by prefix, so a test that spelled the names itself would only prove this
+      // file agrees with itself. Both comparisons, so a drop that stopped after
+      // one pin key is red.
+      for (const range of [row.live, row.orphan]) {
+        const pinned = await pinSnapshotObjects(runner, fixture.dir, review.id, range)
+        expect(pinned.ok).toBe(true)
+      }
+      seeded.push({ id: review.id, live, orphan })
+    }
+
+    store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY))
+    return { one: seeded[0], two: seeded[1] }
+  }
+
+  test('one review goes whole, and nothing else is touched', async () => {
+    const store = openStore()
+    const { one, two } = await seedTwoReviews(store)
+    const humanId = CONFORMANCE_SESSION.human.id
+    const { api } = worldOver(store, createSyncGate())
+
+    // Every absence asserted below has its positive control here: the rows, the
+    // refs and the halves all demonstrably existed before the removal ran.
+    expect(store.getLocalReview(one.id)).not.toBeNull()
+    expect(store.getLocalSnapshot(one.id)).not.toBeNull()
+    expect(store.listLocalThreads(one.id)).toHaveLength(1)
+    expect(store.getLocalDraft(humanId, one.id)).not.toBeNull()
+    expect(await listing(one.id)).toHaveLength(4)
+    expect(await listing(two.id)).toHaveLength(4)
+    expect(store.listImmutableKeys().sort()).toEqual(
+      [LIVE_PR_KEY, one.live, one.orphan, two.live, two.orphan].sort(),
+    )
+    const prEnvelopeBefore = readEnvelope('snapshots', 'pr_number', SEEDED_PR)
+    const twoRefsBefore = await listing(two.id)
+
+    await api.deleteLocalReview(one.id)
+
+    // Review one: every table that carried a row for it gave the row up...
+    expect(store.getLocalReview(one.id)).toBeNull()
+    expect(store.getLocalSnapshot(one.id)).toBeNull()
+    expect(store.listLocalThreads(one.id)).toEqual([])
+    expect(store.getLocalDraft(humanId, one.id)).toBeNull()
+    expect(store.getLocalViewed(humanId, one.id)).toEqual({})
+    // ...and the objects its snapshot was read from are held by nothing now.
+    expect(await listing(one.id)).toEqual([])
+
+    // Review two, untouched in every one of them. The refs are compared against
+    // the names listed before the removal, so "still pinned" means the same four
+    // refs rather than merely some non-empty listing.
+    expect(store.getLocalReview(two.id)).not.toBeNull()
+    expect(store.getLocalSnapshot(two.id)).not.toBeNull()
+    expect(store.listLocalThreads(two.id).map((thread) => thread.id)).toEqual([
+      'LOCALTHREAD_two',
+    ])
+    expect(store.getLocalDraft(humanId, two.id)?.body).toBe(`pending on ${two.id}`)
+    expect(store.getLocalViewed(humanId, two.id)['a.ts']?.viewed).toBe(true)
+    expect(await listing(two.id)).toEqual(twoRefsBefore)
+
+    // The cache holds exactly the two comparisons a live snapshot still names —
+    // review two's and the pull request's. Both orphans went, review one's live
+    // half went with its envelope, and neither survivor was disturbed.
+    expect(store.listImmutableKeys().sort()).toEqual([LIVE_PR_KEY, two.live].sort())
+
+    // The pull request's envelope, byte for byte. A removal driven from the
+    // local keyspace has no standing to rewrite a fact about the client
+    // repository, and comparing the bytes says so more exactly than a count.
+    expect(readEnvelope('snapshots', 'pr_number', SEEDED_PR)).toBe(prEnvelopeBefore)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  }, 60_000)
+
+  test('the removal writes no pull-request-keyed table', async () => {
+    const store = openStore()
+    const { one } = await seedTwoReviews(store)
+    // Armed after seeding, so the tripwires forbid only what the removal itself
+    // does. The helper closes the store and hands back a fresh handle over the
+    // same file, so the api below is built on the armed one.
+    const armed = armPrKeyedTripwires(store)
+    // Proved to bite before it is relied on: without this, "nothing wrote a
+    // pull-request table" would pass just as cleanly over triggers that were
+    // never created.
+    expectPrSnapshotWritesRefused()
+
+    const { api } = worldOver(armed, createSyncGate())
+    await api.deleteLocalReview(one.id)
+
+    // An INSERT, an UPDATE or a DELETE on any of the three would have aborted
+    // the transaction it sat in and surfaced as a failed persist. Reaching this
+    // line is the assertion.
+    expect(armed.getLocalReview(one.id)).toBeNull()
+    armed.close()
+  }, 60_000)
+
+  test('an id that carries no review is a clean no-op, and removes nothing else', async () => {
+    const store = openStore()
+    const { one, two } = await seedTwoReviews(store)
+    const { api } = worldOver(store, createSyncGate())
+    const neverCreated = two.id + 500
+
+    // The control: this id really does name nothing, so the resolution below is
+    // idempotence rather than a removal of something that happened to be absent.
+    expect(store.getLocalReview(neverCreated)).toBeNull()
+
+    await api.deleteLocalReview(neverCreated)
+
+    // A removal whose answer was lost has to be safe to repeat, and "already
+    // gone" is the outcome the caller asked for — but it must not become a
+    // licence to reclaim on behalf of a review nobody named.
+    expect(store.getLocalReview(one.id)).not.toBeNull()
+    expect(store.getLocalReview(two.id)).not.toBeNull()
+    expect(await listing(one.id)).toHaveLength(4)
+    expect(await listing(two.id)).toHaveLength(4)
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  }, 60_000)
+
+  test('a pull request number on the local removal is refused by name', async () => {
+    const store = openStore()
+    const { one } = await seedTwoReviews(store)
+    const { api } = worldOver(store, createSyncGate())
+
+    // The other side of the idempotence above. A pull request number is a
+    // positive integer too, so a clean success would report a pull request
+    // removed as a review of a branch pair.
+    await expect(api.deleteLocalReview(SEEDED_PR)).rejects.toThrow(/local-review band/)
+    expect(store.getLocalReview(one.id)).not.toBeNull()
+    expect(snapshotRowCount()).toBe(1)
+    store.close()
+  }, 60_000)
+
+  test('a removal reclaims what it stranded, and reaches no draft it was not given', async () => {
+    const store = openStore()
+    const { one, two } = await seedTwoReviews(store)
+    const humanId = CONFORMANCE_SESSION.human.id
+    const { api } = worldOver(store, createSyncGate())
+    const before = immutableRowCount()
+
+    await api.deleteLocalReview(one.id)
+
+    // The reclamation really ran — the control for the draft assertion below,
+    // which would otherwise be satisfied by a removal that did nothing at all.
+    expect(immutableRowCount()).toBeLessThan(before)
+    // Review one's draft went WITH its review, which is an explicit act of
+    // removal. Review two's draft is the one no reclamation may reach: the
+    // sweep that followed the removal walked the whole store and left it alone.
+    expect(store.getLocalDraft(humanId, one.id)).toBeNull()
+    expect(store.getLocalDraft(humanId, two.id)).not.toBeNull()
+    store.close()
+  }, 60_000)
+})
+
+describe('a successful local sync is what triggers a reclamation', () => {
+  let fixture: FixtureRepo
+  const runner = createBunCommandRunner()
+
+  /** The half nothing names, seeded so a sweep has something it really would remove. */
+  const STRANDED_BY_A_REBASE = 'rebased...away'
+
+  /** The bytes nothing names, for the leg that turns the byte pass on. */
+  const STRANDED_BLOB = 'strandedblob'
+
+  function worldOver(
+    store: DirectStore,
+    gate: SyncGate,
+    blobRetention?: BlobRetentionPolicy,
+  ): { api: DirectApi; surface: LocalReviewSurface } {
+    const surface = createLocalReviewSurface({
+      store,
+      runner,
+      toplevel: fixture.dir,
+      repo: REMOVAL_REPO,
+      session: CONFORMANCE_SESSION,
+    })
+    const api = createDirectApi({
+      session: CONFORMANCE_SESSION,
+      store,
+      runner,
+      cwd: fixture.dir,
+      localReviews: surface,
+      syncGate: gate,
+      ...(blobRetention !== undefined ? { blobRetention } : {}),
+    })
+    return { api, surface }
+  }
+
+  beforeAll(async () => {
+    fixture = await createFixtureRepo()
+  }, 120_000)
+
+  afterAll(() => {
+    fixture.dispose()
+  })
+
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), 'revu-cadence-'))
+  })
+
+  afterEach(() => {
+    rmSync(storeDir, { recursive: true, force: true })
+  })
+
+  test('a real sync leaves the store pruned, and every draft where it was', async () => {
+    const store = openStore()
+    const gate = createSyncGate()
+    const { api, surface } = worldOver(store, gate)
+    const humanId = CONFORMANCE_SESSION.human.id
+
+    // A pull request's snapshot alongside, so the sweep the sync triggers is
+    // judged against both snapshot tables rather than only the local one.
+    store.putSnapshot(storedSnapshot(SEEDED_PR, LIVE_PR_KEY))
+    const review = await surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    store.putImmutable(immutableHalf(STRANDED_BY_A_REBASE))
+    store.putLocalDraft(unsubmittedDraft(humanId, review.id, 'still unsubmitted'))
+
+    // Measured, not assumed: the half is on disk and no snapshot names it, so a
+    // sweep that ran would have something to remove and a sweep that never ran
+    // is distinguishable from one that found nothing.
+    expect(store.listImmutableKeys()).toContain(STRANDED_BY_A_REBASE)
+
+    // A REAL sync of a real branch pair, through the route the daemon serves —
+    // not a prune called by hand. A cadence no test drives is a cadence nothing
+    // drives.
+    const snapshot = await api.syncPull(review.id)
+
+    // The sync did its own job first: the comparison it built is stored, cached
+    // and readable.
+    expect(snapshot.immutable.compareKey).toBe(
+      compareKeyOf(fixture.mergeBaseSha, fixture.headSha),
+    )
+    expect(store.getLocalSnapshot(review.id)).not.toBeNull()
+    expect(store.listImmutableKeys()).toContain(snapshot.immutable.compareKey)
+
+    // And the reclamation followed it: the stranded half is gone, with nothing
+    // but a completed sync between seeding it and finding it removed.
+    expect(store.listImmutableKeys()).not.toContain(STRANDED_BY_A_REBASE)
+
+    // The unsubmitted draft is untouched. Deleting a review removes its drafts
+    // because someone asked for the review to go; a sweep that runs on its own
+    // may never reach one, and this sweep walked the whole store.
+    expect(store.getLocalDraft(humanId, review.id)?.body).toBe('still unsubmitted')
+    expectEverySnapshotStillReadable(store)
+    store.close()
+  }, 60_000)
+
+  test('the prune runs with the gate already lowered, never inside the wrapper', async () => {
+    // The trap this is built to catch: a prune called from INSIDE the in-flight
+    // wrapper reads its own sync's raised count, stands aside before it reaches
+    // the store, and never removes a row — which from the outside is a prune
+    // that keeps finding nothing to do. The witness records the count the
+    // deleting statement was reached with, so the two are no longer the same
+    // green test: inside the wrapper it records nothing at all.
+    const store = openStore()
+    const gate = createSyncGate()
+    const witness = pruneWitness(store, gate)
+    const { api, surface } = worldOver(witness.store, gate)
+
+    const review = await surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    // Nothing has been reached before the sync, so the entry below belongs to
+    // the sync and to nothing that preceded it.
+    expect(witness.reached).toEqual([])
+
+    await api.syncPull(review.id)
+
+    // One prune, and it reached the store with the count back at zero. The blob
+    // pass is absent because the policy is off and it refuses before the store
+    // — the same list therefore pins both facts at once.
+    expect(witness.reached).toEqual(['immutables@0'])
+    // And the count really was raised for the duration, so the zero above is the
+    // wrapper having exited rather than a wrapper that never counted.
+    expect(gate.inFlight).toBe(0)
+    store.close()
+  }, 60_000)
+
+  test('the same cadence reclaims bytes when a deployment has asked for it', async () => {
+    // The control for the absence in the leg above. Without it, "the blob pass
+    // is off by default" and "the cadence never reaches the blob pass at all"
+    // are the same green test, and a wiring that dropped the byte pass outright
+    // would look exactly like a wiring that correctly withheld it. The fixture
+    // is the same and the only difference is the flag.
+    const store = openStore()
+    const gate = createSyncGate()
+    const witness = pruneWitness(store, gate)
+    const { api, surface } = worldOver(witness.store, gate, { reclaimBlobs: true })
+
+    const review = await surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: fixture.headBranch,
+    })
+    store.putBlobs([localBlob(STRANDED_BLOB)])
+    // Measured: the bytes are on disk and no comparison names them, which is
+    // exactly why the reference subtraction would propose them.
+    expect(store.hasBlob(STRANDED_BLOB)).toBe(true)
+    expect(store.listReferencedBlobShas()).not.toContain(STRANDED_BLOB)
+
+    await api.syncPull(review.id)
+
+    // Both passes reached the store, in that order, each with the count already
+    // back at zero — the halves first, so the bytes are judged against what the
+    // half sweep left behind rather than against what it was about to remove.
+    expect(witness.reached).toEqual(['immutables@0', 'blobs@0'])
+    expect(store.getBlob(STRANDED_BLOB)).toBeNull()
+    // And the bytes the sync itself provisioned, which its snapshot names, are
+    // all still there — the pass removed what nothing referenced and no more.
+    expectEveryReferencedBlobStillPresent(store)
+    store.close()
+  }, 60_000)
+
+  test('a sync that FAILS reclaims nothing', async () => {
+    // The falsification of the cadence: the same fixture, the same stranded
+    // half, and a sync that cannot complete. Without this, "the prune runs after
+    // a successful sync" and "the prune runs whenever anyone asks for a sync"
+    // are the same green test.
+    const store = openStore()
+    const gate = createSyncGate()
+    const witness = pruneWitness(store, gate)
+    const { api, surface } = worldOver(witness.store, gate)
+
+    const doomed = 'doomed-head'
+    const branched = await runner.run(['git', 'branch', doomed, fixture.headSha], {
+      cwd: fixture.dir,
+    })
+    expect(branched.ok).toBe(true)
+    const review = await surface.createLocalReview({
+      baseRef: fixture.baseBranch,
+      headRef: doomed,
+    })
+    store.putImmutable(immutableHalf(STRANDED_BY_A_REBASE))
+
+    // The branch the review names is removed, so the sync's own ref resolution
+    // fails against a real repository rather than against a rigged runner.
+    const removed = await runner.run(['git', 'branch', '-D', doomed], { cwd: fixture.dir })
+    expect(removed.ok).toBe(true)
+
+    await expect(api.syncPull(review.id)).rejects.toThrow()
+
+    // Nothing was reclaimed, and the evidence is that the deleting statement was
+    // never reached at all — not merely that it removed nothing.
+    expect(witness.reached).toEqual([])
+    expect(store.listImmutableKeys()).toContain(STRANDED_BY_A_REBASE)
+    // The count is released even so, so the next successful sync is not held off
+    // by the failure of this one.
+    expect(gate.inFlight).toBe(0)
+    store.close()
+  }, 60_000)
+
+  test('a sync REFUSED before it started reclaims nothing either', async () => {
+    // The other way a sync does not happen: an id no review carries. The refusal
+    // is raised by the dispatch inside the wrapper, so it travels out of the
+    // wrapper exactly as a failure does and never reaches the cadence.
+    const store = openStore()
+    const gate = createSyncGate()
+    const witness = pruneWitness(store, gate)
+    const { api } = worldOver(witness.store, gate)
+    store.putImmutable(immutableHalf(STRANDED_BY_A_REBASE))
+
+    await expect(api.syncPull(LOCAL_ID)).rejects.toThrow()
+
+    expect(witness.reached).toEqual([])
+    expect(store.listImmutableKeys()).toContain(STRANDED_BY_A_REBASE)
+    expect(gate.inFlight).toBe(0)
+    store.close()
   }, 60_000)
 })

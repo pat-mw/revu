@@ -88,6 +88,40 @@ import {
  *   - `meta` — the `store_version` row that drives migrate-in-place, plus the
  *     monotonic id high-water marks the local keyspace allocates from.
  *
+ * ## What can be removed, and on what rule
+ *
+ * Three statements in this file remove a row, and no others do. They are worth
+ * reading together, because "which tables can shrink" is a question about the
+ * store rather than about whichever caller happens to ask:
+ *
+ *   - `local_reviews`, with the five tables keyed to a local review —
+ *     `local_snapshots`, `local_threads`, `local_reviews_submitted`,
+ *     `local_drafts` and `local_viewed` — go together, by id, in one
+ *     transaction, when a caller asks for that review to be removed. The rule is
+ *     an explicit act and nothing else: no age, no last-sync time, no cap on how
+ *     many reviews may be kept. It takes every human's drafts on that review
+ *     with it, which is the only removal of unsubmitted text anywhere here, and
+ *     it happens because someone asked for the review itself to go.
+ *   - `immutables` gives up a row when no snapshot in EITHER snapshot table
+ *     names its compare key. Reference-based and never age-based — the table
+ *     records nothing about when a row was written, so there is no clock to
+ *     consult even if one were wanted, and a half a live snapshot names is
+ *     needed however long ago its review was last synced.
+ *   - `blobs` gives up a row when no stored comparison names its SHA on either
+ *     side of any path, AND only when a deployment has explicitly asked for the
+ *     bytes to be reclaimed. Left alone, which is the default, the table only
+ *     grows: every re-sync of a rebased branch mints a fresh compare key and
+ *     stores that branch's file contents again.
+ *
+ * Everything else is permanent. `snapshots`, `audit_log` and `pr_author` are
+ * keyed by a real pull-request number and this surface offers no way to remove a
+ * row from any of them — the journal in particular is append-only by design, and
+ * a delete counterpart would turn it from evidence of what was written into
+ * evidence of what was not later removed. `prefs` belongs to a human rather than
+ * to any review. And nothing here reclaims the FILE: deleted rows release their
+ * space inside it for later writes, and the file on disk stays the size its
+ * high-water mark left it.
+ *
  * The local tables carry a repository identity and the pull-request tables do
  * not, which looks inconsistent until the keys are compared. Two repositories
  * sharing one data directory collide on a pull-request number only when the same
