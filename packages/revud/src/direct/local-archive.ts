@@ -21,6 +21,13 @@
  * syncs its local reviews. So the seam is optional, its rejection is caught, and
  * the answer in every degraded case is "not archived" — never a thrown error and
  * never a guess.
+ *
+ * A SERVER THAT NEVER ANSWERS IS ONE OF THOSE FAILURES. Syncing a local review
+ * is otherwise entirely local work, so a host that accepts the connection and
+ * then says nothing would hold open a call that touches no network at all
+ * without this: no rejection ever arrives to be caught. The read therefore
+ * carries its own deadline, and expiring it is treated as the rejection that
+ * never came.
  */
 import type { LocalReviewSummary, PullSummary } from '@revu/shared'
 import { bareBranchName, supersedingPull } from '@revu/shared'
@@ -71,7 +78,9 @@ export interface ArchiveDetection {
 export interface LocalArchiveDetector {
   /**
    * Run the check for one review, ahead of its sync. Never throws for a GitHub
-   * reason; a store failure is a real failure and is left to propagate.
+   * reason, and never for the one store refusal that is really a disagreement
+   * about a number — a `RangeError` from the mark. Every other store failure is
+   * a real failure and is left to propagate.
    */
   detect(review: LocalReviewSummary): Promise<ArchiveDetection>
 }
@@ -82,6 +91,61 @@ export interface LocalArchiveDetectorDeps {
   store: ArchiveStore
   /** Where a failed check is reported; defaults to `console.warn`. */
   warn?: (line: string) => void
+  /**
+   * How long the listing seam is given to answer, in milliseconds; defaults to
+   * `DEFAULT_ARCHIVE_DEADLINE_MS`.
+   *
+   * Injectable so a test can prove the deadline exists in milliseconds instead
+   * of in seconds of waiting. A caller with a slow link may raise it; the cost
+   * of raising it is the length of time a sync of purely local work can be held
+   * open by a host that has stopped answering.
+   */
+  deadlineMs?: number
+}
+
+/**
+ * How long the one hosted read is given before the check gives up on it.
+ *
+ * Long enough that an ordinary listing over a slow link answers well inside it,
+ * and short enough that a human waiting on a sync of local work notices a hung
+ * host as a pause rather than as a hang.
+ */
+export const DEFAULT_ARCHIVE_DEADLINE_MS = 10_000
+
+/**
+ * The expiry of that deadline, raised as an error so the check's one failure
+ * path handles a silent host and a rejecting one identically.
+ *
+ * The name is what a warning reports, and it is fixed text: the duration is not
+ * folded into it, because the warning is written by a sink that has no bound on
+ * what it does with the line.
+ */
+class ArchiveCheckTimeout extends Error {
+  constructor() {
+    super('the archive check deadline expired')
+    this.name = 'ArchiveCheckTimeout'
+  }
+}
+
+/**
+ * `work`, or a rejection once `deadlineMs` has passed.
+ *
+ * The timer is cleared on BOTH outcomes. An armed timer keeps the process alive
+ * until it fires, so a deadline left running behind a fast answer would turn
+ * every check into a delay of its own length at exit — and a rejection that
+ * arrives after the race has settled is already handled, because the race
+ * itself subscribed to both sides.
+ */
+async function withDeadline<T>(work: Promise<T>, deadlineMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new ArchiveCheckTimeout()), deadlineMs)
+  })
+  try {
+    return await Promise.race([work, expiry])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -115,6 +179,7 @@ export function createLocalArchiveDetector(
 ): LocalArchiveDetector {
   const { source, store } = deps
   const warn = deps.warn ?? ((line: string) => console.warn(line))
+  const deadlineMs = deps.deadlineMs ?? DEFAULT_ARCHIVE_DEADLINE_MS
 
   return {
     async detect(review: LocalReviewSummary): Promise<ArchiveDetection> {
@@ -129,10 +194,13 @@ export function createLocalArchiveDetector(
 
       let pulls: PullSummary[]
       try {
-        pulls = await source.listOpenPullsForPair({
-          headRef: bareBranchName(review.headRef),
-          baseRef: bareBranchName(review.baseRef),
-        })
+        pulls = await withDeadline(
+          source.listOpenPullsForPair({
+            headRef: bareBranchName(review.headRef),
+            baseRef: bareBranchName(review.baseRef),
+          }),
+          deadlineMs,
+        )
       } catch (cause) {
         warn(
           `local review #${review.id}: the archive check could not read the ` +
@@ -144,7 +212,24 @@ export function createLocalArchiveDetector(
       const match = supersedingPull(review, pulls)
       if (match === null) return { archivedPr: null, requested: true }
 
-      store.markLocalReviewArchived(review.id, match.number)
+      try {
+        store.markLocalReviewArchived(review.id, match.number)
+      } catch (cause) {
+        // DEFENCE IN DEPTH, and only against the one refusal the store makes on
+        // the number itself. The predicate above already rejects every value the
+        // store would refuse, so a `RangeError` here means the two disagree — and
+        // the cost of that disagreement must be a review that stays live, not a
+        // sync of local work failing over a malformed row in somebody else's
+        // listing. Every OTHER store failure is a real one and propagates: a data
+        // directory that cannot be written to is not something this check may
+        // decide to keep quiet about.
+        if (!(cause instanceof RangeError)) throw cause
+        warn(
+          `local review #${review.id}: the store refused the pull request number ` +
+            `the archive check found (${errorKind(cause)}); the review stays live`,
+        )
+        return { archivedPr: null, requested: true }
+      }
       // Re-read rather than report `match.number`: the write is write-once, so
       // the number that stands may be one an earlier writer recorded, and the
       // caller must be told what the review actually says.

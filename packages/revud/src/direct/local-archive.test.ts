@@ -292,6 +292,152 @@ describe('a failing listing never fails the sync', () => {
   })
 })
 
+/**
+ * `setTimeout`/`clearTimeout` doubles that delegate to the real timers while
+ * counting how many were armed and how many are still outstanding.
+ *
+ * A deadline that is never cleared keeps a handle alive for its full duration,
+ * which is invisible in the verdict and shows up only as a process that will
+ * not exit. Counting the handles is how "the fast path leaves nothing behind"
+ * becomes an observation rather than a claim.
+ */
+function probeTimers(): {
+  armed: () => number
+  outstanding: () => number
+  restore: () => void
+} {
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  const live = new Set<unknown>()
+  let armed = 0
+  globalThis.setTimeout = ((handler: never, ms?: number, ...rest: never[]) => {
+    const handle: unknown = realSetTimeout(handler, ms, ...rest)
+    armed += 1
+    live.add(handle)
+    return handle
+  }) as unknown as typeof globalThis.setTimeout
+  globalThis.clearTimeout = ((handle: never) => {
+    live.delete(handle)
+    realClearTimeout(handle)
+  }) as unknown as typeof globalThis.clearTimeout
+  return {
+    armed: () => armed,
+    outstanding: () => live.size,
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout
+      globalThis.clearTimeout = realClearTimeout
+    },
+  }
+}
+
+describe('the one hosted read is bounded by a deadline', () => {
+  /** A seam that accepts the question and never answers it. */
+  function hangingSource(): SupersedingPullSource {
+    return { listOpenPullsForPair: () => new Promise<PullSummary[]>(() => {}) }
+  }
+
+  test('a seam that never answers is not waited on: not-archived, warned once', async () => {
+    const lines: string[] = []
+    const detector = createLocalArchiveDetector({
+      source: hangingSource(),
+      store: untouchedStore(),
+      warn: (line) => lines.push(line),
+      deadlineMs: 5,
+    })
+    const verdict = await detector.detect(review())
+    // The same answer a rejection gets, down to `requested`: the question was
+    // asked, and the hosted repository said nothing about it.
+    expect(verdict).toEqual({ archivedPr: null, requested: true })
+    expect(lines).toHaveLength(1)
+  })
+
+  test('the timeout warning names the deadline as the kind and quotes nothing', async () => {
+    const lines: string[] = []
+    const detector = createLocalArchiveDetector({
+      source: hangingSource(),
+      store: untouchedStore(),
+      warn: (line) => lines.push(line),
+      deadlineMs: 5,
+    })
+    await detector.detect(review())
+    expect(lines[0]).toContain('ArchiveCheckTimeout')
+    expect(lines[0]).not.toContain('https://')
+  })
+
+  test('a seam that answers in time is not timed out, and its timer is cleared', async () => {
+    const timers = probeTimers()
+    try {
+      const store = recordingStore()
+      const detector = createLocalArchiveDetector({
+        source: recordingSource([pull()]),
+        store,
+        warn: () => {
+          throw new Error('a seam that answered in time must produce no warning')
+        },
+        deadlineMs: 5,
+      })
+      const verdict = await detector.detect(review())
+
+      expect(verdict).toEqual({ archivedPr: 12, requested: true })
+      // The control for "cleared": a timer WAS armed for this check, so the
+      // zero below is a timer that was taken back rather than one that was
+      // never set.
+      expect(timers.armed()).toBe(1)
+      expect(timers.outstanding()).toBe(0)
+    } finally {
+      timers.restore()
+    }
+  })
+})
+
+describe('a store that refuses the number never fails the sync', () => {
+  /** The sentinel a leaked store message would carry. */
+  const REFUSAL = 'received 0 for /Users/dev/secret-checkout'
+
+  test('a RangeError from the mark answers not-archived and warns once, without content', async () => {
+    const lines: string[] = []
+    const detector = createLocalArchiveDetector({
+      source: recordingSource([pull()]),
+      store: {
+        markLocalReviewArchived: () => {
+          throw new RangeError(REFUSAL)
+        },
+        getLocalReview: () => {
+          throw new Error('the detector read the row back after a refused mark')
+        },
+      },
+      warn: (line) => lines.push(line),
+    })
+    const verdict = await detector.detect(review())
+    expect(verdict).toEqual({ archivedPr: null, requested: true })
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('RangeError')
+    expect(lines[0]).not.toContain('secret-checkout')
+  })
+
+  test('the control: a store failure of any other kind propagates', async () => {
+    const lines: string[] = []
+    const detector = createLocalArchiveDetector({
+      source: recordingSource([pull()]),
+      store: {
+        markLocalReviewArchived: () => {
+          throw new Error('the data directory is gone')
+        },
+        getLocalReview: () => {
+          throw new Error('the detector read the row back after a failed mark')
+        },
+      },
+      warn: (line) => lines.push(line),
+    })
+    const outcome = await detector.detect(review()).then(
+      () => 'answered',
+      (error: unknown) => (error instanceof Error ? error.message : 'untyped'),
+    )
+    expect(outcome).toBe('the data directory is gone')
+    expect(lines).toEqual([])
+  })
+})
+
 describe('a matching pull request archives the review', () => {
   test('the store is written once with the review id and the pull number', async () => {
     const store = recordingStore()

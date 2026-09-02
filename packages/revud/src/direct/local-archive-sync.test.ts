@@ -641,3 +641,219 @@ describe('a review another repository owns is never asked about', () => {
     }
   }, 120_000)
 })
+
+// ————————————————————————————————————————————————————————————————
+// A branch that stops existing between one sync and the next
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * A head branch of this file's own, at the fixture's head tip, so a case can
+ * delete it without touching the pair every other case in this file reviews.
+ */
+async function createHeadBranch(name: string): Promise<void> {
+  const made = await createBunCommandRunner().run(['git', 'branch', name, fixture.headSha], {
+    cwd: fixture.dir,
+  })
+  if (!made.ok) throw new Error(`fixture git failed: branch ${name} — ${made.stderr}`)
+}
+
+/** Delete such a branch, as a reviewer does once the pull request is open. */
+async function deleteHeadBranch(name: string): Promise<void> {
+  const gone = await createBunCommandRunner().run(['git', 'branch', '-D', name], {
+    cwd: fixture.dir,
+  })
+  if (!gone.ok) throw new Error(`fixture git failed: branch -D ${name} — ${gone.stderr}`)
+}
+
+/** How `syncPull` answered: the code of its typed refusal, or that it resolved. */
+async function syncOutcome(w: World, localId: number): Promise<string> {
+  return w.api.syncPull(localId).then(
+    () => 'answered',
+    (error: unknown) => (error instanceof ApiError ? error.code : 'untyped'),
+  )
+}
+
+/**
+ * The reviewer pushed the branch, opened a pull request, and deleted their local
+ * head. The archive check runs before the sync and marks the row; the catch-up
+ * sync that would produce the closing snapshot then has no branch to resolve.
+ *
+ * Without a fallback the review is stranded: the row says archived, the stored
+ * snapshot still says open, and every later sync re-runs the same git and fails
+ * the same way, so nothing ever freezes and the review can never be read again.
+ * The documented promise is that an archived review stands at its last sync, and
+ * the last SUCCESSFUL sync is the only one there is to stand at.
+ */
+describe('an archived review whose branch is gone freezes at its last successful sync', () => {
+  const DOOMED = 'feature/doomed-archive'
+  let w: World
+  let doomedId: number
+  /** The pull state of the snapshot the last successful sync stored. */
+  let liveState: string
+  let frozenBytes: string
+  let againBytes: string
+  let gitDuringSecond = 0
+
+  beforeAll(async () => {
+    w = await world()
+    await createHeadBranch(DOOMED)
+    doomedId = (
+      await w.api.createLocalReview({ baseRef: fixture.baseBranch, headRef: DOOMED })
+    ).id
+    // A thread of its own, written while the review is live, so the refusals
+    // asserted below have something real to be aimed at — and a second sync
+    // after it, so the envelope this review freezes at carries that thread.
+    const first = await w.api.syncPull(doomedId)
+    const submitted = await w.api.submitReview({
+      prNumber: doomedId,
+      expectedHeadSha: first.immutable.headSha,
+      event: 'COMMENT',
+      body: 'A note written while the branch still existed.',
+      comments: [
+        {
+          key: `doomed-${doomedId}`,
+          path: fixture.paths.modified,
+          side: 'RIGHT',
+          start_side: null,
+          line: 2,
+          start_line: null,
+          body: 'Seeded thread.',
+          createdAt: w.clock.now(),
+          updatedAt: w.clock.now(),
+          anchor: { lineText: '', contextBefore: [], contextAfter: [] },
+        },
+      ],
+    })
+    if (submitted.status !== 'ok') throw new Error(`seeding submit answered ${submitted.status}`)
+
+    // The last sync that can read the repository: no pull request is listed yet,
+    // so the review is live and its snapshot reads open.
+    liveState = (await w.api.syncPull(doomedId)).mutable.pull.state
+
+    w.source.pulls = [pull({ number: 55, headRef: DOOMED })]
+    await deleteHeadBranch(DOOMED)
+    w.clock.tick()
+
+    frozenBytes = JSON.stringify(await w.api.syncPull(doomedId))
+
+    const gitBefore = w.gateAtGit.length
+    againBytes = JSON.stringify(await w.api.syncPull(doomedId))
+    gitDuringSecond = w.gateAtGit.length - gitBefore
+  }, 120_000)
+
+  afterAll(() => w.close())
+
+  test('the precondition: the last successful sync stored a snapshot reading open', () => {
+    expect(liveState).toBe('open')
+  })
+
+  test('the row is archived against the pull request the check found', () => {
+    expect(rowOf(w, doomedId).archivedPr).toBe(55)
+  })
+
+  test('the sync answers the stored snapshot, closed, instead of failing', () => {
+    expect(JSON.parse(frozenBytes).mutable.pull.state).toBe('closed')
+  })
+
+  test('the stored snapshot reads closed when it is read back', () => {
+    expect(storedBytes(w, doomedId)).toBe(frozenBytes)
+    expect(w.api.getSnapshot(doomedId)?.mutable.pull.state).toBe('closed')
+  })
+
+  test('the list shows the review closed', () => {
+    const row = w.api.listPulls(null).items.find((item) => item.pull.number === doomedId)
+    expect(row?.pull.state).toBe('closed')
+  })
+
+  test('the sync after it is byte-identical and runs no git at all', () => {
+    expect(againBytes).toBe(frozenBytes)
+    expect(gitDuringSecond).toBe(0)
+  })
+
+  test('all four writes refuse, exactly as on any other archived review', async () => {
+    expect(await writeOutcomes(w, doomedId)).toEqual(refusedOutcomes(w, doomedId))
+  })
+
+  test('the control: a LIVE review over a deleted branch still refuses, rewriting nothing', async () => {
+    const LIVE_DOOMED = 'feature/doomed-live'
+    await createHeadBranch(LIVE_DOOMED)
+    const liveId = (
+      await w.api.createLocalReview({ baseRef: fixture.baseBranch, headRef: LIVE_DOOMED })
+    ).id
+    await w.api.syncPull(liveId)
+    const before = storedBytes(w, liveId)
+    await deleteHeadBranch(LIVE_DOOMED)
+    w.clock.tick()
+
+    // No pull request over THIS pair, so nothing archives it and the failure has
+    // to travel: a review nobody superseded has no last-archived state to stand
+    // at, and answering a stale snapshot would hide a branch the reviewer still
+    // has to restore.
+    expect(await syncOutcome(w, liveId)).toBe('not_found')
+    expect(rowOf(w, liveId).archivedPr).toBeNull()
+    expect(storedBytes(w, liveId)).toBe(before)
+    expect(w.api.getSnapshot(liveId)?.mutable.pull.state).toBe('open')
+  }, 120_000)
+
+  test('the control: an archived review that never synced still refuses — there is nothing to serve', async () => {
+    const NEVER_SYNCED = 'feature/doomed-unsynced'
+    await createHeadBranch(NEVER_SYNCED)
+    const unsyncedId = (
+      await w.api.createLocalReview({ baseRef: fixture.baseBranch, headRef: NEVER_SYNCED })
+    ).id
+    w.source.pulls = [pull({ number: 56, headRef: NEVER_SYNCED })]
+    await deleteHeadBranch(NEVER_SYNCED)
+
+    // The check marks the row without touching git, so this review is archived
+    // AND has no snapshot: the freeze has nothing to answer with and the refusal
+    // is the honest answer.
+    expect(await syncOutcome(w, unsyncedId)).toBe('not_found')
+    expect(rowOf(w, unsyncedId).archivedPr).toBe(56)
+    expect(w.api.getSnapshot(unsyncedId)).toBeNull()
+  }, 120_000)
+})
+
+/**
+ * The GitHub mapper turns a listing row with no `number` into a pull request
+ * numbered 0, and the lowest number wins the tiebreak — so an unguarded zero
+ * beats every real pull request and then hands the store a value it refuses.
+ * What arrives at the daemon is a malformed row in somebody else's listing, and
+ * what it must cost is nothing: the sync answers, and the review stays live.
+ */
+describe('a listing row carrying no pull request number never fails a sync', () => {
+  test('a zero-numbered row archives nothing and the sync answers normally', async () => {
+    const w = await world()
+    try {
+      w.source.pulls = [pull({ number: 0 })]
+
+      expect(await syncOutcome(w, w.reviewId)).toBe('answered')
+      expect(rowOf(w, w.reviewId).archivedPr).toBeNull()
+      expect(w.api.getSnapshot(w.reviewId)?.mutable.pull.state).toBe('open')
+      // The seam really was consulted, so the row above was rejected rather
+      // than never looked at.
+      expect(w.source.asked).toHaveLength(1)
+
+      // The control for "never fails": 0 is a number the store refuses outright,
+      // so a zero that reached the column would have thrown out of that sync —
+      // and the refusal leaves the review exactly as live as it was.
+      expect(() => w.store.markLocalReviewArchived(w.reviewId, 0)).toThrow(RangeError)
+      expect(rowOf(w, w.reviewId).archivedPr).toBeNull()
+    } finally {
+      w.close()
+    }
+  }, 120_000)
+
+  test('a real pull request listed beside it still archives, against the real number', async () => {
+    const w = await world()
+    try {
+      // Were the zero taken for a pull request it would win on number and
+      // archive this review against nothing.
+      w.source.pulls = [pull({ number: 77 }), pull({ number: 0 })]
+      await w.api.syncPull(w.reviewId)
+      expect(rowOf(w, w.reviewId).archivedPr).toBe(77)
+      expect(w.api.getSnapshot(w.reviewId)?.mutable.pull.state).toBe('closed')
+    } finally {
+      w.close()
+    }
+  }, 120_000)
+})

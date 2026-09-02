@@ -4,19 +4,19 @@ import { loadMock } from './mock-bridge'
 import { startLoopbackAlias, startServer } from './server'
 import type { RevuMode } from './api-router'
 import type { CommandRunner } from './direct/command-runner'
+import type { SupersedingPullClient } from './direct/github-client'
+import type { SupersedingPullSource } from './direct/local-archive'
+import type { RepoRef } from './direct/repo'
 import {
   DirectStartupError,
   requireGithubContext,
   resolveDirectContext,
 } from './direct/context'
 import { createDirectApi } from './direct/direct-api'
+import { createGithubClient } from './direct/github-client'
 import { discoverRepoRoot, repoIdentity } from './direct/local-git'
 import { createLocalReviewSurface } from './direct/local-surface'
 import { resolveBotLogin } from './direct/session'
-import type { SupersedingPullClient } from './direct/github-client'
-import { createGithubClient } from './direct/github-client'
-import type { SupersedingPullSource } from './direct/local-archive'
-import type { RepoRef } from './direct/repo'
 import { openDirectStore, resolveDirectDataDir } from './direct/store'
 import { createBrokerWriteDecorator } from './direct/write-decorator'
 import { createFileCredentialTokenSource } from './broker/token-source'

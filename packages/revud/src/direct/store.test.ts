@@ -24,6 +24,7 @@ import { Database } from 'bun:sqlite'
 import type {
   FileBlob,
   HumanPreferences,
+  LocalReviewSummary,
   ReviewDraft,
   ReviewSummary,
   ReviewThread,
@@ -4253,6 +4254,12 @@ describe('archiving a local review under the pull request that superseded it', (
     const seededSubmitted = store.listLocalSubmittedReviews(id)
     const seededViewed = store.getLocalViewed('h1', id)
     const seededSnapshot = store.getLocalSnapshot(id)
+    // The review row as it stood before the mark, serialised so the comparison
+    // below is against a value of its own rather than against an object the
+    // store might still hold a reference to and rewrite in place.
+    const seededRow = JSON.parse(
+      JSON.stringify(store.getLocalReview(id)),
+    ) as LocalReviewSummary
     // The seeds are real documents, so the byte comparisons below cannot pass by
     // comparing one absent read against another.
     expect(seededDraft).not.toBeNull()
@@ -4265,6 +4272,12 @@ describe('archiving a local review under the pull request that superseded it', (
     // Positive control first. "Nothing else changed" says nothing at all after a
     // call that changed nothing whatsoever.
     expect(store.getLocalReview(id)!.archivedPr).toBe(7)
+
+    // EVERY other column of the row, pinned in one comparison rather than one
+    // stamp at a time. A mark that also rewrote the title, either ref, a sha or
+    // the dirty flag leaves all the counts and all the documents below intact,
+    // so this is the only assertion in the file that would notice it.
+    expect(store.getLocalReview(id)).toEqual({ ...seededRow, archivedPr: 7 })
 
     // Pinned to literals rather than only to `before`, so a seeder that quietly
     // stopped populating a table cannot make "unchanged" true by leaving that
