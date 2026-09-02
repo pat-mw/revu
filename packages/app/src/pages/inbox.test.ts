@@ -111,6 +111,36 @@ describe('what a local review row claims about itself', () => {
     expect(badges(asPullRequest(localRow, 482))).toContain('org PR — approvable')
   })
 
+  /** The badge cluster for a row whose review a pull request has covered. */
+  function badgesFor(item: PullListItem, archivedPr: number | null): string {
+    return renderToStaticMarkup(
+      createElement(RowBadges, { row: { item, draft: null }, archivedPr }),
+    )
+  }
+
+  test('an archived row names the pull request that took over', () => {
+    // The row's identity slot draws a branch pair rather than a number, so this
+    // badge is the only place a number appears on it — and the only thing on
+    // the row that says the review can no longer be written to.
+    expect(visibleText(badgesFor(localRow, 101))).toContain('archived · superseded by #101')
+  })
+
+  test('and a live one says nothing of the sort', () => {
+    // The control is in this body: the same component and the same row, with
+    // the number present, does draw the badge — so the absence is the null
+    // doing its work rather than a cluster that draws nothing.
+    expect(badgesFor(localRow, null)).not.toContain('superseded')
+    expect(badgesFor(localRow, 101)).toContain('superseded')
+  })
+
+  test('and a pull request never does, even handed a number', () => {
+    // The annotation this is drawn from is local-only, so a pull request
+    // should never carry one at all. The control is the same number on the
+    // same row one band higher.
+    expect(badgesFor(asPullRequest(localRow, 482), 101)).not.toContain('superseded')
+    expect(badgesFor(localRow, 101)).toContain('superseded')
+  })
+
   test('the local seal is drawn instead', () => {
     // The cluster is not simply empty for a local row: it says what the row is.
     expect(visibleText(badges(localRow))).toContain('local')

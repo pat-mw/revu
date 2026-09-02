@@ -1,7 +1,7 @@
 import type { Session } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import { createBunCommandRunner } from './command-runner'
-import type { FetchLike, GithubClient } from './github-client'
+import type { FetchLike, GithubClient, SupersedingPullClient } from './github-client'
 import { createGithubClient } from './github-client'
 import type { RepoRef } from './repo'
 import { resolveRepo } from './repo'
@@ -49,6 +49,18 @@ interface DirectContextBase {
 export interface GithubDirectContext extends DirectContextBase {
   repo: RepoRef
   github: GithubClient
+  /**
+   * The branch-pair listing the local-review archive check reads, served by the
+   * SAME client instance as `github` — never a second client. A second one would
+   * hold its own connection behaviour over the same credential while looking
+   * from the outside like one daemon making one kind of request.
+   *
+   * Present exactly when the GitHub half is, because it is that half: it is a
+   * separate field rather than a widened `github` so that the many fakes
+   * implementing `GithubClient` need not grow a method only this one check
+   * calls.
+   */
+  supersedingPulls: SupersedingPullClient
 }
 
 /**
@@ -63,6 +75,7 @@ export interface GithubDirectContext extends DirectContextBase {
 export interface LocalDirectContext extends DirectContextBase {
   repo?: undefined
   github?: undefined
+  supersedingPulls?: undefined
 }
 
 /** The assembled context the server runs against, with or without GitHub. */
@@ -401,7 +414,10 @@ export async function resolveDirectContext(
   if (repo === undefined || github === undefined) {
     return { session, tokenSource, runner, cwd }
   }
-  return { session, repo, tokenSource, github, runner, cwd }
+  // `supersedingPulls` is the same object as `github`, not a second client: the
+  // value satisfies both interfaces, and naming it twice is how the archive
+  // check depends on one method without depending on the whole client.
+  return { session, repo, tokenSource, github, supersedingPulls: github, runner, cwd }
 }
 
 /** Turn a repo-resolution failure into the exact line the user should read. */

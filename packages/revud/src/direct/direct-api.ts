@@ -23,6 +23,8 @@ import type {
 import { ApiError, draftHoldsText, isLocalReviewId } from '@revu/shared'
 import type { CommandRunner } from './command-runner'
 import type { GithubClient } from './github-client'
+import type { SupersedingPullSource } from './local-archive'
+import { createLocalArchiveDetector } from './local-archive'
 import type { LocalReviewSurface } from './local-surface'
 import { shortRefName, synthesizeLocalUser } from './local-sync'
 import { reconcileDraft as runReconcileDraft } from './reconcile'
@@ -347,6 +349,21 @@ export interface DirectApiDeps {
   pullList?: PullListSource
 
   /**
+   * The listing seam the local sync path consults to find out whether a pull
+   * request has appeared for a local review's branch pair — the read half of
+   * archiving a superseded review. Nothing is ever written to GitHub through
+   * it; the write it leads to is a column on the local row.
+   *
+   * ABSENT in a workspace with no origin and no credential, which is the
+   * deployment local reviews exist for: there is no repository to ask about, so
+   * nothing is asked and every review stays live. Absent also in the mock and
+   * in broker mode's non-local paths. Only the local sync path reads it, and it
+   * is optional precisely so that a boot without a GitHub half needs no
+   * stand-in to pass.
+   */
+  supersedingPulls?: SupersedingPullSource
+
+  /**
    * The operations behind reviews created from local branches. Wired when this
    * daemon serves local reviews; ABSENT otherwise, and then every id from the
    * reserved local band answers a typed `not_found` rather than being handed to
@@ -559,6 +576,17 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
   const syncGate = deps.syncGate ?? createSyncGate()
 
   /**
+   * The archive check the local sync path runs, or null when this daemon has
+   * no listing seam — a workspace with no origin or no credential — and so
+   * nothing to ask. Built once: the seam and the store are both fixed for the
+   * life of the api, and the detector holds nothing per review.
+   */
+  const archiveDetector =
+    deps.supersedingPulls === undefined
+      ? null
+      : createLocalArchiveDetector({ source: deps.supersedingPulls, store: deps.store })
+
+  /**
    * The repository a pin drop acts in, or a refusal.
    *
    * A local review's pins are refs in a git object database, so dropping them
@@ -622,6 +650,64 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
           'removed, and the store keeps every row it already held.',
       )
     }
+  }
+
+  /**
+   * The sync of a local review, in four steps whose ORDER is the contract.
+   *
+   * 1. THE ROW, through the surface's ownership guard and never off the store.
+   *    Ids are minted from one mark shared by every repository using the data
+   *    directory, so the row an id names may belong to a repository this daemon
+   *    does not serve; the guard answers that with the same typed not-found an
+   *    absent id gets, and nothing below runs. Read off the store instead, a
+   *    foreign row's branch pair would be carried into a question about THIS
+   *    repository's pull requests.
+   *
+   * 2. DETECTION, for a live review with a seam to ask. It runs BEFORE the git
+   *    work so that the sync which finds a pull request goes on to store a
+   *    snapshot already describing the review as closed — the synthesized pull
+   *    derives its state from the row's number, and the surface re-reads the
+   *    row — rather than leaving one stale envelope behind that still claims
+   *    open and that nothing would ever rewrite. It runs OUTSIDE the gate
+   *    because it waits on a network: a sweep held off for the length of a
+   *    hosted request would be held off for a window that protects nothing,
+   *    since detection writes one column of one row and touches no half. An
+   *    already archived review skips it: archival is one-way, and the detector
+   *    would answer the standing number without asking anyway.
+   *
+   * 3. THE SYNC, inside the gate. The surface writes the blob bytes and then
+   *    reads git three more times before its envelope lands, and on this side
+   *    the bytes have no second source to be refetched from, so a sweep is
+   *    held off across the whole of it. A review the surface finds archived
+   *    with a snapshot that already agrees comes back FROZEN: the stored
+   *    snapshot, no git, no new half, no pin, no re-stamped row.
+   *
+   * 4. RECLAMATION, outside the gate, and only after a sync that READ the
+   *    repository. A re-synced branch pair is the event that strands a half —
+   *    a rebased branch mints a fresh compare key and the envelope that lands
+   *    stops naming the old one — so the moment there is something new to
+   *    reclaim is the moment to reclaim it. A frozen sync minted nothing and
+   *    stranded nothing, and a prune keyed on it would sweep for no reason.
+   *    Outside the wrapper is the whole of the placement: the gate holds a
+   *    sweep off while any sync is in flight, so a prune called from inside it
+   *    would read its own sync's raised count, stand aside every time, and
+   *    never remove a row — indistinguishable from a prune that keeps finding
+   *    nothing to do. A sync that rejects never reaches the prune at all.
+   */
+  const syncLocalPull = async (local: LocalReviewSurface, localId: number): Promise<Snapshot> => {
+    const review = local.getLocalReview(localId)
+
+    if (review.archivedPr === null && archiveDetector !== null) {
+      // The verdict is not read back here: the surface re-reads the row and
+      // derives everything it stores from what stands on it, which is also
+      // what a write-once column racing another daemon leaves there.
+      await archiveDetector.detect(review)
+    }
+
+    const outcome = await withSyncInFlight(syncGate, () => local.syncLocalReview(localId))
+
+    if (!outcome.frozen) reclaimUnreferenced()
+    return outcome.snapshot
   }
 
   /**
@@ -952,31 +1038,18 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
     },
 
     async syncPull(prNumber: number): Promise<Snapshot> {
-      // BOTH branches are inside the gate, and the dispatch that chooses between
-      // them is inside it too. Each one leaves a different piece of a review
-      // exposed on the way through: the hosted engine puts the immutable half
-      // down and lands its envelope several awaits later, while the local
-      // surface writes the blob bytes and then reads git three more times before
-      // its envelope lands — and on that side the bytes have no second source to
-      // be refetched from. Gating one branch would leave the other's window
-      // exactly as wide as it is now.
-      //
-      // The wrapper holds the try/finally, so a refusal raised by the dispatch
-      // itself — an id from the local band on a daemon that serves no local
-      // reviews — releases the count on its way out like any other failure.
-      let syncedLocally = false
-      const snapshot = await withSyncInFlight(syncGate, async () => {
-        const local = localFor(prNumber)
-        if (local !== null) {
-          const built = await local.syncPull(prNumber)
-          // Set only once the sync has RETURNED. A sync that rejects never
-          // reaches this line, and the rejection travels out of the wrapper and
-          // past everything below it — so a failed or refused sync reclaims
-          // nothing, twice over.
-          syncedLocally = true
-          return built
-        }
-        return runSyncPull(
+      // The dispatch sits AHEAD of the gate rather than inside it. Its one
+      // refusal — an id from the local band on a daemon that serves no local
+      // reviews — is raised before any count is taken, so there is nothing to
+      // release on the way out; and the local path has work to do before its
+      // git work that must not hold a sweep off while it waits on a network.
+      const local = localFor(prNumber)
+      if (local !== null) return syncLocalPull(local, prNumber)
+
+      // The hosted engine puts the immutable half down and lands its envelope
+      // several awaits later; the gate holds a sweep off across that window.
+      return withSyncInFlight(syncGate, () =>
+        runSyncPull(
           {
             ...githubTarget(),
             store: deps.store,
@@ -985,25 +1058,8 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
             ...(deps.now !== undefined ? { now: deps.now } : {}),
           },
           prNumber,
-        )
-      })
-
-      // The cadence: a successful sync of a local review is what triggers a
-      // reclamation. Not a boot, not a timer — a re-synced branch pair is the
-      // event that STRANDS a half, because a rebased branch mints a fresh
-      // compare key and the envelope that lands stops naming the old one. The
-      // moment there is something new to reclaim is the moment to reclaim it,
-      // and nothing has to remember to ask later.
-      //
-      // OUTSIDE the wrapper, and that placement is the whole of it. The gate
-      // holds a sweep off while any sync is in flight, so a prune called from
-      // inside the wrapper would read its own sync's raised count, stand aside
-      // every single time, and never remove a row — which from the outside is
-      // indistinguishable from a prune that keeps finding nothing to do. Here
-      // the wrapper has already returned, its `finally` has already lowered the
-      // count, and the prune reads the store the sync finished writing.
-      if (syncedLocally) reclaimUnreferenced()
-      return snapshot
+        ),
+      )
     },
 
     async getRateLimit(): Promise<RateLimitInfo> {

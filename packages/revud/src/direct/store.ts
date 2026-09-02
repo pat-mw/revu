@@ -15,6 +15,7 @@ import type {
 } from '@revu/shared'
 import {
   DEFAULT_PREFERENCES,
+  isLocalReviewId,
   LOCAL_ENTITY_ID_BASE,
   LOCAL_REVIEW_ID_BASE,
 } from '@revu/shared'
@@ -653,6 +654,45 @@ export interface DirectStore {
    * is an unchanged `ReviewSummary`.
    */
   putLocalSubmittedReview(localId: number, review: ReviewSummary): void
+  /**
+   * Record that a pull request now covers the same branch pair as a local review,
+   * by writing that pull request's number onto the review.
+   *
+   * WRITE-ONCE, decided in SQL: the statement matches only a review whose archive
+   * column is still empty, so a second call carrying a different number leaves
+   * the first standing. The first pull request observed over a branch pair is the
+   * one that superseded the review; a later observation is a re-observation, not
+   * a correction, and rewriting the number would relabel history a reader has
+   * already been shown. Deciding it in the predicate rather than by reading the
+   * column and then writing it is what makes the rule hold between two daemons
+   * sharing a data directory: the row settles it under its own write lock, so two
+   * callers cannot both see it empty and both write. There is no inverse — the
+   * column only ever goes from empty to a number.
+   *
+   * NON-DESTRUCTIVE, and that is the whole of it: exactly one column of exactly
+   * one row changes. No thread, draft, submitted review, viewed row, snapshot,
+   * cached immutable half or blob is read, rewritten or removed, so every word a
+   * human wrote against the branch before the pull request existed is still there
+   * afterwards. `updated_at` is deliberately not stamped either — it records when
+   * the review's own sync-derived state last moved, and a pull request appearing
+   * elsewhere moved none of it.
+   *
+   * `prNumber` must be a positive safe integer BELOW the reserved local-review
+   * band, or a `RangeError` is thrown before the database is touched. Everything
+   * that later reads this column reads it as a pull request that exists on the
+   * forge; a synthetic review id, a fraction or a `NaN` sitting in it would be
+   * indistinguishable from a real one, and no later reader could undo that.
+   *
+   * An id that names no review updates nothing and throws nothing — plain
+   * `UPDATE` semantics, chosen rather than hidden. A caller reaches this having
+   * just read the review, so an id matching no row means the review was removed
+   * underneath it, and a retried archive of a removed review has to be safe. A
+   * caller that must tell the two apart reads the review back.
+   *
+   * Durable: the column reaches disk before the call returns, or a
+   * `StoreWriteError` surfaces and it did not.
+   */
+  markLocalReviewArchived(localId: number, prNumber: number): void
   /**
    * Remove one local review and every row keyed to it, in ONE transaction, and
    * report how many rows each table gave up.
@@ -2050,6 +2090,32 @@ export function openDirectStore(
             'ON CONFLICT(local_id, review_id) DO UPDATE SET data = excluded.data',
           [localId, review.id, JSON.stringify(review)],
         )
+      })
+    },
+
+    markLocalReviewArchived(localId: number, prNumber: number): void {
+      // Refused BEFORE the wrapper, so a rejected value never becomes a statement
+      // at all and the failure is a caller's programming error rather than a
+      // persist failure a caller would be right to retry.
+      if (!Number.isSafeInteger(prNumber) || prNumber <= 0 || isLocalReviewId(prNumber)) {
+        throw new RangeError(
+          `A local review can only be archived under a real pull request number; received ${prNumber}. ` +
+            'It must be a positive integer that is exactly representable and below the reserved ' +
+            `local-review band (${LOCAL_REVIEW_ID_BASE}), because every later reader of this column ` +
+            'treats what it finds there as a pull request that exists on the forge.',
+        )
+      }
+      write('local_reviews', () => {
+        // ONE column, and the write-once rule lives in the predicate: the row is
+        // matched only while its archive column is still empty, so the second
+        // number never lands and no read-then-write window exists for a second
+        // daemon to slip through. Nothing else is set — not `updated_at`, and no
+        // statement against any other table — which is what makes a human's
+        // threads and unsubmitted drafts survive being superseded.
+        db.run('UPDATE local_reviews SET archived_pr = ? WHERE id = ? AND archived_pr IS NULL', [
+          prNumber,
+          localId,
+        ])
       })
     },
 

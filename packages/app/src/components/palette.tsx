@@ -35,6 +35,7 @@ import { SHORTCUT_CATALOG } from '@/lib/shortcuts'
 import { ApiError } from '@revu/shared'
 import type { PullListItem } from '@revu/shared'
 import { partitionInbox, rowIdentity } from '@/lib/local-reviews'
+import { showsInInbox } from '@/lib/inbox-sections'
 import type { RowIdentity } from '@/lib/local-reviews'
 import { paletteReviewHeading } from '@/lib/mode-copy'
 import { matchPrNumber, prPaletteCommands, reviewMode } from '@/lib/review-mode'
@@ -118,12 +119,16 @@ function toPaletteReview(item: PullListItem): PaletteReview {
  * Pure and exported so that "no local review's number is drawn or searchable"
  * is a property of a function rather than of a component that renders through a
  * dialog portal and serializes to nothing.
+ *
+ * The rows offered are exactly the rows the inbox lists: open pull requests,
+ * and every local review whatever its state — an archived local review is
+ * closed on its row but still has to be reachable from any screen.
  */
 export function paletteReviews(items: readonly PullListItem[]): {
   pulls: PaletteReview[]
   local: PaletteReview[]
 } {
-  const { local, github } = partitionInbox(items.filter((i) => i.pull.state === 'open'))
+  const { local, github } = partitionInbox(items.filter(showsInInbox))
   return {
     pulls: github.slice(0, PALETTE_REVIEW_CAP).map(toPaletteReview),
     local: local.slice(0, PALETTE_REVIEW_CAP).map(toPaletteReview),

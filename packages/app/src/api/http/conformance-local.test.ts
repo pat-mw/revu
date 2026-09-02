@@ -1,9 +1,10 @@
 /**
- * Conformance runner: drives the shared LOCAL-REVIEW conformance block — the
- * whole loop over a branch pair with no pull request behind it — against
- * revud-mock over REAL HTTP. The assertions live in `@revu/shared/conformance`
- * and are run identically against the in-process mock by a sibling runner, so
- * both transports are held to the same contract from one source of truth.
+ * Conformance runner: drives the shared LOCAL-REVIEW conformance blocks — the
+ * whole loop over a branch pair with no pull request behind it, and what
+ * happens once a pull request covers one — against revud-mock over REAL HTTP.
+ * The assertions live in `@revu/shared/conformance` and are run identically
+ * against the in-process mock by a sibling runner, so both transports are held
+ * to the same contract from one source of truth.
  *
  * What this leg adds over the in-process one is the two layers between the
  * reviewer and the store: the HTTP envelope and the client adapter. Everything
@@ -42,12 +43,31 @@
  *   diff, so the honest snapshot is the legal empty compare (merge base ==
  *   head, no files, no blobs, no commits) and a comment anchors wherever it
  *   says it does.
+ *
+ * ## The archive block's own pair, and its conditional list reads
+ *
+ * The daemon serves the app's mock store, which is its own stand-in for GitHub:
+ * a pull request "appears" for a pair by that pair already being one a fixture
+ * covers. So the archive block's `appear` is a no-op and its pair is `main ←
+ * feat/gateway-rate-limiting`, which fixture pull request 312 covers — the same
+ * pair the in-process runner uses, because both legs read the same fixtures.
+ *
+ * The block's conditional list reads go through ONE adapter handle rather than
+ * a per-call one. A `304` carries no body, so the adapter replays items and
+ * rate limit from the last full list IT fetched; a fresh handle asked to make a
+ * conditional read would have nothing to replay and would refuse the answer as
+ * a contract violation. The handle is rebuilt whenever the daemon is, since a
+ * restart rebinds a new port.
  */
 import { afterAll, beforeAll, describe } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runLocalReviewConformanceSuite } from '@revu/shared/conformance'
+import type { RevuApi } from '@revu/shared'
+import {
+  runLocalReviewArchiveConformance,
+  runLocalReviewConformanceSuite,
+} from '@revu/shared/conformance'
 import { createHttpApi } from './adapter'
 import type { Daemon } from './conformance-daemon'
 import { makeStubDist, startDaemon, stopDaemon } from './conformance-daemon'
@@ -55,6 +75,8 @@ import { makeStubDist, startDaemon, stopDaemon } from './conformance-daemon'
 let daemon: Daemon
 let dataDir: string
 let distDir: string
+/** The handle the archive block's conditional list reads go through. */
+let listHandle: RevuApi | null = null
 
 beforeAll(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'revud-conf-local-data-'))
@@ -86,6 +108,33 @@ describe('revud-mock over HTTP local review conformance', () => {
       await stopDaemon(daemon)
       daemon = await startDaemon(dataDir, distDir)
       return createHttpApi(daemon.base)
+    },
+  })
+
+  runLocalReviewArchiveConformance({
+    label: 'revud-mock over HTTP',
+    makeApi: () => {
+      listHandle = createHttpApi(daemon.base)
+      return listHandle
+    },
+    humanId: async () => (await createHttpApi(daemon.base).getSession()).human.id,
+    superseded: {
+      // Fixture pull request 312 is open over exactly this pair in the store
+      // the daemon serves, so the pull request is already there the moment the
+      // review is created.
+      pair: { baseRef: 'main', headRef: 'feat/gateway-rate-limiting' },
+      prNumber: 312,
+      appear: () => {},
+    },
+    listPulls: (etag) => {
+      if (listHandle === null) throw new Error('the list handle was read before it was built')
+      return listHandle.listPulls(etag === null ? undefined : { etag })
+    },
+    restart: async () => {
+      await stopDaemon(daemon)
+      daemon = await startDaemon(dataDir, distDir)
+      listHandle = createHttpApi(daemon.base)
+      return listHandle
     },
   })
 })

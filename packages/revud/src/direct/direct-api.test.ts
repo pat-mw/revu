@@ -59,7 +59,9 @@ import type { DirectApi } from './direct-api'
 import { createDirectApi } from './direct-api'
 import type { GithubClient } from './github-client'
 import { throwingGithubClient } from './github-write-stubs'
-import type { LocalReviewSurface } from './local-surface'
+import type { CommandRunner } from './command-runner'
+import type { LocalReviewSurface, LocalSyncOutcome } from './local-surface'
+import { createLocalReviewSurface } from './local-surface'
 import type { RepoRef } from './repo'
 import { openDirectStore, type DirectStore } from './store'
 
@@ -327,16 +329,18 @@ function fakeLocalSurface(): { surface: LocalReviewSurface; spy: SurfaceSpy } {
       spy.calls.push('listLocalReviews')
       return [LOCAL_SUMMARY]
     },
+    getLocalReview(localId: number): LocalReviewSummary {
+      spy.calls.push(`getLocalReview:${localId}`)
+      return LOCAL_SUMMARY
+    },
     async listBranches(): Promise<BranchRef[]> {
       spy.calls.push('listBranches')
       return [LOCAL_BRANCH]
     },
-    syncLocalReview: (): never => {
-      // Never driven through this double: the real surface's `syncPull`
-      // delegates here, but a double implements `syncPull` directly.
-      throw new Error('these tests do not exercise syncLocalReview')
+    async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
+      spy.calls.push(`syncLocalReview:${localId}`)
+      return { frozen: false, snapshot: LOCAL_SNAPSHOT, pin: { ok: true } }
     },
-
     async syncPull(localId: number): Promise<Snapshot> {
       spy.calls.push(`syncPull:${localId}`)
       return LOCAL_SNAPSHOT
@@ -518,8 +522,12 @@ describe('direct api band dispatch', () => {
     })
 
     // Every id-keyed method reached the local surface, with the local id intact.
+    // A sync reads the row through the surface first — the ownership-guarded
+    // read that decides whether the hosted repository is asked about it — and
+    // then runs the richer sync, whose outcome says whether anything was read.
     expect(spy.calls).toEqual([
-      `syncPull:${LOCAL_ID}`,
+      `getLocalReview:${LOCAL_ID}`,
+      `syncLocalReview:${LOCAL_ID}`,
       `getSnapshot:${LOCAL_ID}`,
       `getDraft:${LOCAL_ID}`,
       `saveDraft:${LOCAL_ID}`,
@@ -833,6 +841,92 @@ describe('a GitHub-band write refuses to run without a viewer identity', () => {
     expect(api.getSnapshot(MOVING_BASE_PR)?.immutable.compareKey).toBe('MB1...HEAD-FIXED')
     expect(api.getSnapshot(MOVING_BASE_PR + 1)).toBeNull()
 
+    store.close()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// The review list etag follows an archive.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * An archive is one column of one row: no sha moves, no title, no thread. The
+ * only thing the list serves differently afterwards is the row's state, and an
+ * etag that did not follow it would leave a client replaying a matching etag
+ * on a list that is no longer what it would be served — the review shown open
+ * for as long as the client kept asking. So the etag is pinned twice here: a
+ * replay is a not-modified while nothing has moved, and the SAME etag is a full
+ * list once the row is archived, with everything but the state unchanged.
+ *
+ * The surface is the REAL one over the store rather than the spy the dispatch
+ * cases use: the archive lands in the store, and only a surface that reads the
+ * store can show the served row following it.
+ */
+describe('the review list etag follows an archive', () => {
+  /** A runner the list must never reach: a list is assembled from the store alone. */
+  const noGit: CommandRunner = {
+    run: () => Promise.reject(new Error('the review list must not run git')),
+  }
+
+  function listWorld(): { api: DirectApi; store: DirectStore; localId: number } {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const localId = store.createLocalReview({
+      repo: 'o/r',
+      baseRef: 'refs/heads/main',
+      headRef: 'refs/heads/feature/x',
+      title: 'feature/x',
+    }).id
+    const api = createDirectApi({
+      session: SESSION,
+      store,
+      now,
+      localReviews: createLocalReviewSurface({
+        store,
+        runner: noGit,
+        toplevel: '/nowhere',
+        repo: 'o/r',
+        session: SESSION,
+        now,
+      }),
+    })
+    return { api, store, localId }
+  }
+
+  test('a replayed etag is not-modified while nothing has moved', () => {
+    const { api, store, localId } = listWorld()
+    const first = api.listPulls(null)
+    expect(first.notModified).toBe(false)
+    expect(first.items.map((it) => [it.pull.number, it.pull.state])).toEqual([[localId, 'open']])
+
+    // Byte-identical: the whole response, not merely the flag.
+    expect(api.listPulls(first.etag)).toEqual({
+      items: [],
+      etag: first.etag,
+      notModified: true,
+      rateLimit: first.rateLimit,
+    })
+    store.close()
+  })
+
+  test('the same etag is a full list once the review is archived, showing it closed', () => {
+    const { api, store, localId } = listWorld()
+    const first = api.listPulls(null)
+    expect(api.listPulls(first.etag).notModified).toBe(true)
+
+    // Every other input held constant: same store, same clock, same surface.
+    store.markLocalReviewArchived(localId, 9)
+
+    const after = api.listPulls(first.etag)
+    expect(after.notModified).toBe(false)
+    expect(after.etag).not.toBe(first.etag)
+    expect(after.items.map((it) => [it.pull.number, it.pull.state])).toEqual([[localId, 'closed']])
+    // The state is the ONLY thing that moved in the served row.
+    expect(after.items[0]).toEqual({
+      ...first.items[0],
+      pull: { ...first.items[0].pull, state: 'closed' },
+    })
+    // The moved etag is stable in its own turn.
+    expect(api.listPulls(after.etag).notModified).toBe(true)
     store.close()
   })
 })

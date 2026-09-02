@@ -1,3 +1,67 @@
+## 2026-09-02 — M8.9 is In Review on #82; M8.12 is next
+
+### Orient
+1. `git checkout m8.9/archive-on-pr` — stack tip, [PR #82](https://github.com/pat-mw/revu/pull/82), base
+   `m8.11/conformance-e2e-docs`.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3276 pass · 1 skip · 0 fail · 116 files**.
+3. **CI on #82 was pending at hand-off** — check `gh pr checks 82` before building on it (check ·
+   conformance-matrix · e2e · docs-build). #78, #79, #80 were green.
+4. `bun run conformance:matrix` → A/B/E/F/G `PASS`, C/D `SKIP`. `bun run test:e2e` → two `ALL CHECKS PASSED`.
+5. Read `BOARD.md` → this entry → the ticket you pick up.
+
+### State
+`main` untouched at `177068a`. **Thirteen PRs, one linear chain, none merged:** … → #80 (M8.11) → #82 (M8.9).
+Tree clean, branch pushed. M8.8, M8.10, M8.11, M8.9 In Review. 99 units. **Stacked PRs are the protocol —
+open one every session. Never merge, never commit to `main`, never retarget.** (PR number 81 does not exist
+on this repository; nothing is missing from the chain.)
+
+### Next, in order
+1. **M8.12 — delete confirmation for a review holding a draft.** Branch `m8.12/delete-confirm` off the `m8.9`
+   tip. **Greenfield on the app side:** `deleteLocalReview` has zero call sites in `packages/app/src` outside
+   the transport adapters — there is no delete affordance, no mutation hook, no dialog. The ruling (2026-08-19)
+   is that there is **no force flag**: the daemon refuses (`unprocessable`, message names the remedy) while any
+   human's draft holds text; the client discards its own draft explicitly, then repeats the delete unchanged.
+   So the unit texts saying "retry with force" are superseded: confirm = discard the current human's draft
+   (`api.deleteDraft`) then delete. Copy must be honest that the *discard* destroys that text by the user's
+   choice (say "discard", never "lost"); another human's blocking draft cannot be discarded from here — surface
+   the daemon's sentence. Dialog precedents: `head-moved-dialog.tsx`, `reconcile-dialog.tsx`,
+   `CreateLocalReviewDialog` (`create-local-review.tsx`, body/wrapper split); there is no `AlertDialog`
+   primitive; `discard-confirm.tsx` is a two-step *button* hook, not a dialog. After a delete invalidate
+   `qk.pulls` + `qk.localReviews` (`refetchType: 'all'`) and navigate to the inbox. Affordance: a local-mode
+   action in the review header. The `?mock=1` dev server config is `.claude/launch.json` → `app-dev`.
+2. **Follow-ups on the board, not tickets:** `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
+   stored PR URL column when an Enterprise host matters; 52 stale `.claude/worktrees/agent-*` directories
+   (gitignored, disk only — `git worktree prune` after removing them is the owner's call).
+
+### What this session learned — apply before calling anything done
+- **A mutation must refresh every cache its result can change.** The unit tests were all green and the
+  archived review never showed on the page: `useSyncPull` refreshed nothing the archive changes, the list poll
+  pauses in a hidden tab, the annotation query has no interval. Only the `?mock=1` walk saw it. Memory:
+  `sync-refreshes-what-it-changes.md`.
+- **An allowlist of targets catches a new target, not a new statement against a known one** — the
+  `DELETE FROM` allowlist stayed green under a `DELETE FROM local_drafts`; the row-count case caught it.
+  Landmine shape 12 in `known-landmines.md`.
+- **"Exactly one column" needs the whole row pinned**, not one sibling column — the review's `title`
+  rewrite survived every test until the row was compared as a whole.
+- **Detect before sync, and expect the sync after the mark to fail.** The head branch is usually deleted
+  once the PR is open; the freeze must fall back to the last successful snapshot or the review is stuck.
+- **The mock reads its own fixtures as "GitHub"** — a mock local review on `main ← fix/cache-ttl-jitter`
+  archives to #101 on its first sync; `main ← feat/gateway-rate-limiting` → #312. The conformance pair and
+  the seeded review are covered by nothing.
+
+### Landmines
+- **`--local-only` does not drop the GitHub half by itself** — it makes the half droppable. A local-only
+  daemon with a github.com origin and a credential still resolves both and archives; the e2e's zero-remote
+  repo is what makes it network-free. The guide now says exactly this.
+- **Two syncs in one millisecond share `syncedAt`** — never assert it moved.
+- **`RevuApi.listPulls(opts?)` and `DirectApi.listPulls(ifNoneMatch)` are not mutually assignable** (pre-existing);
+  the conformance block carries a `listPulls` hook. `createLocalReview` answers `headSha: null` on every
+  transport (pre-existing, now pinned) — save a pre-sync draft against an empty head.
+- Standing: `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC`; **NEVER `git add -A`** (reviewers mutate the tree —
+  this session's reviewer worked in its own worktree, which is the better shape); `--end-of-options`; ticket
+  line pointers rot — read the seam; a fix landing in the same edit as its test has no red — obtain one by
+  control and verify the revert byte-for-byte.
+
 ## 2026-09-02 — M8.11 is DONE on #80; every exit criterion has a run; M8.9 and M8.12 remain
 
 ### Orient

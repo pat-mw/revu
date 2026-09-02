@@ -66,8 +66,11 @@ import {
   reconcileFailureCopy,
   reconcileSuccessCopy,
   stateChipCopy,
+  stateChipVariant,
   submitFailureCopy,
   submitSuccessCopy,
+  supersededBadgeCopy,
+  supersededBannerCopy,
   syncCostCopy,
   syncErrorCopy,
   tooLargeDiffCopy,
@@ -108,6 +111,10 @@ const SCANNED: ScannedFile[] = [
   { path: 'components/review/reconcile-dialog.tsx', marker: /export function ReconcileDialog\(/ },
   { path: 'components/author/author-banner.tsx', marker: /export function AuthorBanner\(/ },
   { path: 'components/review/dirty-banner.tsx', marker: /export function DirtyWorktreeBanner\(/ },
+  {
+    path: 'components/review/superseded-banner.tsx',
+    marker: /export function SupersededBanner\(/,
+  },
   { path: 'components/review/head-moved-dialog.tsx', marker: /export function HeadMovedDialog\(/ },
 ]
 
@@ -255,6 +262,12 @@ const BANNED: BannedLiteral[] = [
   // The rule that says what a review is built from, which is the one sentence
   // in the header that a reader with an editor open beside it depends on.
   { pattern: /covers committed content only/i },
+  // The archived notice, whose wording is correct where it is drawn and would
+  // be a second source of truth anywhere else. Fragments rather than whole
+  // sentences, because both lines interpolate a pull request number and a
+  // pattern built around one would stop matching the moment it changed.
+  { pattern: /frozen at its last sync/i },
+  { pattern: /archived · superseded by/i },
   // Three more sentences the module owns whose wording is CORRECT on a
   // mediated pull request. They are banned inline for the same reason the wrong
   // ones are: a second copy of a right sentence is a second source of truth,
@@ -464,6 +477,54 @@ describe('every swept surface asks the copy module for its sentence', () => {
       importsFrom('components/review/dirty-banner.tsx', '@/lib/mode-copy', 'dirtyWorktreeCopy'),
     ).toBe(true)
   })
+
+  test('the archived banner asks for both of its lines', () => {
+    expect(
+      importsFrom(
+        'components/review/superseded-banner.tsx',
+        '@/lib/mode-copy',
+        'supersededBannerCopy',
+      ),
+    ).toBe(true)
+  })
+
+  test('and the inbox row asks for the badge that names what took over', () => {
+    expect(importsFrom('pages/inbox.tsx', '@/lib/mode-copy', 'supersededBadgeCopy')).toBe(true)
+  })
+
+  test('and the header asks for the tint of its state chip as well as its word', () => {
+    // The tint is half of what the chip says and varies by the same question,
+    // so a header that kept the word and reinvented the colour would put an
+    // alarm back on every archived review with every sentence still right.
+    expect(importsFrom('pages/pr-layout.tsx', '@/lib/mode-copy', 'stateChipVariant')).toBe(true)
+  })
+})
+
+describe('the review layout draws the notice about what superseded a review', () => {
+  test('the layout imports the banner by name', () => {
+    // PRESENCE, not execution. The banner decides its own visibility and is
+    // asserted on real markup beside itself; what nothing but a read of this
+    // file can say is that the header still has a slot it is rendered into.
+    expect(
+      importsFrom(
+        'pages/pr-layout.tsx',
+        '@/components/review/superseded-banner',
+        'ReviewSupersededBanner',
+      ),
+    ).toBe(true)
+  })
+
+  test('and renders it above the other banners in the stack', () => {
+    // The order is the widest claim first: everything else the header says is
+    // said about a review that can still be written to, and this one says it
+    // cannot. Read as positions in the file rather than as a literal block, so
+    // reformatting the slot does not turn it red.
+    const text = source('pages/pr-layout.tsx')
+    const superseded = text.indexOf('<ReviewSupersededBanner')
+    const dirtyBanner = text.indexOf('<ReviewDirtyBanner')
+    expect(superseded).toBeGreaterThan(-1)
+    expect(dirtyBanner).toBeGreaterThan(superseded)
+  })
 })
 
 /**
@@ -640,6 +701,9 @@ const SWEPT: SweptCopy[] = [
   { name: 'orgMemberTitle', text: flatten(orgMemberTitle('local')) },
   { name: 'dirtyWorktreeCopy', text: flatten(dirtyWorktreeCopy('local')) },
   { name: 'paletteReviewHeading', text: flatten(paletteReviewHeading('local')) },
+  { name: 'stateChipVariant', text: flatten(stateChipVariant('local', 'closed')) },
+  { name: 'supersededBadgeCopy', text: flatten(supersededBadgeCopy('local', 101)) },
+  { name: 'supersededBannerCopy', text: flatten(supersededBannerCopy('local', 101)) },
 ]
 
 describe('the copy sweep covers the module it is sweeping', () => {
@@ -677,6 +741,36 @@ describe('the copy sweep covers the module it is sweeping', () => {
   })
 })
 
+/**
+ * The one pattern a copy function can be granted, and the family granted it.
+ *
+ * A branch pair has no pull request behind it — except in exactly one state.
+ * When a pull request appears covering the same two branches the review is
+ * archived against it, and from then on naming that pull request is not a
+ * false claim but the whole content of the notice: the review is read-only
+ * BECAUSE the pull request exists, and a reader told only "archived" cannot
+ * reach the work that took over. So this family is granted the phrase and
+ * nothing else, and every other pattern below still sweeps it.
+ *
+ * The same RegExp OBJECT is what the list holds, so the grant is anchored to
+ * the entry actually being swept rather than to a re-spelling of it that could
+ * drift away from it silently.
+ */
+const NAMES_A_PULL_REQUEST = /pull request/i
+
+/**
+ * The copy functions granted that phrase, by name.
+ *
+ * A name-level grant rather than a subtraction of one sentence, because these
+ * functions interpolate a number: there is no fixed string to take out, and a
+ * pattern built from one would stop matching the moment the number changed.
+ * The controls below are what keep it narrow — every name here must be a real
+ * swept function whose branch-pair copy really does name a pull request, so a
+ * grant that has stopped doing anything fails instead of quietly widening the
+ * sweep by one function.
+ */
+const NAMES_A_PULL_REQUEST_GRANTED = new Set(['supersededBannerCopy'])
+
 /** Vocabulary that asserts something a review of two local branches lacks. */
 const BANNED_VOCABULARY: RegExp[] = [
   /github\.com/i,
@@ -685,18 +779,72 @@ const BANNED_VOCABULARY: RegExp[] = [
   /rate limit/i,
   /\bbucket\b/i,
   /org member/i,
-  /pull request/i,
+  NAMES_A_PULL_REQUEST,
   /\bbroker\b/i,
   /\brequests\b/i,
 ]
 
+/** Which functions this pattern is not swept over — none, for all but one. */
+function granted(pattern: RegExp): ReadonlySet<string> {
+  return pattern === NAMES_A_PULL_REQUEST ? NAMES_A_PULL_REQUEST_GRANTED : new Set<string>()
+}
+
 describe('no copy function says anything about GitHub for a branch pair', () => {
   for (const pattern of BANNED_VOCABULARY) {
     test(`no branch-pair copy matches ${String(pattern)}`, () => {
-      const offenders = SWEPT.filter((c) => pattern.test(c.text)).map((c) => c.name)
+      const exempt = granted(pattern)
+      const offenders = SWEPT.filter(
+        (c) => !exempt.has(c.name) && pattern.test(c.text),
+      ).map((c) => c.name)
       expect(offenders).toEqual([])
     })
   }
+})
+
+describe('the one grant is anchored to copy that needs it', () => {
+  test('every granted name is a function this sweep actually calls', () => {
+    // A grant spelled wrong exempts nothing and is invisible: the sweep stays
+    // green because the name it names is not in the list either way, and the
+    // function it was meant to cover is swept by everything. Reported by name
+    // rather than as a count.
+    const swept = new Set(SWEPT.map((c) => c.name))
+    expect([...NAMES_A_PULL_REQUEST_GRANTED].filter((name) => !swept.has(name))).toEqual([])
+  })
+
+  test('and really does name a pull request, or the grant is a hole', () => {
+    // The positive control for the exemption itself. Without it the grant is
+    // satisfied by copy that never needed it — which proves nothing about
+    // whether the exemption is doing any work, and quietly licenses adding
+    // whatever names one likes to it.
+    const idle = SWEPT.filter(
+      (c) => NAMES_A_PULL_REQUEST_GRANTED.has(c.name) && !NAMES_A_PULL_REQUEST.test(c.text),
+    ).map((c) => c.name)
+    expect(idle).toEqual([])
+  })
+
+  test('and every other pattern still sweeps the granted copy', () => {
+    // The grant is one phrase wide, not one function wide. Asserted directly
+    // rather than left to the loop above: an exemption keyed on the function
+    // instead of on the pattern would satisfy every test in that loop while
+    // letting the archived notice say anything at all.
+    const granted = SWEPT.filter((c) => NAMES_A_PULL_REQUEST_GRANTED.has(c.name))
+    expect(granted.length).toBeGreaterThan(0)
+    for (const pattern of BANNED_VOCABULARY) {
+      if (pattern === NAMES_A_PULL_REQUEST) continue
+      expect([String(pattern), granted.filter((c) => pattern.test(c.text))]).toEqual([
+        String(pattern),
+        [],
+      ])
+    }
+  })
+
+  test('and no other branch-pair copy borrows the phrase', () => {
+    // The rule this whole file exists for, restated over the one exemption:
+    // the archived notice is the ONE local surface that legitimately names a
+    // pull request, and the grant is a list of one rather than a category
+    // anything can join by having the phrase in it.
+    expect([...NAMES_A_PULL_REQUEST_GRANTED]).toEqual(['supersededBannerCopy'])
+  })
 })
 
 // ————————————————————————————————————————————————————————————————

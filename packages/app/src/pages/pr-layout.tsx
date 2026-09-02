@@ -15,7 +15,7 @@ import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/que
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
 import type { CheckCounts } from '@/lib/checks-rollup'
-import { notFoundCopy, stateChipCopy, syncCostCopy } from '@/lib/mode-copy'
+import { notFoundCopy, stateChipCopy, stateChipVariant, syncCostCopy } from '@/lib/mode-copy'
 import type { ReviewState } from '@/lib/mode-copy'
 import { reviewMode, reviewTabs } from '@/lib/review-mode'
 import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
@@ -33,6 +33,7 @@ import { useToast } from '@/components/ui/toast'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ReviewBar } from '@/components/review/review-bar'
 import { ReviewDirtyBanner } from '@/components/review/dirty-banner'
+import { ReviewSupersededBanner } from '@/components/review/superseded-banner'
 import { AuthorBanner } from '@/components/author/author-banner'
 
 /**
@@ -355,13 +356,6 @@ PrTabs.displayName = 'PrTabs'
 // Identity row — what the review is, at the top of the header.
 // ————————————————————————————————————————————————————————————————
 
-/** The chip's tint per state: the review is live, it landed, or it did not. */
-const STATE_VARIANT: Record<ReviewState, 'add' | 'default' | 'danger'> = {
-  open: 'add',
-  merged: 'default',
-  closed: 'danger',
-}
-
 /**
  * Which of the three states a review is in, read off the review itself. A
  * merge timestamp is the only evidence one landed — a merged pull request also
@@ -433,7 +427,7 @@ export function PrIdentityRow({ mode, pull }: { mode: ReviewMode; pull: PullSumm
           local
         </Badge>
       )}
-      <Badge className="shrink-0" variant={STATE_VARIANT[state]}>
+      <Badge className="shrink-0" variant={stateChipVariant(mode, state)}>
         {stateChipCopy(mode, state)}
       </Badge>
       {pull.draft && (
@@ -666,6 +660,7 @@ export function PrLayout() {
             about the review down to the narrowest: what has superseded it,
             then what it does not cover, then what it is waiting on. */}
         <div className="flex flex-col gap-2 py-2 empty:hidden">
+          <ReviewSupersededBanner prNumber={prNumber} mode={mode} />
           <ReviewDirtyBanner prNumber={prNumber} mode={mode} />
           <AuthorBanner prNumber={prNumber} mode={mode} />
         </div>
