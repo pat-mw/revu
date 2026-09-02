@@ -164,16 +164,24 @@ point of reviewing locally: the feedback that exists to be thrown away — the
 wrong first approach, the misread requirement — never becomes part of the record
 on someone else's repository.
 
-What a pull request is meant to change is the local review's *state*. A local
-review is designed to be archived read-only once a pull request for the same
-branch pair is detected, keeping everything it holds — every thread, every
-draft, all of its history. That detection is not yet wired, so today a local
-review stays open until you delete it.
+What a pull request changes is the local review's *state*. Each time you sync
+a local review, revu asks GitHub for open pull requests whose head and base are
+that review's branch pair in the same repository. When one exists, the review
+is archived: it goes read-only, freezes at that last sync, and links to the
+pull request — keeping everything it holds, every thread, every draft, all of
+its history. The check is a read of GitHub, so it needs an `origin` on
+github.com and a `gh` login; in a workspace with no remote no local review is
+ever archived. It runs only when you sync: a review nobody re-syncs stays open
+until its next sync, however long a pull request has been open. A pull request
+opened against a *different* base branch does not archive a review of the same
+head against another base — the diffs genuinely differ, and the review stays
+live.
 
 <Callout title="Read-only, never destructive">
 Archiving is a marker on the review itself, never a delete: an archived review
 keeps everything it holds, and a pull request later closed without merging will
-not un-archive it — create a new local review for the pair instead.
+not un-archive it. The branch pair is a one-way door: creating a local review
+for the same pair again returns the archived review rather than a fresh one.
 </Callout>
 
 ## Where to go next
