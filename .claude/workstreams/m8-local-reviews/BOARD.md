@@ -10,34 +10,31 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing is running.** M8.8 is In Review at 8/8 with its adversarial pass done, on
-`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78). **M8.10 is In Review at 7/7
-units — and is NOT done**, on `m8.10/retention-and-gc`, PR [#79](https://github.com/pat-mw/revu/pull/79),
-based on M8.8.
+**Nothing is running.** Two tickets are In Review, both gated and pushed.
 
-**Gate at the M8.10 tip: 2888 pass · 1 skip · 0 fail · 101 files**, `TZ=UTC`. M8.8 was re-gated **in
-isolation after the branch cut** (2741 · 1 · 0 · 100) rather than inferred from the combined tree.
+| ticket | state | branch / PR | gate |
+| --- | --- | --- | --- |
+| **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
+| **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
 
-### ⚠️ Read this before calling M8.10 done
+**M8.10 is now genuinely done**, not merely at full unit count. `M8.10.8` closed the gap that 7/7 had
+hidden: the owner's ruling 1 was unimplemented in **both** transports, and the mock and direct disagreed
+about whether a delete destroys unsubmitted text and about a repeated delete. **All three had survived the
+gate because `deleteLocalReview` had no conformance coverage at all.** It now has a three-transport parity
+leg — in-process mock, mock over real HTTP, and the direct engine on a real repository — which is what
+stops the class recurring rather than this instance.
 
-**All seven units landed and the owner's ruling 1 is still unimplemented.** The ruling — *the server
-refuses a delete while any human holds a non-empty draft* — was recorded at M8.10's Open question 3 and
-**never turned into a unit**, so no unit's `Do` ever asked for it. Alongside it, the mock and direct
-disagree about **whether a delete destroys unsubmitted text** (direct removes `local_drafts` and
-`local_viewed` for every human; the mock deliberately orphans them and asserts they survive) and about a
-**repeated delete** (mock `not_found`, direct idempotent).
+**The lesson, now twice-proven on this milestone: a unit percentage is not a done ticket.** Before calling
+one complete, check that every ruling recorded at an Open question has a unit that implements it, and that
+every contract method it touches has a conformance leg.
 
-**All three shipped green because `deleteLocalReview` has zero conformance coverage.** That absence is the
-reusable lesson: a contract method with no conformance leg is a divergence waiting to be found by a user,
-not by a gate. Tracked as **M8.10.8**, which must move the **mock first** — it is the oracle, and moving a
-transport first inverts the authority.
+### One recorded deviation in M8.10's `Verify`
 
-**A unit percentage is not a done ticket, and this is the second time that has bitten this milestone.**
-
-### The stack was pushed and CI matters more than the local gate
-
-`main` untouched at `177068a`. **Eleven PRs, one linear chain, none merged.** #78 is fully green.
-**#79 went red once on a pre-existing flake the diff never caused** — see the gate-timeout note below.
+`Verify` says no file under `packages/shared/src/api/` may be modified. One was: `client.ts`'s
+`deleteLocalReview` docstring said drafts are "deliberately left behind — user-written text is never
+destroyed", which the owner's ruling made false in both transports. The prose was corrected; **no type,
+shape, field or signature moved.** The full reasoning is at the ticket's `Verify` section. Splitting it into
+its own contract commit is one command if the owner prefers.
 
 ### The owner's rulings — 2026-08-19
 
@@ -109,7 +106,7 @@ is derived from it, never the other way round.**
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | **In Review** | 10 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | [#76](https://github.com/pat-mw/revu/pull/76) |
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
-| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
+| [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8, `Verify` green) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |

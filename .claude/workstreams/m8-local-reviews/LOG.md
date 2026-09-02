@@ -539,3 +539,37 @@ because `deleteLocalReview` has **no conformance coverage**. Appended as **M8.10
 
 **Next.** M8.10.8 (mock first), then M8.10's `Verify` and M8.8's. Then **M8.9**, independent and unblocked.
 **M8.11 remains the real critical path** — 3 of the 6 exit criteria, not started.
+
+**update — 2026-08-20 (close)**
+
+**Done.** **M8.10 is complete at 8/8 with its `Verify` green**, and **M8.8's `Verify` is green** with its
+owed adversarial pass discharged. Both PRs are pushed and **CI is green on both**.
+
+- **M8.10.8** (`faa1ad6`) — the owner's ruling 1 implemented in both transports: a delete **refuses** with
+  `unprocessable` while any human holds a draft carrying text, as a precondition that leaves every row in
+  place. `draftHoldsText` is **one shared predicate** both transports import, because two definitions of
+  "has the reviewer written anything" is how the divergence started. The mock moved first.
+- **A three-transport conformance leg for `deleteLocalReview`** — in-process mock, mock over real HTTP, and
+  the direct engine on a real repository witnessed through a raw handle over all six local tables. Its
+  absence is what let three wire-level divergences ship green.
+
+**Decisions.**
+- **`unprocessable`, not `conflict` or `not_found`** — its own docstring in the frozen contract describes
+  this exact case: the target exists, its state cannot honour the request, and the caller can put it in one
+  that can and retry unchanged.
+- **The mock moved to delete drafts; direct was right.** "Drafts survive everything" is preserved by the
+  refusal, not by orphaning — only an editor-created empty draft can now be removed, which destroys nothing.
+- **An unknown id answers `not_found` alike** whether never created, already deleted, or belonging to
+  another repository sharing the data directory — a distinguishable answer would confirm an id exists
+  elsewhere. **Cost taken:** a "not found" call now has no side effects, so it no longer opportunistically
+  tidies refs left by a drop that failed part-way; that belongs to an explicit operator action.
+
+**Deviation, recorded not buried.** M8.10's `Verify` says no file under `packages/shared/src/api/` may be
+modified; `client.ts`'s `deleteLocalReview` docstring was corrected, because the ruling made its claim that
+drafts are "deliberately left behind" false in both transports. Comment-only — no type, shape, field or
+signature moved. Splitting it into its own contract commit is one command if the owner prefers.
+
+**Blockers.** None.
+
+**Next.** **M8.9** — independent and unblocked. Then **M8.11, the real critical path**: it gates **3 of the
+6 exit criteria** and has not started.
