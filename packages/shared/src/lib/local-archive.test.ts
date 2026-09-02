@@ -218,3 +218,30 @@ describe('archivedReviewRefusal', () => {
     expect(reason).not.toMatch(/approv|author|your own|installation/i)
   })
 })
+
+describe('supersedes — the shape a hostile or degraded listing can take', () => {
+  it('never matches a pull request whose number is not a positive integer', () => {
+    // The client maps a row with no number to 0, and the lowest number wins
+    // the tiebreak — so an unguarded 0 would beat every real pull request and
+    // hand the store a number it must refuse.
+    for (const number of [0, -1, 4.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(supersedes(REVIEW, pull({ number }))).toBe(false)
+    }
+    // The control: the same row with a real number matches.
+    expect(supersedes(REVIEW, pull({ number: 7 }))).toBe(true)
+  })
+
+  it('compares the repository identity case-insensitively, as GitHub does', () => {
+    // A clone URL may spell the owner and name in any case; GitHub reports
+    // the canonical spelling on the pull request. Both name one repository.
+    expect(supersedes({ ...REVIEW, repo: 'ACME/Widgets' }, pull())).toBe(true)
+    expect(supersedes(REVIEW, pull({ headRepo: 'Acme/WIDGETS' }))).toBe(true)
+    // The control: a different name in the same case still does not match.
+    expect(supersedes(REVIEW, pull({ headRepo: 'acme/widgets2' }))).toBe(false)
+  })
+
+  it('supersedingPull skips a zero-numbered row rather than letting it win', () => {
+    const winner = supersedingPull(REVIEW, [pull({ number: 0 }), pull({ number: 7 })])
+    expect(winner?.number).toBe(7)
+  })
+})

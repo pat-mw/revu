@@ -71,12 +71,24 @@ export interface ArchivableLocalReview {
  * for a repository identity. Two absences are not an agreement, and letting them
  * compare equal would archive every such review against the first pull request
  * listed.
+ *
+ * THE NUMBER MUST BE A POSITIVE SAFE INTEGER. A listing row with no number is
+ * mapped to 0 by the client, and the lowest number wins the tiebreak below, so
+ * an unguarded 0 would beat every real pull request and hand the store a value
+ * it refuses — turning a malformed row from GitHub into a failed sync.
+ *
+ * REPOSITORY IDENTITIES COMPARE CASE-INSENSITIVELY. A clone URL may spell the
+ * owner and name in any case while GitHub reports the canonical spelling on the
+ * pull request; both name one repository, and a case-sensitive compare would
+ * leave such a workspace never archiving, silently, one request per sync.
  */
 export function supersedes(review: ArchivableLocalReview, pull: PullSummary): boolean {
   if (pull.state !== 'open') return false
+  if (!Number.isSafeInteger(pull.number) || pull.number <= 0) return false
 
-  const headRepo = pull.head.repo.full_name
-  if (review.repo === '' || headRepo === '' || headRepo !== review.repo) return false
+  const headRepo = pull.head.repo.full_name.toLowerCase()
+  const reviewRepo = review.repo.toLowerCase()
+  if (reviewRepo === '' || headRepo === '' || headRepo !== reviewRepo) return false
 
   const headRef = bareBranchName(review.headRef)
   const pullHeadRef = bareBranchName(pull.head.ref)
