@@ -513,3 +513,29 @@ Recorded as a durable memory.
 **Next.** M8.10.4 → M8.10.7 → M8.10.5 → M8.10.6, in that order (the gate must exist before any caller is
 wired). Then **M8.9**, independent and unblocked. **M8.11 remains the real critical path** — it gates 3 of
 the 6 exit criteria and has not started; unit percentage does not close the milestone, the criteria do.
+
+**update — 2026-08-20 (later)**
+
+**Done.** M8.10 reached 7/7 units on #79: the immutable sweep (`974513a`), the in-flight gate (`4a73b36`),
+the blob walk shipping dark (`566539e`), and the wiring plus the operator policy (`16c3c87`). Gate at the
+tip **2888 pass · 1 skip · 0 fail · 101 files**.
+
+**Decisions.**
+- **The gate default moved into the scripts, not `bunfig.toml`.** Bun ignores a `timeout` key there
+  (verified against 1.3.11), so `test` and `check` now pass `--timeout=20000`. CI went red on a
+  pre-existing allocator case that runs **437ms locally and 9372ms on a runner** — a factor of twenty-one —
+  so a limit tuned to local timings is a coin flip on someone else's hardware. Roughly half the
+  sync-driving tests in one file carry no explicit budget, so per-test patching would not have converged.
+- **Prune failures are logged, not raised**, so one corrupt row belonging to an unrelated review cannot
+  turn a sync whose snapshot is already on disk into a permanent 500.
+- **`syncGate` stays optional**: both the wrapper and every prune read one binding inside
+  `createDirectApi`, so the pairing cannot come apart by omission; requiring it would touch 40 construction
+  sites for no safety gain.
+
+**Blockers.** **M8.10 is not done at 7/7.** Owner ruling 1 was recorded at an Open question and never
+became a unit, so the delete has no draft precondition in either transport; the mock and direct also
+disagree on whether a delete destroys unsubmitted text and on a repeated delete. All three passed the gate
+because `deleteLocalReview` has **no conformance coverage**. Appended as **M8.10.8**.
+
+**Next.** M8.10.8 (mock first), then M8.10's `Verify` and M8.8's. Then **M8.9**, independent and unblocked.
+**M8.11 remains the real critical path** — 3 of the 6 exit criteria, not started.

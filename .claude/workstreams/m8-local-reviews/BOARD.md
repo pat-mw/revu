@@ -10,66 +10,34 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**M8.8 is In Review at 8/8 with its adversarial pass done, and M8.10 is In Review at 4/7.** M8.8 sits on
-`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78), base `prefs/lost-update`; M8.10 sits on
-`m8.10/retention-and-gc`, PR [#79](https://github.com/pat-mw/revu/pull/79), based on M8.8. **Nothing is running.**
+**Nothing is running.** M8.8 is In Review at 8/8 with its adversarial pass done, on
+`m8.8/resync-and-pinning`, PR [#78](https://github.com/pat-mw/revu/pull/78). **M8.10 is In Review at 7/7
+units — and is NOT done**, on `m8.10/retention-and-gc`, PR [#79](https://github.com/pat-mw/revu/pull/79),
+based on M8.8.
 
-**The full-diff adversarial pass is done and its findings are fixed.** Six dimension reviewers over
-`prefs/lost-update...HEAD`, one independent refuter per finding defaulting to refuting: **16 raw → 5
-survived → 4 fixed, 1 recorded as owed** (M8.8 OQ8). The synthesis verdict on the pre-fix tree was **not
-safe to push**, on the strength of a guard that could not observe the thing it guarded. All four fixes are
-in `bbc4bc6`; the detail is in the M8.8 ticket's `## Log`.
+**Gate at the M8.10 tip: 2888 pass · 1 skip · 0 fail · 101 files**, `TZ=UTC`. M8.8 was re-gated **in
+isolation after the branch cut** (2741 · 1 · 0 · 100) rather than inferred from the combined tree.
 
-**What M8.8 still owes is only its own `Verify`.** Five questions have now been put to the owner
-across two sessions and **all five are answered** — recorded below and written into the tickets they bind.
+### ⚠️ Read this before calling M8.10 done
 
-| unit | what landed | commit |
-| --- | --- | --- |
-| **M8.8.1** the pin seam | `local-pins.ts`, one atomic `update-ref --stdin` batch | `9522087` |
-| **M8.8.2** pin before the first read | `syncLocalReview` carries the outcome; `syncPull` unchanged on the wire | `4d73d69` |
-| **M8.8.3** rewrite detection | the author-date fallback reported **zero** on a rebase; mock moved first | `7ed601d` |
-| **M8.8.4** missing objects | the `line-deleted` lie closed, **and the re-sync advice made to actually work** | `048ea90` |
-| **M8.8.5** deleted/renamed branch | survival walk + runtime deletion tripwire; **no production change needed** | `b52f181` |
-| **M8.8.8** prune survival | the pinned/unpinned pair — the control fails when the pin is removed | `cb2c5a0` |
-| **M8.8.6** rewrite copy + D8 | **the unit's Check was wrong twice**; the base tip is not in `compareKey` | `bc847ad` |
-| **M8.8.7** the stale draft head | fixed where the re-anchor happens, **before** the submit a refusal survives | `407911a` |
+**All seven units landed and the owner's ruling 1 is still unimplemented.** The ruling — *the server
+refuses a delete while any human holds a non-empty draft* — was recorded at M8.10's Open question 3 and
+**never turned into a unit**, so no unit's `Do` ever asked for it. Alongside it, the mock and direct
+disagree about **whether a delete destroys unsubmitted text** (direct removes `local_drafts` and
+`local_viewed` for every human; the mock deliberately orphans them and asserts they survive) and about a
+**repeated delete** (mock `not_found`, direct idempotent).
 
-**Gate: M8.8 alone 2741 pass · 1 skip · 0 fail · 100 files; the M8.10 tip 2800 pass · 1 skip · 0 fail ·
-101 files.** Both run under `TZ=UTC`, and M8.8 was re-gated **in isolation after the branch cut** rather
-than inferred from the combined tree. Older figure for reference: 2718/99**, under `TZ=UTC`, re-run by the orchestrator in the
-main tree after every unit. **CI on #78 is fully green** — `check`, `conformance-matrix` and `e2e` all
-passed on the 6/8 tip, which is why the PR was opened before the ticket was complete.
+**All three shipped green because `deleteLocalReview` has zero conformance coverage.** That absence is the
+reusable lesson: a contract method with no conformance leg is a divergence waiting to be found by a user,
+not by a gate. Tracked as **M8.10.8**, which must move the **mock first** — it is the oracle, and moving a
+transport first inverts the authority.
 
-**M8.8.6 corrected its own Check in two places, and both would have shipped a test that proves nothing.**
-`isRewritten` must be asked of the **full** compare, never `newCommits` — that list is `commits.slice(draftHeadIndex + 1)`,
-so the draft head is never in it and a membership test there reports *every* fast-forward as a rewrite. And
-"commit on the base branch only" does **not** move `compareKey`: the base tip is explicitly not part of the
-key (`local-sync.ts:146`), which moves only when the base absorbs a commit the head already carries. Both
-corrections, and a third unnamed state (an empty compare is not a rewrite), are recorded in the ticket's `## Log`.
+**A unit percentage is not a done ticket, and this is the second time that has bitten this milestone.**
 
-**Remaining: the `Verify` and the adversarial pass.** M8.8.6's staleness half wants M8.5.3's `listPulls` merge (a soft dependency — until then
-`useStaleness` returns `null` and the banner degrades rather than blocking). **The PR was opened at 6/8 on purpose.** Stacked PRs are the repo's protocol, opened every session — and a
-branch without one gets no CI, because `ci.yml` triggers only on `pull_request` and pushes to `main`. §8
-orders the adversarial review *before the PR*; it is not a rule that the ticket must be complete first.
-The full-diff adversarial pass is still owed before this is considered done.
+### The stack was pushed and CI matters more than the local gate
 
-**M8.10 landed its first wave alongside M8.8, as ruling 4 requires** — the pin set was only allowed to be
-unbounded because the collector arrives right behind it, and it now has. **M8.10.1** (the store's second
-`DELETE`), **M8.10.2** (`dropPinnedRefs`, the milestone's only ref-deletion path) and **M8.10.3** (the
-fail-closed live-`compareKey` read) and **M8.10.4** (the immutable sweep) are on
-[#79](https://github.com/pat-mw/revu/pull/79), **CI green**.
-
-**A CI red on #79 was not the change under review**, and is worth knowing before the next push: a
-thousand-call allocator test measured **437ms locally and 9372ms on the runner** against Bun's 5000ms
-default. The gate now passes `--timeout=20000` in the root `package.json` `test` *and* `check` scripts —
-**not** in `bunfig.toml`, which Bun ignores for that key.
-
-**M8.10.4 has landed too — the immutable sweep.** **Remaining, in dependency order: M8.10.7 → M8.10.5 →
-M8.10.6.** **M8.10.7 (the in-flight-sync gate) must
-land before M8.10.6 wires any caller** — it is the guard every prune call site routes through, and a guard
-written after its callers encodes what they do rather than what they must never do. M8.10.5 (the blob
-prune) needs 3 and 4 and ships **dark behind a policy flag** per ruling 3. M8.10.6 needs all six and, per
-**ruling 5**, must drive the prune **at a real local sync**, not by calling the prune function directly.
+`main` untouched at `177068a`. **Eleven PRs, one linear chain, none merged.** #78 is fully green.
+**#79 went red once on a pre-existing flake the diff never caused** — see the gate-timeout note below.
 
 ### The owner's rulings — 2026-08-19
 
@@ -124,7 +92,7 @@ opened. CI is green on all nine PRs.
 
 ## Tickets
 
-**97 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**98 units across 12 tickets** (M8.10.8 was appended at integration when a recorded owner ruling turned out to have no unit). Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
 count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
 from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14), and from 95 as three more

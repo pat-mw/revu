@@ -1,3 +1,81 @@
+## 2026-08-20 (later) — M8.10 is 7/7 units and NOT done; start at M8.10.8
+
+### Orient
+1. `git checkout m8.10/retention-and-gc` — stack tip, PR #79, base `m8.8/resync-and-pinning`.
+2. `TZ=UTC bun run check` → expect **2888 pass · 1 skip · 0 fail · 101 files**. The 1 skip is pre-existing.
+3. **Check CI on #79 before working.** It has been red once already on a flake the diff never caused.
+4. Read `BOARD.md`'s "Read this before calling M8.10 done" → this entry → `tickets/M8.10-*.md` `## Log`.
+
+### Start here: M8.10.8, and why it exists
+**All seven M8.10 units landed green and the owner's ruling 1 is still unimplemented.** The ruling — *the
+server refuses a delete while any human holds a non-empty draft* — was recorded at the ticket's Open
+question 3 and **never turned into a unit**, so no unit's `Do` ever asked for it and every unit passed.
+Two further wire-level disagreements ride along: direct **destroys** `local_drafts`/`local_viewed` for
+every human while the mock deliberately **orphans** them (and asserts they survive), and a repeated delete
+is `not_found` in the mock but idempotent in direct.
+
+**All three shipped green because `deleteLocalReview` has zero conformance coverage.** Fix that as part of
+the unit, and **move the mock first** — it is the oracle, and moving a transport first inverts the
+authority. The full statement is M8.10.8 in the ticket.
+
+**The transferable lesson: a unit percentage is not a done ticket.** Check every ruling recorded at an Open
+question has a unit that implements it before calling a ticket complete. This milestone has now been bitten
+by that twice.
+
+### State
+`main` untouched at `177068a`. **Eleven PRs, one linear chain, none merged:**
+`main` → #69 → … → #77 → **#78 (M8.8, 8/8, CI green)** → **#79 (M8.10, 7/7 units)**.
+**Stacked PRs are the protocol. Never merge, never commit to `main`, never retarget.**
+
+### Next, in order
+1. **M8.10.8** (mock first), then M8.10's `Verify`, then M8.8's `Verify`.
+2. **M8.9** — independent, unblocked; ruling 2 settled its trigger.
+3. **M8.11 is the real critical path** — **3 of the 6 exit criteria**, not started. Unit percentage does
+   not close the milestone; the criteria do.
+
+### The owner's five rulings — settled, do not re-ask
+1. **Delete + draft → the server refuses.** No contract change. **NOT YET IMPLEMENTED — this is M8.10.8.**
+2. **Archive detection → on each sync of that review.** (M8.9 OQ2)
+3. **Blob prune → off by default**, behind an explicit policy flag. **Done** — the default is encoded in
+   the type, and a withheld pass names its reason rather than returning a zero count.
+4. **Keep every pin** — conditional on M8.10 landing alongside M8.8. **Discharged.**
+5. **The prune runs after every successful local sync.** **Done** — it fires after the in-flight wrapper
+   exits, proved by a witness recording the gate count at the moment the deleting statement is reached.
+
+Still open, deliberately unasked: M8.9 OQ1/OQ8/OQ9, M8.8 OQ5, M8.8 OQ8 (a remedy promised for corruption
+a re-sync cannot repair — needs a reason field on `StoreUnreadableError`).
+
+### Landmines
+- **`TZ=UTC bun run check` before every push.** **The local gate is not CI.** One allocator case runs
+  **437ms locally and 9372ms on a runner** — a factor of twenty-one, because runners fsync far slower. The
+  gate now passes `--timeout=20000` from the root `package.json` scripts; **Bun ignores a `timeout` key in
+  `bunfig.toml`** (verified on 1.3.11), so raise it in `test` **and** `check` or the two disagree.
+- **NEVER `git add -A`.** Stage explicit paths; `git diff --cached --stat` before committing.
+- **⚠️ A git argv without `--end-of-options` is rejected before the spawn** — reports success, does
+  nothing. Route through `runGit` with refs/prefixes/SHAs in `revs`. Two ticket Checks have now specified
+  argvs the checker rejects.
+- **⚠️ A trigger-based absence test is vacuous if no row matches** — SQLite fires `BEFORE DELETE` triggers
+  once per *matched* row, so a tripwire on an empty table catches nothing. Seed before arming.
+- **⚠️ Asserting an error code is not asserting a path.** Two failures here raise `not_found` and both say
+  "re-sync"; pin a phrase only the path under test produces.
+- **⚠️ A staged red that gets skipped ships a vacuous test.** M8.10.5's acceptance leg first ran with the
+  blob policy off, so it was withheld and asserted nothing; it only went red once the flag was passed.
+- **Ticket line pointers are worthless.** **Every** pointer in M8.10's Context table was stale, some by
+  40+ lines, and one file path was wrong (`direct-router.ts` is not under `direct/`). Read the seam first.
+- **A `:memory:` store gives no second handle** for `SELECT COUNT(*)`; this suite's doctrine is that a raw
+  handle is the independent witness. Use `mkdtempSync`.
+- **`DirectApiDeps.syncGate` is optional by design** — the wrapper and every prune read one binding inside
+  `createDirectApi`, so it cannot come apart by omission. Do not "fix" it into a required field without
+  reading that reasoning; it would touch 40 construction sites.
+
+### For M8.11 when it starts
+- **`deleteLocalReview` has no conformance leg at all** — that is what let three wire-level divergences
+  ship green. M8.10.8 adds one; make sure M8.11 does not assume it is covered elsewhere.
+- The mock has **no `immutables` table**, so orphaning cannot exist there and the prune is invisible
+  through `RevuApi`. Retention is proven by revud-internal tests only. (M8.10 OQ9.)
+- `oracleResults` (`reconcile.test.ts:289`) replays only the mock's *classification*, not `newCommits`.
+- M8.8.4's pre-flight was deliberately not mirrored into the mock (the state is unreachable there).
+
 ## 2026-08-20 — M8.8 is complete and reviewed; M8.10 is open at 3/7 on #79
 
 ### Orient
