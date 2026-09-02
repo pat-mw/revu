@@ -12,7 +12,7 @@
  *   - The base64 REST decode and the `object()` batch shape.
  *   - A blob no tier can produce is reported `missing`, never fabricated.
  */
-import { describe, expect, test } from 'bun:test'
+import { beforeAll, describe, expect, test } from 'bun:test'
 import type { SnapshotImmutable } from '@revu/shared'
 import type { CommandResult, CommandRunner } from './command-runner'
 import type {
@@ -25,7 +25,7 @@ import type {
 import type { RepoRef } from './repo'
 import { unusedWriteMethods } from './github-write-stubs'
 import { openDirectStore, type DirectStore } from './store'
-import { isBinaryContent, provisionBlobs } from './blobs'
+import { BINARY_SNIFF_BYTES, isBinaryContent, provisionBlobs } from './blobs'
 
 const REPO: RepoRef = { owner: 'o', repo: 'r' }
 
@@ -173,6 +173,26 @@ describe('isBinaryContent — git NUL-in-first-8000-bytes heuristic', () => {
   })
   test('an empty blob is not binary', () => {
     expect(isBinaryContent(new Uint8Array(0))).toBe(false)
+  })
+
+  test('the window is 8000 bytes, stated once here', () => {
+    // The one place the number is written down as an assertion. Every other
+    // producer that has to reproduce this convention imports the constant
+    // instead of restating it, so this is the single pin the whole convention
+    // rests on — and the boundary cases above are what give it teeth.
+    expect(BINARY_SNIFF_BYTES).toBe(8000)
+  })
+
+  test('the exported constant is the window the heuristic actually applies', () => {
+    // Without this the pin above would hold over a constant nothing reads: a
+    // NUL at the last byte inside the exported window is binary, and the first
+    // byte outside it is not, both derived from the constant rather than typed.
+    const lastInside = new Uint8Array(BINARY_SNIFF_BYTES + 1).fill(0x41)
+    lastInside[BINARY_SNIFF_BYTES - 1] = 0
+    expect(isBinaryContent(lastInside)).toBe(true)
+    const firstOutside = new Uint8Array(BINARY_SNIFF_BYTES + 1).fill(0x41)
+    firstOutside[BINARY_SNIFF_BYTES] = 0
+    expect(isBinaryContent(firstOutside)).toBe(false)
   })
 })
 
@@ -510,3 +530,150 @@ describe('provisionBlobs — the cost ladder', () => {
     expect(store.getBlob('SAME')?.content).toBe('same\n')
   })
 })
+
+// ————————————————————————————————————————————————————————————————————————————
+// The hosted tier is reached when a client is supplied, and does not exist when
+// one is not. The two halves are a matched pair and neither means much alone.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * The distinctive failure the throwing client raises. A tag rather than a
+ * generic message so the observation is unmistakably of *this* client being
+ * called, and not of some other failure arriving at the same place.
+ */
+const COLD_TIER_TAG = 'cold-tier-was-entered'
+
+/**
+ * A client whose blob reads record the attempt and then throw. It exists to
+ * prove the ladder genuinely descends this far when a client is in hand: the
+ * absence test below asserts that nothing is fetched with no client present,
+ * and on its own that assertion would read identically on a build where the
+ * ladder stopped short for some completely unrelated reason. This is the half
+ * that tells those two apart.
+ */
+function throwingBlobApi(): { client: GithubClient; observed: string[] } {
+  const observed: string[] = []
+  const { client } = fakeApi({})
+  client.getBlobObjects = async (): Promise<Record<string, GhGraphqlBlobObject | null>> => {
+    observed.push('batch')
+    throw new Error(COLD_TIER_TAG)
+  }
+  client.getBlob = async (): Promise<GhBlobRaw> => {
+    observed.push('single')
+    throw new Error(COLD_TIER_TAG)
+  }
+  return { client, observed }
+}
+
+/**
+ * The identical situation both halves of the pair run against: an empty store,
+ * a local git that holds none of the objects, and three objects requested in an
+ * order that is not their sorted order — so a provider that reports them as a
+ * set rather than a sequence is visible.
+ */
+function coldSituation(): {
+  store: DirectStore
+  git: ReturnType<typeof fakeGitRunner>
+  index: SnapshotImmutable['blobIndex']
+  requested: string[]
+} {
+  return {
+    store: memStore(),
+    git: fakeGitRunner({}),
+    index: indexOf({
+      'a.ts': { base: 'Z1', head: 'M1' },
+      'b.ts': { base: null, head: 'A1' },
+    }),
+    requested: ['Z1', 'M1', 'A1'],
+  }
+}
+
+describe('with a client in hand, the cold tier is reached', () => {
+  const situation = coldSituation()
+  const api = throwingBlobApi()
+  const bumps: number[] = []
+  let result: Awaited<ReturnType<typeof provisionBlobs>>
+
+  beforeAll(async () => {
+    result = await provisionBlobs(
+      {
+        github: api.client,
+        repo: REPO,
+        store: situation.store,
+        runner: situation.git.runner,
+        cwd: '/repo',
+        counter: { bump: () => bumps.push(1) },
+      },
+      situation.index,
+    )
+  })
+
+  test('the client was called at all', () => {
+    expect(api.observed.length).toBeGreaterThan(0)
+  })
+
+  test('both cold reads were attempted, batch first and then one straggler per object', () => {
+    // The exact shape of the descent, so "the client was called" cannot be
+    // satisfied by a single incidental call on some other path.
+    expect(api.observed).toEqual(['batch', 'single', 'single', 'single'])
+  })
+
+  test('the objects are still reported missing rather than fabricated', () => {
+    expect(result.missing).toEqual(situation.requested)
+  })
+
+  test('a failed attempt is still an attempt, so request budget was spent', () => {
+    // The counter is what separates "the tier was skipped" from "the tier ran
+    // and failed": both end with the same missing list, and only this tells
+    // them apart.
+    expect(bumps.length).toBeGreaterThan(0)
+  })
+})
+
+describe('with no client in the dependencies, the cold tier does not exist', () => {
+  const situation = coldSituation()
+  const bumps: number[] = []
+  let result: Awaited<ReturnType<typeof provisionBlobs>>
+
+  beforeAll(async () => {
+    result = await provisionBlobs(
+      {
+        // No client key at all — not a null, not a flag. The compiler is what
+        // keeps this call site honest: making the client required again stops
+        // this file compiling rather than quietly re-enabling the hosted tier.
+        store: situation.store,
+        runner: situation.git.runner,
+        cwd: '/repo',
+        counter: { bump: () => bumps.push(1) },
+      },
+      situation.index,
+    )
+  })
+
+  test('nothing was fetched', () => {
+    expect(result.stats.blobsFetched).toBe(0)
+  })
+
+  test('nothing was reused either, so the store was genuinely cold', () => {
+    expect(result.stats.blobsReused).toBe(0)
+  })
+
+  test('every requested object is named missing, in the order it was requested', () => {
+    expect(result.missing).toEqual(situation.requested)
+  })
+
+  test('no request budget was spent, because no request was attempted', () => {
+    // The load-bearing difference from the paired control above. A provider
+    // that still walked into the hosted tier with nothing to call would fail
+    // in exactly the same swallowed way it fails for a dead network — same
+    // stats, same missing list — and only the unspent budget says otherwise.
+    expect(bumps).toEqual([])
+  })
+
+  test('the local read tier was still consulted, so the ladder really ran', () => {
+    // Without this the assertions above would also hold over a provider that
+    // returned early and never looked at anything.
+    expect(situation.git.calls.length).toBeGreaterThan(0)
+  })
+})
+

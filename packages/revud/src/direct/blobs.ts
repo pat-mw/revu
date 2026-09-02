@@ -36,8 +36,13 @@ import type { DirectStore } from './store'
  * binary bytes.
  */
 
-/** Git's binary sniff window: a NUL in the first this-many bytes marks a blob binary. */
-const BINARY_SNIFF_BYTES = 8000
+/**
+ * Git's binary sniff window: a NUL in the first this-many bytes marks a blob
+ * binary. Exported so anything that has to reproduce the same convention states
+ * the window once, here, rather than restating the number where a later change
+ * would move one copy and leave the other.
+ */
+export const BINARY_SNIFF_BYTES = 8000
 
 /**
  * The GraphQL `object()` batch size. GitHub's node-count limits and query size
@@ -53,8 +58,19 @@ export interface RequestBump {
 
 /** How blob bytes are provisioned, injectable so the whole path is unit-testable with fakes. */
 export interface BlobProviderDeps {
-  github: GithubClient
-  repo: RepoRef
+  /**
+   * The hosted-API client behind tier 3, and the repository its blob reads are
+   * addressed to. Both are OPTIONAL, and omitting them is how a caller that must
+   * not make hosted requests says so: tier 3 is then not entered at all, so
+   * there is no client in this object for any code path to mis-call. An absent
+   * client is a stronger statement than a flag saying "do not call it", because
+   * a flag leaves a callable client one forgotten branch away.
+   *
+   * They travel together. A client without a repository could address nothing,
+   * so either one missing disables the tier.
+   */
+  github?: GithubClient
+  repo?: RepoRef
   store: DirectStore
   runner: CommandRunner
   /** The git clone directory `git cat-file` runs in (the repo being reviewed). */
@@ -239,60 +255,77 @@ export async function provisionBlobs(
     coldPaths.set(sha, path)
   }
 
-  // Tier 3 — the GitHub API, only for what local git and the store both lacked.
-  // Batch through GraphQL `object()` aliases (~30/query); each batch is ONE API
-  // request regardless of how many blobs it carries, and every blob it returns
-  // is an honest fetch.
   const coldShas = [...coldPaths.keys()]
-  for (let i = 0; i < coldShas.length; i += GRAPHQL_BATCH_SIZE) {
-    const batch = coldShas.slice(i, i + GRAPHQL_BATCH_SIZE)
-    // A THROWN batch request (endpoint down, network gone) is a provisioning
-    // miss, not a sync failure: everything else in the snapshot is already
-    // fetched, and a missing blob is exactly what `partial` exists to name. So
-    // a failed batch leaves every SHA unresolved — each falls to the REST
-    // straggler below, which itself degrades to `missing` — rather than
-    // throwing away the whole sync. The attempt still cost one API request.
-    let objects: Record<string, GhGraphqlBlobObject | null> = {}
-    try {
-      objects = await github.getBlobObjects(repo.owner, repo.repo, batch)
-    } catch {
-      // Fall through with the empty map: every SHA in this batch is unresolved.
-    }
-    counter?.bump()
-    for (const sha of batch) {
-      const obj = objects[sha]
-      const path = coldPaths.get(sha) ?? ''
-      // The batch answer is trusted only when it is DECISIVE: an explicit
-      // `isBinary: true` (collapse it), or full untruncated text. GitHub nulls
-      // `text` both for binaries AND for blobs it cannot classify or render
-      // (`isBinary` itself can be null), and `isTruncated` marks text it
-      // clipped — minting a FileBlob from either would fabricate a collapsed
-      // "binary" out of a text file or store silently clipped content. Every
-      // indecisive answer falls to the single-blob REST endpoint, which
-      // returns the real bytes.
-      const indecisive =
-        obj === null ||
-        obj === undefined ||
-        (obj.isBinary !== true && (obj.text === null || obj.isTruncated === true))
-      if (indecisive) {
-        const rest = await fetchBlobViaRest(github, repo, sha, path)
-        counter?.bump()
-        if (rest !== null) {
-          provisioned.push(rest)
-          blobsFetched += 1
-        } else {
-          missing.push(sha)
-        }
-        continue
+  if (github === undefined || repo === undefined) {
+    // No hosted client was supplied, so there is no third tier — not a tier that
+    // is present and declines to run, but one this call has no way to enter.
+    //
+    // The consequence is deliberate and is the reason the omission is expressed
+    // as an absent dependency rather than as a flag. Tier 2 becomes the only
+    // producer of bytes, so an object the local clone can no longer produce —
+    // one whose commit was rewritten away and whose loose object has since been
+    // pruned — is reported here by name instead of being silently bought back
+    // over the network. That report is the signal: it says the reviewed content
+    // is no longer fully reachable locally, which is a fact worth surfacing,
+    // whereas a quiet hosted refetch would hide it behind a bill. What is never
+    // acceptable is the third option — inventing an empty blob so the counts
+    // come out even.
+    missing.push(...coldShas)
+  } else {
+    // Tier 3 — the GitHub API, only for what local git and the store both lacked.
+    // Batch through GraphQL `object()` aliases (~30/query); each batch is ONE API
+    // request regardless of how many blobs it carries, and every blob it returns
+    // is an honest fetch.
+    for (let i = 0; i < coldShas.length; i += GRAPHQL_BATCH_SIZE) {
+      const batch = coldShas.slice(i, i + GRAPHQL_BATCH_SIZE)
+      // A THROWN batch request (endpoint down, network gone) is a provisioning
+      // miss, not a sync failure: everything else in the snapshot is already
+      // fetched, and a missing blob is exactly what `partial` exists to name. So
+      // a failed batch leaves every SHA unresolved — each falls to the REST
+      // straggler below, which itself degrades to `missing` — rather than
+      // throwing away the whole sync. The attempt still cost one API request.
+      let objects: Record<string, GhGraphqlBlobObject | null> = {}
+      try {
+        objects = await github.getBlobObjects(repo.owner, repo.repo, batch)
+      } catch {
+        // Fall through with the empty map: every SHA in this batch is unresolved.
       }
-      const binary = obj.isBinary === true
-      const text = binary ? '' : (obj.text ?? '')
-      const size =
-        typeof obj.byteSize === 'number'
-          ? obj.byteSize
-          : new TextEncoder().encode(text).length
-      provisioned.push({ sha, path, content: text, size, binary })
-      blobsFetched += 1
+      counter?.bump()
+      for (const sha of batch) {
+        const obj = objects[sha]
+        const path = coldPaths.get(sha) ?? ''
+        // The batch answer is trusted only when it is DECISIVE: an explicit
+        // `isBinary: true` (collapse it), or full untruncated text. GitHub nulls
+        // `text` both for binaries AND for blobs it cannot classify or render
+        // (`isBinary` itself can be null), and `isTruncated` marks text it
+        // clipped — minting a FileBlob from either would fabricate a collapsed
+        // "binary" out of a text file or store silently clipped content. Every
+        // indecisive answer falls to the single-blob REST endpoint, which
+        // returns the real bytes.
+        const indecisive =
+          obj === null ||
+          obj === undefined ||
+          (obj.isBinary !== true && (obj.text === null || obj.isTruncated === true))
+        if (indecisive) {
+          const rest = await fetchBlobViaRest(github, repo, sha, path)
+          counter?.bump()
+          if (rest !== null) {
+            provisioned.push(rest)
+            blobsFetched += 1
+          } else {
+            missing.push(sha)
+          }
+          continue
+        }
+        const binary = obj.isBinary === true
+        const text = binary ? '' : (obj.text ?? '')
+        const size =
+          typeof obj.byteSize === 'number'
+            ? obj.byteSize
+            : new TextEncoder().encode(text).length
+        provisioned.push({ sha, path, content: text, size, binary })
+        blobsFetched += 1
+      }
     }
   }
 
