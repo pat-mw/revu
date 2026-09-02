@@ -13,6 +13,10 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 **Nothing is running.** Five tickets are In Review, all gated, reviewed and pushed. **No Todo ticket remains in
 M8**; the milestone closes when the chain merges.
 
+**Re-verified 2026-09-02 (third session, verification only):** gate on the tip **3348 · 1 · 0 · 117**,
+fifteen PRs open, none merged, CI green on #84; **no OQ10 ruling yet** — its seams are pinned in the
+handover's top entry so the unit executes either way. Nothing else is runnable without the owner.
+
 | ticket | state | branch / PR | gate |
 | --- | --- | --- | --- |
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |

@@ -1,3 +1,70 @@
+## 2026-09-02 (third session) — verification only; the chain waits on the owner (merges, OQ10)
+
+### Orient
+1. `git checkout board/m8.9-scratch-proof` — still the stack tip, [PR #84](https://github.com/pat-mw/revu/pull/84)
+   (board-only), base `m8.12/delete-confirm` ([PR #83](https://github.com/pat-mw/revu/pull/83)). The code tip is
+   still `m8.12/delete-confirm`; branch new code off `board/m8.9-scratch-proof` so the chain stays linear.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → **3348 pass · 1 skip · 0 fail · 117 files** (re-run
+   this session on the tip: 67 s, zero `(fail)` lines in the teed log).
+3. `gh pr list` → fifteen OPEN, #69 → … → #82 → #83 → #84. **No base has merged**; `origin/main` is still
+   `177068a`. `gh pr checks 84` → check · conformance-matrix · e2e pass (docs-build is path-filtered; Vercel
+   green).
+4. Read `BOARD.md` → this entry → the previous entry — its "What this session learned" and "Landmines" apply in
+   full and are not repeated here.
+
+### State
+Unchanged from the previous entry: every M8 ticket In Review, every `Verify` line run, fifteen PRs in one
+linear chain, none merged, `main` untouched. **No code changed this session.** This record rides #84's branch
+rather than opening a sixteenth PR — a verification-only session has nothing that warrants its own PR.
+
+### What this session did
+- Re-verified the chain, the gate and CI (numbers above).
+- **Looked for an OQ10 ruling and found none.** #82, #83 and #84 carry only the Vercel bot's comment; no
+  review-thread comments, no reviews; `gh issue list` is empty; the ticket's OQ10 text is unchanged. **Do not
+  pick a side** — the two shapes below are so the ruling executes as one unit, not a recommendation.
+- **Pinned the seams OQ10's unit touches, whichever way it lands** (read each before editing — line pointers
+  rot, these are named by symbol on purpose):
+  - **App predicate:** `packages/app/src/lib/review-mode.ts` — `reviewArchived`
+    (`mode === 'local' && state === 'closed'`) and `reviewComposerHidden` (the same truth under its own name;
+    its docstring says why they are two functions). `reviewComposerHidden`'s **only** consumer is
+    `packages/app/src/components/review/review-bar.tsx` (`writesHidden`). The inline gutter composer opens
+    through `openComposer` in `packages/app/src/pages/files.tsx` — reached from the gutter selection and from
+    the `openComposerAt` handle declared in `packages/app/src/state/files-view.tsx` — and consults **nothing**
+    about the review's state.
+  - **Write sink, direct:** `saveDraft` in `packages/revud/src/direct/local-surface.ts` does `requireReview`
+    then `store.putLocalDraft`; it never calls the archived refusal. The four refused verbs are in
+    `packages/revud/src/direct/local-writes.ts` through `archivedRefusal(deps, localId)` (submit answers
+    `{ status: 'forbidden', reason }`; the other three throw `ApiError('forbidden', …)`). The sentence comes
+    from `archivedReviewRefusal` in `packages/shared/src/lib/local-archive.ts`, shared with the mock.
+  - **Write sink, mock:** `saveDraft` in `packages/app/src/api/mock/adapter.ts` does
+    `local.requireLocalReviewForDraft` then `store.putDraft`; no `archivedRefusalFor`. The mock's four refusals
+    are in `packages/app/src/api/mock/local.ts` (`archivedRefusalFor(record)`).
+  - **Shared conformance:** `packages/shared/conformance/local-archive.ts` holds the archived-review cases;
+    a "draft `PUT` on an archived review" case belongs beside them and runs on legs E/F/G with no adapter.
+  - **Guide:** `packages/docs/content/docs/guides/local-review.mdx` — the archive paragraph ("keeping
+    everything it holds, every thread, every draft") and the "Read-only, never destructive" callout are where
+    "a draft stays editable" would be said if the ruling is keep.
+- **Ruling A — refuse:** `saveDraft` on both transports calls the archived refusal before the write, answering
+  `forbidden` with the same sentence the four verbs use; one shared case in `local-archive.ts` asserting the
+  refusal **and** that the stored draft is unchanged after it (a read behind the claim); the gutter open path
+  gated by `reviewComposerHidden` (the review's state has to reach `files.tsx` / the `openComposerAt` handle).
+  Two things for the owner to say with the ruling: whether `discardDraft` stays open on an archived review (so
+  a kept draft can still be cleaned up), and that the client keeps the refused text editable — "drafts survive
+  everything" is a hard constraint, and a refused save must roll back with text intact.
+- **Ruling B — keep:** one sentence in the guide's archive paragraph saying a draft on an archived review can
+  still be edited and saved but never submitted; a shared case in `local-archive.ts` pinning that `saveDraft`
+  on an archived review answers 200 and round-trips through `getDraft` (so the mock stays the spec for it, not
+  an accident); the ticket's OQ10 closed with the ruling.
+
+### Next, in order
+Unchanged: (1) if a base merges, rebase the rest of the stack onto it and retarget its PR — never merge, never
+touch `main`, never retarget ahead of a merge; (2) OQ10's unit only on the owner's ruling, as one unit;
+(3) the follow-ups listed in the previous entry only if the owner asks for them.
+
+### Landmines (additions)
+- zsh expands an unquoted `--include=*.tsx` inside `grep -r` and aborts the whole command with `no matches
+  found`; quote the glob. Same family as the `=word` expansion already recorded.
+
 ## 2026-09-02 (later) — M8.9's scratch-repo proof is done; every M8 Verify line has now run
 
 ### Orient

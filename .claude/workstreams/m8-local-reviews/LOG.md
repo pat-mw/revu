@@ -664,3 +664,14 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
   shared conformance case for draft verbs on a deleted review; the stale `.claude/worktrees/agent-*`
   directories; a committed live direct runner if leg C is ever meant to run; OQ10's unit; the title field's
   append-not-replace nit.
+
+**update — 2026-09-02 (verification only)**
+- **Done:** re-verified the stack tip: gate **3348 · 1 · 0 · 117** (67 s, zero `(fail)` lines in the teed
+  log); fifteen PRs open in one chain, none merged, `origin/main` still `177068a`; CI green on #84. Looked for
+  an OQ10 ruling and found none (no PR comments beyond the Vercel bot, no reviews, no review-thread comments,
+  no issues). Pinned OQ10's seams in the handover — the app predicate and its single consumer, the gutter's
+  ungated open path, `saveDraft` on both transports, the shared archived-cases file, the guide paragraph — so
+  the ruling executes as one unit either way. **No code changed**; this record rides #84.
+- **Decisions:** none. OQ10 stays the owner's call, deliberately unmade here.
+- **Blockers:** the chain waits on the owner's merges and on the OQ10 ruling; nothing else is runnable.
+- **Next:** unchanged — rebase and retarget on a merge; OQ10's unit on a ruling; follow-ups only on request.
