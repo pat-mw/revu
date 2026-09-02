@@ -10,14 +10,26 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing is running.** Four tickets are In Review, all gated, reviewed and pushed. M8.12 is next.
+**Nothing is running.** Five tickets are In Review, all gated, reviewed and pushed. **No Todo ticket remains in
+M8**; the milestone closes when the chain merges.
 
 | ticket | state | branch / PR | gate |
 | --- | --- | --- | --- |
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
 | **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
 | **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI green** (check · conformance-matrix · e2e · docs-build) |
-| **M8.9** archive when a PR appears | In Review, **8/8, `Verify` run**, adversarial pass done (five findings landed) | `m8.9/archive-on-pr` · [#82](https://github.com/pat-mw/revu/pull/82) | 3276 · 1 · 0 · 116, matrix A/B/E/F/G PASS, e2e ×2 PASSED — **CI pending at hand-off** |
+| **M8.9** archive when a PR appears | In Review, **8/8, `Verify` run**, adversarial pass done (five findings landed) | `m8.9/archive-on-pr` · [#82](https://github.com/pat-mw/revu/pull/82) | 3276 · 1 · 0 · 116, matrix A/B/E/F/G PASS, e2e ×2 PASSED, **CI green** (check · conformance-matrix · e2e · docs-build) |
+| **M8.12** delete confirmation | In Review, **3/3, `Verify` green**, adversarial pass done (one blocker + six findings landed) | `m8.12/delete-confirm` · [#83](https://github.com/pat-mw/revu/pull/83) | 3348 · 1 · 0 · 117, **CI pending at hand-off** |
+
+**M8.12 lands the delete affordance** (in review on #83): the app had no way to delete a local review at all,
+so the ticket built the action, the mutation and the confirmation from nothing under the no-force ruling —
+confirm discards the reader's own draft through the draft store's own path, then repeats the same delete. Its
+adversarial review found a blocker the tests had not: a *failed* discard still dropped the cached draft, which
+is the editing surface, so an outage erased an edit whose save had failed in the same outage. Fixed with a
+result that reports whether a discard happened and a cache rule that drops the draft only after one that
+succeeded; six honesty holes (whose draft is in the way, a discard followed by a failed delete, the synthetic
+id inside the refusal sentence in both producers, a race with a pending save, "nothing was deleted" after
+something was) landed with it.
 
 **M8.9 lands D1** (in review on #82): a local review is archived on the sync that finds an open pull request
 on its branch pair — read-only through the write sink's own port, frozen at its last successful sync, linked
@@ -106,7 +118,7 @@ unreachable, so M8.10 may start.
 Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
-**The stack, bottom-up — thirteen PRs, none merged** (#82, M8.9, now sits above #80): `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+**The stack, bottom-up — fourteen PRs, none merged** (#82 M8.9 and #83 M8.12 now sit above #80): `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
 (M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8) →
 [#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 8/8) → [#80](https://github.com/pat-mw/revu/pull/80)
 (M8.11, 8/8). `main` is untouched at `177068a`.
@@ -143,7 +155,7 @@ is derived from it, never the other way round.**
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | **In Review** (8/8, `Verify` run) | 8 | revud, app, shared | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | [#82](https://github.com/pat-mw/revu/pull/82) |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | **In Review** (8/8, `Verify` green) | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | [#80](https://github.com/pat-mw/revu/pull/80) |
-| [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
+| [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | **In Review** (3/3, `Verify` green) | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | [#83](https://github.com/pat-mw/revu/pull/83) |
 
 ## Dependency graph
 
