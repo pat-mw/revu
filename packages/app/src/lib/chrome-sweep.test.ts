@@ -56,6 +56,8 @@ import * as modeCopy from './mode-copy'
 import {
   authorBannerCopy,
   conversationEmptyCopy,
+  deleteLocalReviewCopy,
+  deleteLocalReviewRefusedCopy,
   dirtyWorktreeCopy,
   draftSavedCopy,
   neverSyncedCopy,
@@ -116,6 +118,10 @@ const SCANNED: ScannedFile[] = [
     marker: /export function SupersededBanner\(/,
   },
   { path: 'components/review/head-moved-dialog.tsx', marker: /export function HeadMovedDialog\(/ },
+  {
+    path: 'components/confirm-delete-local-review.tsx',
+    marker: /export function ConfirmDeleteLocalReviewBody\(/,
+  },
 ]
 
 /**
@@ -634,6 +640,49 @@ describe('the launcher names the open review rather than assuming one', () => {
   })
 })
 
+describe('the delete confirmation is drawn where it can be read, and says what it is given', () => {
+  test('the confirmation asks the copy module for every sentence in it', () => {
+    // PRESENCE, not execution. What it turns red is the confirmation quietly
+    // growing its own wording — which every assertion that calls the module
+    // would stay green through, because the module would still be right.
+    expect(
+      importsFrom('components/confirm-delete-local-review.tsx', '@/lib/mode-copy', 'deleteLocalReviewCopy'),
+    ).toBe(true)
+    expect(
+      importsFrom(
+        'components/confirm-delete-local-review.tsx',
+        '@/lib/mode-copy',
+        'deleteLocalReviewRefusedCopy',
+      ),
+    ).toBe(true)
+  })
+
+  test('and it is offered on a branch pair only, named by its branch pair', () => {
+    // Two decisions in one line, and both are invisible to every assertion
+    // that calls a pure function: dropping the gate puts a delete control on
+    // every pull request header, and handing it anything but the row's own
+    // identity is how the synthetic key reaches a screen. Structural, and
+    // deliberately so — there is no render of this layout to assert against,
+    // because it needs a query client, a session and a loaded list first.
+    expect(scanned('pages/pr-layout.tsx')).toContain(
+      "{mode === 'local' && ( <DeleteLocalReviewAction prNumber={prNumber} identity={rowIdentity(item)} /> )}",
+    )
+  })
+
+  test('and the review header is where it is raised from', () => {
+    // The affordance is the only way a reader reaches the delete at all, so a
+    // tidy-up that removed the import would leave a confirmation nothing can
+    // open and no assertion about the confirmation itself would notice.
+    expect(
+      importsFrom(
+        'pages/pr-layout.tsx',
+        '@/components/confirm-delete-local-review',
+        'ConfirmDeleteLocalReviewDialog',
+      ),
+    ).toBe(true)
+  })
+})
+
 describe('the topbar consults the rate-chip gate', () => {
   test('the shell imports the gate by name', () => {
     // The rate chip is the one surface in this sweep whose regression adds NO
@@ -704,6 +753,11 @@ const SWEPT: SweptCopy[] = [
   { name: 'stateChipVariant', text: flatten(stateChipVariant('local', 'closed')) },
   { name: 'supersededBadgeCopy', text: flatten(supersededBadgeCopy('local', 101)) },
   { name: 'supersededBannerCopy', text: flatten(supersededBannerCopy('local', 101)) },
+  {
+    name: 'deleteLocalReviewCopy',
+    text: flatten(deleteLocalReviewCopy('local', { pendingCount: 3, hasBody: true })),
+  },
+  { name: 'deleteLocalReviewRefusedCopy', text: flatten(deleteLocalReviewRefusedCopy('local')) },
 ]
 
 describe('the copy sweep covers the module it is sweeping', () => {

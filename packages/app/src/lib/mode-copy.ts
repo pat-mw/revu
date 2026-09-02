@@ -613,3 +613,110 @@ export function orgMemberTitle(mode: ReviewMode): string | null {
 export function orgMemberChip(mode: ReviewMode): string | null {
   return mode === 'local' ? null : 'org member · github.com'
 }
+
+/** What an unsubmitted draft holds, as much as the confirmation needs to say. */
+export interface DeleteDraftSummary {
+  /** Line comments written and not yet submitted. */
+  pendingCount: number
+  /** Whether the summary field has any character in it. */
+  hasBody: boolean
+}
+
+/** The lines of the confirmation asked before a review is deleted. */
+export interface DeleteReviewCopy {
+  /** The question, naming the act rather than hedging it. */
+  title: string
+  /** What goes with the review, and what the reader is giving up to delete it. */
+  body: string
+  /** The label on the destructive control, which names everything it does. */
+  confirm: string
+  /** The label on the way out. */
+  cancel: string
+}
+
+/** How a draft is described inside the body, or null when it holds nothing. */
+function describeDraft(draft: DeleteDraftSummary | null): string | null {
+  if (draft === null) return null
+  const comments =
+    draft.pendingCount > 0
+      ? `${draft.pendingCount} pending comment${draft.pendingCount === 1 ? '' : 's'}`
+      : null
+  const summary = draft.hasBody ? 'a summary' : null
+  if (comments !== null && summary !== null) return `${comments} and ${summary}`
+  return comments ?? summary
+}
+
+/**
+ * The confirmation asked before a review of two local branches is deleted, or
+ * `null` on the other reading.
+ *
+ * Null rather than a softer sentence, and it is not a stylistic choice: nothing
+ * in this app deletes a mediated review. There is no act to confirm there, so
+ * there is no honest wording to fall back to, and inventing one would invent
+ * the act behind it.
+ *
+ * ## Why the draft clause is a promise the copy has to keep exactly
+ *
+ * A delete is refused outright while any human's unsubmitted draft on the
+ * review holds text, and the only way past that refusal is to discard the
+ * draft first. So confirming here does two things, not one, and the second is
+ * irreversible in a way the first is not: the review's threads and history are
+ * a record the reader chose to build, while the draft is text they were still
+ * writing.
+ *
+ * The wording therefore says DISCARDED, and says the text is not kept. It must
+ * not say "lost" — the product reserves that word for the guarantee that
+ * nothing was, and every other failure sentence in this module ends with it —
+ * and it must not imply the text survives somewhere out of reach. Both
+ * readings would be a promise of recovery that does not exist: after the
+ * discard the characters are gone, by the reader's own explicit choice, which
+ * is exactly why they are asked before it happens rather than told after.
+ *
+ * A draft holding nothing gets the plain wording, because the plain wording is
+ * what is true of it: the delete is not refused for an empty draft, no discard
+ * happens, and promising one would describe an act the confirm never performs.
+ */
+export function deleteLocalReviewCopy(
+  mode: ReviewMode,
+  draft: DeleteDraftSummary | null,
+): DeleteReviewCopy | null {
+  if (mode !== 'local') return null
+  const held = describeDraft(draft)
+  const kept = 'Its threads, its submitted reviews and its synced history go with it.'
+  const branches = 'The two branches themselves are untouched.'
+  if (held === null) {
+    return {
+      title: 'Delete this local review?',
+      body: `${kept} ${branches}`,
+      confirm: 'Delete review',
+      cancel: 'Cancel',
+    }
+  }
+  return {
+    title: 'Delete this local review?',
+    body: `${kept} Deleting first discards your unsubmitted draft — ${held} — and that text is not kept anywhere. ${branches}`,
+    confirm: 'Discard draft and delete',
+    cancel: 'Cancel',
+  }
+}
+
+/**
+ * The one sentence for a delete still refused after the reader discarded their
+ * own draft, or `null` on the other reading.
+ *
+ * There is exactly one thing that can be true then. The refusal spans every
+ * human's draft rather than the caller's alone — two people reviewing one
+ * branch pair hold two drafts, and the delete would take both — so a refusal
+ * that survives the discard is somebody else's unsubmitted text standing in
+ * the way, and nothing on this screen can or should reach it.
+ *
+ * It is a FRAME, not a replacement: the surface that draws it also draws the
+ * refusal exactly as the workspace worded it, because only that side knows
+ * which review and which draft. This says what the reader needs before reading
+ * it — that the review is still there, and that the remedy is not theirs to
+ * apply.
+ */
+export function deleteLocalReviewRefusedCopy(mode: ReviewMode): string | null {
+  if (mode !== 'local') return null
+  return 'Nothing was deleted — an unsubmitted draft written by someone else is still on this review, and only they can discard it.'
+}
