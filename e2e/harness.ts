@@ -2,12 +2,20 @@
  * End-to-end harness: boots the real built app behind the revud daemon and
  * drives it with a headless system Chrome.
  *
- * The daemon serves the actual `packages/app/dist` (built in HTTP mode, so the
- * app makes same-origin `/api/*` calls) on an ephemeral port with a fresh temp
- * data directory, so every run starts from pristine fixtures and never touches
- * a real data dir. Simulated latency is zeroed after ready so flows are fast
- * and deterministic. `stop()` tears everything down: it closes the browser,
- * SIGTERMs the daemon, and removes the temp data dir.
+ * By default the daemon serves the actual `packages/app/dist` (built in HTTP
+ * mode, so the app makes same-origin `/api/*` calls) on an ephemeral port with
+ * a fresh temp data directory, so every run starts from pristine fixtures and
+ * never touches a real data dir. Simulated latency is zeroed after ready so
+ * flows are fast and deterministic. `stop()` tears everything down: it closes
+ * the browser, SIGTERMs the daemon, and removes the data dir it created.
+ *
+ * A driver that needs something other than that default — another daemon mode,
+ * a working directory to run inside, its own data directory, extra environment,
+ * a module preloaded into the daemon process — passes `HarnessOptions` through
+ * to `resolveHarnessOptions`, which decides the whole spawn. Two rules from
+ * there carry into this file: the no-options spawn is byte-identical to what
+ * this harness has always started, and a data directory the caller supplied is
+ * never removed on teardown.
  *
  * The browser uses the installed system Chrome via playwright-core
  * (`channel: 'chrome'`) — no browser downloads. `E2E_CHROME_PATH` overrides the
@@ -15,14 +23,15 @@
  */
 import { chromium } from 'playwright-core'
 import type { Browser, BrowserContext, Page } from 'playwright-core'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { Subprocess } from 'bun'
+import { resolveHarnessOptions } from './harness-options'
+import type { HarnessOptions } from './harness-options'
 
-/** Absolute path to the revud entrypoint and the real built app dist. */
-const REVUD_ENTRY = resolve(import.meta.dir, '../packages/revud/src/index.ts')
-const DIST_DIR = resolve(import.meta.dir, '../packages/app/dist')
+// The daemon entry and the built dist live with the spawn decision that uses
+// them; re-exported here so a driver needs only this module.
+export { DIST_DIR, REVUD_ENTRY } from './harness-options'
 
 /** Where screenshots-on-failure land. */
 export const ARTIFACTS_DIR = resolve(import.meta.dir, 'artifacts')
@@ -33,7 +42,7 @@ export interface Harness {
   browser: Browser
   /** Base URL of the running daemon, e.g. `http://localhost:53219`. */
   base: string
-  /** Close the browser, kill the daemon, and remove the temp data dir. */
+  /** Close the browser, kill the daemon, and remove a temp data dir it created. */
   stop(): Promise<void>
 }
 
@@ -41,6 +50,8 @@ interface Daemon {
   proc: Subprocess
   base: string
   dataDir: string
+  /** True when the harness created `dataDir` and so may remove it on teardown. */
+  ownsDataDir: boolean
 }
 
 /** Wait until `GET /api/session` answers, or throw after a bounded number of tries. */
@@ -61,26 +72,24 @@ async function waitReady(base: string, tries = 100): Promise<void> {
 }
 
 /**
- * Start a revud child process serving the real built dist on an ephemeral port
- * with a fresh temp data directory and zero simulated latency.
+ * Start a revud child process on an ephemeral port with zero simulated latency.
+ * With no options that is the real built dist, mock mode and a fresh temp data
+ * directory; anything else the caller asks for is decided by
+ * `resolveHarnessOptions` before the spawn.
  */
-async function startDaemon(): Promise<Daemon> {
-  const dataDir = mkdtempSync(join(tmpdir(), 'revu-e2e-'))
-  const proc = Bun.spawn(['bun', 'run', REVUD_ENTRY], {
-    env: {
-      ...process.env,
-      REVU_PORT: '0',
-      REVU_DATA_DIR: dataDir,
-      REVU_DIST_DIR: DIST_DIR,
-      REVU_MODE: 'mock',
-    },
+async function startDaemon(options?: HarnessOptions): Promise<Daemon> {
+  const { dataDir, ownsDataDir, cwd, env, argv } = resolveHarnessOptions(options)
+  const proc = Bun.spawn(argv, {
+    env,
+    cwd,
     stdout: 'pipe',
     stderr: 'pipe',
   })
 
   // Everything past the spawn can throw (a wedged daemon, a failed readiness
-  // probe); on any failure kill the child and remove the temp dir so a failed
-  // start never leaks a live process holding a port or an orphaned data dir.
+  // probe); on any failure kill the child and remove the data dir if this
+  // harness created it, so a failed start never leaks a live process holding a
+  // port or an orphaned temp dir — and never deletes a caller's directory.
   try {
     // The startup line reports the bound port: "... on http://localhost:PORT ...".
     // A timer kills the child after a bound so a daemon that opens stdout but
@@ -127,25 +136,28 @@ async function startDaemon(): Promise<Daemon> {
       body: JSON.stringify({ latency: 'zero' }),
     })
     await res.body?.cancel()
-    return { proc, base, dataDir }
+    return { proc, base, dataDir, ownsDataDir }
   } catch (error) {
     proc.kill()
-    rmSync(dataDir, { recursive: true, force: true })
+    if (ownsDataDir) rmSync(dataDir, { recursive: true, force: true })
     throw error
   }
 }
 
 /**
- * Boot the daemon against the real dist, then launch a headless system Chrome
- * and open a page. The returned `stop()` cleans up everything.
+ * Boot the daemon — against the real dist in mock mode unless `options` say
+ * otherwise — then launch a headless system Chrome and open a page. The
+ * returned `stop()` cleans up everything the harness created.
  */
-export async function startHarness(): Promise<Harness> {
-  const daemon = await startDaemon()
+export async function startHarness(options?: HarnessOptions): Promise<Harness> {
+  const daemon = await startDaemon(options)
 
   const killDaemon = async (): Promise<void> => {
     daemon.proc.kill('SIGTERM')
     await daemon.proc.exited
-    rmSync(daemon.dataDir, { recursive: true, force: true })
+    // Only a directory this harness minted is removed; a caller's own data dir
+    // outlives the run.
+    if (daemon.ownsDataDir) rmSync(daemon.dataDir, { recursive: true, force: true })
   }
 
   // The daemon is already up; from here any failure must still tear it down and

@@ -88,4 +88,8 @@ without a recorded reason** — three were owner calls and the rest are load-bea
 ## Status
 
 Designed 2026-08-12. Design landed on [PR #69](https://github.com/pat-mw/revu/pull/69) (docs only, gate
-green). No implementation has started. Current ticket states are in [`BOARD.md`](./BOARD.md).
+green). Implemented across a linear stack of twelve PRs, none merged; as of 2026-09-02 every exit criterion
+above has a green run on the stack tip ([#80](https://github.com/pat-mw/revu/pull/80), M8.11) — the walk is
+at that ticket's Verify 7. The boxes tick when the chain merges. M8.9 (archive on PR appearance) and M8.12
+(delete confirmation) remain; neither is named by an exit criterion. Current ticket states are in
+[`BOARD.md`](./BOARD.md).

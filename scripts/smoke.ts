@@ -32,6 +32,8 @@ const { createMockApi } = await import('../packages/app/src/api/mock/adapter')
 const { mockDev } = await import('../packages/app/src/api/mock/devtools')
 const { parseCommentIdentity } = await import('@revu/shared')
 const { ApiError } = await import('@revu/shared')
+const { isLocalReviewId } = await import('@revu/shared')
+const { LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } = await import('@revu/shared')
 
 let failures = 0
 function check(label: string, cond: boolean, detail?: unknown) {
@@ -51,14 +53,26 @@ const api = createMockApi()
 const session = await api.getSession()
 check('session is default human h-priya', session.human.id === 'h-priya', session.human)
 
+// The listing carries pull requests AND the workspace's local reviews, which
+// share one id space split by the reserved band. Each half is pinned by
+// IDENTITY rather than by a total, so a fixture that lost a pull request while
+// gaining a local review cannot balance the books and pass.
 const list = await api.listPulls()
-check('list has 10 pulls', list.items.length === 10, list.items.length)
 const numbers = list.items.map((i) => i.pull.number).sort((a, b) => a - b)
+const pullNumbers = numbers.filter((n) => !isLocalReviewId(n))
+const localIds = numbers.filter((n) => isLocalReviewId(n))
 check(
   'pull numbers complete',
-  JSON.stringify(numbers) === JSON.stringify([101, 204, 312, 347, 355, 362, 389, 401, 410, 415]),
-  numbers,
+  JSON.stringify(pullNumbers) ===
+    JSON.stringify([101, 204, 312, 347, 355, 362, 389, 401, 410, 415]),
+  pullNumbers,
 )
+check(
+  'exactly one local review, in the reserved band',
+  localIds.length === 1 && localIds[0] >= LOCAL_REVIEW_ID_BASE,
+  localIds,
+)
+check('list has 11 rows and nothing else', list.items.length === 11, list.items.length)
 const again = await api.listPulls({ etag: list.etag })
 check('etag match → notModified', again.notModified === true)
 
@@ -110,8 +124,20 @@ check(
 )
 await api.syncPull(389)
 const report = await api.reconcileDraft(389)
-const kinds = report.results.map((r) => r.kind).sort()
-check('389 reconcile → clean/drifted/lost', JSON.stringify(kinds) === JSON.stringify(['clean', 'drifted', 'lost']), report.results)
+// Pinned per comment key: a bare sorted multiset of kinds would go on passing
+// after a fixture comment swapped which side of the drift it landed on.
+const kinds = report.results.map((r) => [r.comment.key, r.kind])
+check(
+  '389 reconcile classifies every seeded comment',
+  JSON.stringify(kinds) ===
+    JSON.stringify([
+      ['pc-389-margin', 'clean'],
+      ['pc-389-firein', 'drifted'],
+      ['pc-389-shim', 'lost'],
+      ['pc-389-legacy-signature', 'clean'],
+    ]),
+  kinds,
+)
 const drifted = report.results.find((r) => r.kind === 'drifted')
 check('389 drifted delta is +12', drifted?.kind === 'drifted' && drifted.delta === 12, drifted)
 check('389 reconcile lists 3 new commits', report.newCommits.length === 3, report.newCommits.length)
@@ -174,7 +200,7 @@ const after312 = await api.listReviewThreads(312)
 check('312 submit created a thread', after312.length === before312 + 1, { before: before312, after: after312.length })
 check('312 draft cleared after submit', (await api.getDraft(312)) === null)
 const newThread = after312[after312.length - 1]
-const parsed = parseCommentIdentity(newThread.comments[0])
+const parsed = parseCommentIdentity(newThread.comments[0], session.brokerLogin)
 check('312 new comment renders as Priya (smuggled identity)', parsed.identity.kind === 'human' && parsed.identity.name === 'Priya Raman', parsed.identity)
 
 // ——— approve on org PR (355) ———
@@ -194,7 +220,7 @@ const threads347 = await api.listReviewThreads(347)
 check('347 has 4 unresolved threads', threads347.filter((t) => !t.isResolved).length === 4)
 const target = threads347.find((t) => !t.isResolved)!
 const reply = await api.replyToThread(347, target.id, 'Pushed a fix in the latest commit.')
-const replyParsed = parseCommentIdentity(reply)
+const replyParsed = parseCommentIdentity(reply, session.brokerLogin)
 check('347 reply smuggles current human', replyParsed.identity.kind === 'human' && replyParsed.identity.name === 'Priya Raman')
 check('347 reply threads updated in snapshot', (await api.listReviewThreads(347)).find((t) => t.id === target.id)!.comments.length === target.comments.length + 1)
 const commentWithReaction = threads347.flatMap((t) => t.comments).find((c) => c.reactions.total_count > 0)
@@ -216,7 +242,13 @@ mockDev.setHuman('h-alice')
 check('draft isolation: alice sees no 389 draft', (await api.getDraft(389)) === null)
 check('viewed isolation: alice sees no 312 viewed state', Object.keys(await api.getFileViewed(312)).length === 0)
 mockDev.setHuman('h-priya')
-check('draft survives identity round-trip', (await api.getDraft(389))?.comments.length === 3)
+const roundTripped = (await api.getDraft(389))?.comments.map((c) => c.key) ?? []
+check(
+  'draft survives identity round-trip',
+  JSON.stringify(roundTripped) ===
+    JSON.stringify(['pc-389-margin', 'pc-389-firein', 'pc-389-shim', 'pc-389-legacy-signature']),
+  roundTripped,
+)
 
 // ——— resolve/unresolve ———
 const t347 = (await api.listReviewThreads(347)).find((t) => !t.isResolved)!
@@ -224,6 +256,128 @@ const resolved = await api.resolveThread(347, t347.id, true)
 check('resolve flips thread', resolved.isResolved === true)
 const li347 = (await api.listPulls()).items.find((i) => i.pull.number === 347)!
 check('broker unresolved count follows remote truth', li347.broker.unresolvedThreads === 3, li347.broker.unresolvedThreads)
+
+// ——— local review, end to end (no pull request behind it) ———
+// A branch pair the workspace reviews without anything ever being pushed:
+// created, synced, commented on, submitted, replied to and resolved. It runs
+// last among the passing scenarios because it ADDS a row to the listing, and
+// the fixture counts asserted at the top are about the workspace as it loads.
+const localPair = { baseRef: 'main', headRef: 'feature/smoke-local' }
+const localAnchor = { path: 'src/index.ts', line: 12, lineText: 'const x = compute()' }
+const localBody = 'This guard clause reads inverted — the early return is the happy path.'
+const local = await api.createLocalReview({ ...localPair, title: 'Smoke: local review walk' })
+check(
+  'local review id comes from the reserved review band',
+  isLocalReviewId(local.id) && local.id >= LOCAL_REVIEW_ID_BASE,
+  local.id,
+)
+check(
+  'local review is listed exactly once',
+  (await api.listLocalReviews()).filter((r) => r.id === local.id).length === 1,
+)
+check(
+  'local review shows up in the pull listing',
+  (await api.listPulls()).items.some((i) => i.pull.number === local.id),
+)
+// Nothing cached yet is an ordinary answer, not a rejection the UI would have
+// to route down an error path.
+check('local review starts unsynced (null, not a throw)', (await api.getSnapshot(local.id)) === null)
+
+const localSnap = await api.syncPull(local.id)
+// The key half matters: a `partial` whose value went undefined vanishes in
+// serialization, and a `=== null` check alone would still pass.
+check(
+  'local sync carries partial as a present key valued null',
+  Object.hasOwn(localSnap, 'partial') && localSnap.partial === null,
+  localSnap.partial,
+)
+check(
+  'local compare key is mergeBase...head',
+  localSnap.immutable.compareKey ===
+    `${localSnap.immutable.mergeBaseSha}...${localSnap.immutable.headSha}`,
+  localSnap.immutable.compareKey,
+)
+
+const localAt = new Date().toISOString()
+const localDraft = await api.saveDraft({
+  humanId: session.human.id,
+  prNumber: local.id,
+  headSha: localSnap.immutable.headSha,
+  compareKey: localSnap.immutable.compareKey,
+  body: 'One blocking question.',
+  event: 'COMMENT',
+  comments: [
+    {
+      key: 'smoke-local-12',
+      path: localAnchor.path,
+      side: 'RIGHT',
+      start_side: null,
+      line: localAnchor.line,
+      start_line: null,
+      body: localBody,
+      createdAt: localAt,
+      updatedAt: localAt,
+      anchor: { lineText: localAnchor.lineText, contextBefore: [], contextAfter: [] },
+    },
+  ],
+  createdAt: localAt,
+  updatedAt: localAt,
+})
+check('local draft saved with one pending comment', localDraft.comments.length === 1, localDraft)
+
+const localMoved = await api.submitReview({
+  prNumber: local.id,
+  expectedHeadSha: 'not-the-real-head',
+  event: 'COMMENT',
+  body: localDraft.body,
+  comments: localDraft.comments,
+})
+check('local submit vs wrong head → head_moved', localMoved.status === 'head_moved', localMoved)
+check(
+  'local head guard left the reviewer text where it was',
+  (await api.getDraft(local.id))?.comments[0]?.body === localBody,
+)
+
+const localOk = await api.submitReview({
+  prNumber: local.id,
+  expectedHeadSha: localSnap.immutable.headSha,
+  event: 'COMMENT',
+  body: localDraft.body,
+  comments: localDraft.comments,
+})
+check('local submit vs true head → ok', localOk.status === 'ok', localOk)
+check('local draft cleared after submit', (await api.getDraft(local.id)) === null)
+
+const localThreads = (await api.getSnapshot(local.id))!.mutable.threads
+check('local submit materialized exactly one thread', localThreads.length === 1, localThreads.length)
+const localThread = localThreads[0]
+check(
+  'local thread is anchored where the pending comment was',
+  localThread.path === localAnchor.path && localThread.line === localAnchor.line,
+  { path: localThread.path, line: localThread.line },
+)
+// Stored verbatim: the `**Name** (role)` stamp exists only because many humans
+// share one GitHub account, and a local review has no such account behind it.
+check(
+  'local comment body is the reviewer text, unstamped',
+  localThread.comments[0].body === localBody,
+  localThread.comments[0].body,
+)
+check(
+  'local comment ids come from the reserved entity band',
+  localThread.comments.every((c) => c.id >= LOCAL_ENTITY_ID_BASE),
+  localThread.comments.map((c) => c.id),
+)
+
+const localReply = await api.replyToThread(local.id, localThread.id, 'Rewrote it the other way round.')
+check('local reply id is in the entity band', localReply.id >= LOCAL_ENTITY_ID_BASE, localReply.id)
+const grown = (await api.getSnapshot(local.id))!.mutable.threads.find((t) => t.id === localThread.id)
+check('local reply grew the thread to two comments', grown?.comments.length === 2, grown?.comments.length)
+
+const localResolved = await api.resolveThread(local.id, localThread.id, true)
+check('local resolve flips the thread and names who did it', localResolved.isResolved === true && (localResolved.resolvedBy?.login ?? '').length > 0, localResolved.resolvedBy)
+const localAfter = (await api.getSnapshot(local.id))!.mutable.threads.find((t) => t.id === localThread.id)
+check('local snapshot agrees the thread is resolved', localAfter?.isResolved === true)
 
 // ——— failure modes ———
 mockDev.setFailureMode('all')

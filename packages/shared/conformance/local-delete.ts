@@ -35,21 +35,20 @@
  */
 import { beforeAll, describe, expect, it } from 'bun:test'
 import { ApiError } from '../src/index.ts'
+import type { LocalReviewSummary, ReviewDraft, RevuApi } from '../src/index.ts'
+import { draftOn, pendingAt, rejection, resolve } from './local-common.ts'
 import type {
-  LocalReviewSummary,
-  PendingComment,
-  ReviewDraft,
-  RevuApi,
-} from '../src/index.ts'
+  Answered,
+  Lazy,
+  LocalReviewAnchor,
+  LocalReviewPair,
+  MaybePromise,
+} from './local-common.ts'
+
+export type { Lazy }
 
 /** Where a submitted comment on the runner's branch pair can anchor. */
-export interface LocalDeleteAnchor {
-  /** A path the reviewed range changes, or that the runner's diff carries. */
-  path: string
-  line: number
-  /** The text of that line on the head side, captured as an editor would. */
-  lineText: string
-}
+export type LocalDeleteAnchor = LocalReviewAnchor
 
 /**
  * A count of what the implementation's storage holds for one review, keyed
@@ -60,29 +59,7 @@ export interface LocalDeleteAnchor {
 export type LocalReviewRowCounts = Record<string, number>
 
 /** A branch pair the implementation can create a review of, as the client would spell it. */
-export interface LocalDeletePair {
-  baseRef: string
-  headRef: string
-}
-
-/**
- * A value, or a function that produces it once the runner's own setup has run.
- * A runner over a seeded repository only knows its branch names after the
- * repository exists, and a runner over a daemon only knows its session after
- * the daemon answers — both later than the block is registered.
- */
-export type Lazy<T> = T | (() => T | Promise<T>)
-
-async function resolve<T>(value: Lazy<T>): Promise<T> {
-  return typeof value === 'function' ? (value as () => T | Promise<T>)() : value
-}
-
-type MaybePromise<T> = T | Promise<T>
-
-/** One contract method, with its answer accepted whether or not it arrives as a promise. */
-type Answered<F> = F extends (...args: infer A) => infer R
-  ? (...args: A) => MaybePromise<Awaited<R>>
-  : never
+export type LocalDeletePair = LocalReviewPair
 
 /**
  * The slice of the contract this block drives, spelled so that an in-process
@@ -130,57 +107,8 @@ export interface LocalDeleteConformanceConfig {
   rowsOf?: (reviewId: number) => MaybePromise<LocalReviewRowCounts>
 }
 
-/**
- * One call's rejection, captured whole so its code and message can both be
- * read. Takes the call rather than its promise so an adapter that throws
- * synchronously is captured the same way as one that rejects.
- */
-async function rejection(call: () => unknown): Promise<ApiError | null> {
-  try {
-    await call()
-    return null
-  } catch (e) {
-    return e instanceof ApiError ? e : null
-  }
-}
-
-/** A pending comment on the runner's anchor, with a body only when asked for. */
-function pendingAt(anchor: LocalDeleteAnchor, body: string): PendingComment {
-  const at = new Date().toISOString()
-  return {
-    key: `local-delete-conformance-${anchor.line}`,
-    path: anchor.path,
-    side: 'RIGHT',
-    start_side: null,
-    line: anchor.line,
-    start_line: null,
-    body,
-    createdAt: at,
-    updatedAt: at,
-    anchor: { lineText: anchor.lineText, contextBefore: [], contextAfter: [] },
-  }
-}
-
-/** A draft on one review against one head, keyed to the session's human. */
-function draftOn(
-  humanId: string,
-  review: LocalReviewSummary,
-  head: { headSha: string; compareKey: string },
-  content: { body: string; comments: PendingComment[] },
-): ReviewDraft {
-  const at = new Date().toISOString()
-  return {
-    humanId,
-    prNumber: review.id,
-    headSha: head.headSha,
-    compareKey: head.compareKey,
-    body: content.body,
-    event: 'COMMENT',
-    comments: content.comments,
-    createdAt: at,
-    updatedAt: at,
-  }
-}
+/** The comment-key namespace this block's pending comments are minted under. */
+const KEY_PREFIX = 'local-delete-conformance'
 
 /** The one message shape both absent-id cases must share, with the id itself erased. */
 function messageShape(err: ApiError | null, reviewId: number): string | null {
@@ -232,7 +160,7 @@ export function runLocalReviewDeleteConformance(config: LocalDeleteConformanceCo
           expectedHeadSha: head.headSha,
           event: 'COMMENT',
           body: 'A verdict recorded before the delete is attempted.',
-          comments: [pendingAt(anchor, 'A thread that must survive a refused delete.')],
+          comments: [pendingAt(anchor, 'A thread that must survive a refused delete.', KEY_PREFIX)],
         })
         expect(submitted.status).toBe('ok')
         await api.setFileViewed(review.id, anchor.path, true, null)
@@ -291,7 +219,7 @@ export function runLocalReviewDeleteConformance(config: LocalDeleteConformanceCo
         await api.saveDraft(
           draftOn(humanId, review, head, {
             body: '',
-            comments: [pendingAt(anchor, 'An anchored note with nothing in the body.')],
+            comments: [pendingAt(anchor, 'An anchored note with nothing in the body.', KEY_PREFIX)],
           }),
         )
         const refused = await rejection(() => api.deleteLocalReview(review.id))

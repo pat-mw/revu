@@ -10,7 +10,10 @@
  * report XML. So there is exactly one copy of the contract assertions, held to
  * over both transports, and this file only orchestrates and summarizes.
  *
- * The four legs:
+ * The seven legs. Four drive the pull-request suite; three drive the
+ * local-review suite — the same contract methods answered for a review of a
+ * local branch pair that has no pull request, which needs no token and no
+ * network in ANY transport, so every one of those legs is required and in-gate.
  *   A (required, in-gate): the in-process mock adapter.
  *   B (required, in-gate): revud serving the mock store over real HTTP — the
  *      runner spawns revud in mock mode against a STUB dist + a temp data dir,
@@ -25,6 +28,16 @@
  *      reason. The live scratch-org run needs a real org with member accounts,
  *      which is stood up during on-prem deployment, so this leg is deferred and
  *      never fails the matrix in the network-free gate.
+ *   E (required, in-gate): the local-review suite over the in-process mock —
+ *      the oracle whose semantics the other two local legs are held to.
+ *   F (required, in-gate): the local-review suite over revud-mock via real HTTP,
+ *      spawned exactly as leg B is.
+ *   G (required, in-gate): the local-review suite over the DIRECT engine —
+ *      the real sync, store and write path — against a git repository the
+ *      runner seeds on disk with zero remotes, under a `fetch` tripwire. This is
+ *      why the local direct leg is required where the GitHub direct leg (C) is
+ *      not: C needs a token and a network to have anything to talk to, G needs
+ *      neither, so nothing about the environment can excuse skipping it.
  *
  * Honesty rule: an optional leg that cannot run logs an explicit
  * `skipped: <required secret/env> absent` line. It is NEVER reported as a silent
@@ -252,6 +265,34 @@ function main(): void {
       name: 'revud-mock over HTTP',
       required: true,
       testFile: 'packages/app/src/api/http/conformance.test.ts',
+    }),
+  )
+
+  // Legs E, F, G: the local-review suite over every in-gate transport. All
+  // three are required — a review of a local branch pair needs no token and no
+  // network, so no leg here has an environmental reason to skip.
+  results.push(
+    runSuiteLeg({
+      id: 'E',
+      name: 'mock in-process (local reviews)',
+      required: true,
+      testFile: 'packages/app/src/api/mock/conformance-local.test.ts',
+    }),
+  )
+  results.push(
+    runSuiteLeg({
+      id: 'F',
+      name: 'revud-mock over HTTP (local reviews)',
+      required: true,
+      testFile: 'packages/app/src/api/http/conformance-local.test.ts',
+    }),
+  )
+  results.push(
+    runSuiteLeg({
+      id: 'G',
+      name: 'direct engine over a seeded local repo (local reviews)',
+      required: true,
+      testFile: 'packages/revud/src/direct/conformance-local.test.ts',
     }),
   )
 

@@ -1,0 +1,43 @@
+{
+  /* The repository-root tooling sources: the end-to-end drivers under `e2e`
+     and the root-level suites under `test`. They live outside every package,
+     so without this project they would be invisible to `tsc -b` and a green
+     typecheck would say nothing about them. Settings mirror the daemon's
+     project because these files run the same way: bun, ES modules, no bundler
+     step, and the Node types the root already depends on. */
+  "references": [{ "path": "./packages/shared/tsconfig.json" }],
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tools.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "module": "esnext",
+    "strict": true,
+    "skipLibCheck": true,
+    "paths": {
+      "@revu/shared": ["./packages/shared/src/index.ts"],
+      "@revu/shared/*": ["./packages/shared/src/*"]
+    },
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+
+    /* Nothing here is ever built: bun runs these files from source. The
+       declarations a composite project must emit are therefore parked inside
+       `node_modules` so no generated file ever lands beside a source one. */
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/tools-types",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["e2e", "test"]
+}

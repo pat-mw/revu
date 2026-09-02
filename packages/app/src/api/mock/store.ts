@@ -611,6 +611,22 @@ export const store = {
     state = seed()
   },
 
+  /**
+   * Re-read the persisted document, discarding the in-memory copy, so what the
+   * next read answers is exactly what `localStorage` holds. A handle rebuilt
+   * over the same memory cannot tell a persisted write from an unpersisted
+   * one; a handle over a reloaded document can, which is what lets a test
+   * prove a draft survived persistence. A pending debounce is cancelled first,
+   * or it would write the copy being discarded over the document just read.
+   */
+  reload(): void {
+    if (persistTimer !== null) {
+      clearTimeout(persistTimer)
+      persistTimer = null
+    }
+    state = load()
+  },
+
   // ——— simulated shared rate bucket ———
 
   rateInfo(): RateLimitInfo {

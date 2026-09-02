@@ -31,6 +31,20 @@ The rule follows from that:
 - The immutable store has **no TTL**. Content addressed by a compare key does not expire — it
   either matches, in which case it is reused, or it does not, in which case it is refetched.
 
+### A local review's merge base moves on its own
+
+A [local review](/docs/guides/local-review) — a branch pair with no pull request
+behind it — computes its merge base against the **live tip** of the base branch,
+with `git merge-base`. So its compare key can change because the base advanced,
+with zero new commits on the head, and the re-sync that follows reflects a real
+change in the diff rather than a false alarm.
+
+A pull request behaves differently, and the difference is worth knowing: GitHub
+only refreshes a pull request's base SHA when it records a `synchronize` event,
+so a PR's merge base can lag behind where its base branch actually is. Both
+paths key on `merge_base...head`; they disagree about when the merge base is
+allowed to move.
+
 Two scenarios in the demo exist purely to catch this: a PR where the base branch advanced but
 the head did not — the diff still changed, and the seal says so — and a PR where a thread was
 resolved elsewhere with zero new commits, so a re-sync reuses every blob and only the mutable
