@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { Check, ChevronDown, Moon, Sun } from 'lucide-react'
@@ -18,6 +18,11 @@ import {
 } from '@/components/ui/tooltip'
 import { CommandPalette } from '@/components/palette'
 import { ShortcutSheet } from '@/components/shortcut-sheet'
+import {
+  CreateLocalReviewDialog,
+  CreateLocalReviewProvider,
+} from '@/components/create-local-review'
+import type { CreateLocalReviewControl } from '@/components/create-local-review'
 import { DevPanel } from '@/components/dev/dev-panel'
 import { usePullList, useRateLimit } from '@/state/queries'
 import { useCurrentHuman, useSession } from '@/state/session'
@@ -196,10 +201,16 @@ function IdentityMenu({
  * The topbar carries the product mark (the one place violet appears outside
  * draft state — a 5px dot standing in for "your unseen work"), the quiet repo
  * context, the shared rate-limit chip, a keyboard-help affordance, and the
- * identity menu. The shell owns the three global overlays (command palette,
- * shortcut sheet, dev panel), lifting their open-state here so any of them can
- * open any other, and it registers the `g …` navigation sequences that jump
- * between the inbox and a PR's tabs.
+ * identity menu. The shell owns the four global overlays (command palette,
+ * shortcut sheet, create-review dialog, dev panel), lifting their open-state
+ * here so any of them can open any other, and it registers the `g …` sequences
+ * that jump between the inbox and a PR's tabs and start a local review.
+ *
+ * The create dialog is also offered from the routed screen below, which the
+ * shell cannot pass props to, so the shell provides the dialog's own opener
+ * context around everything. The palette takes the opener as a prop instead,
+ * exactly as it already takes the one for the shortcut sheet — the shell
+ * renders it, so there is nothing to reach across.
  */
 export function AppShell({ children }: { children: ReactNode }) {
   const navigate = useNavigate()
@@ -207,6 +218,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [sheetOpen, setSheetOpen] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
   const [devOpen, setDevOpen] = useState(false)
 
   // Color scheme is applied to <html> and the highlighter from the stored
@@ -218,10 +230,18 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const openSheet = useCallback(() => setSheetOpen(true), [])
   const openDevPanel = useCallback(() => setDevOpen(true), [])
+  const openCreate = useCallback(() => setCreateOpen(true), [])
   const repoContext = useRepoContext()
 
+  const createControl = useMemo<CreateLocalReviewControl>(
+    () => ({ open: openCreate, isOpen: createOpen }),
+    [openCreate, createOpen],
+  )
+
   // Sequence navigation. `g i` always goes home; `g f` / `g c` switch the
-  // current PR's tab and no-op gracefully when no PR is open.
+  // current PR's tab and no-op gracefully when no PR is open. `g l` starts a
+  // local review, and is registered here rather than on the inbox so it works
+  // from a PR page too — the same reach the palette entry has.
   useSequenceShortcut(['g', 'i'], () => navigate('/'))
   useSequenceShortcut(['g', 'f'], () => {
     const n = matchPrNumber(location.pathname)
@@ -231,61 +251,69 @@ export function AppShell({ children }: { children: ReactNode }) {
     const n = matchPrNumber(location.pathname)
     if (n !== null) navigate(`/pr/${n}/conversation`)
   })
+  useSequenceShortcut(['g', 'l'], openCreate)
 
   // Toggle the color scheme from anywhere; documented in the '?' sheet catalog.
   useShortcut('mod+shift+l', toggleTheme)
 
   return (
-    <div className="flex h-screen flex-col bg-canvas">
-      <header className="hairline-b flex h-10 shrink-0 items-center gap-3 px-3">
-        <Link
-          to="/"
-          className="flex items-center gap-1 rounded-(--radius-xs) font-display font-semibold tracking-tight text-ink outline-none"
-          aria-label="revu — go to inbox"
-        >
-          <span>revu</span>
-          <span
-            className="size-[5px] rounded-full bg-draft"
-            aria-hidden
-          />
-        </Link>
-
-        {repoContext !== null && (
-          <span className="hidden font-mono text-2xs text-ink-faint sm:inline">
-            {repoContext}
-          </span>
-        )}
-
-        <div className="ml-auto flex items-center gap-2.5">
-          <RateChip />
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Keyboard shortcuts"
-            onClick={openSheet}
+    <CreateLocalReviewProvider control={createControl}>
+      <div className="flex h-screen flex-col bg-canvas">
+        <header className="hairline-b flex h-10 shrink-0 items-center gap-3 px-3">
+          <Link
+            to="/"
+            className="flex items-center gap-1 rounded-(--radius-xs) font-display font-semibold tracking-tight text-ink outline-none"
+            aria-label="revu — go to inbox"
           >
-            <span className="text-sm font-medium" aria-hidden>
-              ?
+            <span>revu</span>
+            <span
+              className="size-[5px] rounded-full bg-draft"
+              aria-hidden
+            />
+          </Link>
+
+          {repoContext !== null && (
+            <span className="hidden font-mono text-2xs text-ink-faint sm:inline">
+              {repoContext}
             </span>
-          </Button>
-          <IdentityMenu
-            onOpenDevPanel={openDevPanel}
-            theme={theme}
-            onToggleTheme={toggleTheme}
-          />
-        </div>
-      </header>
+          )}
 
-      <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
+          <div className="ml-auto flex items-center gap-2.5">
+            <RateChip />
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Keyboard shortcuts"
+              onClick={openSheet}
+            >
+              <span className="text-sm font-medium" aria-hidden>
+                ?
+              </span>
+            </Button>
+            <IdentityMenu
+              onOpenDevPanel={openDevPanel}
+              theme={theme}
+              onToggleTheme={toggleTheme}
+            />
+          </div>
+        </header>
 
-      <CommandPalette
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onOpenSheet={openSheet}
-      />
-      <ShortcutSheet open={sheetOpen} onOpenChange={setSheetOpen} />
-      <DevPanel open={devOpen} onOpenChange={setDevOpen} />
-    </div>
+        <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
+
+        <CommandPalette
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          onOpenSheet={openSheet}
+          onCreateLocalReview={openCreate}
+        />
+        <ShortcutSheet open={sheetOpen} onOpenChange={setSheetOpen} />
+        {/* The one mount of the create dialog. Every entry point — the header
+            control, the empty inbox's invitation, the palette, the chord —
+            raises this instance through the control above. */}
+        <CreateLocalReviewDialog open={createOpen} onOpenChange={setCreateOpen} />
+        <DevPanel open={devOpen} onOpenChange={setDevOpen} />
+      </div>
+    </CreateLocalReviewProvider>
   )
 }
 AppShell.displayName = 'AppShell'

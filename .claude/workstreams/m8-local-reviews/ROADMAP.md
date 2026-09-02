@@ -18,7 +18,7 @@ everything, including this file's assumptions about what has landed.
 | session | name | tickets | boundary reason (why it *ends*) | exit condition (compressed) |
 | --- | --- | --- | --- | --- |
 | S1 | The spec | [M8.1](./tickets/M8.1-contract-and-mock.md) (+ Spike B) | **Verification gate** — the frozen-contract extension proven before 60+ units conform to it (D6); also the fork point for two parallel sessions and the human's cheapest contract-ratification moment | `m8.1` PR open, conformance matrix green with zero diff to `suite.ts`, M8.1.7's route↔adapter bijection + pinned 19-pair table green, invariant tests unamended, the three absence controls Logged, recorded `?mock=1` walk with zero `/api/*` requests, decision package #1 seeded in HANDOVER.md |
-| S2 | The app, whole | [M8.6](./tickets/M8.6-app-creation-flow.md), [M8.7](./tickets/M8.7-app-local-chrome.md) | **Verification gate** — the entire feature visible and proven under `?mock=1` before any daemon exists; the chrome sweep observed RED before it is trusted | `m8.6`+`m8.7` PRs stacked, both harnesses (M8.6.7 shim, M8.7.10 static-render) landed first with self-tests green, chrome-sweep test seen red-then-green, the negative-control ledger Logged, four KEEP files proven untouched by M8.7, recorded walk: no `#1000000001`, tab strip Conversation·Files·Commits, no rate chip |
+| S2 | The app, whole | [M8.6](./tickets/M8.6-app-creation-flow.md), [M8.7](./tickets/M8.7-app-local-chrome.md) | **Verification gate** — the entire feature visible and proven under `?mock=1` before any daemon exists; the chrome sweep observed RED before it is trusted | `m8.6`+`m8.7` PRs stacked, both harnesses (M8.6.7 shim, M8.7.10 static-render) landed first with self-tests green, chrome-sweep test seen red-then-green, the negative-control ledger Logged, four KEEP files proven untouched by M8.7, recorded walk: no `#1000000001`, tab strip Conversation·Files·Commits (the rate-chip and author-banner legs were amended out 2026-08-14 — see the S2 exit condition) |
 | S3 | The daemon core | [M8.2](./tickets/M8.2-store-v4.md), [M8.3](./tickets/M8.3-local-snapshot-builder.md), [M8.4](./tickets/M8.4-local-write-sink.md), + M8.8.1/M8.8.2 | **Human decision** — decision package #1 (M8.5 OQ1, M8.8 OQ2, M8.10 OQ1–OQ3, M8.2 OQ1's behavioral half) must be ruled before the join session shapes options around it | three PRs stacked, v3→v4 migration byte-identical proof, M8.2.7's containment tripwires armed as a permanent assertion, injection gate with empty arg sink, both D7 guards (M8.3.8, M8.4.6) observed red-then-green, full local write loop + draft-survival matrix green, pin-ref legality proven against real git |
 | S4 | The join + hardening | [M8.5](./tickets/M8.5-daemon-wiring.md), [M8.8](./tickets/M8.8-resync-and-pinning.md) (rest), [M8.10](./tickets/M8.10-retention-and-gc.md), + M8.11.1/.5/.7/.8 | **Human decision + verification** — M8.9's rulings (OQ1/OQ2/OQ4/OQ8) needed next; the headline offline proof, the pinning control, and the retention sweep must be inspected before the milestone-proof session builds gates on them | `local-reviews-serve` green offline, `mode-select` zero-diff + the fourth-mode tripwire proven by its control, prune-survival green **with M8.8.8's swallowed-`update-ref` control asserting its named red as a permanent test**, M8.10.7's in-flight gate green before retention wires a caller, retention sweep zero throws, three more PRs |
 | S5 | Archive + the proof | [M8.9](./tickets/M8.9-archive-on-pr.md), [M8.11](./tickets/M8.11-conformance-e2e-docs.md) (rest) | **Milestone exit** — every criterion in MILESTONE.md ticked against the run that proves it | matrix exit 0 with `[E][F][G] PASS` required, e2e netlog empty **with the guard's installed-marker present**, all five negative controls observed red and reverted, archived re-sync behavior pinned (M8.9.7), `env -u GH_TOKEN -u GITHUB_TOKEN bun test` green, eleven PRs in one chain |
@@ -263,7 +263,20 @@ chord catalog entry legitimately touch two of the four KEEP files
 is that **M8.7** changed nothing there; `failure-drills.test.ts` green unamended; all eight
 break-observe-revert pairs in the Log; recorded walk shows tab strip
 Conversation · Files · Commits, `base ← head` + local chip, `document.body.innerText` containing no
-synthetic id, no rate chip, no author banner; duplicate creation navigates to the same id with one inbox row.
+synthetic id; duplicate creation navigates to the same id with one inbox row.
+
+**Amended 2026-08-14 by the owner's rulings** (see [`HANDOVER.md`](./HANDOVER.md)'s top entry and M8.7's
+`## Rulings` section — the rulings win over this file):
+
+- **"no rate chip" leaves the recorded walk.** Suppression is workspace-scoped, not route-scoped, and under
+  `?mock=1` the workspace genuinely has GitHub — so the chip legitimately renders on the fixture local review
+  and asserting its absence there would be asserting a falsehood. Replaced by the in-gate predicate assertion
+  on `showRateChip({ rateAvailable })` in both states, plus the loading-vs-unavailable distinction that makes
+  the chip omit rather than skeleton forever.
+- **"no author banner" leaves the recorded walk.** The author row renders the local human plainly, and the
+  Walk-threads action survives under local copy — only the "You authored this PR" framing is suppressed. The
+  walk instead confirms the banner slot renders its stack in order (superseded → dirty → walk threads) with
+  no PR framing in any of them.
 
 **Stop risks** — §5.1 across M8.7's owner calls: any resolution implying §4.1's field table is wrong is a
 finding. §5.8 at M8.6.2/OQ7: "remember my last base branch" → `HumanPreferences` → frozen-contract change;
