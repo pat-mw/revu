@@ -17,6 +17,15 @@ M8**; the milestone closes when the chain merges.
 fifteen PRs open, none merged, CI green on #84; **no OQ10 ruling yet** — its seams are pinned in the
 handover's top entry so the unit executes either way. Nothing else is runnable without the owner.
 
+**Landing audit ran 2026-09-02** ([`AUDIT-2026-09-02.md`](./AUDIT-2026-09-02.md)): every ticket has code and a
+green gate on the tip and the six exit criteria hold there — but **four majors survived three refuters each**
+(M8.8's real-mock parity leg never written; read-only after a vanished branch only half-pinned; no local walk
+of new-commit → re-sync → reconcile; a local review can never go stale before a re-sync), **owner ruling 4 has
+no implementing unit for a live review** (pins grow two refs per sync forever), deleting an archived review is
+unspecified by the mock, and the milestones doc, the design doc and this table had drifted (the M8.10 row above
+read 4/7; fixed). The handover of that date carries the closers. **M8 is not closable until the owner rules on
+those and the majors land.**
+
 | ticket | state | branch / PR | gate |
 | --- | --- | --- | --- |
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
@@ -172,7 +181,7 @@ is derived from it, never the other way round.**
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8, `Verify` green) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | **In Review** (8/8, `Verify` fully run) | 8 | revud, app, shared | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | [#82](https://github.com/pat-mw/revu/pull/82) |
-| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
+| [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (8/8, `Verify` green) | 8 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | **In Review** (8/8, `Verify` green) | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | [#80](https://github.com/pat-mw/revu/pull/80) |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | **In Review** (3/3, `Verify` green) | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | [#83](https://github.com/pat-mw/revu/pull/83) |
 

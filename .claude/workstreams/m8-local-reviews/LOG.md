@@ -675,3 +675,16 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
 - **Decisions:** none. OQ10 stays the owner's call, deliberately unmade here.
 - **Blockers:** the chain waits on the owner's merges and on the OQ10 ruling; nothing else is runnable.
 - **Next:** unchanged — rebase and retarget on a merge; OQ10's unit on a ruling; follow-ups only on request.
+
+**update — 2026-09-02 (landing audit)**
+- **Done:** the owner asked whether every M8 milestone had landed. Ran a read-only audit of the stack tip —
+  27 auditors over the chain, all twelve tickets, the six exit criteria and eight design-doc sections; 99 gaps
+  (0 blocker · 4 major · 95 minor); the 4 majors and 7 behaviour-level minors each put to three independent
+  refuters, **none refuted**; a completeness critic last. Record: `AUDIT-2026-09-02.md`. Verdict: the code and
+  its gate are on the tip and the exit criteria hold there; what survives is four majors, ruling 4 without a
+  unit, an unspecified archived-review delete, and doc/board drift. **No code changed.** Fixed the board's
+  M8.10 row (read 4/7, is 8/8).
+- **Decisions:** none — every surviving item is the owner's call or a unit for the next session.
+- **Blockers:** the owner's rulings (OQ10; ruling 4's live-pin bound; archived delete; pre- or post-merge for
+  the majors).
+- **Next:** rulings, then one unit per major with a control seen red, then one docs commit for the drift.

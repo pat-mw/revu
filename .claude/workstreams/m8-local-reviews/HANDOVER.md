@@ -1,3 +1,80 @@
+## 2026-09-02 (audit) — "did every M8 milestone land?": yes on the tip, with four majors and a ruling without a unit
+
+### Verdict
+Every M8 ticket has code on the stack tip and a non-vacuous pin behind its core flow; the six exit criteria
+hold on the tip; the fifteen-PR chain is linear, unmerged, green, and 0 behind at every link. **Nothing has
+merged.** The audit — 27 read-only auditors (chain, 12 tickets, 6 exit criteria, 8 design sections); 99 gaps
+raised, 0 blocker · 4 major · 95 minor; the 4 majors and 7 behaviour-level minors each put to three independent
+refuters, **none refuted**; a completeness critic last — is recorded in full in
+[`AUDIT-2026-09-02.md`](./AUDIT-2026-09-02.md). Read that before re-auditing anything; do not re-run it.
+
+### What survived — act on these before calling M8 closed (read the seam first; pointers rot)
+**Majors** (none breaks the day-to-day loop; 2 and 4 are user-visible):
+1. **M8.8.3's real-mock parity leg was never written** (ticket Verify 7). `reconcile.test.ts` imports nothing
+   from `@revu/app/mock`; its `oracleResults()` replays classification only; the head-absent rule is pinned
+   separately per transport, so a divergence would pass. The M8.8 Verify-run record lists clauses 1–5 of 8.
+   *Closer:* one test importing `createMockApi`/`mockDev`, sync a mock review, save a draft, replace the
+   snapshot's commits with SHAs absent from the draft head, assert the mock's and revud's `newCommits` agree.
+2. **"Review read-only" after a deleted/renamed branch is half-pinned.** `submitReview` and `replyToThread`
+   answer `not_found` after `git branch -D` (`local-surface.test.ts`, "head resolution failures on ordinary
+   repository states…"), but `resolveThread` and `addReaction` do not pass through head resolution, and the
+   app renders no read-only state. *Closer:* route the other two verbs through the same resolution; one
+   four-verb test after `git branch -D`.
+3. **No local walk of new commit → re-sync → reconcile with a draft** — exit criterion 2 clause 1 is held by
+   composition only. *Closer:* one `describe` in `local-resync.test.ts` reusing `seed()`/`advanceHead()`:
+   `syncPull` then `reconcileDraft`, `newCommits` exactly `[the new tip]`.
+4. **A local review never goes stale before a re-sync.** `localPullListItem` (`direct-api.ts`) builds the
+   row's `compareKey` and head sha from the stored row, so `useStaleness` can never see `baseMoved` or
+   "N new commits since sync" on a local review; the D8 tooltip is unreachable there. *Closer:* make the list
+   row live (`rev-parse` / `merge-base` / `rev-list --count` at list time), as the mock's `listLocalPullRows`
+   docstring already specifies.
+
+**Critic's finds, confirmed by hand:**
+5. **Owner ruling 4 has no implementing unit for a live review.** Pins are additive per sync; `dropPinnedRefs`
+   is called only from the delete path (`direct-api.ts`); `pruneImmutables(store, gate)` takes no git runner.
+   A weekly-rebased branch accumulates two `refs/revu/reviews/<id>/…` refs per sync forever, while the
+   immutable halves the pins protect are pruned out from under them. *Needs a ruling:* accept and document,
+   or prune stale pins after a successful sync.
+6. **Deleting an archived review is unspecified.** No archived case in `conformance/local-delete.ts`; the
+   mock's `deleteLocalReview` has no archived branch. The mock is the spec — pin allow-or-refuse on all three
+   transports.
+7. **A mis-titled review cannot be corrected.** The contract has no rename, and the create dialog's title
+   field appends to the pre-filled branch name. Delete + recreate is the only remedy, and for an archived pair
+   recreate returns the archived review.
+
+**Behaviour-level minors that survived three refuters** (user-visible unless noted): the inbox section stays
+at the top when every local review is archived — the guide, M8.6 R1 and the module docstring say it drops
+below, `buildInboxSections` orders on any local rows; a failed pin lands on the sync outcome and is rendered
+or logged nowhere (M8.8 OQ3); the guide overstates archive coverage for a workspace that gained its `origin`
+after the review was created (a path-keyed identity never archives); the author-date heuristic survives in
+`files.tsx` `commitsSince` and `queue.tsx`; the branch list refreshes on reopen only past a 10 s staleTime;
+the runbook promises an operator-settable blob flag boot never reads; the mock never sets `dirty: true`, so
+D3's banner is unspecified in the spec and invisible under `?mock=1` (maintainer-visible).
+
+**Doc/board drift** (facts): `docs/agent/MILESTONES.md` has no M8.12 (doc 11 issues, board 12 — the doc's own
+rule forbids this); `docs/agent/LOCAL_REVIEWS.md` still says `MAX(id)+1` minting and a three-column UNIQUE
+(§3.1, §4.2), "zero eviction… the only DELETE is deleteDraft" (§8 #23), "21 `RevuApi` methods" (§2), the pin
+ref as `refs/revu/reviews/<id>/<compareKey>` (§5.1 — a name git rejects), "direct/broker mode" (D5 — direct
+only), and "the Linear board carries the units" (line 5); `BOARD.md`'s M8.10 row read `In Review (4/7)` —
+**fixed in this commit** to 8/8; M8.12's ticket has no `## Landmines` section; M8.1's OQ5 text ("drafts
+deliberately orphaned") no longer describes the delete boundary; the M8.8 Landmines about `git push --mirror`
+carrying pins and linked-worktree pins have no doc line; the M8.10 Log calls `reconcile.test.ts` "unedited"
+while #79 adds eight stub lines to it.
+
+**Refuted** (do not re-raise): M8.2's "UNIQUE constraint has no pin of its own" (2 of 3 refuters). The
+chain's procedural notes are facts about repository settings, not M8 defects: the ruleset requires one
+approving review with admin bypass and has no required status check; delete-branch-on-merge is off, so after
+each merge the next PR must be retargeted to `main` by hand (or the merged head branch deleted); merge with
+merge commits, not squash, or every later PR shows its predecessors' history; `m8.3` and `m8.4` are checked
+out in two prunable scratchpad worktrees (`git worktree prune` before rebasing either).
+
+### Next, in order (supersedes the earlier entries' item 2)
+1. If a base merges, rebase the rest and retarget. Never merge, never touch `main`.
+2. **Owner rulings, one sitting:** OQ10 (draft on an archived review); ruling 4's live-pin bound; the
+   archived-review delete; and whether majors 1–4 land before or after the merge.
+3. Then one unit per surviving major (closers above), each fixed with a control seen red; the doc/board drift
+   as one docs commit; the behaviour-level minors as the owner prioritises.
+
 ## 2026-09-02 (third session) — verification only; the chain waits on the owner (merges, OQ10)
 
 ### Orient
