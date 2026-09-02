@@ -4,8 +4,9 @@
 1. `git checkout m8.12/delete-confirm` — stack tip, [PR #83](https://github.com/pat-mw/revu/pull/83), base
    `m8.9/archive-on-pr` ([PR #82](https://github.com/pat-mw/revu/pull/82), base `m8.11/conformance-e2e-docs`).
 2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3348 pass · 1 skip · 0 fail · 117 files**.
-3. **CI on #82 is fully green** (check · conformance-matrix · e2e · docs-build), as are #78–#80; **CI on #83
-   was pending at hand-off** — `gh pr checks 83` first.
+3. **CI is green on #82** (check · conformance-matrix · e2e · docs-build) **and on #83** (check ·
+   conformance-matrix · e2e; docs-build is path-filtered and did not run), as on #78–#80. Re-check with
+   `gh pr checks <n>` before building on either — it is one command.
 4. `bun run conformance:matrix` → A/B/E/F/G `PASS`, C/D `SKIP`. `bun run test:e2e` → two `ALL CHECKS PASSED`.
 5. Read `BOARD.md` → this entry → the ticket you pick up.
 
