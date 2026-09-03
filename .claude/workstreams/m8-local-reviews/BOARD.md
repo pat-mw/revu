@@ -10,12 +10,19 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing is running.** Five tickets are In Review, all gated, reviewed and pushed. **No Todo ticket remains in
-M8**; the milestone closes when the chain merges.
+**Nothing is running.** The twelve original tickets are In Review, gated, reviewed and pushed. **Five Todo
+tickets remain — M8.13–M8.17, the close-out plan** — and M8 closes when M8.17's Verify has run, not when the
+chain merges.
 
 **Re-verified 2026-09-02 (third session, verification only):** gate on the tip **3348 · 1 · 0 · 117**,
 fifteen PRs open, none merged, CI green on #84; **no OQ10 ruling yet** — its seams are pinned in the
 handover's top entry so the unit executes either way. Nothing else is runnable without the owner.
+
+**Superseded by the close-out plan (2026-09-02).** The audit below produced five tickets, **M8.13–M8.17**, and
+**M8 is not closable until M8.17's Verify has run.** Every one of the audit's 146 findings has a disposition in
+[`AUDIT-DISPOSITION.md`](./AUDIT-DISPOSITION.md): 104 closed by a named unit, 30 closed by another finding's
+unit, 11 accepted with a written reason, 1 refuted. **The first thing the next session needs is the owner's
+answers to M8.15's twelve questions** — each is written as two alternative units, one to be struck.
 
 **Landing audit ran 2026-09-02** ([`AUDIT-2026-09-02.md`](./AUDIT-2026-09-02.md)): every ticket has code and a
 green gate on the tip and the six exit criteria hold there — but **four majors survived three refuters each**
@@ -184,6 +191,11 @@ is derived from it, never the other way round.**
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (8/8, `Verify` green) | 8 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | **In Review** (8/8, `Verify` green) | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | [#80](https://github.com/pat-mw/revu/pull/80) |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | **In Review** (3/3, `Verify` green) | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | [#83](https://github.com/pat-mw/revu/pull/83) |
+| [M8.13](./tickets/M8.13-local-staleness-and-readonly.md) | Local staleness, read-only after a vanished branch, small behaviour fixes | **Todo** (0/9) | 9 | app + revud | M8.5, M8.6, M8.8, M8.9, M8.12 | `m8.13/local-staleness-and-readonly` | — |
+| [M8.14](./tickets/M8.14-proof-debt.md) | Proof debt: every missing, vacuous or misplaced test | **Todo** (0/37) | 37 | all | M8.1–M8.12 | `m8.14/proof-debt` | — |
+| [M8.15](./tickets/M8.15-owner-rulings.md) | Owner rulings with their implementing units | **Todo** (0/24, twelve questions × two answers) | 24 | shared + revud + app | M8.9, M8.10, M8.11 | `m8.15/owner-rulings` | — |
+| [M8.16](./tickets/M8.16-docs-and-board-drift.md) | Docs, design doc, guides, runbook and board: every stale sentence | **Todo** (0/25) | 25 | docs | M8.15 (six units wait on rulings) | `m8.16/docs-and-board-drift` | — |
+| [M8.17](./tickets/M8.17-close-out.md) | Close-out: merge day, exit criteria ticked, workstream sealed | **Todo** (0/9) | 9 | all | M8.13, M8.14, M8.15, M8.16 | `m8.17/close-out` | — |
 
 ## Dependency graph
 

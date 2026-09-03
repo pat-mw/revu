@@ -421,6 +421,8 @@ Add a real **light mode** to the web app — reopening the DESIGN.md dark-only d
 
 **Live tracking for this workstream is the local board at `.claude/workstreams/m8-local-reviews/`** — `BOARD.md` for current state, `HANDOVER.md` for the cross-session handover, and one file per ticket under `tickets/` carrying its units, its Verify, and verified code anchors. The sections below are the seed text those files were built from; the board is what changes as work lands.
 
+A landing audit run on 2026-09-02 (`.claude/workstreams/m8-local-reviews/AUDIT-2026-09-02.md`) read every ticket, design section and exit criterion against the code on the stack tip and produced the close-out tickets M8.13–M8.17; M8 closes only once M8.17's Verify has actually been run.
+
 Full design, including the surface map and the decision record, is `docs/agent/LOCAL_REVIEWS.md`. The shape in one line: **one new snapshot producer and one new write sink**, plugged into machinery (`anchor.ts`, `reconcile.ts`, `blobs.ts`, the two-half cache, the store's per-human halves) that is already provenance-blind.
 
 **Decisions carried by the design doc** — D1 archive-on-PR (never publish local comments); D2 reserved high-number identity at the contract level; D3 committed content only + dirty-worktree warning; D4 the reserved band never enters `snapshots.pr_number` / `audit_log.pr` / `pr_author.pr` (the store gets its own `local_*` tables); D5 a capability inside direct/broker mode, not a fourth mode; D6 the mock specifies it first; D7 the local write path has no GitHub client in scope; D8 local reviews use the live base tip where PRs use GitHub's stale `pull.base.sha`.
@@ -519,3 +521,122 @@ The first `DELETE` this store grows beyond `deleteDraft`. A constantly rebased b
 - [sub] An e2e that creates a local review and drives create → sync → comment → submit headlessly, asserting zero GitHub requests.
 - [sub] Docs: the local-review flow in the user-facing docs and the run-modes page; `docs/security-review.md` gains the statement that local reviews are deliberately invisible to the audit trail because they are deliberately invisible to the client.
 **Verify:** `bun run check` + e2e green; the conformance matrix has no skipped local leg; the e2e asserts zero outbound GitHub requests for the whole local flow.
+
+### Issue M8.12 — Delete confirmation for a review holding a draft
+Added to the board after the owner's ruling of 2026-08-19, closing a gap M8.6 and M8.10 both left implicit: deleting a local review that holds an unsubmitted draft is refused server-side while any human's draft holds text — the daemon is the authority, not the client — and the app needs a confirmation surface for that refusal instead of a bare error. There is no force flag: confirming discards the reader's own draft through the draft store's own path and only then repeats the same, unchanged delete.
+- [sub] Refusal copy: a one-sentence mapping of the typed refusal, in the established one-honest-sentence-per-error shape, that never claims text is destroyed and never says "lost".
+- [sub] The confirm dialog: a portal-free body naming the review by its `base ← head` pair (never its number), the destructive control on the red treatment and not the default focus.
+- [sub] Wiring: an unforced delete attempt surfaces the refusal as the dialog rather than a toast; confirming discards the draft then retries the delete; dismissing changes nothing, because the refusal happens before any record is touched.
+**Verify:** create a review, save a draft, delete without confirming → refused, review still listed; confirm → draft discarded and the review deleted, gone from the list, its draft unreachable under its own key.
+
+### Issue M8.13 — Local reviews: staleness, read-only after a vanished branch, rewrite honesty, and the small behaviour fixes
+The 2026-09-02 landing audit found the local-review feature complete and the gate green, and found a short list of places where a local review's runtime behaviour diverges from something already written down — a mock docstring (the mock is the specification), a guide sentence, or a message naming a remedy — so no owner ruling stands between reading the gap and closing it.
+- [sub] Serve the local list row's compare key, head SHA and commit count from live ref tips, as the mock's docstring already specifies, instead of from the last-synced snapshot — so a review can go stale before a Re-sync.
+- [sub] Pin the sentence the base-advanced seal's tooltip shows, as one exported constant.
+- [sub] Refuse all four write verbs, not only submit and reply, after the head branch is deleted or renamed, and show a read-only banner naming the vanished ref.
+- [sub] Count commits-since-the-draft by SHA position rather than author date in the files-tab badge and the author queue counter, so a rebase (which preserves author dates) is counted correctly.
+- [sub] Order the inbox's local section by whether it holds an open row rather than by row presence, so an all-archived local section drops to the bottom as the guide promises.
+- [sub] Warn in the daemon log when a sync's ref-pin write fails, so a lost collection guarantee is no longer silent.
+- [sub] Refetch the branch listing every time the create dialog opens, instead of only past a ten-second staleness window that no longer matches the dialog's lifetime.
+- [sub] Make the create dialog's title field replace the pre-filled branch name on the first keystroke instead of appending to it.
+- [sub] Rebuild a re-sync over a corrupted snapshot envelope or immutables row, so "Re-sync to rebuild" is a remedy that can actually run.
+**Verify:** both live-row legs (head moved; base advanced with the head standing still) and the vanished-ref refusal are green on every transport with independently computed literals; conformance legs E/F/G carry both new cases; a `?mock=1` walk corroborates the seal going stale, the branch-gone banner, the reordered inbox section, the refetching create dialog and the title field.
+
+### Issue M8.14 — Proof debt: every missing, vacuous or misplaced test the audit found
+The landing audit found the feature's behaviour sound almost everywhere and found the proof missing in specific, named places — two majors that survived a three-lens refutation, dozens of minors whose remedy the audit itself named as a test or a control, and Verify items three tickets honestly recorded as partially-proven. Scope is tests, controls and test harness only; a handful of units move code with no behaviour change so a sequence becomes drivable, and one unit changes the mock (the contract's specification) under an owner ruling.
+- [sub] A real-mock reconcile parity leg for a draft whose head SHA fell out of the compare, driven against two producers rather than a transcription.
+- [sub] A new-commit → re-sync → reconcile walk on a local review, discriminating the slice branch from a rewrite branch by an independent literal.
+- [sub] A real `git rebase` fixture onto an advanced base, so pin survival is proven against genuinely collectable objects rather than an amend that keeps every blob reachable.
+- [sub] Scope the no-deletion source scan to the `performSync` closure it is meant to guard, rather than the whole file that also contains two legitimate deletes.
+- [sub] Graph-walk `local-surface.ts` in the write-isolation test, asserting the one legitimate GitHub-module edge as a literal path rather than leaving the file uncovered.
+- [sub] Boot the real daemon with a GitHub half wired and drive all four local writes, proving the client is never entered on a local id.
+- [sub] Wrap `Bun.fetch` in the same guards as `fetch`, and pin statically that no source calls it directly.
+- [sub] Clear `GH_TOKEN`/`GITHUB_TOKEN` from the serve suite's spawned child environment.
+- [sub] A positive control that the serve suite's fetch tripwire actually loaded in the child process.
+- [sub] Replace the decorative `requests === 0` assertion with evidence that can actually fail.
+- [sub] Read `audit_log`/`pr_author` directly for a local id after a real local write, as a redundant, direct proof beside the store's own tripwire sweep.
+- [sub] Run the collector and the poll loop over a store that also holds local reviews, and assert their view of a real PR is unchanged.
+- [sub] Document and pin the sweep guard's three-table scope, with a control proving the excluded pair is covered elsewhere.
+- [sub] Assert `mutable.checks` is `[]` on a local snapshot on every transport.
+- [sub] Pin that the local write path cannot raise the `conflict` code, by a whole-file scan with a positive control.
+- [sub] Sync a remote-tracking base ref to a successful snapshot with real git, not only the existing failure leg.
+- [sub] Assert a synced local snapshot's committed content ignores an uncommitted worktree edit.
+- [sub] Pin on three transports that re-creating an already-archived branch pair returns the archived review, never a new live one.
+- [sub] Pin that the daemon's delete refusal names no review id, matching the mock's existing rule.
+- [sub] Register the direct-engine local-delete runner as its own required conformance-matrix leg.
+- [sub] Pin that the matrix runner exits 1 and names a skipped or failed required leg, rather than passing silently.
+- [sub] Run the shared local-review suite over HTTP against a booted `--local-only` direct daemon *(runs only under the owner's ruling on Open question 3(a))*.
+- [sub] Give the mock a way to stand behind a real compare so legs E and F exercise the diff-content assertions *(runs only under the owner's ruling on Open question 2(a))*.
+- [sub] Retarget the dead `normalizeRef` rejection table at the production ref validator, and delete the unreachable seam.
+- [sub] Add the `@ts-expect-error` row proving `DraftHead`'s paired fields cannot be set independently.
+- [sub] Lift the reconcile-apply sequence into a drivable function and pin the head move strictly before submit on a conflict-terminated apply.
+- [sub] Drive `useResolveThread`/`useAddReaction` end-to-end against the local sink's actual returned values.
+- [sub] Render `RowBadges` with `dirty: true` and assert the worktree-dirty badge actually appears.
+- [sub] Dispatch `base_defaulted` in the create-dialog reducer tests and pin its preselection-not-override rule.
+- [sub] Rename a mis-named inbox-sections test to what it actually asserts.
+- [sub] Pin that the header banner stack orders the dirty-worktree banner before the author banner.
+- [sub] Extract and pin `RateChip`'s `rateAvailable` derivation as a pure function.
+- [sub] Pin the mode argument at three presence-only gates, walking call sites rather than listing them.
+- [sub] Drive the command-palette Go entry and the `g l` chord for a new local review in the e2e.
+- [sub] Drive the create dialog's key-swallowing (`j` blocked while open, restored once closed) in the e2e.
+- [sub] Drive the delete dialog — open, cancel, confirm — end to end in the e2e.
+- [sub] Extend the `?mock=1` e2e segment with a create and a hard reload, proving zero network requests survive both.
+**Verify:** every named test file green with its red observed first and recorded in a falsification ledger; `bun run conformance:matrix` exits 0 with the ruling-dependent legs matching the owner's answers; `bun run test:e2e` exits 0 over both drivers; the gate's pass count moves up and nothing moves down; a diff against the branch's own stack-parent base (never `main`) touches only the explicitly allowlisted non-test files.
+
+### Issue M8.15 — Owner rulings with their implementing units
+The landing audit found twelve questions that need a decision before code, each a place where two agents could land opposite behaviour with nothing going red because the behaviour was never decided. For each question this ticket writes both answers as complete, executable units; the owner strikes one before the other starts.
+- [sub] Question 1 (M8.9 OQ10) — a draft on an archived review: refuse the write and hide the gutter composer, or keep it writable and pin that the guide says so.
+- [sub] Question 2 — what bounds a live review's pin set: accept the two-refs-per-resync growth and document it as accepted, or prune stale pins after a successful sync.
+- [sub] Question 3 — deleting an archived review: leave it allowed (pinned on three transports), or refuse it and teach the app the refusal.
+- [sub] Question 4 (M8.8 OQ2) — the reconcile change that also reaches the pull-request path: record the sign-off, or revert the PR-path change with a test.
+- [sub] Question 5 (M8.11 OQ3) — `local-scenario.test.ts`: keep it as the mock-armed tripwire, or collapse it into the shared conformance runner.
+- [sub] Question 6 (M8.3 OQ3) — a live byte-level parity leg against real GitHub: rule it out as unnecessary given the structural leg, or write the committed runner.
+- [sub] Question 7 — D3's `dirty` flag in the mock: make `dirty: true` reachable with a conformance case, or rule the mock's `dirty` permanently false and record why.
+- [sub] Question 8 — the runbook's operator blob-reclamation flag: wire `REVU_RECLAIM_BLOBS` at boot, or reword the runbook to match what ships.
+- [sub] Question 9 (M8.5 OQ6) — `bin/revu`'s local path: keep deferring it, recorded on the board, or ship it.
+- [sub] Question 10 — renaming a mis-titled local review: no rename verb, pin the "set once" hint and fix the title field's append bug, or add a rename verb to the contract.
+- [sub] Question 11 (M8.9 OQ2) — where the sync-cost caveat lives: in the live-review sync copy, or left to the guide alone with the narrowing recorded.
+- [sub] Question 12 (M8.3 OQ5) — the `C → added` rename mapping: keep it as recorded, or pass `-C` so the mapping becomes reachable and pin it.
+**Verify:** exactly one unit of each pair survives, marked struck at its source open question; each kept unit's Check run with its red or its control observed and reverted byte-for-byte; `bun run conformance:matrix` green on A/B/E/F/G; the mock's local conformance leg moved by exactly the cases the kept units added; `?mock=1` walks corroborate the archived gutter, the dirty badge and the create dialog's title field; `docs:build` green and the design doc, the guide and the board agree on every ruled question.
+
+### Issue M8.16 — Docs, design doc, guides, runbook and board: every stale sentence
+The landing audit read every ticket, design section and user-facing page against the tree and found no code defects — only sentences written before a ruling, an owner call or a measurement, and never revisited after the code moved under them. Each unit names the file, quotes the stale sentence and states its replacement; the only non-prose changes are one self-contained comment in `index.ts` and one new gate test guarding present-tense claims in the guides.
+- [sub] Amend the design doc's schema, minting and eviction sections to the landed `generation` column, the durable high-water-mark minter, and the eviction paths M8.10 shipped.
+- [sub] State the `-uno` (untracked-file-excluded) qualifier on the dirty-worktree detection in the design doc, the schema comment and the guide.
+- [sub] Say "direct mode alone", not "direct and broker mode", in the design doc, both decision records and the `index.ts` comment — broker mode builds no local surface today.
+- [sub] Correct §5/§5.1's absent-client claim, the real two-ref-per-compare pin naming scheme, and the re-sync-refusal-on-missing-objects behaviour.
+- [sub] Correct §4.1's `etag` and `rateLimit` synthesis-table rows to what each transport actually composes.
+- [sub] Fix three one-line inaccuracies: the board pointer, the two routers' actual id-band gates, and the query-key count.
+- [sub] Move §8's unrelated-histories and shallow-clone cases from Creation to Re-sync, matching that creation resolves no SHAs.
+- [sub] Add the path-keyed repository identity caveat — a review created before an `origin` existed is never archived — to the guide and to `direct.mdx`.
+- [sub] Reword or verify the guide's "can go stale" staleness claim against whatever M8.13.1 actually shipped.
+- [sub] Verify the guide's "drops below" inbox-ordering claim against whatever M8.13.5 actually shipped.
+- [sub] Add the operator runbook's one residual fact — pinned refs live in the shared git dir and are visible from every linked worktree — once M8.15's pin and blob-flag rulings have landed.
+- [sub] Add a security-review paragraph on pinned refs: real refs, invisible to an ordinary push, and what a mirror-push would and would not disclose.
+- [sub] Annotate M8.1's settled Open question 5 with the owner's later delete-boundary supersession, without rewriting the original record.
+- [sub] Correct M8.4's Check literals (the eleven-key port set, the five-file scanned set) and its now-false "forbidden is unreachable" claim.
+- [sub] Restate M8.7's zero-diff corroboration as a commit-range claim, since two later commits have since touched the same files.
+- [sub] Record M8.8's Verify clauses 6 and 8 as run, and clause 7 (real-mock parity) as open until M8.14.1 lands.
+- [sub] Record the broker archive-seam's true evidence status in M8.9's Log (direct wiring corroborated live, broker wiring inert by construction), and stand down on OQ2 in favor of M8.15's question 11.
+- [sub] Correct M8.10's Verify Log to say what its "unedited" file actually gained (eight `unexpected(...)` stubs, no behavioural line).
+- [sub] Rewrite M8.12's unit text to the no-force ruling that shipped, and add the Landmines section it never had.
+- [sub] Replace the `MILESTONES.md` M8.12 gap with a pointer noting the seed is owed, ahead of the real mirror step.
+- [sub] Amend exit criterion 6 in both milestone records to carry the workspace-scoped rate-chip deviation (ruling R2).
+- [sub] Add the board follow-ups this audit surfaces: `bin/revu`'s deferred local path, the `MILESTONES.md` seed debt, and the guides' missing gate guard.
+- [sub] Add the smallest gate guard that catches copy drift between the product's own UI strings and what the guides quote them as.
+- [sub] *(alternative A, taken only if M8.15 keeps the archived-draft refusal)* mirror the withheld-composer wording into `direct.mdx`.
+- [sub] *(alternative B, taken only if M8.15 keeps the writable archived draft)* mirror the writable-draft wording into `direct.mdx` instead.
+**Verify:** `bun run docs:build` green; the security-review and guide-claims guards both green with their red obtained by control; a diff against the branch's stack-parent base touches only `.md`/`.mdx` files plus the one new test and the one comment-only `index.ts` change; every stale sentence's grep returns zero hits and its replacement at least one, pasted into the Log.
+
+### Issue M8.17 — Close-out: merge day, the exit criteria ticked against their runs, the workstream sealed
+M8 exists on a branch and nowhere else — fifteen-plus pull requests open, none merged, every exit criterion green on the stack tip and unchecked because the boxes were always going to tick when the chain merged. This ticket is that day: the merge itself, the runs that make the ticks true, and the six records — `MILESTONE.md`, `BOARD.md`, every ticket's `State`, this document, the repo memories and `gh pr list` — brought into agreement and read back once, together. It writes no product code; its whole diff is the board and the docs, and it cannot close itself while any unit in M8.13–M8.16 is still open.
+- [sub] Build and hand the owner the merge-day checklist, re-deriving live the five procedural facts that would otherwise bite the merger (no auto-retarget, three allowed merge methods with only one correct, an admin-only merge path, no required status check, two stale worktrees) and pruning the worktrees.
+- [sub] Walk the checklist with the owner, one PR at a time, bottom-up, recording every merge commit SHA and how each next base was restored.
+- [sub] Run the gate, the conformance matrix and the e2e suite on merged `main`, and record the exact numbers.
+- [sub] Re-run M8.12's Verify 1 on `main` across all three of its files together, and move M8.12 to `Done`.
+- [sub] Tick every exit criterion in `MILESTONE.md` against the run that proves it, named on the box's own line, and set the milestone `Status` to `CLOSED`.
+- [sub] Mirror M8.12–M8.17 into this document, replacing the pointer M8.16.20 left with the real seed sections.
+- [sub] Point the repo memories' active-workstream marker away from the now-closed board, and retire any landmine the merged code actually closed.
+- [sub] Read `BOARD.md`, every ticket's `State` row and `gh pr list` together in one sitting and confirm they agree — and hold M8.17 at `In Review` while any of M8.13–M8.16 is not `Done`.
+- [sub] The seal: the owner merges this ticket's own PR, then a one-line `board/m8-sealed` PR flips its `State` and `BOARD.md`'s row to `Done` together.
+**Verify:** the three runs on merged `main` recorded with their numbers; every recorded head SHA an ancestor of `origin/main` with one merge commit per PR; no unchecked exit criterion and no tick without a named run; the three-way read agreeing before and after the seal; this document mirroring all seventeen tickets; the memories pointing at no closed workstream as active; M8.13–M8.16 each `Done` with a green Verify recorded in their own Log.

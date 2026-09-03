@@ -1,3 +1,69 @@
+## 2026-09-02 (close-out plan) — M8.13–M8.17 exist; the owner's twelve rulings are the gate
+
+### Orient
+1. `git checkout board/m8-closeout` — the stack tip, base `board/m8.9-scratch-proof` ([PR #84](https://github.com/pat-mw/revu/pull/84)).
+   Branch new code off **this** branch so the chain stays linear.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → **3348 pass · 1 skip · 0 fail · 117 files** (no
+   code changed this session; docs and board only).
+3. `gh pr list` → sixteen OPEN, `main` → … → #83 → #84 → this one. **No base has merged**; `origin/main` is
+   still `177068a`.
+4. Read `BOARD.md` → this entry → **`M8.15-owner-rulings.md`** (the gate) → whichever ticket you pick up.
+
+### What this session did
+The owner asked to seal the workstream with no tech debt. The 2026-09-02 landing audit is now **durable in the
+repo** and **converted into a plan**:
+- **`AUDIT-2026-09-02.md`** — the complete record: 27 auditors, **613 audited items**, **99 gaps**, every
+  refuter's full reasoning and closers, the completeness critic. **`AUDIT-2026-09-02.json`** is its
+  machine-readable twin (same ids). Ids are stable: `<audit>-g<n>` a gap, `<audit>-i<n>` an item; audits are
+  `PRCHAIN`, `M8.1`–`M8.12`, `EC1`–`EC6`, `D3`–`D9` (design sections). **Never `cat` the JSON — it is 1 MB;
+  query it with python** (recipes are in each close-out ticket's preamble).
+- **`AUDIT-DISPOSITION.md`** — where every one of the **146** findings went: 104 closed by a named unit, 30
+  covered by another finding's unit, **11 accepted with a written reason (challenge these if you disagree)**,
+  1 refuted.
+- **Five close-out tickets, 104 units**, each written from the seams read on this tip, then **adversarially
+  reviewed** (71 findings, two blockers — a Check whose red was unobtainable, a seam that did not exist) with
+  **every finding applied**:
+
+| ticket | what | units |
+| --- | --- | --- |
+| **M8.13** | behaviour fixes: live staleness, read-only after a vanished branch, commits-since by SHA, inbox order, failed-pin warning, dialog refetch, title replace, re-sync over a corrupt row | 9 |
+| **M8.14** | proof debt: the real-mock parity leg, the new-commit walk, a real `git rebase` fixture, and every vacuous or missing control | 37 |
+| **M8.15** | **twelve owner questions, each as two alternative units — one to be struck** | 24 |
+| **M8.16** | every stale sentence in the design doc, the guides, the runbook, the tickets and the board | 25 |
+| **M8.17** | merge day, the exit criteria ticked against runs, the workstream sealed | 9 |
+
+`docs/agent/MILESTONES.md` gained seeds for **M8.12–M8.17**, so the doc and the board no longer drift.
+
+### Next, in order
+1. **The owner answers M8.15's twelve questions.** Nothing else is worth starting first: six of M8.16's units
+   and all of M8.17 wait on them. Each question states both answers, what each costs, and the unit that
+   implements it. They are: OQ10 (a draft on an archived review); ruling 4's live-pin bound; deleting an
+   archived review; M8.8 OQ2 (sign off the PR-path reconcile change, or revert it); M8.11 OQ3
+   (`local-scenario.test.ts`); M8.3 OQ3 (a live byte-level parity leg); the mock's `dirty` flag; the runbook's
+   blob flag; `bin/revu`'s local path; a rename verb; M8.9 OQ2's copy; M8.3 OQ5 (`C`→`added`).
+2. **Then run M8.13, M8.14 and M8.16 in parallel** — disjoint surfaces (app+revud / tests / prose), one PR
+   each stacked on this branch. M8.15's kept halves land alongside; **strike the alternative unit in the
+   ticket and say so in its `## Log`**, or the seed and the board will disagree.
+3. **M8.17 last.** It cannot close while any M8.13–M8.16 unit is open, and it carries the merge-day checklist:
+   merge bottom-up with **merge commits, never squash**; after each merge retarget the next PR to `main` or
+   delete the merged head branch (`delete_branch_on_merge` is off); `git worktree prune` before touching
+   `m8.3`/`m8.4`; the ruleset needs one approving review (admin bypass) and enforces **no** status check, so
+   eyeball CI per PR.
+
+### Decisions not to relitigate
+The audit's method and its ids; the five-ticket split; that M8 closes on M8.17's Verify rather than on the
+merge; the 11 accepted findings (each carries its reason in `AUDIT-DISPOSITION.md` — disagree by ruling, not
+by re-auditing); `M8.2-g1` refuted 2 of 3.
+
+### Hazards
+- **Do not re-audit.** The record is complete and the ids are referenced by 104 units; a fresh audit would
+  renumber everything.
+- **The audit JSON is 1 MB.** Query it; never read it whole into context.
+- M8.15's units come in pairs. Landing both halves of a question is a contradiction — one is struck.
+- Standing: `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC`; **NEVER `git add -A`**; `--end-of-options`; ticket line
+  pointers rot — read the seam; a fix landing in the same edit as its test has no red — obtain one by control;
+  code comments never name a ticket, PR, session or audit id.
+
 ## 2026-09-02 (audit) — "did every M8 milestone land?": yes on the tip, with four majors and a ruling without a unit
 
 ### Verdict
