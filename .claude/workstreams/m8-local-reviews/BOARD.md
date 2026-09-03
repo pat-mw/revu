@@ -22,7 +22,9 @@ handover's top entry so the unit executes either way. Nothing else is runnable w
 **M8 is not closable until M8.17's Verify has run.** Every one of the audit's 146 findings has a disposition in
 [`AUDIT-DISPOSITION.md`](./AUDIT-DISPOSITION.md): 104 closed by a named unit, 30 closed by another finding's
 unit, 11 accepted with a written reason, 1 refuted. **The first thing the next session needs is the owner's
-answers to M8.15's twelve questions** — each is written as two alternative units, one to be struck.
+answers to M8.15's twelve questions** — each is written as two alternative units, one to be struck. The
+kickoff for that session is [`PROMPTS.md`](./PROMPTS.md) → **Session 6 — the close-out interview**, which asks
+the twelve in person before any code is dispatched.
 
 **Landing audit ran 2026-09-02** ([`AUDIT-2026-09-02.md`](./AUDIT-2026-09-02.md)): every ticket has code and a
 green gate on the tip and the six exit criteria hold there — but **four majors survived three refuters each**

@@ -35,6 +35,10 @@ repo** and **converted into a plan**:
 `docs/agent/MILESTONES.md` gained seeds for **M8.12–M8.17**, so the doc and the board no longer drift.
 
 ### Next, in order
+0. **Paste `PROMPTS.md` → "Session 6 — The close-out interview".** It opens the session with a live interview
+   over M8.15's twelve questions (user-visible decisions first), records each ruling and strikes the losing
+   unit, and only then dispatches the build waves. It also says what to do if the owner goes quiet mid-interview:
+   run M8.13 and M8.14, which need no ruling, and leave the rest.
 1. **The owner answers M8.15's twelve questions.** Nothing else is worth starting first: six of M8.16's units
    and all of M8.17 wait on them. Each question states both answers, what each costs, and the unit that
    implements it. They are: OQ10 (a draft on an archived review); ruling 4's live-pin bound; deleting an
