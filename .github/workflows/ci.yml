@@ -43,17 +43,18 @@ jobs:
         run: bun run check
 
   # Runs the RevuApi conformance suites across every transport leg as a matrix.
-  # Five required legs run in-gate here: the pull-request suite over the
+  # Six required legs run in-gate here: the pull-request suite over the
   # in-process mock (A) and over revud serving the mock store via real HTTP (B),
   # and the local-review suite over the in-process mock (E), over revud-mock via
-  # HTTP (F), and over the direct engine against a git repository the runner
-  # seeds with zero remotes (G) — a local review needs no token and no network,
-  # so G is required where C is not. The two live legs — direct mode vs the
-  # scratch repo (C) and broker mode vs the scratch org (D) — run only when
-  # their secret/env is present; without secrets they log a visible
+  # HTTP (F), over the direct engine against a git repository the runner seeds
+  # with zero remotes (G), and over the broker boot assembly against a seeded
+  # clone that has an origin remote (H) — a local review needs no token and no
+  # network, so G and H are required where C is not. The two live legs — direct
+  # mode vs the scratch repo (C) and broker mode vs the scratch org (D) — run
+  # only when their secret/env is present; without secrets they log a visible
   # skipped-pending-secrets line and do not fail the matrix. No repository
   # secrets are wired into this job, so on a public fork or a secret-less run it
-  # is legs A+B+E+F+G green with C+D skipped.
+  # is legs A+B+E+F+G+H green with C+D skipped.
   conformance-matrix:
     name: conformance-matrix
     needs: check
@@ -79,7 +80,7 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Conformance matrix (A+B pull-request and E+F+G local-review legs required; live legs skipped-pending-secrets)
+      - name: Conformance matrix (A+B pull-request and E+F+G+H local-review legs required; live legs skipped-pending-secrets)
         run: bun run conformance:matrix
 
   # Runs the browser-driven end-to-end flows after the gate passes. The app is

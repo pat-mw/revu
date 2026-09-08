@@ -10,8 +10,19 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing is running.** Five tickets are In Review, all gated, reviewed and pushed. **No Todo ticket remains in
-M8**; the milestone closes when the chain merges.
+**In flight: M8.18** — the local-review surface in the broker boot, on `m8.18/broker-local-surface`, based on
+`main`, open as [#86](https://github.com/pat-mw/revu/pull/86).
+
+**The M8 chain merged on 2026-09-08.** Every implementation PR (#73–#84) and the design/board PR (#69) are on
+`main`; the twelve implementation tickets are Done. Two things did **not** merge and are still open work: the
+close-out plan on [#85](https://github.com/pat-mw/revu/pull/85) (`board/m8-closeout`, carrying **M8.13–M8.17**,
+the landing audit and its disposition) and this session's ticket below. Because #85 is still open, its tickets
+and audit files are **not on `main`** — a branch cut from `main` will not see them.
+
+**M8.18 came from outside the board.** A client workspace running **broker mode** went to pull the local-review
+pipeline in and found nothing there: the surface was assembled in `mainDirect` alone, so every id in the
+reserved band answered `not_found` on a broker daemon. The fix moves the assembly into one `createBootApi` both
+boots call, which is what stops the same class of omission recurring one boot away.
 
 **Re-verified 2026-09-02 (third session, verification only):** gate on the tip **3348 · 1 · 0 · 117**,
 fifteen PRs open, none merged, CI green on #84; **no OQ10 ruling yet** — its seams are pinned in the
@@ -32,6 +43,7 @@ those and the majors land.**
 | **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
 | **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI green** (check · conformance-matrix · e2e · docs-build) |
 | **M8.9** archive when a PR appears | In Review, **8/8, `Verify` fully run** (scratch-repo both-halves proof done, 2026-09-02 — [revu-sandbox#6](https://github.com/pat-mw/revu-sandbox/pull/6)), adversarial pass done (five findings landed) | `m8.9/archive-on-pr` · [#82](https://github.com/pat-mw/revu/pull/82) | 3276 · 1 · 0 · 116, matrix A/B/E/F/G PASS, e2e ×2 PASSED, **CI green** (check · conformance-matrix · e2e · docs-build) |
+| **M8.18** the local-review surface in the broker boot | In Review, **5/5, `Verify` green** | `m8.18/broker-local-surface` · [#86](https://github.com/pat-mw/revu/pull/86) | 3406 · 1 · 0 · 118, matrix A/B/E/F/G/**H** PASS, **CI green** (check · conformance-matrix · e2e · docs-build) |
 | **M8.12** delete confirmation | In Review, **3/3, `Verify` green**, adversarial pass done (one blocker + six findings landed) | `m8.12/delete-confirm` · [#83](https://github.com/pat-mw/revu/pull/83) | 3348 · 1 · 0 · 117, **CI green** (check · conformance-matrix · e2e; docs-build not triggered — no docs changed) |
 
 **M8.12 lands the delete affordance** (in review on #83): the app had no way to delete a local review at all,

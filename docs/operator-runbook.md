@@ -22,7 +22,17 @@ Differences from direct mode:
    `broker_unreachable` state per request until the credential lands.
 3. The HTTP server binds `127.0.0.1`, not `0.0.0.0`.
 
-Source: `packages/revud/src/index.ts` — `mainBroker`;
+Everything else is the direct-mode engine, assembled identically — including
+reviews of **local branch pairs**, which the daemon serves from the repository
+it discovers in its workspace at boot. Those are not mediated writes: nothing
+about them reaches GitHub, so no body is stamped, no audit row is written, and
+they are not gated on `REVU_BOT_LOGIN` — a reads-only broker serves the whole
+local loop while still refusing every write to a pull request. They do appear in
+the review list, merged into the live pull-request rows; that list is the one
+local-review surface that needs the credential, because it asks the poll cache
+for the GitHub half and answers `broker_unreachable` until a poll has succeeded.
+
+Source: `packages/revud/src/index.ts` — `mainBroker` and `createBootApi`;
 `packages/revud/src/broker/token-source.ts` — `createFileCredentialTokenSource`.
 
 ## Starting the daemon in broker mode

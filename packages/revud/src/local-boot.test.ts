@@ -3,8 +3,8 @@
  * one thing it must never add.
  *
  * A `main*` function is assertable only by spawning a process, so each decision
- * is an exported pure function and boot is wiring over them. That is what makes
- * the four claims below testable at all:
+ * is an exported function and boot is wiring over them. That is what makes the
+ * five claims below testable at all:
  *
  * 1. **Local reviews are a CAPABILITY, never a mode.** The mode axis is about
  *    credential custody and bind address — mock, direct, broker — and a daemon
@@ -32,18 +32,47 @@
  * 4. **The startup line is pinned.** A daemon-spawning test reads the bound port
  *    out of it with a regex, so a reformat breaks every such suite; and a
  *    local-only boot must not print the absent halves as `undefined` or `?`.
+ * 5. **The surface is assembled ONCE, and every boot shares that assembly.**
+ *    Because local reviews ride inside a mode rather than being one, every boot
+ *    that assembles a read/persist surface has to assemble the same one. While
+ *    each boot wired the local half for itself, nothing said so: one discovered
+ *    a repository and passed a surface, another passed none, and the difference
+ *    was invisible in the type system until a workspace asked the second kind of
+ *    daemon for a review of a local branch pair and was told the id did not
+ *    exist. One shared assembler makes the two agree by construction, and it is
+ *    an exported function for the same reason every decision above is one. The
+ *    block below pins what it now owns: the local half is identical whichever
+ *    shape of boot calls it, the repository it acts on is the discovered
+ *    toplevel, the GitHub half travels exactly as the context holds it, and the
+ *    plumbing a boot genuinely owns — a poll cache, a credential-bound
+ *    branch-pair listing, a write decorator — still reaches the api.
  */
 import { describe, expect, test } from 'bun:test'
 import { ApiError, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
-import type { Session } from '@revu/shared'
+import type {
+  GhRef,
+  PullListItem,
+  PullListResponse,
+  RateLimitInfo,
+  Session,
+} from '@revu/shared'
 import type { CommandResult, CommandRunner } from './direct/command-runner'
+import type { PullListSource } from './direct/direct-api'
 import { createDirectApi } from './direct/direct-api'
+import type { SupersedingPullClient } from './direct/github-client'
 import { throwingGithubClient } from './direct/github-write-stubs'
+import type { SupersedingPullSource } from './direct/local-archive'
+import type { RepoRef } from './direct/repo'
+import type { DirectStore } from './direct/store'
 import { openDirectStore } from './direct/store'
+import type { TokenSource } from './direct/token-source'
+import type { WriteDecorator } from './direct/write-decorator'
+import type { DirectContext } from './direct/context'
 import { resolveDirectContext } from './direct/context'
 import { handleDirectApi } from './direct-router'
 import {
   assertLocalOnlySupported,
+  createBootApi,
   directStartupLine,
   resolveGithubRequirement,
   resolveLocalSurfaceRoot,
@@ -594,5 +623,456 @@ describe('directStartupLine', () => {
     })
 
     expect(PORT_FROM_STARTUP_LINE.exec(line)?.[1]).toBe('51234')
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// Block 5 — the shared assembly.
+// ————————————————————————————————————————————————————————————————————————————
+
+/** The clone every assembly below is booted inside, and where it was started. */
+const CLONE_ROOT = '/repo'
+const INSIDE_CLONE = '/repo/packages/app'
+const OUTSIDE_ANY_CLONE = '/tmp/not-a-repo'
+const CLONE_ORIGIN = 'git@github.com:acme/revu.git'
+
+/** The identity discovery reads off that origin, in both of its spellings. */
+const CLONE_IDENTITY = 'acme/revu'
+const CLONE_REPO_REF: RepoRef = { owner: 'acme', repo: 'revu' }
+
+/** The branch pair the seeded review names, fully qualified and bare. */
+const BASE_REF = 'refs/heads/main'
+const HEAD_REF = 'refs/heads/feature'
+const BASE_BRANCH = 'main'
+const HEAD_BRANCH = 'feature'
+
+/**
+ * A runner that answers `rev-parse --show-toplevel` PER DIRECTORY, the way git
+ * does: inside the clone the toplevel is the clone, and anywhere else there is
+ * no repository at all. Everything else fails loudly, so a command the assembly
+ * did not need is a wiring mistake rather than a silent empty result.
+ *
+ * Answering per directory is what makes the pair of assemblies below differ in
+ * exactly one thing — the directory the daemon was started in — instead of in
+ * two fixtures that could have diverged for any reason.
+ */
+function cloneRunner(): FakeRunner {
+  const calls: Invocation[] = []
+  return {
+    calls,
+    async run(argv: string[], opts?: { cwd?: string }): Promise<CommandResult> {
+      calls.push({ argv: [...argv], cwd: opts?.cwd })
+      const key = argv.join(' ')
+      const cwd = opts?.cwd ?? ''
+      const inside = cwd === CLONE_ROOT || cwd.startsWith(`${CLONE_ROOT}/`)
+      if (key === TOPLEVEL_ARGV) {
+        return inside
+          ? OK(`${CLONE_ROOT}\n`)
+          : FAILED(128, 'fatal: not a git repository (or any of the parent directories)')
+      }
+      if (key === ORIGIN_ARGV) return OK(`${CLONE_ORIGIN}\n`)
+      return FAILED(128, `the clone runner has no answer for ${JSON.stringify(key)}`)
+    },
+  }
+}
+
+/**
+ * A credential source that fails if it is ever consulted.
+ *
+ * Assembling the read/persist surface must reach GitHub for nothing: the local
+ * half is git and the store, and the GitHub half is carried through exactly as
+ * the context holds it. A token fetched during assembly would be hidden work
+ * done on a path a `--local-only` boot has no credential for at all.
+ */
+const REFUSING_TOKENS: TokenSource = {
+  getToken(): Promise<string> {
+    throw new Error('assembling the api must not fetch a GitHub credential')
+  },
+}
+
+/**
+ * The branch-pair listing a GitHub-backed CONTEXT carries, recording the
+ * repository each question was asked about. The repository is in the record
+ * because that is the thing binding it to a context can get wrong.
+ */
+function contextPairClient(log: string[]): SupersedingPullClient {
+  return {
+    async listOpenPullsForPair(owner, repo, pair) {
+      log.push(`context:${owner}/${repo}:${pair.headRef}...${pair.baseRef}`)
+      return []
+    },
+  }
+}
+
+/**
+ * The branch-pair listing a CALLER passes, already bound to its own repository —
+ * broker mode passes the one its poll loop's client already holds. It names no
+ * repository for exactly that reason: the binding was made before it got here.
+ */
+function callerPairSource(log: string[]): SupersedingPullSource {
+  return {
+    async listOpenPullsForPair(pair) {
+      log.push(`caller:${pair.headRef}...${pair.baseRef}`)
+      return []
+    },
+  }
+}
+
+/** A GitHub-backed context over one working directory, and nothing else varying. */
+function githubBackedContext(
+  cwd: string,
+  runner: CommandRunner,
+  pairs: SupersedingPullClient,
+): DirectContext {
+  return {
+    session: SESSION,
+    tokenSource: REFUSING_TOKENS,
+    runner,
+    cwd,
+    repo: CLONE_REPO_REF,
+    github: throwingGithubClient(),
+    supersedingPulls: pairs,
+  }
+}
+
+/**
+ * A context that resolved no GitHub half — no origin, no credential, no viewer —
+ * which is the deployment reviews of local branch pairs exist for. The absence
+ * is typed rather than blank, so there is no stand-in repository to pass on.
+ */
+function repositorylessContext(cwd: string, runner: CommandRunner): DirectContext {
+  return { session: SESSION, tokenSource: REFUSING_TOKENS, runner, cwd }
+}
+
+/** The allowance the poll half reports; a merged list carries it through. */
+const POLL_RATE_LIMIT: RateLimitInfo = {
+  limit: 5000,
+  remaining: 4999,
+  used: 1,
+  reset: '2026-01-01T00:00:00.000Z',
+}
+
+/** A pull-request row of the kind a poll cache serves. */
+function pollRow(number: number): PullListItem {
+  const side = (ref: string): GhRef => ({
+    ref,
+    sha: 'a'.repeat(40),
+    label: `acme:${ref}`,
+    repo: { full_name: CLONE_IDENTITY, default_branch: BASE_BRANCH },
+  })
+  return {
+    pull: {
+      id: number,
+      node_id: `PR_${number}`,
+      number,
+      state: 'open',
+      draft: false,
+      merged_at: null,
+      title: `pull ${number}`,
+      body: null,
+      user: { login: 'carol', id: 9, node_id: '', avatar_url: '', html_url: '', type: 'User' },
+      labels: [],
+      requested_reviewers: [],
+      head: side(HEAD_BRANCH),
+      base: side(BASE_BRANCH),
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+    },
+    broker: {
+      authorHumanId: null,
+      canApprove: true,
+      unresolvedThreads: 0,
+      assignedReviewerHumanIds: [],
+      compareKey: `${'a'.repeat(40)}...${'a'.repeat(40)}`,
+      commitCount: 1,
+    },
+  }
+}
+
+/** A poll cache serving a fixed set of rows, as broker mode's loop does. */
+function pollSourceServing(items: PullListItem[]): PullListSource {
+  return {
+    listPulls(): PullListResponse {
+      return { items, etag: 'W/"poll-1"', notModified: false, rateLimit: POLL_RATE_LIMIT }
+    },
+  }
+}
+
+/**
+ * A decorator that declares the broker write capability. Declaring it is the
+ * ONLY way an api can hold it — the capability is read off the decorator
+ * actually injected — so this is what makes "the decorator reached the api" an
+ * observable fact rather than an assumption about the parts object.
+ */
+function brokerShapedDecorator(): WriteDecorator {
+  return {
+    decorateBody: (body: string): string => `**Dana Reeve** (contractor)\n\n${body}`,
+    recordWrite: (): void => {},
+    brokerWritesEnabled: true,
+  }
+}
+
+/** One in-memory store carrying one recorded local review, and that review's id. */
+function storeWithOneLocalReview(): { store: DirectStore; localId: number } {
+  const store = openDirectStore({ dataDir: ':memory:' })
+  const { id } = store.createLocalReview({
+    repo: CLONE_IDENTITY,
+    baseRef: BASE_REF,
+    headRef: HEAD_REF,
+    title: 'a review of a local branch pair',
+  })
+  return { store, localId: id }
+}
+
+/**
+ * The typed code a synchronous call refused with — `null` when it returned, and
+ * a described string when it threw something the contract has no code for, so a
+ * plain error can never be mistaken for the typed refusal being asserted.
+ */
+function refusalCode(call: () => unknown): string | null {
+  try {
+    call()
+  } catch (err) {
+    if (err instanceof ApiError) return err.code
+    return `untyped: ${err instanceof Error ? err.name : String(err)}`
+  }
+  return null
+}
+
+/** The git the local surface ran, with the discovery commands taken out. */
+function surfaceInvocations(runner: FakeRunner): Invocation[] {
+  return runner.calls.filter((call) => {
+    const key = call.argv.join(' ')
+    return key !== TOPLEVEL_ARGV && key !== ORIGIN_ARGV
+  })
+}
+
+describe('createBootApi assembles the local surface for every boot', () => {
+  test('a broker-shaped assembly answers the local band from the surface itself', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      // The parts a broker boot brings that a direct boot does not: a poll
+      // cache to serve the list from, and a stamping write decorator.
+      const api = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+        pullList: pollSourceServing([]),
+        writeDecorator: brokerShapedDecorator(),
+      })
+
+      // The seeded review sits in the reserved band, so the answers below are
+      // about the band and not about some ordinary number.
+      expect(localId).toBeGreaterThanOrEqual(LOCAL_REVIEW_ID_BASE)
+
+      // The surface's OWN methods answer: the listing carries the recorded
+      // review, and the band id resolves to a review that has simply never been
+      // synced. An unwired daemon can produce neither — it refuses both.
+      expect(api.listLocalReviews().map((review) => review.id)).toEqual([localId])
+      expect(api.getSnapshot(localId)).toBeNull()
+    } finally {
+      store.close()
+    }
+  })
+
+  test('the same assembly started outside any repository refuses the local band', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      // Identical in every part but the working directory — same session, same
+      // repository, same client, same store, same row. Without this the claim
+      // above is about an api that could never have refused, which is no claim
+      // about the wiring at all.
+      const api = await createBootApi({
+        context: githubBackedContext(OUTSIDE_ANY_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+        pullList: pollSourceServing([]),
+        writeDecorator: brokerShapedDecorator(),
+      })
+
+      expect(refusalCode(() => api.listLocalReviews())).toBe('not_found')
+      expect(refusalCode(() => api.getSnapshot(localId))).toBe('not_found')
+    } finally {
+      store.close()
+    }
+  })
+
+  test('the surface acts on the DISCOVERED toplevel, not on the starting directory', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    const runner = cloneRunner()
+    try {
+      const api = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, runner, contextPairClient([])),
+        store,
+      })
+
+      // The sync's git runs against a runner that answers nothing, so it fails.
+      // The rejection is the fixture's limit and not the claim: what is asserted
+      // is the directory the commands were issued in on the way there.
+      await expect(api.syncPull(localId)).rejects.toThrow()
+
+      const issued = surfaceInvocations(runner)
+      expect(issued.length).toBeGreaterThan(0)
+      for (const call of issued) {
+        expect(call.cwd).toBe(CLONE_ROOT)
+        expect(call.cwd).not.toBe(INSIDE_CLONE)
+      }
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a direct-shaped assembly is wired identically for the local half', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      const brokerShaped = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+        pullList: pollSourceServing([]),
+        writeDecorator: brokerShapedDecorator(),
+      })
+      // No poll cache, no decorator, no listing seam of its own — everything a
+      // direct boot declines to bring.
+      const directShaped = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+      })
+
+      // Pinned against the seed FIRST. Two apis that both refused would agree
+      // with each other just as exactly as two that both serve.
+      expect(directShaped.listLocalReviews().map((review) => [review.id, review.repo])).toEqual([
+        [localId, CLONE_IDENTITY],
+      ])
+      expect(directShaped.getSnapshot(localId)).toBeNull()
+
+      // And only then against each other: the two modes' local surfaces differ
+      // in nothing, because there is only one of them.
+      expect(directShaped.listLocalReviews()).toEqual(brokerShaped.listLocalReviews())
+      expect(directShaped.getSnapshot(localId)).toEqual(brokerShaped.getSnapshot(localId))
+
+      // The local surface alone is a review list, so a direct boot that brought
+      // no poll cache still serves one.
+      expect(directShaped.pullListEnabled).toBe(true)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a context with no repository yields no GitHub capability and still serves the band', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      const api = await createBootApi({
+        context: repositorylessContext(INSIDE_CLONE, cloneRunner()),
+        store,
+      })
+
+      // No stand-in repository was invented to fill the absent half, and the
+      // local half is untouched by that absence: the two are independent.
+      expect(api.githubEnabled).toBe(false)
+      expect(api.listLocalReviews().map((review) => review.id)).toEqual([localId])
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a GitHub-backed context yields the capability', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    try {
+      const api = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+      })
+
+      expect(api.githubEnabled).toBe(true)
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a caller-supplied branch-pair listing is used INSTEAD of one bound from the context', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      const fromContext: string[] = []
+      const fromCaller: string[] = []
+      const api = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient(fromContext)),
+        store,
+        supersedingPulls: callerPairSource(fromCaller),
+      })
+
+      // The archive check runs ahead of the sync's git work, and that git work
+      // then fails against a runner answering nothing. Which listing was
+      // consulted can only be read off the recorders for that reason — the
+      // sync's own outcome says nothing about it.
+      await expect(api.syncPull(localId)).rejects.toThrow()
+
+      expect(fromCaller).toEqual([`caller:${HEAD_BRANCH}...${BASE_BRANCH}`])
+      expect(fromContext).toEqual([])
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a context-supplied listing is bound to the context repository when the caller passes none', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      const fromContext: string[] = []
+      const api = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient(fromContext)),
+        store,
+      })
+
+      await expect(api.syncPull(localId)).rejects.toThrow()
+
+      // The repository in the record is the context's own, spelled out rather
+      // than derived from anything the call carried: binding is the step that
+      // decides which repository a pair is asked about, and a per-call one would
+      // make "the repository this daemon serves" an argument.
+      expect(fromContext).toEqual([`context:acme/revu:${HEAD_BRANCH}...${BASE_BRANCH}`])
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a caller-supplied pull list reaches the api and merges with the local half', async () => {
+    const { store, localId } = storeWithOneLocalReview()
+    try {
+      const merged = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+        pullList: pollSourceServing([pollRow(101)]),
+      })
+      // The same assembly with the poll cache withheld. `pullListEnabled` alone
+      // could not tell these two apart — the local surface raises it on its own
+      // — so the served rows are what the claim rests on.
+      const localOnly = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+      })
+
+      expect(merged.pullListEnabled).toBe(true)
+      expect(merged.listPulls(null).items.map((item) => item.pull.number)).toEqual([101, localId])
+      expect(localOnly.listPulls(null).items.map((item) => item.pull.number)).toEqual([localId])
+    } finally {
+      store.close()
+    }
+  })
+
+  test('a caller-supplied write decorator reaches the api, and its absence fails closed', async () => {
+    const store = openDirectStore({ dataDir: ':memory:' })
+    try {
+      const stamping = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+        writeDecorator: brokerShapedDecorator(),
+      })
+      const passthrough = await createBootApi({
+        context: githubBackedContext(INSIDE_CLONE, cloneRunner(), contextPairClient([])),
+        store,
+      })
+
+      expect(stamping.brokerWritesEnabled).toBe(true)
+      expect(passthrough.brokerWritesEnabled).toBe(false)
+    } finally {
+      store.close()
+    }
   })
 })

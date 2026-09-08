@@ -29,13 +29,20 @@ shipping yet.
 ## Local reviews are not a fourth mode
 
 A **local review** — two branches in your workspace compared with no pull
-request behind them — is a capability *inside* direct mode alone, not a mode of
-its own, which is why the table above has three rows and not four.
-`REVU_MODE` is a credential-custody and bind axis: it decides where the GitHub
-token comes from and what the daemon listens on. Where a review's content came
-from is a different question, and one the shared core is already indifferent to
-— it sees a snapshot, not a provenance. Mock mode carries a local review as a
-fixture, so the flow is demonstrable with no daemon at all.
+request behind them — is a capability *inside* a mode, not a mode of its own,
+which is why the table above has three rows and not four. `REVU_MODE` is a
+credential-custody and bind axis: it decides where the GitHub token comes from
+and what the daemon listens on. Where a review's content came from is a
+different question, and one the shared core is already indifferent to — it sees
+a snapshot, not a provenance. Mock mode carries a local review as a fixture, so
+the flow is demonstrable with no daemon at all.
+
+Every mode that runs the real engine serves them, and serves the same one: the
+daemon discovers the repository it sits in at boot and builds one local-review
+surface over it, whichever mode is booting. So a workspace reviewing a branch
+pair behaves identically whether its GitHub calls authenticate as you or as a
+shared bot — and in neither case does anything about the local review reach
+GitHub.
 
 One behavioural difference is deliberate and worth stating plainly: a local
 review's merge base is computed against the **live tip** of the base branch, so

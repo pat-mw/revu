@@ -7,17 +7,21 @@ import type { CommandRunner } from './direct/command-runner'
 import type { SupersedingPullClient } from './direct/github-client'
 import type { SupersedingPullSource } from './direct/local-archive'
 import type { RepoRef } from './direct/repo'
+import type { DirectContext } from './direct/context'
 import {
   DirectStartupError,
   requireGithubContext,
   resolveDirectContext,
 } from './direct/context'
+import type { DirectApi, PullListSource } from './direct/direct-api'
 import { createDirectApi } from './direct/direct-api'
 import { createGithubClient } from './direct/github-client'
 import { discoverRepoRoot, repoIdentity } from './direct/local-git'
 import { createLocalReviewSurface } from './direct/local-surface'
 import { resolveBotLogin } from './direct/session'
+import type { DirectStore } from './direct/store'
 import { openDirectStore, resolveDirectDataDir } from './direct/store'
+import type { WriteDecorator } from './direct/write-decorator'
 import { createBrokerWriteDecorator } from './direct/write-decorator'
 import { createFileCredentialTokenSource } from './broker/token-source'
 import { createPollLoop } from './broker/poll-loop'
@@ -160,13 +164,20 @@ export function resolveGithubRequirement(
  * confusing answer. That is the same silent degradation the unrecognized
  * `REVU_LOCAL_ONLY` value is refused for, one level up, and it is refused the
  * same way: loudly, at boot, with the fix in the message.
+ *
+ * The refusal is about the REQUIREMENT the switch lifts, not about the
+ * capability it is reached for. Broker mode serves reviews of local branch
+ * pairs exactly as direct mode does — it just always serves them alongside a
+ * GitHub repository it mediates, so there is no requirement there to lift and
+ * a switch that asked for one was misunderstood rather than merely ignored.
  */
 export function assertLocalOnlySupported(mode: BootMode, requireGithub: boolean): void {
   if (requireGithub || mode === 'direct') return
   throw new Error(
-    `${LOCAL_ONLY_FLAG} (or ${LOCAL_ONLY_ENV_VAR}) serves local reviews inside direct ` +
-      `mode, but the resolved mode is "${mode}", which would ignore it. Pass --direct ` +
-      `(or set REVU_MODE=direct) alongside the switch.`,
+    `${LOCAL_ONLY_FLAG} (or ${LOCAL_ONLY_ENV_VAR}) lifts the requirement for a resolvable ` +
+      `GitHub repository, which only the direct boot consults, but the resolved mode is ` +
+      `"${mode}", which would ignore it. Pass --direct (or set REVU_MODE=direct) alongside ` +
+      `the switch.`,
   )
 }
 
@@ -304,37 +315,6 @@ async function mainMock(env: Record<string, string | undefined>): Promise<void> 
 }
 
 /**
- * Direct-mode boot: resolve the target repo, prove a GitHub token is obtainable,
- * and build the real session — all guarded, so a missing repo/token stops the
- * daemon with a clear message and non-zero exit (thrown as `DirectStartupError`
- * and handled at the entry point). Then open the durable SQLite store and bind
- * the read/persist surface (sync engine + store) that serves sync, snapshot,
- * drafts, viewed, and preferences. GraphQL threads and the write path stay
- * `not_implemented` until they land.
- *
- * Reviews of local branches are wired here as a CAPABILITY of this same boot,
- * never as a mode of their own: `resolveGithubRequirement` decides whether the
- * GitHub half is a precondition, and the local surface is assembled over the
- * repository this daemon actually sits in. With the requirement lifted the
- * GitHub half may be absent ENTIRELY — a repository with no `origin` remote,
- * or one whose credential could not be obtained — and the api then reports no
- * GitHub capability, so the router refuses the GitHub-only routes with a
- * message naming what is missing.
- * Nothing is narrowed to a repository here, because there may be none to narrow
- * to. The repository is DISCOVERED once —
- * the context's own working directory is a bare `process.cwd()` that nothing
- * resolved, so threading it would read blobs and write refs against whichever
- * directory the daemon was started in rather than against the repository that
- * directory belongs to. When discovery finds nothing, no surface is assembled
- * and every id from the local band answers a typed not-found, because a daemon
- * with no repository must serve no local reviews rather than pin into the wrong
- * repository.
- *
- * The token is never logged: only the resolved repo, viewer login, and data dir
- * appear in the startup line. The store lives under
- * `${XDG_DATA_HOME:-~/.local/share}/revu`, so a restart loses no draft.
- */
-/**
  * Bind a branch-pair listing client to one repository, giving the api the
  * one-method seam its local sync path consults.
  *
@@ -352,6 +332,136 @@ function pairListingFor(
   }
 }
 
+/** What a boot brings to the shared api assembly, beyond its context and its store. */
+export interface BootApiParts {
+  /**
+   * The resolved boot context: the session, the subprocess runner, the working
+   * directory git commands run in, and the GitHub half when one was resolved.
+   */
+  context: DirectContext
+  /** The durable store this daemon persists to, already opened and migrated. */
+  store: DirectStore
+  /**
+   * The live pulls-list source `/v1/pulls` is served from — the broker's poll
+   * cache. Absent in direct mode, where the list is built from local reviews
+   * alone.
+   */
+  pullList?: PullListSource
+  /**
+   * The branch-pair listing the local archive check reads. Omitted, it is bound
+   * from the context's own client and repository; broker mode passes its own so
+   * the check rides the client its poll loop already holds over the injected
+   * credential rather than a second one over the same credential.
+   */
+  supersedingPulls?: SupersedingPullSource
+  /**
+   * The write strategy — stamp+journal, or the passthrough the api defaults to.
+   * Broker mode injects the stamping decorator exactly when a bot identity is
+   * configured. Local writes never reach it: they post to no shared account, so
+   * there is no display name to smuggle into a body and no mediated write to
+   * journal.
+   */
+  writeDecorator?: WriteDecorator
+}
+
+/**
+ * The read/persist surface a boot serves, assembled over one context and one
+ * store — including the local-review surface, whichever mode is booting.
+ *
+ * That last clause is why this function exists. Reviews of local branches are a
+ * capability that rides INSIDE a mode rather than a mode of its own, so every
+ * boot that assembles a `DirectApi` has to assemble the same one. While each
+ * boot wired the surface for itself, nothing said so: direct mode discovered a
+ * repository and passed a surface, broker mode passed none, and the difference
+ * was invisible until a workspace asked a broker daemon for a review of a local
+ * branch pair and was told the id did not exist. Assembling it here makes the
+ * two modes agree by construction, and leaves each boot to pass only what is
+ * genuinely its own — a poll cache, a credential-bound listing client, a write
+ * decorator.
+ *
+ * The repository the surface acts on is DISCOVERED from the context's working
+ * directory rather than taken to be it. That directory is a bare
+ * `process.cwd()` nothing resolved, so handing it over would read blobs and
+ * write pin refs against whichever directory the daemon happened to be started
+ * in — a different repository whenever it was started from a subdirectory or a
+ * linked worktree. A failed discovery yields NO surface rather than a failed
+ * boot: a daemon with no repository must answer an id from the reserved band a
+ * typed `not_found` rather than pin into the wrong repository.
+ *
+ * The GitHub half travels exactly as the context holds it — both halves together
+ * or neither — so a boot that resolved none passes no stand-in repository and
+ * the router refuses the GitHub-only routes on the api's own capability.
+ */
+export async function createBootApi(parts: BootApiParts): Promise<DirectApi> {
+  const { context, store } = parts
+
+  // Resolved ONCE, and from the context's working directory only as a starting
+  // point: everything downstream is handed the discovered toplevel instead.
+  const localRoot = await resolveLocalSurfaceRoot(context.runner, context.cwd)
+  const localReviews =
+    localRoot === null
+      ? undefined
+      : createLocalReviewSurface({
+          store,
+          runner: context.runner,
+          toplevel: localRoot.root,
+          repo: localRoot.repo,
+          session: context.session,
+        })
+
+  const github = context.github
+  const repo = context.repo
+  // Bound from the context only when the caller brought no listing of its own,
+  // and only when there is a repository to bind to. Absent altogether is what a
+  // `--local-only` boot and a workspace with no origin both produce: the archive
+  // check then has nothing to consult, asks nothing, and every local review
+  // stays live.
+  const supersedingPulls =
+    parts.supersedingPulls ??
+    (context.supersedingPulls !== undefined && repo !== undefined
+      ? pairListingFor(context.supersedingPulls, repo)
+      : undefined)
+
+  return createDirectApi({
+    session: context.session,
+    // Passed on exactly as the context holds it: both halves together, or
+    // neither. The api reports the result as its `githubEnabled` capability and
+    // the router refuses the GitHub-only routes on it, so nothing downstream
+    // needs a stand-in repository to interpolate into a request path.
+    ...(github !== undefined && repo !== undefined ? { github, repo } : {}),
+    ...(supersedingPulls !== undefined ? { supersedingPulls } : {}),
+    store,
+    // The local-first blob provider reads the git clone via the same runner and
+    // directory startup validated, so blob bytes come free from local git.
+    runner: context.runner,
+    cwd: context.cwd,
+    ...(localReviews !== undefined ? { localReviews } : {}),
+    ...(parts.pullList !== undefined ? { pullList: parts.pullList } : {}),
+    ...(parts.writeDecorator !== undefined ? { writeDecorator: parts.writeDecorator } : {}),
+  })
+}
+
+/**
+ * Direct-mode boot: resolve the target repo, prove a GitHub token is obtainable,
+ * and build the real session — all guarded, so a missing repo/token stops the
+ * daemon with a clear message and non-zero exit (thrown as `DirectStartupError`
+ * and handled at the entry point). Then open the durable SQLite store and
+ * assemble the read/persist surface (sync engine + store) that serves sync,
+ * snapshot, drafts, viewed, and preferences.
+ *
+ * Reviews of local branches are wired as a CAPABILITY of this boot, never as a
+ * mode of their own: `resolveGithubRequirement` decides whether the GitHub half
+ * is a precondition, and the surface itself is assembled by `createBootApi`,
+ * which every mode's boot shares. With the requirement lifted the GitHub half
+ * may be absent ENTIRELY — a repository with no `origin` remote, or one whose
+ * credential could not be obtained — and the api then reports no GitHub
+ * capability, so the router refuses the GitHub-only routes with a message
+ * naming what is missing.
+ *
+ * The token is never logged: only the resolved repo, viewer login, and data dir
+ * appear in the startup line. The store lives under
+ * `${XDG_DATA_HOME:-~/.local/share}/revu`, so a restart loses no draft.
+ */
 async function mainDirect(env: Record<string, string | undefined>): Promise<void> {
   const argv = process.argv.slice(2)
   const port = resolvePort(env)
@@ -381,45 +491,13 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
   const dataDir = resolveDirectDataDir(env)
   const store = openDirectStore({ dataDir, env })
 
-  // Resolved ONCE, and from the context's working directory only as a starting
-  // point: everything downstream is handed the discovered toplevel instead.
-  const localRoot = await resolveLocalSurfaceRoot(context.runner, context.cwd)
-  const localReviews =
-    localRoot === null
-      ? undefined
-      : createLocalReviewSurface({
-          store,
-          runner: context.runner,
-          toplevel: localRoot.root,
-          repo: localRoot.repo,
-          session: context.session,
-        })
-
-  // The GitHub half is passed on exactly as the context holds it: both halves
-  // together, or neither. The api reports the result as its `githubEnabled`
-  // capability and the router refuses the GitHub-only routes on it, so nothing
-  // downstream needs a stand-in repository to interpolate into a request path.
-  const github = context.github
+  // Assembled by the shared boot assembler, which discovers the repository the
+  // local-review surface acts on and passes the GitHub half through exactly as
+  // the context holds it. Direct mode brings nothing else: no poll cache, no
+  // injected credential to bind a second listing client to, and no stamping
+  // decorator — the human authenticates to GitHub as themselves here.
+  const directApi = await createBootApi({ context, store })
   const repo = context.repo
-  // Absent together with the rest of the GitHub half, which is what a
-  // `--local-only` boot and a workspace with no origin both produce: the archive
-  // check then has nothing to consult, asks nothing, and every local review
-  // stays live.
-  const supersedingPulls = context.supersedingPulls
-
-  const directApi = createDirectApi({
-    session: context.session,
-    ...(github !== undefined && repo !== undefined ? { github, repo } : {}),
-    ...(supersedingPulls !== undefined && repo !== undefined
-      ? { supersedingPulls: pairListingFor(supersedingPulls, repo) }
-      : {}),
-    store,
-    // The local-first blob provider reads the git clone via the same runner and
-    // directory startup validated, so blob bytes come free from local git.
-    runner: context.runner,
-    cwd: context.cwd,
-    ...(localReviews !== undefined ? { localReviews } : {}),
-  })
 
   const server = startServer({
     port,
@@ -499,6 +577,17 @@ async function mainDirect(env: Record<string, string | undefined>): Promise<void
  * run without the self-review guard. Reads (sync, snapshot, blobs, reconcile)
  * are fully served either way. The token is never logged: only the resolved
  * repo, write configuration, and data dir appear in the startup line.
+ *
+ * Reviews of LOCAL branch pairs are served here exactly as direct mode serves
+ * them, over the same assembled surface, because the workspace this daemon runs
+ * in is an ordinary clone with branches in it. They are not mediated writes and
+ * they are not gated on the bot identity: nothing about them reaches GitHub, so
+ * a reads-only broker serves the whole loop — create, sync, draft, submit,
+ * reply, resolve, react — while refusing every pull-request write, and no local
+ * body is stamped and no local write is journaled, because there is no shared
+ * account to attribute them to. The one thing the mode adds is the review list:
+ * a local review is merged into the poll cache's rows, so it appears in the
+ * inbox beside the pull requests.
  */
 async function mainBroker(env: Record<string, string | undefined>): Promise<void> {
   const port = resolvePort(env)
@@ -560,14 +649,13 @@ async function mainBroker(env: Record<string, string | undefined>): Promise<void
   // confers: without the bot login no decorator is injected, the capability
   // stays false, and all four write routes answer 501 — the default passthrough
   // is structurally unreachable by a broker write.
-  const brokerApi = createDirectApi({
-    session: context.session,
-    github: context.github,
-    repo: context.repo,
+  const brokerApi = await createBootApi({
+    context,
     store,
-    runner: context.runner,
-    cwd: context.cwd,
-    // Serve `/v1/pulls` LIVE from the poll cache.
+    // Serve `/v1/pulls` LIVE from the poll cache. The list the client reads is
+    // the merge of that cache with this workspace's local reviews, which is why
+    // a local review shows up in the inbox beside the pull requests rather than
+    // in a surface of its own.
     pullList: pollLoop,
     // The archive check reads through the poll loop's OWN client rather than a
     // third one: this daemon already holds a client over the injected

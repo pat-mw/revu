@@ -14,11 +14,16 @@ same [reconcile](/docs/concepts/reconcile) when the branch moves under you. The
 only thing that changes is what is being named: a branch pair instead of a pull
 request.
 
-Local reviews are a capability of [direct mode](/docs/run-modes/direct), not a
-run mode of their own. In a repository with no GitHub `origin`, start the daemon
-with `bun run revud --direct --local-only` (or `REVU_LOCAL_ONLY=1`) so it stops
+Local reviews are a capability *inside* a run mode, not a run mode of their
+own: every daemon running the real engine — [direct](/docs/run-modes/direct) and
+[broker](/docs/run-modes/broker) alike — discovers the repository it sits in at
+boot and serves reviews of its branch pairs beside whatever pull requests that
+mode reaches. In a repository with no GitHub `origin`, start the daemon with
+`bun run revud --direct --local-only` (or `REVU_LOCAL_ONLY=1`) so it stops
 requiring a resolvable repository and a token; a repository that *does* have an
-`origin` needs no switch, and offers local reviews beside its pull requests.
+`origin` needs no switch. The switch belongs to direct mode because it lifts a
+requirement only that boot has: a broker workspace always mediates a real
+repository, and serves local reviews alongside it.
 Follow along in mock mode — the demo workspace already holds one, **Pre-tag
 review of release/0.41** (`main ← release/0.41`).
 
@@ -170,7 +175,7 @@ that review's branch pair in the same repository. When one exists, the review
 is archived: it goes read-only, stays frozen at its last successful sync, and
 links to the pull request — keeping everything it holds, every thread, every
 draft, all of its history. The check is a read of GitHub, so it needs the
-GitHub half of [direct mode](/docs/run-modes/direct): an `origin` on github.com
+daemon's GitHub half: an `origin` on github.com
 *and* a credential behind it — a `gh` login, or `GH_TOKEN` / `GITHUB_TOKEN` in
 the environment. Ordinarily a daemon missing either refuses to start. Under
 `--local-only` it boots anyway and drops that half instead, and it drops the

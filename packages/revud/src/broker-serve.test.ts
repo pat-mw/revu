@@ -92,9 +92,12 @@ function stubApi(): DirectApi {
     setFileViewed: () => ({}),
     getPreferences: () => ({ ...DEFAULT_PREFERENCES }),
     setPreferences: () => ({ ...DEFAULT_PREFERENCES }),
-    // A broker serves no local reviews: it has no repository on disk to read
-    // branches from. The three local operations are wired to throw so a serve
-    // test that reached one would fail rather than answer plausibly.
+    // These serve tests are about the bind address, the one-port serve and the
+    // session — no request they make names a review of a local branch pair. A
+    // broker daemon does serve those (its workspace is an ordinary clone, and
+    // the surface is assembled at boot exactly as direct mode's is); this stub
+    // simply has no repository behind it, so the local operations throw rather
+    // than answer plausibly to a test that strayed into them.
     listBranches: async () => {
       throw new Error('not used')
     },
