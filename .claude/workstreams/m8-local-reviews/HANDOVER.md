@@ -1,3 +1,223 @@
+## 2026-09-02 (audit) — "did every M8 milestone land?": yes on the tip, with four majors and a ruling without a unit
+
+### Verdict
+Every M8 ticket has code on the stack tip and a non-vacuous pin behind its core flow; the six exit criteria
+hold on the tip; the fifteen-PR chain is linear, unmerged, green, and 0 behind at every link. **Nothing has
+merged.** The audit — 27 read-only auditors (chain, 12 tickets, 6 exit criteria, 8 design sections); 99 gaps
+raised, 0 blocker · 4 major · 95 minor; the 4 majors and 7 behaviour-level minors each put to three independent
+refuters, **none refuted**; a completeness critic last — is recorded in full in
+[`AUDIT-2026-09-02.md`](./AUDIT-2026-09-02.md). Read that before re-auditing anything; do not re-run it.
+
+### What survived — act on these before calling M8 closed (read the seam first; pointers rot)
+**Majors** (none breaks the day-to-day loop; 2 and 4 are user-visible):
+1. **M8.8.3's real-mock parity leg was never written** (ticket Verify 7). `reconcile.test.ts` imports nothing
+   from `@revu/app/mock`; its `oracleResults()` replays classification only; the head-absent rule is pinned
+   separately per transport, so a divergence would pass. The M8.8 Verify-run record lists clauses 1–5 of 8.
+   *Closer:* one test importing `createMockApi`/`mockDev`, sync a mock review, save a draft, replace the
+   snapshot's commits with SHAs absent from the draft head, assert the mock's and revud's `newCommits` agree.
+2. **"Review read-only" after a deleted/renamed branch is half-pinned.** `submitReview` and `replyToThread`
+   answer `not_found` after `git branch -D` (`local-surface.test.ts`, "head resolution failures on ordinary
+   repository states…"), but `resolveThread` and `addReaction` do not pass through head resolution, and the
+   app renders no read-only state. *Closer:* route the other two verbs through the same resolution; one
+   four-verb test after `git branch -D`.
+3. **No local walk of new commit → re-sync → reconcile with a draft** — exit criterion 2 clause 1 is held by
+   composition only. *Closer:* one `describe` in `local-resync.test.ts` reusing `seed()`/`advanceHead()`:
+   `syncPull` then `reconcileDraft`, `newCommits` exactly `[the new tip]`.
+4. **A local review never goes stale before a re-sync.** `localPullListItem` (`direct-api.ts`) builds the
+   row's `compareKey` and head sha from the stored row, so `useStaleness` can never see `baseMoved` or
+   "N new commits since sync" on a local review; the D8 tooltip is unreachable there. *Closer:* make the list
+   row live (`rev-parse` / `merge-base` / `rev-list --count` at list time), as the mock's `listLocalPullRows`
+   docstring already specifies.
+
+**Critic's finds, confirmed by hand:**
+5. **Owner ruling 4 has no implementing unit for a live review.** Pins are additive per sync; `dropPinnedRefs`
+   is called only from the delete path (`direct-api.ts`); `pruneImmutables(store, gate)` takes no git runner.
+   A weekly-rebased branch accumulates two `refs/revu/reviews/<id>/…` refs per sync forever, while the
+   immutable halves the pins protect are pruned out from under them. *Needs a ruling:* accept and document,
+   or prune stale pins after a successful sync.
+6. **Deleting an archived review is unspecified.** No archived case in `conformance/local-delete.ts`; the
+   mock's `deleteLocalReview` has no archived branch. The mock is the spec — pin allow-or-refuse on all three
+   transports.
+7. **A mis-titled review cannot be corrected.** The contract has no rename, and the create dialog's title
+   field appends to the pre-filled branch name. Delete + recreate is the only remedy, and for an archived pair
+   recreate returns the archived review.
+
+**Behaviour-level minors that survived three refuters** (user-visible unless noted): the inbox section stays
+at the top when every local review is archived — the guide, M8.6 R1 and the module docstring say it drops
+below, `buildInboxSections` orders on any local rows; a failed pin lands on the sync outcome and is rendered
+or logged nowhere (M8.8 OQ3); the guide overstates archive coverage for a workspace that gained its `origin`
+after the review was created (a path-keyed identity never archives); the author-date heuristic survives in
+`files.tsx` `commitsSince` and `queue.tsx`; the branch list refreshes on reopen only past a 10 s staleTime;
+the runbook promises an operator-settable blob flag boot never reads; the mock never sets `dirty: true`, so
+D3's banner is unspecified in the spec and invisible under `?mock=1` (maintainer-visible).
+
+**Doc/board drift** (facts): `docs/agent/MILESTONES.md` has no M8.12 (doc 11 issues, board 12 — the doc's own
+rule forbids this); `docs/agent/LOCAL_REVIEWS.md` still says `MAX(id)+1` minting and a three-column UNIQUE
+(§3.1, §4.2), "zero eviction… the only DELETE is deleteDraft" (§8 #23), "21 `RevuApi` methods" (§2), the pin
+ref as `refs/revu/reviews/<id>/<compareKey>` (§5.1 — a name git rejects), "direct/broker mode" (D5 — direct
+only), and "the Linear board carries the units" (line 5); `BOARD.md`'s M8.10 row read `In Review (4/7)` —
+**fixed in this commit** to 8/8; M8.12's ticket has no `## Landmines` section; M8.1's OQ5 text ("drafts
+deliberately orphaned") no longer describes the delete boundary; the M8.8 Landmines about `git push --mirror`
+carrying pins and linked-worktree pins have no doc line; the M8.10 Log calls `reconcile.test.ts` "unedited"
+while #79 adds eight stub lines to it.
+
+**Refuted** (do not re-raise): M8.2's "UNIQUE constraint has no pin of its own" (2 of 3 refuters). The
+chain's procedural notes are facts about repository settings, not M8 defects: the ruleset requires one
+approving review with admin bypass and has no required status check; delete-branch-on-merge is off, so after
+each merge the next PR must be retargeted to `main` by hand (or the merged head branch deleted); merge with
+merge commits, not squash, or every later PR shows its predecessors' history; `m8.3` and `m8.4` are checked
+out in two prunable scratchpad worktrees (`git worktree prune` before rebasing either).
+
+### Next, in order (supersedes the earlier entries' item 2)
+1. If a base merges, rebase the rest and retarget. Never merge, never touch `main`.
+2. **Owner rulings, one sitting:** OQ10 (draft on an archived review); ruling 4's live-pin bound; the
+   archived-review delete; and whether majors 1–4 land before or after the merge.
+3. Then one unit per surviving major (closers above), each fixed with a control seen red; the doc/board drift
+   as one docs commit; the behaviour-level minors as the owner prioritises.
+
+## 2026-09-02 (third session) — verification only; the chain waits on the owner (merges, OQ10)
+
+### Orient
+1. `git checkout board/m8.9-scratch-proof` — still the stack tip, [PR #84](https://github.com/pat-mw/revu/pull/84)
+   (board-only), base `m8.12/delete-confirm` ([PR #83](https://github.com/pat-mw/revu/pull/83)). The code tip is
+   still `m8.12/delete-confirm`; branch new code off `board/m8.9-scratch-proof` so the chain stays linear.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → **3348 pass · 1 skip · 0 fail · 117 files** (re-run
+   this session on the tip: 67 s, zero `(fail)` lines in the teed log).
+3. `gh pr list` → fifteen OPEN, #69 → … → #82 → #83 → #84. **No base has merged**; `origin/main` is still
+   `177068a`. `gh pr checks 84` → check · conformance-matrix · e2e pass (docs-build is path-filtered; Vercel
+   green).
+4. Read `BOARD.md` → this entry → the previous entry — its "What this session learned" and "Landmines" apply in
+   full and are not repeated here.
+
+### State
+Unchanged from the previous entry: every M8 ticket In Review, every `Verify` line run, fifteen PRs in one
+linear chain, none merged, `main` untouched. **No code changed this session.** This record rides #84's branch
+rather than opening a sixteenth PR — a verification-only session has nothing that warrants its own PR.
+
+### What this session did
+- Re-verified the chain, the gate and CI (numbers above).
+- **Looked for an OQ10 ruling and found none.** #82, #83 and #84 carry only the Vercel bot's comment; no
+  review-thread comments, no reviews; `gh issue list` is empty; the ticket's OQ10 text is unchanged. **Do not
+  pick a side** — the two shapes below are so the ruling executes as one unit, not a recommendation.
+- **Pinned the seams OQ10's unit touches, whichever way it lands** (read each before editing — line pointers
+  rot, these are named by symbol on purpose):
+  - **App predicate:** `packages/app/src/lib/review-mode.ts` — `reviewArchived`
+    (`mode === 'local' && state === 'closed'`) and `reviewComposerHidden` (the same truth under its own name;
+    its docstring says why they are two functions). `reviewComposerHidden`'s **only** consumer is
+    `packages/app/src/components/review/review-bar.tsx` (`writesHidden`). The inline gutter composer opens
+    through `openComposer` in `packages/app/src/pages/files.tsx` — reached from the gutter selection and from
+    the `openComposerAt` handle declared in `packages/app/src/state/files-view.tsx` — and consults **nothing**
+    about the review's state.
+  - **Write sink, direct:** `saveDraft` in `packages/revud/src/direct/local-surface.ts` does `requireReview`
+    then `store.putLocalDraft`; it never calls the archived refusal. The four refused verbs are in
+    `packages/revud/src/direct/local-writes.ts` through `archivedRefusal(deps, localId)` (submit answers
+    `{ status: 'forbidden', reason }`; the other three throw `ApiError('forbidden', …)`). The sentence comes
+    from `archivedReviewRefusal` in `packages/shared/src/lib/local-archive.ts`, shared with the mock.
+  - **Write sink, mock:** `saveDraft` in `packages/app/src/api/mock/adapter.ts` does
+    `local.requireLocalReviewForDraft` then `store.putDraft`; no `archivedRefusalFor`. The mock's four refusals
+    are in `packages/app/src/api/mock/local.ts` (`archivedRefusalFor(record)`).
+  - **Shared conformance:** `packages/shared/conformance/local-archive.ts` holds the archived-review cases;
+    a "draft `PUT` on an archived review" case belongs beside them and runs on legs E/F/G with no adapter.
+  - **Guide:** `packages/docs/content/docs/guides/local-review.mdx` — the archive paragraph ("keeping
+    everything it holds, every thread, every draft") and the "Read-only, never destructive" callout are where
+    "a draft stays editable" would be said if the ruling is keep.
+- **Ruling A — refuse:** `saveDraft` on both transports calls the archived refusal before the write, answering
+  `forbidden` with the same sentence the four verbs use; one shared case in `local-archive.ts` asserting the
+  refusal **and** that the stored draft is unchanged after it (a read behind the claim); the gutter open path
+  gated by `reviewComposerHidden` (the review's state has to reach `files.tsx` / the `openComposerAt` handle).
+  Two things for the owner to say with the ruling: whether `discardDraft` stays open on an archived review (so
+  a kept draft can still be cleaned up), and that the client keeps the refused text editable — "drafts survive
+  everything" is a hard constraint, and a refused save must roll back with text intact.
+- **Ruling B — keep:** one sentence in the guide's archive paragraph saying a draft on an archived review can
+  still be edited and saved but never submitted; a shared case in `local-archive.ts` pinning that `saveDraft`
+  on an archived review answers 200 and round-trips through `getDraft` (so the mock stays the spec for it, not
+  an accident); the ticket's OQ10 closed with the ruling.
+
+### Next, in order
+Unchanged: (1) if a base merges, rebase the rest of the stack onto it and retarget its PR — never merge, never
+touch `main`, never retarget ahead of a merge; (2) OQ10's unit only on the owner's ruling, as one unit;
+(3) the follow-ups listed in the previous entry only if the owner asks for them.
+
+### Landmines (additions)
+- zsh expands an unquoted `--include=*.tsx` inside `grep -r` and aborts the whole command with `no matches
+  found`; quote the glob. Same family as the `=word` expansion already recorded.
+
+## 2026-09-02 (later) — M8.9's scratch-repo proof is done; every M8 Verify line has now run
+
+### Orient
+1. `git checkout board/m8.9-scratch-proof` — stack tip, [PR #84](https://github.com/pat-mw/revu/pull/84) (board-only, no
+   code), base `m8.12/delete-confirm` ([PR #83](https://github.com/pat-mw/revu/pull/83)). The code tip is still
+   `m8.12/delete-confirm`; branch the next code change off `board/m8.9-scratch-proof` so the chain stays linear.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **3348 pass · 1 skip · 0 fail · 117 files**
+   (re-run on the tip this session, before anything else).
+3. CI was green on #82 and #83 at the start of this session (`gh pr checks 82` / `83`). **No base in the chain
+   has merged** — `gh pr list` shows fourteen OPEN, #69 → … → #80 → #82 → #83.
+4. Read `BOARD.md` → this entry → whatever the owner asks for.
+
+### State
+`main` untouched. **Fifteen PRs, one linear chain, none merged:** … → #80 (M8.11) → #82 (M8.9) → #83 (M8.12) →
+#84 (this record). Every M8 ticket is
+In Review; **every `Verify` line in M8 has now actually run**, the last being M8.9's scratch-repo both-halves
+proof. No Todo ticket remains. **Stacked PRs are the protocol. Never merge, never commit to `main`, never
+retarget ahead of a merge.**
+
+### What this session did
+- **Ran M8.9's both-halves proof for real** against `pat-mw/revu-sandbox`, in the served app, revud `--direct`
+  from `tmp/revu-sandbox` with the `gh auth token` credential path. PR
+  [pat-mw/revu-sandbox#6](https://github.com/pat-mw/revu-sandbox/pull/6) (now closed). Observed exactly what
+  the design promises: the matching review archived on its next sync (banner linking to #6; thread, submitted
+  review and pending draft kept; no submit, no verdict picker; inbox chip `archived · superseded by #6`); the
+  second review of the same head against `fixture/base-advances-target` stayed live (OQ8); the PR carried
+  **zero** comments, reviews and reactions (D1); the four writes refused naming #6; closing the PR did not
+  un-archive; deleting the head branch left the frozen snapshot servable with zero requests. The full record,
+  the Verify tick and the in-gate assertions it corroborates are in M8.9's ticket; `LOG.md` and `BOARD.md`
+  updated. **No code changed.**
+- Cleaned up: proof branch deleted locally and remotely, the five fixture PRs untouched, the temporary
+  `.claude/launch.json` entry reverted, the daemon stopped.
+
+### Next, in order
+1. **Nothing in M8 is left to build or to verify.** The owner merges the chain bottom-up; each exit criterion
+   ticks in `MILESTONE.md` as the run that proves it lands. If a base merges, rebase the rest and retarget.
+2. **Open question for the owner — M8.9 OQ10** (deliberately unasked, recorded in the ticket): on an archived
+   review the **inline gutter composer still opens and a draft `PUT` answers 200**. The bar's composer and
+   verdict picker are withheld as M8.9.6 promised, and the design lists drafts under "reads stay open", so this
+   is the design as written — but it is a composer whose text can never be submitted. Either answer is one
+   unit (refuse in the write sink + a conformance case + hide the gutter behind the same predicate, or keep it
+   and say so in the guide).
+3. **Follow-ups on the board, not tickets:** `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a
+   shared conformance case for draft verbs on a deleted review; the stale `.claude/worktrees/agent-*`
+   directories; **a committed live direct runner** if leg C is ever meant to run (see Landmines); OQ10's unit;
+   the create dialog's title field appends to the pre-filled branch name instead of replacing it (cosmetic —
+   the proof review is titled `proof/archive-2026-09-02Proof: …`).
+
+### What this session learned — apply before calling anything done
+- **A promised "bonus" run needs a committed runner.** The previous handover offered
+  `GH_TOKEN=$(gh auth token) bun run conformance:matrix` as a live leg C. `scripts/conformance-matrix.ts`
+  reseeds the scratch repo and then looks for `packages/revud/src/direct/conformance-live.test.ts`, **which
+  does not exist** — so the "bonus" would have force-pushed every fixture branch and reported
+  `skipped-deferred`. Read the runner's `existsSync` targets before promising a live leg. Not attempted.
+- **"Direct mode works there" was one config line short.** The sandbox clone had `user.email` and no
+  `user.name`; direct mode refuses to boot without both. Set locally in the clone now (`git -C tmp/revu-sandbox
+  config user.name …`), left in place.
+- **The walk against the real transport again found what the unit level cannot express** — not a defect this
+  time but a design edge (OQ10). Do the walk; read the persisted store beside the page (`sqlite3 -readonly
+  <REVU_DATA_DIR>/direct.sqlite` — tables `local_reviews`, `local_reviews_submitted`, `local_threads`,
+  `local_drafts`) so a stale page is distinguishable from a transport that did nothing.
+- **`mutable.reviews` is `[]` on a local review by design** (`local-surface.ts` — the submitted summary lives
+  in `local_reviews_submitted`); "renders its submitted review" means the stored summary plus its thread. Do
+  not read the empty list as a lost submit.
+
+### Landmines
+- **The sandbox's `origin/pr/*` refs are `refs/pull/*/head`, fetched by the seed.** Any `git fetch --prune` in
+  `tmp/revu-sandbox` deletes them locally; restore with
+  `git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'`.
+- **zsh `echo` of a JSON body turns `\n` inside strings into raw control characters** — a parsed id comes back
+  empty and every probe 404s on a malformed route. Pipe `curl` straight into the parser.
+- **A hidden preview tab throttles the app's timers; the daemon's own state does not lie.** The archive showed
+  on the page within one re-sync here, but read `/api/local-reviews` alongside the page anyway.
+- Standing: `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC`; **NEVER `git add -A`**; `--end-of-options`; ticket line
+  pointers rot — read the seam; a fix landing in the same edit as its test has no red — obtain one by control.
+
 ## 2026-09-02 — M8.9 (#82) and M8.12 (#83) are In Review; no Todo ticket remains in M8
 
 ### Orient
