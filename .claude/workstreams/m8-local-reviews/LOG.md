@@ -628,3 +628,18 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
   on `m8.9`. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a stored PR
   URL column if an Enterprise host is ever supported; the 52 stale agent worktrees under `.claude/worktrees/`.
 
+**update — 2026-09-02 (M8.12)**
+- **Done:** M8.12 delete confirmation, 3/3, In Review on [#83](https://github.com/pat-mw/revu/pull/83)
+  stacked on #82. Greenfield: the app had no delete affordance, hook or dialog. Two commits: the feature, then
+  the adversarial review's blocker and six findings. Gate **3348 · 1 · 0 · 117**. **No Todo ticket remains in
+  M8.**
+- **Decisions:** the dialog shows for every delete (threads and history go with it), with the discard sentence
+  and `Discard draft and delete` only when the reader's own draft holds text; the refusal sentence in both
+  producers names no review id; a draft verb aimed at a deleted review answers `not_found` in the mock as in
+  the daemon; the cached draft is dropped only after a discard that succeeded.
+- **Blockers:** none.
+- **Next:** the owner merges the fourteen-PR chain bottom-up (`main` → … → #80 → #82 → #83); the exit
+  criteria tick as it lands. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` in the netlog
+  guard; a stored PR URL column for an Enterprise host; a shared conformance case for draft verbs on a
+  deleted review; the stale `.claude/worktrees/agent-*` directories.
+

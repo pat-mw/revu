@@ -992,10 +992,17 @@ export function createDirectApi(deps: DirectApiDeps): DirectApi {
       // below. Nothing else on this surface can write a draft in that gap, so
       // the precondition cannot hold here and have stopped holding by the time
       // the rows go.
+      //
+      // The refusal names no id. A reading surface shows this sentence
+      // verbatim — only this side knows what is in the way — and a local
+      // review's id is a synthetic key minted so routes and cache keys can stay
+      // plain numbers. It names nothing a reader could look up, so it must not
+      // reach a screen, and the one sentence that travels to one is where that
+      // rule is easiest to break.
       if (deps.store.listLocalDrafts(reviewId).some(draftHoldsText)) {
         throw new ApiError(
           'unprocessable',
-          `Local review ${reviewId} still holds an unsubmitted draft with text in it — ` +
+          'This local review still holds an unsubmitted draft with text in it — ' +
             'discard that draft, then delete the review.',
         )
       }

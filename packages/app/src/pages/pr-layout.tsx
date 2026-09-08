@@ -1,22 +1,34 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Link, NavLink, Outlet, useParams } from 'react-router'
-import { Download, Inbox, RefreshCw } from 'lucide-react'
+import { Link, NavLink, Outlet, useNavigate, useParams } from 'react-router'
+import { Download, Inbox, RefreshCw, Trash2 } from 'lucide-react'
 import type {
   ApiError,
   CommentIdentity,
   PullDetail,
   PullSummary,
+  ReviewDraft,
   Snapshot,
   StalenessInfo,
 } from '@revu/shared'
-import { identityName, parseCommentIdentity } from '@revu/shared'
+import { draftHoldsText, identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
+import { useDraft, useDraftActions } from '@/state/drafts'
+import { useDeleteLocalReview } from '@/state/local-reviews'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
 import type { CheckCounts } from '@/lib/checks-rollup'
-import { notFoundCopy, stateChipCopy, stateChipVariant, syncCostCopy } from '@/lib/mode-copy'
-import type { ReviewState } from '@/lib/mode-copy'
+import { rowIdentity } from '@/lib/local-reviews'
+import type { RowIdentity } from '@/lib/local-reviews'
+import {
+  deleteLocalReviewCopy,
+  deleteLocalReviewFailedCopy,
+  notFoundCopy,
+  stateChipCopy,
+  stateChipVariant,
+  syncCostCopy,
+} from '@/lib/mode-copy'
+import type { DeleteDraftSummary, ReviewState } from '@/lib/mode-copy'
 import { reviewMode, reviewTabs } from '@/lib/review-mode'
 import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
 import { minutesUntil, relativeTime, shortSha } from '@/lib/time'
@@ -31,6 +43,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { useToast } from '@/components/ui/toast'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { ConfirmDeleteLocalReviewDialog } from '@/components/confirm-delete-local-review'
+import type {
+  DeleteAttemptAnswer,
+  DeleteDraftRead,
+} from '@/components/confirm-delete-local-review'
+import { describeApiError } from '@/components/review/error-copy'
 import { ReviewBar } from '@/components/review/review-bar'
 import { ReviewDirtyBanner } from '@/components/review/dirty-banner'
 import { ReviewSupersededBanner } from '@/components/review/superseded-banner'
@@ -441,6 +459,142 @@ export function PrIdentityRow({ mode, pull }: { mode: ReviewMode; pull: PullSumm
 PrIdentityRow.displayName = 'PrIdentityRow'
 
 // ————————————————————————————————————————————————————————————————
+// Deleting the review — the one action that ends a branch pair
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * What the confirmation needs to know about a draft, or null when it holds no
+ * text at all.
+ *
+ * Null is the same answer for "no draft" and "a draft an editor made on its own
+ * and nobody typed into", because the two are the same fact to everything
+ * downstream: the delete is not refused for either, no discard is sent, and the
+ * confirmation promises none. What counts as text is asked of the one shared
+ * definition rather than re-derived here — a second reading of that question is
+ * a second answer, and the wrong one either destroys text without a word or
+ * makes a review nobody has touched undeletable.
+ */
+function heldText(draft: ReviewDraft | null): DeleteDraftSummary | null {
+  if (draft === null || !draftHoldsText(draft)) return null
+  return { pendingCount: draft.comments.length, hasBody: draft.body.length > 0 }
+}
+
+/**
+ * The header's way of ending a review of two local branches.
+ *
+ * Offered on a branch pair only, and on an archived one as much as a live one:
+ * a review superseded by work that moved on is exactly the review someone wants
+ * to clear out, and withholding the action there would leave it with no way to
+ * go at all.
+ *
+ * Quiet until it is reached — a bare control in the header, taking its red only
+ * on hover and keyboard focus — because the header is somewhere a reader passes
+ * through constantly and this is the one thing on it that cannot be undone. The
+ * confirmation behind it is where the act is spelled out.
+ *
+ * The control waits for the draft read to SUCCEED before it will confirm
+ * anything, and that is a correctness matter rather than polish: whether this
+ * reader's own draft is discarded on the way is decided from that read, and
+ * deciding it from a read that is still in flight — or from one that failed,
+ * which answers with the same empty-looking absence — would send a delete that
+ * leaves their own text in the way and then explain the refusal as somebody
+ * else's.
+ *
+ * The discard itself is the editing surface's own, not a bare request. That
+ * surface holds a debounced save and a retry behind it, and a discard that
+ * skipped them would race a timer that re-creates the draft between the discard
+ * and the delete.
+ */
+function DeleteLocalReviewAction({
+  prNumber,
+  identity,
+}: {
+  prNumber: number
+  identity: RowIdentity
+}) {
+  const navigate = useNavigate()
+  const draft = useDraft(prNumber)
+  const draftActions = useDraftActions(prNumber)
+  const remove = useDeleteLocalReview()
+  const { toast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [attempt, setAttempt] = useState<DeleteAttemptAnswer | null>(null)
+
+  const held = heldText(draft.data ?? null)
+  const draftRead: DeleteDraftRead = draft.isSuccess
+    ? 'read'
+    : draft.isError
+      ? 'unreadable'
+      : 'reading'
+  // The trigger says exactly what the plain confirmation's own control says,
+  // read from the one place either sentence is decided. It stays the plain
+  // wording whatever the draft holds: the escalation belongs in the
+  // confirmation, where the consequence is spelled out beside it.
+  const label = deleteLocalReviewCopy('local', null)?.confirm ?? ''
+
+  const confirm = () => {
+    setAttempt(null)
+    remove.mutate(
+      { reviewId: prNumber, discard: held === null ? null : draftActions.discard },
+      {
+        onSuccess: (result) => {
+          if (result.outcome === 'deleted') {
+            setOpen(false)
+            navigate('/')
+            return
+          }
+          // Kept open, holding whatever the far end answered: there is nothing
+          // this reader can do about it here, and closing onto an unchanged
+          // header would say nothing happened at all. A failure is reported in
+          // the toast as well, because the dialog can be dismissed and the fact
+          // that a draft was discarded on the way must outlive it.
+          if (result.outcome === 'failed') {
+            const detail = describeApiError(result.error)
+            setAttempt({ kind: 'failed', detail, discarded: result.discarded })
+            toast({
+              kind: 'error',
+              title: deleteLocalReviewFailedCopy('local', result) ?? '',
+              detail,
+            })
+            return
+          }
+          setAttempt({ kind: 'refused', detail: result.reason, discarded: result.discarded })
+        },
+      },
+    )
+  }
+
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="shrink-0 hover:bg-danger/12 hover:text-danger focus-visible:bg-danger/12 focus-visible:text-danger"
+        onClick={() => {
+          setAttempt(null)
+          setOpen(true)
+        }}
+      >
+        <Trash2 strokeWidth={1.5} aria-hidden />
+        {label}
+      </Button>
+      <ConfirmDeleteLocalReviewDialog
+        open={open}
+        onOpenChange={setOpen}
+        identity={identity}
+        draft={held}
+        draftRead={draftRead}
+        busy={remove.isPending}
+        attempt={attempt}
+        onConfirm={confirm}
+        onCancel={() => setOpen(false)}
+      />
+    </>
+  )
+}
+DeleteLocalReviewAction.displayName = 'DeleteLocalReviewAction'
+
+// ————————————————————————————————————————————————————————————————
 // Meta row — who wrote it and how big it is, under the identity row.
 // ————————————————————————————————————————————————————————————————
 
@@ -639,8 +793,14 @@ export function PrLayout() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="hairline-b px-4 pt-3">
-        {/* Row 1 — identity of the review itself */}
-        <PrIdentityRow mode={mode} pull={pull} />
+        {/* Row 1 — identity of the review itself, and (on a branch pair) the
+            one action that ends it */}
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <PrIdentityRow mode={mode} pull={pull} />
+          {mode === 'local' && (
+            <DeleteLocalReviewAction prNumber={prNumber} identity={rowIdentity(item)} />
+          )}
+        </div>
 
         {/* Row 2 — meta: author, refs, mergeability, checks, diff size */}
         <PrMetaRow

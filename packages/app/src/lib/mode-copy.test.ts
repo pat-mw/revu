@@ -17,6 +17,10 @@ import * as modeCopy from './mode-copy'
 import {
   authorBannerCopy,
   conversationEmptyCopy,
+  deleteLocalReviewCopy,
+  deleteLocalReviewDraftUnreadableCopy,
+  deleteLocalReviewFailedCopy,
+  deleteLocalReviewRefusedCopy,
   dirtyWorktreeCopy,
   draftSavedCopy,
   neverSyncedCopy,
@@ -36,7 +40,7 @@ import {
   syncErrorCopy,
   tooLargeDiffCopy,
 } from './mode-copy'
-import type { DirtyWorktreeCopy } from './mode-copy'
+import type { DeleteDraftSummary, DirtyWorktreeCopy } from './mode-copy'
 import type { ReviewMode } from './review-mode'
 
 /**
@@ -723,6 +727,221 @@ describe('the descriptor on an author resolved to a GitHub account', () => {
   })
 })
 
+// ————————————————————————————————————————————————————————————————
+// Deleting a review of two local branches
+// ————————————————————————————————————————————————————————————————
+
+/** A draft holding both kinds of text, as the confirmation summarises one. */
+const FULL_DRAFT: DeleteDraftSummary = { pendingCount: 3, hasBody: true }
+
+/**
+ * Every line the confirmation says about a branch pair, as one string — so a
+ * field added to the copy later is swept by the bans below without editing
+ * them, and so a `null` on the branch-pair reading fails loudly instead of
+ * satisfying every absence for free.
+ */
+function deleteText(draft: DeleteDraftSummary | null): string {
+  const copy = deleteLocalReviewCopy('local', draft)
+  if (copy === null) throw new Error('a branch pair was offered no delete confirmation')
+  return Object.values(copy).join(' ')
+}
+
+describe('the confirmation before a branch pair is deleted', () => {
+  test('names the act and what goes with the review', () => {
+    const copy = deleteLocalReviewCopy('local', null)
+    expect(copy?.title).toBe('Delete this local review?')
+    expect(copy?.body).toBe(
+      'Its threads, its submitted reviews and its synced history go with it. The two branches themselves are untouched.',
+    )
+    expect(copy?.confirm).toBe('Delete review')
+    expect(copy?.cancel).toBe('Cancel')
+  })
+
+  test('and a pull request is offered no such thing', () => {
+    // Null rather than a reworded sentence: nothing in this app deletes a pull
+    // request, so there is no softer wording to fall back to and inventing one
+    // would invent the act behind it.
+    expect(deleteLocalReviewCopy('github', null)).toBeNull()
+    expect(deleteLocalReviewCopy('github', FULL_DRAFT)).toBeNull()
+  })
+
+  test('an unsubmitted draft is counted, and said to be discarded rather than kept', () => {
+    const copy = deleteLocalReviewCopy('local', FULL_DRAFT)
+    expect(copy?.body).toBe(
+      'Its threads, its submitted reviews and its synced history go with it. Deleting first discards your unsubmitted draft — 3 pending comments and a summary — and that text is not kept anywhere. The two branches themselves are untouched.',
+    )
+    expect(copy?.confirm).toBe('Discard draft and delete')
+  })
+
+  test('one pending comment is counted as one', () => {
+    expect(deleteLocalReviewCopy('local', { pendingCount: 1, hasBody: false })?.body).toContain(
+      'your unsubmitted draft — 1 pending comment —',
+    )
+  })
+
+  test('a summary with no pending comments is named as what it is', () => {
+    expect(deleteLocalReviewCopy('local', { pendingCount: 0, hasBody: true })?.body).toContain(
+      'your unsubmitted draft — a summary —',
+    )
+  })
+
+  test('and the two bodies are different sentences', () => {
+    // The check that needs no wording to be useful: a function that returns one
+    // paragraph whatever it is handed satisfies every ban below, because a ban
+    // is satisfied by any wording that happens not to contain the word — the
+    // wording it was supposed to replace included.
+    const withDraft = deleteLocalReviewCopy('local', FULL_DRAFT)
+    const without = deleteLocalReviewCopy('local', null)
+    expect(withDraft?.body).not.toBe(without?.body)
+    expect(withDraft?.confirm).not.toBe(without?.confirm)
+  })
+
+  test('a draft holding nothing is the same offer as no draft at all', () => {
+    // Total over the input rather than only over the inputs the app sends. A
+    // draft an editor made on its own holds no text, discarding it destroys
+    // nothing, and the review deletes without a refusal — so promising to
+    // discard something would be a sentence about an act that never happens.
+    expect(deleteLocalReviewCopy('local', { pendingCount: 0, hasBody: false })).toEqual(
+      deleteLocalReviewCopy('local', null),
+    )
+  })
+})
+
+describe('a refusal that outlives the discard', () => {
+  test('says whose draft is in the way, that nothing was deleted, and that the reader’s own is gone', () => {
+    expect(deleteLocalReviewRefusedCopy('local', { discarded: true })).toBe(
+      'Your draft was discarded, but nothing was deleted: an unsubmitted draft written by someone else is still on this review, and only they can discard it.',
+    )
+  })
+
+  test('and a pull request has no such refusal to explain', () => {
+    expect(deleteLocalReviewRefusedCopy('github', { discarded: true })).toBeNull()
+  })
+})
+
+describe('a refusal met with no discard behind it', () => {
+  test('says a draft with text is in the way, and names the remedy without inventing a person', () => {
+    expect(deleteLocalReviewRefusedCopy('local', { discarded: false })).toBe(
+      'Nothing was deleted — an unsubmitted draft with text in it is still on this review, and it has to be discarded before the review can go.',
+    )
+  })
+
+  test('and never says the draft was somebody else’s', () => {
+    // The reader's own draft may simply never have been read — an errored draft
+    // query answers with the same emptiness as a review nobody has drafted on —
+    // so the delete goes out asking for no discard and comes back refused ON
+    // THE READER'S OWN TEXT. Naming a third party there sends them to ask
+    // somebody who does not exist.
+    //
+    // The discarded reading is the positive control, in this body: it is the
+    // one arrangement where a third party really is the only thing that can be
+    // in the way, so the phrase is a thing this function can say and does.
+    expect(deleteLocalReviewRefusedCopy('local', { discarded: true })).toMatch(/someone else/i)
+    expect(deleteLocalReviewRefusedCopy('local', { discarded: false })).not.toMatch(
+      /someone else/i,
+    )
+  })
+
+  test('and only the discarded reading claims the reader’s draft is gone', () => {
+    expect(deleteLocalReviewRefusedCopy('local', { discarded: true })).toMatch(
+      /your draft was discarded/i,
+    )
+    expect(deleteLocalReviewRefusedCopy('local', { discarded: false })).not.toMatch(
+      /your draft was discarded/i,
+    )
+  })
+})
+
+describe('a delete that failed for a reason no draft explains', () => {
+  test('names the failure alone when nothing was discarded on the way', () => {
+    expect(deleteLocalReviewFailedCopy('local', { discarded: false })).toBe(
+      "Couldn't delete this review",
+    )
+  })
+
+  test('and says the draft is gone when it is, because nothing else on the screen will', () => {
+    // The arrangement a reader would never guess from a sentence about a
+    // delete: the discard went through, the delete did not, so the review is
+    // still there and the text is not. The plain reading is the control in this
+    // body — the sentence is one this function can decline to say.
+    expect(deleteLocalReviewFailedCopy('local', { discarded: true })).toMatch(
+      /your draft was discarded/i,
+    )
+    expect(deleteLocalReviewFailedCopy('local', { discarded: false })).not.toMatch(
+      /your draft was discarded/i,
+    )
+  })
+
+  test('and a pull request has no delete to fail', () => {
+    expect(deleteLocalReviewFailedCopy('github', { discarded: true })).toBeNull()
+  })
+})
+
+describe('a draft this reader’s own client could not read', () => {
+  test('says so, rather than letting the confirmation guess', () => {
+    expect(deleteLocalReviewDraftUnreadableCopy('local')).toBe(
+      'Your unsubmitted draft on this review could not be read, so a delete cannot say whether it would discard one. Close this and try again in a moment.',
+    )
+  })
+
+  test('and a pull request is offered no delete to withdraw', () => {
+    expect(deleteLocalReviewDraftUnreadableCopy('github')).toBeNull()
+  })
+})
+
+/**
+ * Everything this surface says about a branch pair, in one string.
+ *
+ * The bans below get one test body each: two `not.toMatch` calls in one body
+ * abort at the first, so the second is never independently falsifiable and its
+ * control only looks like it bites.
+ */
+const DELETE_VOCABULARY = [
+  deleteText(FULL_DRAFT),
+  deleteText(null),
+  deleteLocalReviewRefusedCopy('local', { discarded: true }) ?? '',
+  deleteLocalReviewRefusedCopy('local', { discarded: false }) ?? '',
+  deleteLocalReviewFailedCopy('local', { discarded: true }) ?? '',
+  deleteLocalReviewFailedCopy('local', { discarded: false }) ?? '',
+  deleteLocalReviewDraftUnreadableCopy('local') ?? '',
+].join(' ')
+
+describe('what the delete copy must never claim', () => {
+  test('it really is reading the sentences it sweeps', () => {
+    // The positive control every absence below rests on: an empty string
+    // satisfies all four of them and asserts nothing at all.
+    expect(DELETE_VOCABULARY).toMatch(/discard/i)
+    expect(DELETE_VOCABULARY.length).toBeGreaterThan(200)
+  })
+
+  test('nothing here was lost', () => {
+    // The word the product reserves for the guarantee that nothing was. Text
+    // discarded here is discarded by the reader's own explicit choice, which is
+    // the opposite of the thing that word is used to deny.
+    expect(DELETE_VOCABULARY).toMatch(/discard/i)
+    expect(DELETE_VOCABULARY).not.toMatch(/lost/i)
+  })
+
+  test('and no pull request is mentioned', () => {
+    expect(DELETE_VOCABULARY).toMatch(/review/i)
+    expect(DELETE_VOCABULARY).not.toMatch(/pull request/i)
+  })
+
+  test('nor abbreviated to one', () => {
+    expect(DELETE_VOCABULARY).toMatch(/branches/i)
+    expect(DELETE_VOCABULARY).not.toMatch(/\bPR\b/)
+  })
+
+  test('and nothing is described as merely unreachable', () => {
+    // The wording an earlier design would have used, when a delete stranded a
+    // draft under an id nothing could name again. It does not: the draft is
+    // discarded outright, by the reader, before the review goes — and copy that
+    // said otherwise would promise a recovery that does not exist.
+    expect(DELETE_VOCABULARY).toMatch(/not kept/i)
+    expect(DELETE_VOCABULARY).not.toMatch(/unreachable/i)
+  })
+})
+
 /** One chrome file's source, read as text. */
 function chromeSource(relative: string): string {
   return readFileSync(new URL(relative, import.meta.url), 'utf8')
@@ -791,6 +1010,26 @@ const BOTH_READINGS: BothReadings[] = [
     name: 'conversationEmptyCopy',
     github: conversationEmptyCopy('github'),
     local: conversationEmptyCopy('local'),
+  },
+  {
+    name: 'deleteLocalReviewCopy',
+    github: deleteLocalReviewCopy('github', FULL_DRAFT),
+    local: deleteLocalReviewCopy('local', FULL_DRAFT),
+  },
+  {
+    name: 'deleteLocalReviewRefusedCopy',
+    github: deleteLocalReviewRefusedCopy('github', { discarded: true }),
+    local: deleteLocalReviewRefusedCopy('local', { discarded: true }),
+  },
+  {
+    name: 'deleteLocalReviewFailedCopy',
+    github: deleteLocalReviewFailedCopy('github', { discarded: true }),
+    local: deleteLocalReviewFailedCopy('local', { discarded: true }),
+  },
+  {
+    name: 'deleteLocalReviewDraftUnreadableCopy',
+    github: deleteLocalReviewDraftUnreadableCopy('github'),
+    local: deleteLocalReviewDraftUnreadableCopy('local'),
   },
   {
     name: 'notFoundCopy',
