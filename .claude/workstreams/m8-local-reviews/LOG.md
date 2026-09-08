@@ -342,3 +342,29 @@ exhaustiveness guard is red-first.
 - Integrate and gate each lane's first unit, then walk each lane's chain. PRs open per ticket the moment that
   ticket's `Verify` is green — after a fable-tier adversarial review of its full diff, never batched to session
   end. Nothing merges; `main` stays at `177068a`.
+
+**update — 2026-08-17 (session 4, the daemon — complete)**
+
+**Done**
+- **All three daemon tickets complete and in review**: M8.2 (7 units, #73), M8.3 (9 units, #74), M8.4 (9 units,
+  #75). Each: units → `Verify` green → fable-tier review of the full diff → fixes → PR, never batched. Gate
+  re-run in the main tree after **every** unit and after **every** rebase; final tip **2445 pass · 1 skip ·
+  0 fail · 91 files**.
+- **Three lanes ran concurrently all session** — the first real parallel wave in this workstream. The width lost
+  was entirely *inside* each ticket, where units are serial on one or two shared files.
+- **Each pre-merge review found a blocker that had passed a green gate**: a corrupt id high-water mark minting a
+  value inside the forge's pull-request range; a typechange making any containing review unbuildable; and a
+  structural guard evadable by a file extension, demonstrated end to end with a real client loading at runtime.
+
+**Decisions**
+- **Integration is serial though the work is parallel** — one tree, and the gate ends in a repo-wide build.
+- **The board lived on the chain base while the lanes ran, and moved to the tip when they converged.**
+- **Guard rails land red**, and both were verified *able* to go green before being left red.
+- **Fix a guard by extending its allowlist, never by loosening its comparison.**
+
+**Blockers**
+- None new. **M8.12 OQ1** and **M8.10 OQ4** remain unruled; both bite at M8.10.
+
+**Next**
+- **M8.5 (daemon wiring)** is unblocked and needs all four of M8.1–M8.4. **Read the five findings addressed to it
+  in the handover before dispatching** — three are traps.

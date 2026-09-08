@@ -1050,11 +1050,25 @@ describe('listBranches against real repositories', () => {
  * Every non-test module whose name marks it as part of the local review path is
  * scanned, except the fixture harness, which is test support: it builds its own
  * temp directory, never serves a request, and is named here explicitly so its
- * exemption is a decision rather than a filter accident. The pure argv predicate
- * is included even though it spawns nothing — scanning a module that cannot need
- * a working directory costs nothing and keeps the membership rule mechanical.
+ * exemption is a decision rather than a filter accident. Modules that spawn
+ * nothing — the pure argv predicate, the id minter, the in-memory store double —
+ * are included anyway: scanning a module that cannot need a working directory
+ * costs nothing, and it keeps the membership rule mechanical rather than a
+ * judgement made afresh each time a module is added.
+ *
+ * The write path's modules are here because they share this directory, not
+ * because they shell out. A module that resolves a path relative to wherever the
+ * daemon happened to be started is wrong on the write side for the same reason
+ * it is wrong on the read side, and the guard should not have to be told twice.
  */
-const CWD_SCANNED_MODULES = ['local-git-argv.ts', 'local-git.ts', 'local-sync.ts'] as const
+const CWD_SCANNED_MODULES = [
+  'local-git-argv.ts',
+  'local-git.ts',
+  'local-ids.ts',
+  'local-sync.ts',
+  'local-write-fakes.ts',
+  'local-writes.ts',
+] as const
 
 const CWD_PATTERN = /process\.cwd/
 
