@@ -14,7 +14,7 @@
     "revud": "bun run packages/revud/src/index.ts",
     "conformance:matrix": "bun run scripts/conformance-matrix.ts",
     "dev:e2e": "VITE_REVU_API=/ bun run build:app && bun run packages/revud/src/index.ts",
-    "test:e2e": "bun run build:e2e && bun run e2e/happy-path.ts",
+    "test:e2e": "bun run build:e2e && bun run e2e/happy-path.ts && bun run e2e/local-review.ts",
     "check": "oxlint --deny-warnings && tsc -b && bun test --timeout=20000 && bun run --filter '@revu/app' build",
     "preview": "bun run --filter '@revu/app' preview",
     "docs:dev": "cd packages/docs && bun install && bun run dev",

@@ -1,3 +1,69 @@
+## 2026-09-02 — M8.11 is DONE on #80; every exit criterion has a run; M8.9 and M8.12 remain
+
+### Orient
+1. `git checkout m8.11/conformance-e2e-docs` — stack tip, PR #80, base `m8.10/retention-and-gc`.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check` → expect **2998 pass · 1 skip · 0 fail · 111 files**.
+   The 1 skip is pre-existing.
+3. **CI on #80 was fully green at hand-off** (check · conformance-matrix · e2e · docs-build), as are #78 and
+   #79. Re-check before building on it anyway — it is one command.
+4. `bun run conformance:matrix` → A/B/E/F/G `PASS` required, C/D `SKIP`. `bun run test:e2e` → two
+   `ALL CHECKS PASSED`.
+5. Read `BOARD.md` → this entry → the ticket you pick up.
+
+### State
+`main` untouched at `177068a`. **Twelve PRs, one linear chain, none merged.** Tree clean, branch pushed.
+**M8.8, M8.10 and M8.11 are In Review, each with `Verify` green and an adversarial pass done.** 98 units.
+**Every M8 exit criterion now has a green run on the stack tip** — the walk is at M8.11's Verify 7; the boxes
+in `MILESTONE.md` tick when the chain merges. **Stacked PRs are the protocol — open one every session. Never
+merge, never commit to `main`, never retarget.**
+
+### Next, in order
+1. **M8.9 — archive when a PR appears.** Independent, unblocked; ruling 2 settled the trigger (on each sync of
+   that review). **The docs now promise it as designed-not-yet-wired** — `guides/local-review.mdx` §7 ("What a
+   pull request is meant to change…") and `run-modes/direct.mdx`'s "Nothing is ever published" bullet — so
+   M8.9 rewrites those two paragraphs to present tense; the wording was chosen to make that a one-paragraph
+   edit each. The marker is `archived_pr` (`store.ts` ~1123, `local-surface.ts` ~809, mock `local.ts` ~300):
+   readers exist, no writer. OQ1/OQ8/OQ9 still open and still deliberately unasked.
+2. **M8.12 — delete confirmation.** Has a real server refusal to render against.
+3. **Follow-ups on the board, not tickets:** `scripts/` into `tsc -b` (the smoke rot this session found is the
+   measured cost of leaving it out); wrap `Bun.fetch` in the netlog guard (inert today).
+
+### What this session learned — apply before calling anything done
+- **A suite branch only one transport can exercise is unverified until that runner exists.** Leg G was the
+  first to run the `'changes'` branch and found the suite asserting non-empty text on a binary blob that every
+  transport stores collapsed. Two green legs and a non-vacuity control had not caught it — the control proves
+  the loop ran, not that its predicate is right. Memory: `conformance-branch-coverage.md`.
+- **"And the snapshot agrees" in a docstring is a claim with a read behind it, or it is decoration.** The
+  review found the reaction case never re-read the snapshot, and both mock restarts rebuilt a handle over the
+  same memory — durability "proven" with persistence disabled. Both fixed, each with a control.
+  Memory: `claims-need-a-read.md`.
+- **Docs describe the product that exists, reviewed against the code.** The first draft of the guide described
+  an archive detector; nothing sets the marker. The design is not the product until a writer exists.
+
+### Landmines
+- **`env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check`** is the gate command now — leg G and the local e2e
+  must never depend on a token being absent by luck. The e2e driver deletes `REVU_REPO` and points
+  `GH_CONFIG_DIR` at an absent directory; keep both.
+- **The mock's local sync is deliberately the EMPTY compare.** Runners declare `compare`; do not give the mock
+  files to make a shared assertion pass.
+- **A mock-driving restart that does not call `store.reload()` proves nothing.**
+- **The local submit toast is `Review saved`, not `Review posted`**, and no branch is preselected as base in a
+  repo with no `origin/HEAD` — both product facts the e2e driver had to learn.
+- **zsh equals-expansion:** a bare `=word` in a shell command (`echo =====X`) aborts it with "not found". Quote
+  separators.
+- Standing: `TZ=UTC`; **NEVER `git add -A`** (and never while a review is running); `--end-of-options`; a
+  trigger-based absence test is vacuous with no matching row; asserting a code is not asserting a path; a
+  staged red that gets skipped ships a vacuous test; ticket line pointers rot — read the seam.
+
+### For M8.9
+- The three-transport shape to reuse for any new conformance block: `packages/shared/conformance/local-common.ts`
+  helpers, a mapped `Answered<RevuApi[K]>` api type, `Lazy` config, runners at
+  `packages/app/src/api/mock/conformance-local.test.ts` · `packages/app/src/api/http/conformance-local.test.ts`
+  (spawn helper `conformance-daemon.ts`) · `packages/revud/src/direct/conformance-local.test.ts`. The suite reads
+  threads off the snapshot and never calls `listReviewThreads`; keep it that way.
+- The e2e cannot produce a PR (OQ7 ruling: archived state is proven at unit level only); do not try to inject
+  one through the daemon — that would weaken the no-GitHub-client story the driver exists to prove.
+
 ## 2026-08-20 (close) — M8.8 and M8.10 are both DONE and green; start at M8.9 or M8.11
 
 ### Orient

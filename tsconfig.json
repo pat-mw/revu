@@ -4,7 +4,8 @@
     { "path": "./packages/shared/tsconfig.json" },
     { "path": "./packages/revud/tsconfig.json" },
     { "path": "./packages/app/tsconfig.app.json" },
-    { "path": "./packages/app/tsconfig.node.json" }
+    { "path": "./packages/app/tsconfig.node.json" },
+    { "path": "./tsconfig.tools.json" }
   ],
   "compilerOptions": {
     "paths": {
