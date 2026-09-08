@@ -33,7 +33,7 @@ import { openHostStore, UnboundOwnerError, type HostStore } from './collector/ho
 import { CONFORMANCE_REPO, CONFORMANCE_SESSION } from './direct/conformance-fakes'
 import { createDirectApi } from './direct/direct-api'
 import { throwingGithubClient } from './direct/github-write-stubs'
-import { openDirectStore, type DirectStore } from './direct/store'
+import { openDirectStore, StoreUnreadableError, type DirectStore } from './direct/store'
 import { startServer } from './server'
 
 const NOW = '2026-07-18T00:00:00.000Z'
@@ -110,6 +110,170 @@ describe('host store: drafts are reachable only through the owning coder.owner b
     const rows = raw.query('SELECT human_id FROM drafts').all() as { human_id: string }[]
     raw.close()
     expect(rows).toEqual([{ human_id: 'alice@corp.com' }])
+  })
+})
+
+/**
+ * Local-review drafts live in their own table, keyed `(human_id, local_id)`
+ * exactly as pull-request drafts are keyed `(human_id, pr_number)`. The review
+ * id travels in the draft document's `prNumber` field, so what is stored is an
+ * unchanged draft and there is no parallel draft type to keep in step.
+ *
+ * These are STORE-level claims only. The store makes per-human keying possible;
+ * it does not enforce who the caller is. The matching HTTP claim — that a
+ * spoofed `humanId` in a request body is overwritten by the session identity
+ * before the store is touched, as the pull-request draft route already proves
+ * below — cannot be made here, because no route dispatches a local-review draft
+ * yet. That gap is deliberate and named so it is not mistaken for coverage: it
+ * becomes assertable when the dispatch exists, and until then the store's keying
+ * is a necessary condition for isolation rather than a sufficient one.
+ */
+describe('direct store: a local-review draft is private to the human it was written for', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'revu-local-draft-iso-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function open(): DirectStore {
+    return openDirectStore({ dataDir: dir })
+  }
+
+  /** Mint a real local review and return its id, so no test invents one. */
+  function localReviewId(store: DirectStore, headRef = 'refs/heads/feature/x'): number {
+    return store.createLocalReview({
+      repo: 'acme/widgets',
+      baseRef: 'refs/heads/main',
+      headRef,
+      title: 'feature/x',
+    }).id
+  }
+
+  /** Rows in `local_drafts`, read past the store through a raw handle. */
+  function countLocalDrafts(): number {
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    const row = raw.query('SELECT COUNT(*) AS n FROM local_drafts').get() as { n: number }
+    raw.close()
+    return row.n
+  }
+
+  test("one human's local draft reads back as null for another human", () => {
+    const store = open()
+    const id = localReviewId(store)
+    store.putLocalDraft(draft('alice@corp.com', id, 'alice unsubmitted review text'))
+
+    // Null, not an error, and above all never Alice's content: unsubmitted
+    // review text is the most private thing this store holds, and two humans
+    // reviewing the same branch pair share the review id that keys it.
+    expect(store.getLocalDraft('bob@corp.com', id)).toBeNull()
+    expect(store.getLocalDraft('alice@corp.com', id)?.body).toBe('alice unsubmitted review text')
+    store.close()
+  })
+
+  test('two humans drafting on one review land two rows, each under its own key', () => {
+    const store = open()
+    const id = localReviewId(store)
+    store.putLocalDraft(draft('alice@corp.com', id, 'alice notes'))
+    store.putLocalDraft(draft('bob@corp.com', id, 'bob notes'))
+    store.close()
+
+    // Read raw, past the getters, because a getter that filters correctly can
+    // sit on top of rows that were written to the wrong key — the leak would
+    // then be invisible until something else read the table. Pairing each key
+    // with the body stored under it is what makes this more than a count: two
+    // rows exist either way, and only the pairing says whose text is whose.
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    const rows = raw
+      .query('SELECT human_id, data FROM local_drafts ORDER BY human_id ASC')
+      .all() as { human_id: string; data: string }[]
+    raw.close()
+    expect(
+      rows.map((r) => ({ humanId: r.human_id, body: (JSON.parse(r.data) as ReviewDraft).body })),
+    ).toEqual([
+      { humanId: 'alice@corp.com', body: 'alice notes' },
+      { humanId: 'bob@corp.com', body: 'bob notes' },
+    ])
+  })
+
+  test('a present-but-corrupt local draft row throws rather than reading as absent', () => {
+    const store = open()
+    const id = localReviewId(store)
+    store.putLocalDraft(draft('alice@corp.com', id, 'real work'))
+    store.close()
+
+    const raw = new Database(join(dir, 'direct.sqlite'))
+    raw.run("UPDATE local_drafts SET data = '{not valid json' WHERE local_id = ?", [id])
+    raw.close()
+
+    // The row EXISTS, so answering `null` would invite the next save to write
+    // over real work. The type is the point too: a corrupt row is not a failed
+    // write, it is not retryable, and only a human can repair it.
+    const reopened = open()
+    expect(() => reopened.getLocalDraft('alice@corp.com', id)).toThrow(StoreUnreadableError)
+    reopened.close()
+  })
+
+  test('a delete removes the addressed draft', () => {
+    const store = open()
+    const id = localReviewId(store)
+    store.putLocalDraft(draft('alice@corp.com', id, 'alice notes'))
+    store.deleteLocalDraft('alice@corp.com', id)
+    expect(store.getLocalDraft('alice@corp.com', id)).toBeNull()
+    store.close()
+  })
+
+  test("a delete leaves another human's draft on the same review intact", () => {
+    const store = open()
+    const id = localReviewId(store)
+    store.putLocalDraft(draft('alice@corp.com', id, 'alice notes'))
+    store.putLocalDraft(draft('bob@corp.com', id, 'bob notes'))
+
+    store.deleteLocalDraft('alice@corp.com', id)
+
+    // Keyed on the review id alone, the delete would take this row with it, and
+    // Bob would lose unsubmitted work he never touched. This assertion is the
+    // only one here that fails in that case.
+    expect(store.getLocalDraft('bob@corp.com', id)?.body).toBe('bob notes')
+    store.close()
+  })
+
+  test("a delete leaves the same human's draft on a different review intact", () => {
+    const store = open()
+    const id = localReviewId(store)
+    const other = localReviewId(store, 'refs/heads/feature/y')
+    store.putLocalDraft(draft('alice@corp.com', id, 'alice notes'))
+    store.putLocalDraft(draft('alice@corp.com', other, 'alice other notes'))
+
+    store.deleteLocalDraft('alice@corp.com', id)
+
+    // The mirror of the case above, on the other key column: keyed on the human
+    // alone, the delete would empty every review Alice has a draft on.
+    expect(store.getLocalDraft('alice@corp.com', other)?.body).toBe('alice other notes')
+    store.close()
+  })
+
+  test('a delete removes exactly one row', () => {
+    const store = open()
+    const id = localReviewId(store)
+    const other = localReviewId(store, 'refs/heads/feature/y')
+    store.putLocalDraft(draft('alice@corp.com', id, 'alice notes'))
+    store.putLocalDraft(draft('bob@corp.com', id, 'bob notes'))
+    store.putLocalDraft(draft('alice@corp.com', other, 'alice other notes'))
+    expect(countLocalDrafts()).toBe(3)
+
+    store.deleteLocalDraft('alice@corp.com', id)
+    store.close()
+
+    // A total claim over the table rather than three point reads. Every defect
+    // this suite currently reproduces is already caught by one of the reads
+    // above, so today this count is a restatement of them; it earns its place
+    // the moment a row is added to a fixture without a read that names it,
+    // which is exactly when a too-wide delete would otherwise go unseen.
+    expect(countLocalDrafts()).toBe(2)
   })
 })
 
