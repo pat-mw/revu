@@ -718,6 +718,24 @@ export function openDirectStore(
   // host — an ack the client can trust as saved.
   db.run('PRAGMA journal_mode = WAL')
   db.run('PRAGMA synchronous = FULL')
+  // Contention pragma, and it belongs HERE rather than in any one statement: a
+  // busy handler is a property of the connection, and every write on this handle
+  // wants the same answer to "another writer holds the lock". Without one, SQLite
+  // refuses immediately, so two daemons sharing a data directory turn an ordinary
+  // few-millisecond overlap into `database is locked` — a write failure reported
+  // for a write that would have succeeded on the next attempt.
+  //
+  // Five seconds because it has to bracket two different things. The lower bound
+  // is the longest write this store performs — a snapshot persist, one
+  // transaction over a handful of rows on a local file — with room for a loaded
+  // or throttled runner to be an order of magnitude slower than a quiet one; a
+  // timeout that expires there would reintroduce the very failure it exists to
+  // remove, intermittently, which is worse than not having it. The upper bound is
+  // human: a wait that reaches five seconds is no longer contention but a holder
+  // that has stopped making progress, and the daemon should say so rather than
+  // sit there. Unbounded would be the tempting choice and the wrong one — it
+  // makes a deadlocked peer indistinguishable from a hung daemon.
+  db.run('PRAGMA busy_timeout = 5000')
 
   migrate(db)
 
@@ -785,9 +803,28 @@ export function openDirectStore(
    * from the statement that caused it.
    *
    * All three statements — the preservation read and the two upserts — run inside
-   * ONE transaction, so a stored envelope never references an immutable half that
-   * is not on disk and no concurrent writer can change the immutable row between
-   * the read of its `partial` and the write that carries that value forward.
+   * ONE transaction, and it is opened with `BEGIN IMMEDIATE` rather than the
+   * deferred `BEGIN` that calling the transaction directly would open. Both halves
+   * of that carry weight. One transaction is what keeps a stored envelope from
+   * referencing an immutable half that is not on disk. Taking the write lock UP
+   * FRONT is what keeps a concurrent writer from changing the immutable row
+   * between the read of its `partial` and the write that carries that value
+   * forward — and it is also the only thing that lets this call WAIT for such a
+   * writer. A deferred transaction takes its read snapshot at the preservation
+   * read and asks for the write lock only at the first upsert, so a commit landing
+   * in between makes that snapshot stale and SQLite refuses the upgrade WITHOUT
+   * consulting the busy handler: waiting cannot refresh a snapshot that is already
+   * stale, so the connection's busy timeout is no help in that shape. Opening
+   * immediate moves the waiting to `BEGIN`, which is a plain busy wait the timeout
+   * does cover.
+   *
+   * That difference is not theoretical here. This is the longest write the store
+   * performs, and it is the last step of a sequence that has already persisted
+   * threads and a summary. Deferred, an ordinary few-millisecond overlap with
+   * another daemon on the same data directory surfaces as `database is locked` for
+   * a write that would have succeeded a moment later, leaving those rows on disk
+   * with no envelope — and the envelope is the only durable home for the map from
+   * a comment to its author.
    *
    * The whole unit sits inside the durability wrapper, so a database that cannot
    * be read or written surfaces as a `StoreWriteError` and the caller learns the
@@ -830,7 +867,7 @@ export function openDirectStore(
           [snapshot.prNumber, JSON.stringify(envelope)],
         )
       })
-      tx()
+      tx.immediate()
     })
   }
 
@@ -1099,20 +1136,14 @@ export function openDirectStore(
           // violation — a NULL in a NOT NULL column — still aborts loudly
           // instead of being indistinguishable from a yielded duplicate.
           //
-          // It does NOT make a genuinely concurrent create idempotent, and an
-          // interleaved pair of writers never reaches it at all. Two daemons on
-          // one file are two connections; this transaction takes its snapshot at
-          // the lookup above, and a write that commits after that snapshot
-          // leaves this one unable to proceed. No busy timeout is set on the
-          // connection, so the loser is refused immediately — at the mark's
-          // update, before the insert exists to conflict — and the caller
-          // receives a write failure rather than the row the winner wrote. The
-          // STATE that failure leaves is still correct, which is why the clause
-          // stays: one row for the pair, a mark consistent with it, nothing
-          // half-written, and a retry that finds the winner's row at the lookup
-          // and returns it. Turning the refusal into a wait is a busy timeout,
-          // which belongs to whatever opens the connection, not to this
-          // statement.
+          // It is not, however, what makes a concurrent create idempotent, and
+          // under the immediate transaction below an interleaved writer never
+          // reaches it: the lookup above already runs on a snapshot taken with
+          // the write lock in hand, so a loser sees the winner's row and returns
+          // before there is an insert to conflict. The clause stays because it is
+          // what holds if that shape is ever weakened, and because the state it
+          // preserves is the one every caller depends on — one row for the pair,
+          // a mark consistent with it, nothing half-written.
           db.run(
             'INSERT INTO local_reviews (id, repo, base_ref, head_ref, generation, title, ' +
               'created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ' +
@@ -1129,7 +1160,26 @@ export function openDirectStore(
             ],
           )
         })
-        tx()
+        // `BEGIN IMMEDIATE`, not the deferred `BEGIN` that calling `tx()`
+        // directly would open, and the difference is this mint's entire
+        // concurrency story. The body READS (the branch-pair lookup) and only
+        // then WRITES, and a deferred transaction takes its read snapshot at that
+        // first read while asking for the write lock afterwards. If another
+        // connection commits in between, the upgrade fails with
+        // `SQLITE_BUSY_SNAPSHOT` and SQLite does NOT consult the busy handler for
+        // it — waiting cannot refresh a snapshot that is already stale — so the
+        // connection's busy timeout is no help here at all. That is why the
+        // timeout is necessary but not sufficient, and why this is a second
+        // change rather than a redundant one.
+        //
+        // Taking the write lock up front moves the waiting to `BEGIN`, which IS a
+        // plain busy wait the timeout covers, and leaves the lookup reading a
+        // snapshot nothing can invalidate underneath it. So the loser of a
+        // concurrent create waits, then finds the winner's row at the lookup and
+        // returns it: a success carrying the row that won, rather than the write
+        // failure a deferred transaction would have reported for state that was
+        // in fact correct.
+        tx.immediate()
         // Read after the commit, so the row returned is the one that WON the
         // branch pair — whether this call inserted it or yielded to a writer that
         // got there first. Absent here means the row was removed from underneath
@@ -1184,6 +1234,13 @@ export function openDirectStore(
       // add a round trip and no guarantee. The mint of a review id is different —
       // it bumps a mark AND inserts a row, two statements that must commit or fail
       // together — and it wraps them accordingly.
+      //
+      // Having no transaction is also why nothing more is needed for a second
+      // daemon on the same file: a lone write statement never reads on one
+      // snapshot and writes on another, so the only way it meets a competing
+      // writer is plain `SQLITE_BUSY` — which the connection's busy timeout
+      // retries until the holder commits, at which point this statement reads the
+      // holder's committed mark and continues from it.
       return write('meta', () =>
         bumpIdHighWater(db, LOCAL_ENTITY_ID_META_KEY, LOCAL_ENTITY_ID_BASE),
       )

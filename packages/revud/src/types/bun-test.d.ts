@@ -6,22 +6,28 @@
  * is intentionally permissive — an `any` index signature accepts any
  * Jest-compatible matcher name — so adding an assertion never means editing
  * this file.
+ *
+ * Every test and every lifecycle hook accepts an optional trailing millisecond
+ * budget, which Bun honours in place of its default. It is declared because a
+ * suite that spawns real processes and seeds real repositories does not fit the
+ * default, and raising the budget for the whole run instead would hide a
+ * genuine hang everywhere else.
  */
 declare module 'bun:test' {
   type TestFn = () => void | Promise<void>
 
   export function describe(label: string, fn: () => void): void
-  export function it(label: string, fn: TestFn): void
+  export function it(label: string, fn: TestFn, timeout?: number): void
   export const test: {
-    (label: string, fn: TestFn): void
+    (label: string, fn: TestFn, timeout?: number): void
     /** Registers the test, skipping it when `condition` is true (e.g. an environment where the setup cannot fail as intended). */
-    skipIf(condition: boolean): (label: string, fn: TestFn) => void
+    skipIf(condition: boolean): (label: string, fn: TestFn, timeout?: number) => void
   }
 
-  export function beforeAll(fn: TestFn): void
-  export function afterAll(fn: TestFn): void
-  export function beforeEach(fn: TestFn): void
-  export function afterEach(fn: TestFn): void
+  export function beforeAll(fn: TestFn, timeout?: number): void
+  export function afterAll(fn: TestFn, timeout?: number): void
+  export function beforeEach(fn: TestFn, timeout?: number): void
+  export function afterEach(fn: TestFn, timeout?: number): void
 
   interface Matchers {
     not: Matchers

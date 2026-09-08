@@ -96,8 +96,16 @@ declare module 'bun:sqlite' {
     run(sql: string, params?: (string | number | null)[]): Changes
     query(sql: string): Statement
     prepare(sql: string): Statement
-    /** Wrap `fn` in a transaction; the returned function commits on success, rolls back on throw. */
-    transaction<Args extends unknown[]>(fn: (...args: Args) => void): (...args: Args) => void
+    /**
+     * Wrap `fn` in a transaction; the returned function commits on success, rolls
+     * back on throw. Calling it directly opens a DEFERRED transaction (`BEGIN`),
+     * which takes no lock until its first statement; `.immediate` opens the same
+     * body as `BEGIN IMMEDIATE`, taking the write lock up front so a body that
+     * reads and then writes cannot have its read snapshot invalidated in between.
+     */
+    transaction<Args extends unknown[]>(
+      fn: (...args: Args) => void,
+    ): ((...args: Args) => void) & { immediate(...args: Args): void }
     close(): void
   }
 }

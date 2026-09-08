@@ -6,6 +6,10 @@
  * migrates IN PLACE, preserving drafts. The two-half cache table (`immutables`)
  * is exercised for reuse-across-restart.
  *
+ * Concurrency gets its own block: a child process holds the file's write lock
+ * across a store call in this one, which is the only way to observe what a second
+ * daemon sharing the data directory actually does to a write.
+ *
  * The last block installs SQLite tripwires on the three tables whose integer key
  * is a real GitHub pull-request number, and proves they abort a write. That is
  * the negative control every absence-shaped claim about those tables depends on:
@@ -13,7 +17,7 @@
  * reach `snapshots` would fail loudly.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -1354,6 +1358,305 @@ describe('the local entity id allocator', () => {
     expect(() => reopened.nextLocalEntityId()).toThrow(StoreUnreadableError)
     reopened.close()
     expect(metaValue('local_entity_id_high_water')).toBe(`${LOCAL_ENTITY_ID_BASE}junk`)
+  })
+})
+
+/**
+ * How long the lock-holding child keeps its transaction open before committing.
+ *
+ * Long enough that the parent's synchronous store call reliably begins while the
+ * lock is still held: the parent enters SQLite within one poll interval of the
+ * readiness file appearing, which leaves two orders of magnitude of margin. Short
+ * enough that a round of it stays well inside the runner's per-test budget. It is
+ * NOT how the two processes synchronise — the parent never sleeps, it waits for
+ * the readiness file — it is only how long the held lock outlives that signal.
+ */
+const LOCK_HOLD_MS = 500
+
+/**
+ * How long the parent waits for the child to report that it holds the write lock.
+ * Reaching it is a failure with its own message rather than a silent pass: a
+ * child that never took the lock leaves the parent's call uncontended, and an
+ * uncontended call proves nothing about waiting.
+ */
+const LOCK_READY_TIMEOUT_MS = 3000
+
+/** How often the parent checks for the child's readiness file. */
+const LOCK_READY_POLL_MS = 5
+
+/** The title the lock holder inserts, so a row it wrote is distinguishable. */
+const LOCK_HOLDER_TITLE = 'from the lock holder'
+
+/**
+ * The lock-holding child, written into the temp data dir and run as its own
+ * process.
+ *
+ * A second process is the only honest shape available. Every store call is
+ * synchronous, so a lock held on this thread could never overlap one of them —
+ * whatever holds the lock has to run somewhere the parent's blocked call is not.
+ *
+ * It takes the write lock with `BEGIN IMMEDIATE`, announces that it holds it by
+ * creating the readiness file, keeps it for a bounded hold, then commits and
+ * records what it wrote. The readiness file is created AFTER the lock is taken,
+ * which is what lets the parent start its own call knowing the lock is already
+ * held rather than guessing at it with a sleep.
+ *
+ * Plain JavaScript and outside the package's sources on purpose: it is a fixture
+ * the test writes at run time, so nothing type-checks or lints it, and it is
+ * removed with the temp directory.
+ */
+const LOCK_HOLDER_SOURCE = `
+import { Database } from 'bun:sqlite'
+import { writeFileSync } from 'node:fs'
+
+const [dbPath, readyPath, resultPath, holdMs, mode, repo, baseRef, headRef] = process.argv.slice(2)
+
+const bump = (db, key) =>
+  Number(
+    db
+      .query(
+        'UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ? RETURNING value',
+      )
+      .get(key).value,
+  )
+
+const db = new Database(dbPath)
+// The holder waits too. Only the PARENT's connection is under test here, and a
+// parent that happened to hold the lock first should slow this process down
+// rather than fail it and turn a real assertion into a spawn error.
+db.run('PRAGMA busy_timeout = 5000')
+db.run('BEGIN IMMEDIATE')
+
+writeFileSync(readyPath, 'holding')
+await Bun.sleep(Number(holdMs))
+
+const entityId = bump(db, 'local_entity_id_high_water')
+let reviewId = null
+if (mode === 'review') {
+  reviewId = bump(db, 'local_review_id_high_water')
+  const at = new Date().toISOString()
+  db.run(
+    'INSERT INTO local_reviews (id, repo, base_ref, head_ref, generation, title, created_at, updated_at) ' +
+      'VALUES (?, ?, ?, ?, 0, ?, ?, ?)',
+    [reviewId, repo, baseRef, headRef, ${JSON.stringify(LOCK_HOLDER_TITLE)}, at, at],
+  )
+}
+db.run('COMMIT')
+db.close()
+
+writeFileSync(resultPath, JSON.stringify({ entityId, reviewId }))
+`
+
+/** What the lock-holding child committed, read back after it has exited. */
+interface LockHolderCommit {
+  entityId: number
+  reviewId: number | null
+}
+
+/** A child process that is holding the store file's write lock right now. */
+interface HeldWriteLock {
+  /** What the child committed, once it has exited cleanly. */
+  commit(): Promise<LockHolderCommit>
+  /** Stop the child and wait for it to be gone, whether or not it committed. */
+  release(): Promise<void>
+}
+
+/**
+ * Spawn the lock holder and return only once it actually holds the write lock.
+ *
+ * The wait is on the child's readiness file, never on a duration. A sleep long
+ * enough to be reliable would make this the slowest test in the file, and a sleep
+ * short enough to be quick silently stops overlapping — leaving the parent's call
+ * uncontended and every assertion after it vacuous. A file that only exists once
+ * `BEGIN IMMEDIATE` has returned says the thing the test actually depends on.
+ *
+ * `mode` selects what the holder commits: `'entity'` bumps the entity mark alone,
+ * `'review'` also mints a review id and inserts the row for `key`.
+ */
+async function holdWriteLock(
+  mode: 'entity' | 'review',
+  key: NewLocalReview,
+): Promise<HeldWriteLock> {
+  const scriptPath = join(dir, 'lock-holder.mjs')
+  const readyPath = join(dir, `lock-holder-${mode}.ready`)
+  const resultPath = join(dir, `lock-holder-${mode}.json`)
+  writeFileSync(scriptPath, LOCK_HOLDER_SOURCE)
+
+  const proc = Bun.spawn(
+    [
+      'bun',
+      'run',
+      scriptPath,
+      join(dir, 'direct.sqlite'),
+      readyPath,
+      resultPath,
+      String(LOCK_HOLD_MS),
+      mode,
+      key.repo,
+      key.baseRef,
+      key.headRef,
+    ],
+    { stdout: 'ignore', stderr: 'inherit' },
+  )
+
+  const release = async (): Promise<void> => {
+    proc.kill()
+    await proc.exited
+  }
+
+  const deadline = Date.now() + LOCK_READY_TIMEOUT_MS
+  while (!existsSync(readyPath)) {
+    if (Date.now() > deadline) {
+      await release()
+      throw new Error(
+        `the lock holder did not report holding the write lock within ${LOCK_READY_TIMEOUT_MS}ms, ` +
+          'so nothing would have been contended and the assertions below would prove nothing',
+      )
+    }
+    await Bun.sleep(LOCK_READY_POLL_MS)
+  }
+
+  return {
+    async commit(): Promise<LockHolderCommit> {
+      const code = await proc.exited
+      if (code !== 0) {
+        throw new Error(`the lock holder exited with code ${code} rather than committing`)
+      }
+      return JSON.parse(readFileSync(resultPath, 'utf8')) as LockHolderCommit
+    },
+    release,
+  }
+}
+
+/** How many rows the store file holds for one branch pair, read through a raw handle. */
+function localReviewCountFor(key: NewLocalReview): number {
+  const raw = new Database(join(dir, 'direct.sqlite'))
+  const row = raw
+    .query(
+      'SELECT COUNT(*) AS n FROM local_reviews WHERE repo = ? AND base_ref = ? AND head_ref = ?',
+    )
+    .get(key.repo, key.baseRef, key.headRef) as { n: number }
+  raw.close()
+  return row.n
+}
+
+describe('two connections writing at once: the loser waits and yields, never fails', () => {
+  // The sequential two-handle test above is NOT this claim. Two handles used one
+  // after the other never interleave, so the second one's write always finds the
+  // lock free; what it proves is that the unique key serialises, not that a
+  // writer arriving mid-transaction survives. Proving that needs a lock genuinely
+  // held across the parent's call, and a file-backed store to hold it on —
+  // `:memory:` gives every connection its own private database, so a test written
+  // against one could not exercise cross-connection locking at all.
+
+  test('an entity id minted against a held write lock waits for the holder rather than failing', async () => {
+    const store = open()
+    const holder = await holdWriteLock('entity', newLocalReview({}))
+    try {
+      // Synchronous, and deliberately called while the child's transaction is
+      // still open — the only condition under which the busy handler is reached.
+      // The whole mint is one autocommit `UPDATE … RETURNING`, so the contention
+      // is plain `SQLITE_BUSY`: a connection with a busy timeout retries until
+      // the holder commits, and a connection without one is refused outright.
+      const mine = store.nextLocalEntityId()
+      const child = await holder.commit()
+
+      // Exactly one above the holder's, which is a claim about ORDER and not only
+      // about distinctness. A parent that had somehow written first would read a
+      // mark the child then bumped again, landing one BELOW it; a parent that
+      // waited reads the child's committed value and continues from it. Equality
+      // would be the real disaster — the same id handed out twice — and any
+      // spelling of "different" rules that out, but only this one also says the
+      // wait happened.
+      expect(mine).toBe(child.entityId + 1)
+    } finally {
+      await holder.release()
+      store.close()
+    }
+  })
+
+  test('a create that arrives while another connection holds the lock resolves to the winner row', async () => {
+    const store = open()
+    const key = newLocalReview({ title: 'from this process' })
+    const holder = await holdWriteLock('review', key)
+    try {
+      // The transaction behind this call READS (the branch-pair lookup) and only
+      // then WRITES, which is why a busy timeout alone would not save it: a
+      // deferred transaction takes its read snapshot at the lookup, and a commit
+      // that lands before the write makes that snapshot stale — a condition
+      // SQLite reports without ever calling the busy handler. Taking the write
+      // lock at `BEGIN` moves the waiting somewhere the timeout applies.
+      const created = store.createLocalReview(key)
+      const child = await holder.commit()
+
+      // The row the child wrote, handed back as this call's success. The title is
+      // what distinguishes them: both callers asked for the same branch pair with
+      // different titles, so a summary carrying the holder's title can only be
+      // the holder's row.
+      expect(created.id).toBe(child.reviewId)
+      expect(created.title).toBe(LOCK_HOLDER_TITLE)
+      expect(localReviewCountFor(key)).toBe(1)
+      expect(localReviewCount()).toBe(1)
+
+      // The yielding create consumed no review id, so the mark still reads as the
+      // holder left it, and the next entity id continues from the holder's rather
+      // than skipping one.
+      expect(metaValue('local_review_id_high_water')).toBe(String(child.reviewId))
+      expect(store.nextLocalEntityId()).toBe(child.entityId + 1)
+    } finally {
+      await holder.release()
+      store.close()
+    }
+  })
+
+  test('a snapshot persisted against a held write lock waits for the holder rather than failing', async () => {
+    const store = open()
+    const compareKey = 'contended...snapshot'
+    // Both minted and seeded before the lock is taken, so the ONE call made under
+    // contention is the snapshot persist itself and nothing else can account for
+    // a failure. The seeded row is what makes the persist's read do work: with an
+    // immutable half already on disk carrying a `partial`, the transaction reads
+    // a value it must carry forward rather than reading an absent row.
+    const localId = store.createLocalReview(newLocalReview({})).id
+    store.putImmutable(immutable(compareKey), {
+      missingBlobShas: [],
+      reason: 'capped at N files',
+    })
+    const holder = await holdWriteLock('entity', newLocalReview({}))
+    try {
+      // The transaction behind this call READS the immutable row and only then
+      // WRITES its two upserts, which is the shape a busy timeout alone does not
+      // rescue: a deferred transaction takes its read snapshot at that SELECT and
+      // asks for the write lock afterwards, so the holder's commit lands in
+      // between and SQLite refuses the upgrade without ever consulting the busy
+      // handler. Taking the write lock at `BEGIN` moves the waiting somewhere the
+      // timeout applies, so this returns after the holder commits instead of
+      // failing in a millisecond.
+      //
+      // Succeeding IS the assertion. The defect this covers is a thrown
+      // `StoreWriteError` for a write that was in fact fine, and the caller's
+      // cost is not a slow persist but a review left with threads and a summary
+      // and no envelope to name their authors.
+      store.putLocalSnapshot(snapshot(localId, compareKey))
+      await holder.commit()
+
+      // The envelope is on disk and re-reads whole, so the persist committed
+      // rather than half-landing: `getLocalSnapshot` throws if the envelope
+      // references an immutable half that is not there.
+      expect(store.getLocalSnapshot(localId)?.immutable.compareKey).toBe(compareKey)
+
+      // The contended read did its work. A snapshot whose own `partial` is null
+      // must not erase the one the immutable row already carried, and that value
+      // only survives if the SELECT inside the transaction ran and was carried
+      // into the upsert.
+      expect(store.getImmutable(compareKey)?.partial).toEqual({
+        missingBlobShas: [],
+        reason: 'capped at N files',
+      })
+    } finally {
+      await holder.release()
+      store.close()
+    }
   })
 })
 

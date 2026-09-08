@@ -3,7 +3,175 @@
 Cross-session handover. **Newest at the top** — the first entry is the live one. Written so a cold agent can
 act from it alone.
 
+## 2026-08-19 — Session 5 (the join) — **M8.5 COMPLETE and in review on #76**
+
+> Every branch is pushed, `main` is untouched at `177068a`, and no §5 stop condition was hit. **CI is green on
+> all nine PRs in the stack** — two of them were red when this session started. Nothing is in flight and no
+> worktree is in use.
+>
+> ⚠️ **FIRST ACTION: interview the owner.** Four questions block what you are about to dispatch. They are
+> written out at the bottom of this entry with options and a recommendation for each. Ask them **before**
+> planning waves — three of them change the shape of the work rather than just a value. The owner asked to be
+> interviewed at the start of the next session specifically, so do not defer them and do not decide them
+> yourself.
+
+### Start here
+
+1. `git checkout m8.5/daemon-wiring` — the tip, and where the board lives.
+2. `bun run check` — expect **2645 pass · 1 skip · 0 fail · 95 files**. The 1 skip is pre-existing.
+3. **Run the gate with `TZ=UTC` before pushing anything that touches dates or git output.** A default local run
+   reproduces CI only by accident; that is exactly how two PRs shipped red this week.
+4. Interview the owner (below), then dispatch. **M8.8, M8.9 and M8.10 are mutually independent** and all
+   unblocked by M8.5 — the widest genuine parallelism left in this milestone.
+
+
+### Both follow-up fixes landed after the handover was first written
+
+- **The silent shed is closed** (`0b32368`, on `m8.5`). Boot could drop the GitHub half for four different
+  reasons and say nothing; it now emits one line naming the cause and the consequence. **The cause is built
+  from an allowlist** — a pattern-checked class name, a bounded HTTP status, an uppercase errno mnemonic — and
+  the error's `message`, the one field a hostile or careless source controls, is **never read**. Redacting the
+  message instead would have been a denylist over every shape a credential can take. The line is emitted once
+  before the context returns rather than at the drop, because it promises the daemon is continuing, and an
+  identity failure on that same path refuses to start.
+- **The preferences lost-update race is fixed** on its own branch, [#77](https://github.com/pat-mw/revu/pull/77),
+  rebased onto the final `m8.5` tip. Kept out of #76 deliberately: it is a pre-existing store defect, not
+  daemon wiring.
+
+### ⚠️ INTERVIEW THE OWNER FIRST — four questions, and they change the shape of the work
+
+The owner asked to be interviewed **at the start of the next session specifically**, on questions that block
+what that session dispatches. Everything else waits for the session that needs it — **do not** raise later
+tickets' questions here, and **do not** decide these four yourself. Use `AskUserQuestion`, one call, options as
+given, and lead with the recommendation.
+
+**1. Deleting a local review that holds an unsubmitted draft.** Blocks **M8.10** and **M8.12**, and the two
+must be answered together. The frozen route set gives `DELETE /api/local-reviews/:n` **no body and no query
+parameter**, so a *server-authoritative* force flag has nowhere to live.
+- **(a) Server refuses while a draft exists** — the client must discard the draft explicitly, then delete.
+  No contract change, server-authoritative, and it keeps "drafts survive everything" true by making the
+  destruction of a draft its own deliberate act. **← recommended**
+- (b) Confirmation is client-side only; the server always deletes. Weaker: any scripted client destroys a
+  draft with no confirmation, and the daemon cannot tell a considered delete from an accident.
+- (c) Add a force parameter to the frozen route. **This is a §5.2 stop condition** — the contract is frozen and
+  M8.1 defined the permitted extension. Only the owner can sanction it.
+
+**2. What triggers archive detection in direct mode.** Blocks **M8.9**. The sweep that notices "a real pull
+request now exists for this branch pair" has no natural tick outside broker mode — `poll-loop.ts` exists only
+there.
+- **(a) On each sync of that review** — the daemon is already talking to git, the user is looking at that
+  review, and the cost is bounded by user action. **← recommended**
+- (b) On each pull-list read. Cheap to wire, but makes an inbox poll do GitHub work.
+- (c) A new timer in direct mode. A second scheduler to own and to shut down cleanly.
+- (d) Broker mode only; direct mode never archives. Honest and cheapest, but the milestone's exit criterion
+  reads as if direct mode archives too.
+
+**3. Is the blob prune on by default?** Blocks **M8.10**. Blobs are content-addressed and the `immutables`
+table is **shared with GitHub pull-request snapshots** — a prune that is wrong deletes content another review
+still needs, and this session already recorded that the two producers can share one row.
+- **(a) Off by default, behind a flag** — unbounded growth is visible and recoverable; a wrong prune is not.
+  **← recommended**
+- (b) On, with a conservative liveness check over every live compare key.
+- (c) On unconditionally.
+
+**4. What bounds the pin set before retention lands?** Blocks **M8.8**. Pins keep git objects alive across a
+rebase so drafts survive; nothing yet removes them.
+- **(a) Keep every pin until the retention work lands in the same session** — unbounded but correct, and the
+  garbage collector arrives right behind it. **← recommended**
+- (b) Pin only the current compare. Bounded, but a rebase can then strand an older draft's objects.
+
+**A second tier exists — raise it ONLY if an answer above opens it, otherwise leave it for the session that
+needs it:** what GitHub call feeds archive detection and at what cost (M8.9 OQ1); whether a pull request opened
+against a *different* base archives the local review (M8.9 OQ8); whether a missing-objects answer is a throw or
+a report (M8.8 OQ5); and whether an archived review still re-syncs (M8.9 OQ9).
+
+### The stack — nine PRs, none merged, all green
+
+`main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → **#76 (M8.5)** → **#77 (a store fix, not M8)**.
+
+**Never merge, never commit to `main`, never retarget.** `main` is untouched at `177068a`. #77 is deliberately
+its own PR: a pre-existing lost-update race in the preferences setter, found while auditing transaction shapes,
+kept out of #76 so the daemon-wiring PR stays about daemon wiring.
+
+### ⚠️ CI was red on #74 and #75, and the local gate could not have caught it
+
+One test, whose control asserted git prints a numeric offset for a UTC commit. **It prints `Z`** — `%aI` is
+strict ISO 8601. The fixture pinned commit **identity** (because a runner has none) but never pinned the
+**timezone**, so every fixture commit inherited the machine's offset: a developer machine at `+01:00` passed, a
+UTC runner failed. `m8.5` would have failed identically the moment its PR opened.
+
+Fixed at the **root** on `m8.3` so the stack inherits it by rebase, then `m8.4` and `m8.5` rebased and
+**re-gated under `TZ=UTC`**. Relaxing the pattern to accept `Z` would have been the wrong repair — it makes the
+control vacuous on precisely the machine where it was failing.
+
+**Standing practice, and the single most useful thing this session learned: run `TZ=UTC bun run check` before
+pushing anything that touches dates, timestamps, or git output.** The default local run reproduces CI by
+accident, not by design.
+
+### Decisions not to relitigate
+
+- **The wiring seam is one `LocalReviewSurface`**, assembled from the store, a `CommandRunner`, the
+  **discovered** repository toplevel, the repo identity and the boot session. The write port is mapped **member
+  by member, never by spread** — two members are spelled differently on the store, and a spread also smuggles a
+  draft writer and the audit journal onto a port whose whole value is being a short, pinnable list of names.
+- **The local-only switch is explicit** (`--local-only` / `REVU_LOCAL_ONLY`), never automatic. Automatic
+  relaxation lets a transient credential failure inside a real clone boot a daemon showing an empty inbox,
+  which reads as data loss. An unrecognised value is refused rather than read as "off".
+- **`not_implemented` is not an `ApiErrorCode`** and adding it would be a frozen-contract change. Degradation
+  uses the router's existing raw-501 convention.
+- **The GitHub half is all-or-nothing** — repo, client and probed viewer together, or none. A kept repo with no
+  viewer is what inverted the approve gate and the submit idempotency check.
+- **`bin/revu` gains no local path.** The exit criterion is proven against `revud` directly. The CLI is a
+  follow-up, not a silent absorption.
+
+### Hazards, all paid for at least once
+
+1. **The gate is not deterministic.** Under load it goes red with `beforeEach`/`afterEach` hook timeouts at
+   ~5000ms in the fixture-driven suites and a fixture `git` killed by signal 143. **The discriminator is the
+   test COUNT, not which assertions failed** — a real regression keeps the count and turns assertions red; this
+   flake *loses* tests. Tee every gate run and grep `(fail)`; a red counts only when it reproduces on a quiet
+   tree with the same names. It fired three times this session and never once meant anything.
+2. **NEVER `git add -A` while a review agent is running against the working tree.** Reviews here work by
+   break-observe-revert on real source. A blind add swept two mutations — including a **debug `throw`** — into a
+   commit labelled `docs(...)`. The next commit reverted them by luck. Stage explicit paths, and
+   `git show --stat` before pushing: a `docs:` commit touching `src/` is the signal.
+3. **A reviewer's prescription can be wrong.** One prescribed guard would have made a reads-only broker answer
+   501 to syncs and snapshot reads it must serve, with no existing test to catch it. The implementer caught it
+   and placed the invariant one layer down. **Verify a prescription before relaying it, and tell implementers
+   they may refuse it.**
+4. **A fix can over-correct into a worse defect than it closed.** The viewer-less-half fix made `--local-only`
+   require the network and a valid token — breaking the flag the change exists to ship. Only a second review
+   pass found it. **Review the fixes, not just the feature.**
+5. **Integration is copy-whole-files out of a worktree**, so two workers on one file means one is silently
+   discarded. Four units share `direct-router.ts`; they were serialised against the roadmap's parallel plan.
+6. **Re-gate after every rebase.** A clean rebase is not a proof.
+
+### What the discipline bought
+
+**Three adversarial passes, four confirmed blockers, every one reproduced before being treated as real** — and
+two of them serious: duplicate reviews posted to a real pull request, and a local review id actionable from any
+repository sharing the data directory. Three of the four were contradicted by docstrings the same diff
+introduced, which is the strongest available signal that the author's model and the code disagree.
+
+**Two guards that could not fail were made falsifiable**, and the second turned out to be guarding something
+real: neither the draft key nor the snapshot key carries a repository, so one human serving two repositories
+from one data directory can hold both rows on a neighbour's review — and the delegate then answers **in full**,
+handing back a report carrying the other repository's head.
+
+### Recorded, unowned, deliberately not fixed
+
+- The viewed-file setters take a **whole** state object, so that read-modify-write lives in the **caller**,
+  outside the store. The same lost-update class may exist there and the store's API shape cannot prevent it.
+  Callers not investigated.
+- Two assertions in the offline HTTP suite **cannot be falsified from outside the process** and say so where
+  they are made: a populated `partial` is unreachable across a process boundary, and a 304's empty body is
+  stripped by the transport before a client sees it.
+- The pull list deserialises every local review's full snapshot on **every** poll, including on the 304 path,
+  to read a commit count. Cheap future fix: denormalise the count onto the review row at sync.
+- Broker mode never wires the local surface, so the merged-list path is forward-looking rather than reachable.
+
 ---
+
 
 ## 2026-08-17 — Session 4 (the daemon, finished) — **M8.2, M8.3 and M8.4 all COMPLETE and in review**
 

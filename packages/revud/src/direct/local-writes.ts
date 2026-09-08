@@ -72,7 +72,11 @@
  *
  * The failures it merely PROPAGATES are a different matter, and the claim above
  * does not reach them. A store write that throws, and a head resolution that
- * rejects, travel out of here exactly as they arrived — untyped. That is
+ * rejects, travel out of here exactly as they arrived, whatever shape that is.
+ * This module neither wraps them nor unwraps them. Head resolution types the
+ * ordinary repository states it can name — a ref that no longer resolves, a
+ * range it cannot count — so those arrive already carrying a code; a store
+ * write's failure arrives untyped. Passing both through unchanged is
  * deliberate rather than an oversight: the code such a failure should carry is a
  * property of the storage and git seams, which the caller owns and this module
  * only borrows, and a code invented here would describe a layer this module

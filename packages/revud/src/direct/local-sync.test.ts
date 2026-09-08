@@ -79,6 +79,7 @@ import {
   readLocalDiffFiles,
   readLocalSnapshotImmutable,
   resolveLocalRange,
+  shortRefName,
   splitPatchSections,
   synthesizeLocalPullDetail,
   synthesizeLocalUser,
@@ -604,6 +605,7 @@ describe('every command the resolver runs is hardened, and none is classified by
       'readLocalPatchSections',
       'readLocalSnapshotImmutable',
       'resolveLocalRange',
+      'shortRefName',
       'splitPatchSections',
       'synthesizeLocalPullDetail',
       'synthesizeLocalUser',
@@ -3637,6 +3639,40 @@ describe('the sentinel author says what it is, positively', () => {
 
   test('the pull detail carries that same account', () => {
     expect(detailFor().user).toEqual(synthesizeLocalUser(LOCAL_REVIEWER_NAME))
+  })
+})
+
+describe('the display form of a ref keeps whatever tells it apart', () => {
+  test('a local branch drops its namespace', () => {
+    expect(shortRefName('refs/heads/topic')).toBe('topic')
+  })
+
+  test('a branch under further segments keeps every one of them', () => {
+    // Only the namespace is removed. A form that took the last segment would
+    // display two differently-nested branches under one name.
+    expect(shortRefName('refs/heads/feature/nested/topic')).toBe('feature/nested/topic')
+  })
+
+  test('a remote-tracking ref keeps its remote', () => {
+    // The remote is the part that tells this ref apart from the local branch of
+    // the same name, so dropping it would display two different refs identically.
+    expect(shortRefName('refs/remotes/origin/main')).toBe('origin/main')
+  })
+
+  test('a name under neither namespace is returned unchanged', () => {
+    // No prefix matched, so nothing is removed — a value trimmed by a rule that
+    // did not apply to it would be a name no ref in the repository carries.
+    expect(shortRefName('refs/tags/v1.0.0')).toBe('refs/tags/v1.0.0')
+  })
+
+  test('the pull detail displays both of its sides through exactly this function', () => {
+    // The pin that keeps the two from drifting: the detail's sides are not a
+    // second implementation of the same trimming.
+    const detail = detailFor({ baseRef: 'refs/remotes/origin/main', headRef: 'refs/heads/topic' })
+    expect([detail.base.ref, detail.head.ref]).toEqual([
+      shortRefName('refs/remotes/origin/main'),
+      shortRefName('refs/heads/topic'),
+    ])
   })
 })
 

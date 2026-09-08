@@ -1,10 +1,12 @@
 import type {
   AnchorResult,
   CommitInfo,
+  FileBlob,
   ReconcileReport,
+  ReviewDraft,
+  Snapshot,
 } from '@revu/shared'
 import { ApiError, blobContentToLines, classifyPendingComment } from '@revu/shared'
-import type { DirectStore } from './store'
 
 /**
  * Draft reconcile — the crown-jewel read path. After a force-push (or a base
@@ -24,9 +26,33 @@ import type { DirectStore } from './store'
  * report structurally impossible.
  */
 
+/**
+ * The three reads reconcile makes, and nothing wider.
+ *
+ * Stated as its own interface rather than as the whole durable store because
+ * this is a PURE READ path: a surface that cannot write cannot be the thing that
+ * mutates a draft while classifying it. It is also what lets a caller whose
+ * documents live in a different keyspace — a review of a local branch pair,
+ * whose drafts and snapshots are keyed in tables of their own — reach the same
+ * classifier through an adapter, so the one classification stays shared instead
+ * of being reimplemented per keyspace. The durable store satisfies this
+ * structurally, so nothing that passes it today has to change.
+ *
+ * The number identifying a review is whatever the calling keyspace uses for it,
+ * and it is passed through unread: nothing here parses or compares it.
+ */
+export interface ReconcileStore {
+  /** One human's draft on one review, or `null` when they have none on it. */
+  getDraft(humanId: string, prNumber: number): ReviewDraft | null
+  /** The stored snapshot of one review, or `null` when it has never been synced. */
+  getSnapshot(prNumber: number): Snapshot | null
+  /** One blob from the content-addressed cache, or `null` when it is absent. */
+  getBlob(sha: string): FileBlob | null
+}
+
 /** Everything reconcile reads from, injected so the core is unit-testable with fakes. */
 export interface ReconcileDeps {
-  store: DirectStore
+  store: ReconcileStore
   /** The session's human id — the draft is read for THIS human, never a client-supplied id. */
   humanId: string
 }
