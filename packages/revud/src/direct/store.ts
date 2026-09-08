@@ -1021,16 +1021,65 @@ export function openDirectStore(
     },
 
     setPreferences(humanId: string, patch: Partial<HumanPreferences>): HumanPreferences {
-      const current = this.getPreferences(humanId)
-      const next: HumanPreferences = { ...current, ...patch }
-      write('prefs', () => {
-        db.run(
-          'INSERT INTO prefs (human_id, data) VALUES (?, ?) ' +
-            'ON CONFLICT(human_id) DO UPDATE SET data = excluded.data',
-          [humanId, JSON.stringify(next)],
-        )
+      return write('prefs', () => {
+        // Read, merge, and upsert as ONE transaction, opened with
+        // `BEGIN IMMEDIATE` rather than the deferred `BEGIN` that calling `tx()`
+        // directly would open. Both halves matter, and for a reason that is
+        // NEITHER of the two this file's other transactions are about.
+        //
+        // The stored row is a whole document, but a caller patches FIELDS: the
+        // setter's contract is that changing one field never overwrites the
+        // others, and the merge is the only thing that honours it. That makes
+        // this a read-modify-write, and a read-modify-write whose read happens
+        // outside the write is a lost update. Two connections patching disjoint
+        // fields — one `theme`, one `diffMode` — each merge onto the state they
+        // read, and the second to write puts back a document reflecting only its
+        // own field. The other's is reverted. Nothing fails: both writes
+        // succeed, both callers are told their field was saved, and it was; the
+        // damage is entirely to the field neither of them mentioned.
+        //
+        // Untransacted, the read cannot even see the contention. A WAL reader
+        // never blocks on a writer, so the SELECT returns the last committed
+        // state and returns it immediately, however many writers are mid
+        // transaction; the connection's busy timeout then makes the upsert WAIT
+        // for them, which is precisely the wrong order — the value being merged
+        // onto goes stale during the wait the timeout imposes. So the timeout is
+        // not a partial defence here, it is the mechanism by which the window
+        // opens.
+        //
+        // Taking the write lock at `BEGIN` closes it by moving the waiting ahead
+        // of the read: a concurrent writer is waited out FIRST, and the merge is
+        // then computed from a committed state that nothing can invalidate
+        // underneath it. `immediate` and not deferred, because a deferred
+        // transaction reproduces the untransacted order — read snapshot at the
+        // SELECT, write lock requested afterwards — and would additionally fail
+        // the upgrade outright if a commit landed in between, a refusal SQLite
+        // issues without ever consulting the busy handler.
+        //
+        // The merged document is carried OUT of the transaction body rather than
+        // re-read after the commit, so a caller is handed what THIS call wrote. A
+        // second read after the commit would see whatever is current by then,
+        // which is a later writer's document if one has landed — a different
+        // answer from "here is your patch applied", returned under that name.
+        let next: HumanPreferences | null = null
+        const tx = db.transaction(() => {
+          next = { ...this.getPreferences(humanId), ...patch }
+          db.run(
+            'INSERT INTO prefs (human_id, data) VALUES (?, ?) ' +
+              'ON CONFLICT(human_id) DO UPDATE SET data = excluded.data',
+            [humanId, JSON.stringify(next)],
+          )
+        })
+        tx.immediate()
+        // The body runs exactly once before the commit returns, so this is the
+        // shape of a transaction wrapper that stopped invoking it — reported
+        // rather than papered over with a document assembled out here, which
+        // would be a merge that no read backed and no write persisted.
+        if (next === null) {
+          throw new Error('the preferences transaction committed without merging a document')
+        }
+        return next
       })
-      return next
     },
 
     appendAudit(entry: AuditEntry): void {
