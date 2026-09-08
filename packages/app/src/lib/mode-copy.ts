@@ -26,6 +26,11 @@
  * named lines where a component renders several. No JSX, no hooks, and nothing
  * imported from a component: a copy function a test cannot call without a
  * renderer defeats the point of the module.
+ *
+ * One export returns a chip TINT rather than a sentence, and belongs here for
+ * the same reason the rest do: it is half of what that chip says, it varies by
+ * exactly the same question, and a colour that contradicts the word beside it
+ * is a claim no sweep over wording would ever catch.
  */
 import type { ReviewMode } from './review-mode'
 
@@ -101,9 +106,11 @@ export type ReviewState = 'open' | 'closed' | 'merged'
  *
  * The one thing that ends it is a pull request coming to cover the same branch
  * pair, at which point the review is kept and archived rather than deleted.
- * The surface that explains that supersession to a reader extends this
- * function rather than growing a second one beside it, so the header and that
- * surface cannot come to different conclusions about the same review.
+ * The surfaces that explain that supersession to a reader — the chip's own
+ * tint below, the badge on the row, and the banner over the review — extend
+ * this family rather than growing a second vocabulary beside it, so the header
+ * and every one of them cannot come to different conclusions about the same
+ * review.
  */
 export function stateChipCopy(mode: ReviewMode, state: ReviewState): string {
   if (mode === 'local') {
@@ -112,6 +119,112 @@ export function stateChipCopy(mode: ReviewMode, state: ReviewState): string {
   // A pull request's chip says what GitHub calls the state, so the word is the
   // state itself.
   return state
+}
+
+/** The badge tints the state chip is drawn in, named as the badge names them. */
+export type StateChipVariant = 'add' | 'default' | 'danger'
+
+/** A pull request's chip: live, landed, or closed without landing. */
+const GITHUB_STATE_VARIANT: Record<ReviewState, StateChipVariant> = {
+  open: 'add',
+  merged: 'default',
+  closed: 'danger',
+}
+
+/**
+ * The tint the state chip is drawn in — the other half of what the chip says,
+ * and the half a reader takes in before reading the word.
+ *
+ * A pull request that closed without landing is the one state in this table
+ * worth looking twice at, so it keeps the alarm tint. A branch pair that has
+ * left the open state left it for exactly one reason: a pull request now
+ * covers the same pair, which is work moving forward rather than work
+ * abandoned. Drawn in the same tint it would read as a failure on every
+ * archived review in the inbox and in every header — a false alarm repeated
+ * everywhere, told by a colour no sweep over words would ever catch.
+ *
+ * Beside the wording rather than in the component for that reason: the tint
+ * and the word are one claim, and two claims about the same review kept in two
+ * places will eventually disagree.
+ */
+export function stateChipVariant(mode: ReviewMode, state: ReviewState): StateChipVariant {
+  if (mode === 'local') return state === 'open' ? 'add' : 'default'
+  return GITHUB_STATE_VARIANT[state]
+}
+
+/**
+ * The badge on an inbox row whose review a pull request has come to cover, or
+ * null on a pull request, which nothing supersedes in this sense.
+ *
+ * Terse because of where it sits: a row already carries its branch pair, its
+ * kind and whatever draft is on it, and this is one more chip in that cluster.
+ * It names the number and says the review is archived, which is as much as a
+ * row can carry — the full statement of what "archived" costs and does not
+ * cost belongs to the banner over the review itself, which is one click away
+ * and is where a reader goes to act on it.
+ *
+ * The number is the only number on the row: a local review's identity slot
+ * draws its branch pair, because the key it is routed by is synthetic and
+ * names nothing a reader could look up. This one is a real pull request
+ * number, and it is the whole reason the badge is worth its space.
+ */
+export function supersededBadgeCopy(mode: ReviewMode, prNumber: number): string | null {
+  if (mode !== 'local') return null
+  return `archived · superseded by #${prNumber}`
+}
+
+/** The lines of the banner over a review a pull request has superseded. */
+export interface SupersededBannerCopy {
+  /** What happened, and which pull request it happened for. */
+  title: string
+  /** What is true of the review now: what it can't do, and what it still holds. */
+  hint: string
+}
+
+/**
+ * The banner over a review that a pull request has taken over from.
+ *
+ * This is the one local surface that legitimately names a pull request, and it
+ * has to: the review is read-only BECAUSE that pull request exists, and a
+ * reader told only "archived" has been handed half a fact and no way to reach
+ * the other half.
+ *
+ * Every clause earns its place, and each one answers a question the reader
+ * would otherwise answer wrongly. What took over — so the work can be
+ * followed. Read-only — so a reader stops looking for the composer they
+ * remember. Frozen at its last sync — so the diff being older than the branch
+ * is a property rather than a bug. Every thread and draft kept — because
+ * "archived" reads as "thrown away" to most people, and the fear of losing a
+ * morning's comments is what would stop them making local reviews at all.
+ * Nothing was sent — because a reader who assumes their private notes went out
+ * on a pull request has been badly surprised in the least recoverable way.
+ *
+ * The vocabulary of the self-approval refusal is deliberately absent, and it
+ * is the nearest wrong reading: both say a control will not do what it looks
+ * like it does, so borrowing that wording would turn this into "you may not
+ * approve your own work, comment instead" — a live review with a narrowed
+ * verdict, which is the opposite of what this is. The word "lost" is absent
+ * for the same reason inverted: nothing here was.
+ *
+ * The number is named once, in the title. The surface that draws this also
+ * offers the pull request as somewhere to GO, and a sentence that repeated the
+ * number beside that link would read as two different pull requests to anyone
+ * skimming it.
+ *
+ * `null` on the other reading. Nothing supersedes a pull request in this sense
+ * — a pull request closes for its own reasons, none of them this one — so
+ * there is no softer sentence to fall back to, and inventing one would invent
+ * the fact behind it.
+ */
+export function supersededBannerCopy(
+  mode: ReviewMode,
+  prNumber: number,
+): SupersededBannerCopy | null {
+  if (mode !== 'local') return null
+  return {
+    title: `Archived — superseded by pull request #${prNumber}`,
+    hint: 'This review is read-only and frozen at its last sync. Every thread and draft in it is kept; nothing in it was sent to that pull request.',
+  }
 }
 
 /**

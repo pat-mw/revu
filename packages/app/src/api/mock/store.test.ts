@@ -1,4 +1,8 @@
 /**
+ * The store's durability surface, its document migrations, and the one place a
+ * store-level fact is only observable through the adapter above it: the pull
+ * list's ETag.
+ *
  * The store's two persistence variants against a failing storage backend.
  *
  * `flush()` SWALLOWS a `setItem` failure — browser semantics, and load-bearing:
@@ -14,6 +18,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import type { ReviewDraft } from '@revu/shared'
 import { LOCAL_ENTITY_ID_BASE, LOCAL_REVIEW_ID_BASE } from '@revu/shared'
+import { createMockApi } from './adapter'
+import { mockDev } from './devtools'
 import { migrateStoreDocument, store } from './store'
 
 const STORAGE_KEY = 'revu.broker.v1'
@@ -259,5 +265,56 @@ describe('migrateStoreDocument repairs local id counters against the records pre
     const doc = documentWithLocalReview({ review: 0, entity: 0 })
     doc.localReviews = {}
     expect(migrateStoreDocument(doc)?.localCounters).toEqual({ review: 0, entity: 0 })
+  })
+})
+
+/**
+ * The pull list's ETag is computed over the WHOLE item list, local reviews
+ * included, which is the only reason a caller holding a cached list ever
+ * learns that a local review archived. Archiving flips the synthesized pull's
+ * `state` to closed, so the list a conditional request would otherwise be told
+ * to keep is genuinely stale — and a validator narrowed to the local rows'
+ * compare keys would miss it entirely, because a compare key is read from the
+ * ref tips and archiving does not move a branch.
+ *
+ * Driven through the adapter rather than the store because the ETag is the
+ * adapter's; the store is what makes it move.
+ */
+describe('the pull list ETag over local reviews', () => {
+  test('moves when a local review is created, and again when that review archives', async () => {
+    mockDev.reset()
+    // Latency is simulated per call; the zero profile keeps the walk quick.
+    mockDev.setLatency('zero')
+    const api = createMockApi()
+
+    const seeded = await api.listPulls()
+
+    // A branch pair fixture pull request 101 covers, so the first sync of the
+    // review created on it archives the review.
+    const created = await api.createLocalReview({
+      baseRef: 'main',
+      headRef: 'fix/cache-ttl-jitter',
+    })
+    const withReview = await api.listPulls()
+    expect(withReview.etag).not.toBe(seeded.etag)
+
+    // The validator is honest before the archive: nothing has changed since it
+    // was issued, so the same list is not re-sent.
+    const unchanged = await api.listPulls({ etag: withReview.etag })
+    expect(unchanged.notModified).toBe(true)
+    expect(unchanged.etag).toBe(withReview.etag)
+
+    await api.syncPull(created.id)
+
+    const afterArchive = await api.listPulls({ etag: withReview.etag })
+    expect(afterArchive.notModified).toBe(false)
+    expect(afterArchive.etag).not.toBe(withReview.etag)
+
+    // The archived review is still a row — archiving makes it read-only, never
+    // absent — and the row is what tells a reader it closed.
+    const row = afterArchive.items.find((i) => i.pull.number === created.id)
+    expect(row?.pull.state).toBe('closed')
+    const summary = (await api.listLocalReviews()).find((s) => s.id === created.id)
+    expect(summary?.archivedPr).toBe(101)
   })
 })

@@ -1,5 +1,5 @@
 import type { BranchRef, BrokerPullMeta, CreateLocalReviewInput, GhRef, GhUser, Human, LocalReviewSummary, PullDetail, ReactionKey, ReactionRollup, ReviewComment, ReviewSummary, ReviewThread, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
-import { ApiError, draftHoldsText, isValidRefName, normalizeRefName } from '@revu/shared'
+import { ApiError, archivedReviewRefusal, draftHoldsText, isValidRefName, normalizeRefName, supersedingPull } from '@revu/shared'
 import type { FixtureDB } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import { fakeSha } from '@/fixtures/helpers'
@@ -72,6 +72,38 @@ function requireLocalReview(id: number): LocalReviewRecord {
     )
   }
   return record
+}
+
+/**
+ * The refusal a write verb answers with on an archived review, or null while
+ * the review is still live.
+ *
+ * The sentence itself is shared with every other transport so all of them
+ * refuse in exactly the same words; this wrapper exists only to turn the
+ * record's nullable `archivedPr` into the "archived or not" question each
+ * write verb actually asks. Returning the message rather than throwing keeps
+ * the choice of shape at the call site: a submit answers with a `forbidden`
+ * VALUE, the other three throw a `forbidden` error.
+ */
+function archivedRefusalFor(record: LocalReviewRecord): string | null {
+  if (record.archivedPr === null) return null
+  return archivedReviewRefusal({
+    archivedPr: record.archivedPr,
+    baseRef: record.baseRef,
+    headRef: record.headRef,
+  })
+}
+
+/**
+ * The pull request that supersedes this review, read from this store's stand-in
+ * for GitHub: its own fixture pull requests, with every overlay applied, which
+ * is the same list the pull list is built from. The shared predicate decides —
+ * same repository, same head branch, same base branch, open only, lowest number
+ * when several match — so this store and the daemon can never disagree about
+ * which pull request archives a review.
+ */
+function supersedingPullFor(record: LocalReviewRecord): { number: number } | null {
+  return supersedingPull(record, store.listEffectiveRemotes().map((r) => r.detail))
 }
 
 /** The wire summary is exactly the record's scalar fields — nothing store-only leaks. */
@@ -260,6 +292,11 @@ export function listBranches(): BranchRef[] {
  * same branch spelled bare and qualified lands on one record. Base and head
  * naming the same ref, or a ref failing validation, is `unprocessable`: the
  * request is well-formed but cannot be satisfied as given.
+ *
+ * That idempotence makes a branch pair a ONE-WAY DOOR once its review has been
+ * archived against a pull request: asking again returns the archived review,
+ * read-only, rather than minting a live sibling that would collect feedback the
+ * pull request never sees. There is no path back, which is the point.
  */
 export function createLocalReview(input: CreateLocalReviewInput): LocalReviewSummary {
   for (const [side, ref] of [
@@ -428,9 +465,50 @@ export function listLocalSubmittedReviews(id: number): ReviewSummary[] {
  * true merge base and diff instead; everything else here is shape.
  *
  * The sync costs nothing: no network, no rate budget, `requests: 0`.
+ *
+ * SYNC IS ALSO WHERE ARCHIVING HAPPENS, in three steps and in this order:
+ *
+ * 1. An archived review with a stored snapshot returns that snapshot unchanged
+ *    and touches nothing else. It is FROZEN at its last sync: the record keeps
+ *    the SHAs, `dirty` flag and timestamps it had, so what a reader sees is the
+ *    branch pair as it stood when the pull request was found, not as it stands
+ *    now. The review stays fully readable forever; only its writes refuse.
+ * 2. A review that is NOT archived is checked against the pull requests this
+ *    store knows, BEFORE the sync's own work. On a match the number is recorded
+ *    and persisted, which makes this sync the review's last one — and because
+ *    the synthesized pull derives its `state` from that number, the snapshot
+ *    stored a few lines below already presents the review as closed. Doing the
+ *    check afterwards would leave one stale snapshot behind, still claiming
+ *    `open`, that nothing would ever rewrite.
+ * 3. Whatever survives the first two steps syncs normally.
+ *
+ * An archived record with NO stored snapshot cannot arise at runtime — step 2
+ * only ever archives on a sync that goes on to store one — but a hand-edited
+ * or partially restored document can hold one, and a review with nothing to
+ * serve is worse than a stale one. Such a record therefore falls through to
+ * step 3 once, so it has a snapshot, and is frozen by step 1 from then on. It
+ * skips step 2 like any archived record: the number it already carries is
+ * never re-derived, which is what makes archiving one-way. A pull request
+ * closed after detection leaves the review archived, and no path clears the
+ * number.
  */
 export function syncLocalReview(id: number): Snapshot {
   const record = requireLocalReview(id)
+  if (record.archivedPr === null) {
+    const superseding = supersedingPullFor(record)
+    if (superseding) {
+      record.archivedPr = superseding.number
+      store.putLocalReview(record)
+    }
+  } else {
+    // Frozen only once the stored snapshot agrees with the row: a mark the
+    // snapshot does not yet reflect (set by another writer, or by hand) earns
+    // exactly one more real sync, so an archived review never serves a
+    // snapshot that still calls itself open.
+    const frozen = store.getSnapshot(record.id)
+    if (frozen && frozen.mutable.pull.state === 'closed') return frozen
+  }
+
   const at = nowISO()
   const headSha = liveRefSha(record.repo, record.headRef)
   const baseSha = liveRefSha(record.repo, record.baseRef)
@@ -534,13 +612,21 @@ function requireLocalThread(record: LocalReviewRecord, threadId: string): Review
  * deleted only after that confirmed success.
  *
  * All three verdicts stay available: there is no self-review rule to enforce
- * because no GitHub identity opened anything, so no `forbidden` branch
- * exists. The idempotency re-check and the post-submit re-validation of
- * other submit paths guard against lost network responses and a remote's
+ * because no GitHub identity opened anything, so the ONE `forbidden` this path
+ * answers is the archived one — a pull request now covers the same branch pair,
+ * the review is read-only, and no verdict may be added to it. It is a RETURNED
+ * value, not a throw, exactly like `head_moved`: both say the submit did not
+ * happen and why, and the caller renders the reason beside the editor with the
+ * draft still intact. It is checked before every write and before the snapshot
+ * and head guards below, because an archived review refuses whatever those two
+ * would have said. The idempotency re-check and the post-submit re-validation
+ * of other submit paths guard against lost network responses and a remote's
  * second opinion; a synchronous local sink has neither, so neither appears.
  */
 export function submitLocalReview(input: SubmitReviewInput): SubmitResult {
   const record = requireLocalReview(input.prNumber)
+  const archived = archivedRefusalFor(record)
+  if (archived) return { status: 'forbidden', reason: archived }
   // Ahead of the head guard as well as of every write: with no snapshot there
   // is no compare behind the expected SHA, so answering `head_moved` would
   // send the reviewer to reconcile against a snapshot that does not exist.
@@ -652,6 +738,11 @@ export function submitLocalReview(input: SubmitReviewInput): SubmitResult {
  * and the body exactly as written — the client swaps its optimistic entry by
  * id, so a duplicate or negative id would orphan it. Authorship is recorded
  * beside the comment as a key, never smuggled into the text.
+ *
+ * An archived review refuses as `forbidden`, checked before the thread is even
+ * looked up: the review is read-only whatever the caller aimed at, so a missing
+ * thread on an archived review is answered with the archive refusal rather than
+ * `not_found`.
  */
 export function replyToLocalThread(
   reviewId: number,
@@ -659,6 +750,8 @@ export function replyToLocalThread(
   body: string,
 ): ReviewComment {
   const record = requireLocalReview(reviewId)
+  const archived = archivedRefusalFor(record)
+  if (archived) throw new ApiError('forbidden', archived)
   const thread = requireLocalThread(record, threadId)
   const root = thread.comments[0]
   if (!root) {
@@ -710,6 +803,10 @@ export function replyToLocalThread(
  *
  * Resolution is attributed to the local reviewer by DISPLAY NAME: there is no
  * bot account to name here, and an email is never rendered.
+ *
+ * An archived review refuses as `forbidden`, checked before the thread is
+ * looked up: a resolution is a write like any other, and the review is
+ * read-only from the sync that found its pull request onwards.
  */
 export function resolveLocalThread(
   reviewId: number,
@@ -717,6 +814,8 @@ export function resolveLocalThread(
   resolved: boolean,
 ): ReviewThread {
   const record = requireLocalReview(reviewId)
+  const archived = archivedRefusalFor(record)
+  if (archived) throw new ApiError('forbidden', archived)
   const thread = requireLocalThread(record, threadId)
   thread.isResolved = resolved
   thread.resolvedBy = resolved ? { login: currentHuman().name } : null
@@ -743,6 +842,10 @@ export function resolveLocalThread(
  *
  * Adding a reaction does not float the review's `updatedAt`, matching how a
  * reaction leaves a pull request's own timestamp alone.
+ *
+ * An archived review refuses as `forbidden`, checked before the comment is
+ * looked up. A reaction is the smallest write there is and it is refused like
+ * the rest: read-only means the stored content cannot change at all.
  */
 export function addLocalReaction(
   reviewId: number,
@@ -750,6 +853,8 @@ export function addLocalReaction(
   reaction: ReactionKey,
 ): ReactionRollup {
   const record = requireLocalReview(reviewId)
+  const archived = archivedRefusalFor(record)
+  if (archived) throw new ApiError('forbidden', archived)
   const comment = record.threads
     .flatMap((t) => t.comments)
     .find((c) => c.id === commentId)

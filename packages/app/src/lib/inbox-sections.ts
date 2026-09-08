@@ -15,7 +15,7 @@
  */
 import type { PullListItem, ReviewDraft } from '@revu/shared'
 import { parseCommentIdentity } from '@revu/shared'
-import { partitionInbox, rowIdentity } from './local-reviews'
+import { isLocalReviewItem, partitionInbox, rowIdentity } from './local-reviews'
 import { buildPullTree } from './pull-tree'
 import type { PullTreeRoot } from './pull-tree'
 
@@ -135,6 +135,32 @@ export function nextFocusIndex(
 }
 
 /**
+ * Whether a listed row belongs on this screen at all, whichever arrangement is
+ * drawing it.
+ *
+ * Open work is the rule, and a review of two local branches is the exception
+ * to it. The asymmetry is about where the review can still be READ, not about
+ * how finished it is. A closed pull request is complete somewhere the reader
+ * can always reach — it has a page of its own, with every comment on it — so
+ * carrying it here forever would grow the inbox without adding anything.
+ *
+ * A local review has nowhere else. It goes read-only when a pull request comes
+ * to cover the same branch pair, and archiving it takes away the right to
+ * write to it rather than the threads and drafts already in it; nothing in it
+ * was ever sent anywhere. Dropping the row would make the only copy of that
+ * work unreachable from the one screen that lists reviews, which is a deletion
+ * in everything but name.
+ *
+ * A predicate rather than an inline test in the filter below, because the
+ * count that decides whether the inbox shows its empty screen has to reach the
+ * same answer: an inbox holding nothing but archived local reviews would
+ * otherwise announce that there is nothing here and draw the rows underneath.
+ */
+export function showsInInbox(item: PullListItem): boolean {
+  return item.pull.state === 'open' || isLocalReviewItem(item)
+}
+
+/**
  * The rows either arrangement is allowed to draw from.
  *
  * Shared by both on purpose. The arrangements are two ways of grouping one set
@@ -142,20 +168,22 @@ export function nextFocusIndex(
  * between them is re-sorting the screen, not re-querying it, and a row that
  * appeared in one and not the other would make the control a filter in
  * disguise.
+ *
+ * Which rows those are is decided by the predicate above rather than here, so
+ * the arrangements and the count that decides whether this screen renders at
+ * all cannot disagree about what is in the inbox.
  */
 function visibleRows(
   items: readonly PullListItem[],
   needle: string,
   botLogin: string,
 ): PullListItem[] {
-  return items.filter(
-    (it) => it.pull.state === 'open' && matchesFilter(it, needle, botLogin),
-  )
+  return items.filter((it) => showsInInbox(it) && matchesFilter(it, needle, botLogin))
 }
 
 /** Everything the tree arrangement reads. */
 export interface InboxTreeInput {
-  /** Every listed row, of any state; only the open ones are arranged. */
+  /** Every listed row, of any state; what is arranged is what belongs here. */
   items: readonly PullListItem[]
   /** The filter box's contents, already trimmed and lowercased. */
   needle: string
@@ -192,7 +220,7 @@ export function buildInboxTree({
 
 /** Everything the derivation reads. Nothing here is fetched — it is all in hand. */
 export interface InboxSectionsInput {
-  /** Every listed row, of any state; only the open ones are sorted. */
+  /** Every listed row, of any state; what is sorted is what belongs here. */
   items: readonly PullListItem[]
   /** The filter box's contents, already trimmed and lowercased. */
   needle: string
@@ -207,13 +235,13 @@ export interface InboxSectionsInput {
    * here can represent.
    *
    * A separate input rather than something read off `items`, and deliberately
-   * so. The row source lists every local review whatever its state; callers
-   * filter it to open reviews, and this function is one of those callers — so
-   * a reader whose local reviews are all closed has no row for any of them
-   * while still having them. Whether a closed local review reaches the row
-   * source at all is a question this module must not depend on either way, and
-   * a flag read alongside the local-only annotations is true under either
-   * answer.
+   * so. This function keeps a local review of any state, so one that reaches
+   * the row source is represented here — but whether an archived review
+   * reaches that source at all, and whether it has reached it yet, are
+   * questions this module must not depend on either way. A reader whose
+   * reviews are all archived would otherwise be shown no section about them
+   * for as long as the two reads disagreed, or for good. A flag read alongside
+   * the local-only annotations is true under either answer.
    *
    * It is a boolean about EXISTENCE and nothing more: no row, title, branch
    * pair or review metadata is ever taken from wherever it came from, so a
@@ -225,9 +253,9 @@ export interface InboxSectionsInput {
 /**
  * Sort the listed rows into the sections the inbox renders, in render order.
  *
- * Closed reviews are dropped here rather than by the caller, so "the inbox
- * shows open work" is a property of this function and not an assumption about
- * a component.
+ * Which rows are dropped is decided here rather than by the caller, so "the
+ * inbox shows open pull requests and every local review" is a property of this
+ * function and not an assumption about a component.
  *
  * Local reviews are pulled out before the intent buckets see them and given
  * their own section, so one is listed exactly once. Where that section sits

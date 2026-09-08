@@ -609,3 +609,22 @@ signature moved. Splitting it into its own contract commit is one command if the
 
 **Next.** **M8.9** (archive on PR appearance — independent, ruling 2 settled the trigger, OQ1/OQ8/OQ9 open),
 then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` unwrapped by the netlog guard.
+
+**update — 2026-09-02 (M8.9)**
+- **Done:** M8.9 archive-on-PR, 8/8 units (M8.9.8 appended: a three-transport conformance block), In Review on
+  [#82](https://github.com/pat-mw/revu/pull/82) stacked on #80. Thirteen commits: shared predicate + refusal
+  sentence, store write-once column + `DELETE` allowlist, mock as spec, app chrome (banner, badge, composer
+  withheld, inbox/zero-state/palette keep archived rows, refresh after a local sync), daemon seam + sweep +
+  refusals + freeze + ETag pins, conformance block, docs, five review fixes. Gate 2998 → **3276 · 1 · 0 ·
+  116**; matrix A/B/E/F/G PASS; e2e ×2 PASSED; docs build green.
+- **Decisions:** OQ1 targeted `state=open` (a reused branch name must not archive a fresh review through the
+  one-way door); OQ4 `pull.state` stays `'closed'`, the inbox learns it; OQ5 a derived `owner/name` link,
+  `null` otherwise; OQ8 a different base does not archive, said in the guide; OQ9 freeze — order inside the
+  local `syncPull` path is freeze check → detection → sync, and a sync that fails after the mark freezes at
+  the last successful one. The predicate lives in `packages/shared` so the mock and the daemon share it.
+- **Blockers:** none. The scratch-repo both-halves proof (a real PR on github.com with zero comments) was not
+  run — no token in this session; it stays corroboration for the in-gate fence + tripwire.
+- **Next:** M8.12 (delete confirmation — greenfield: no delete affordance or hook exists in the app), stacked
+  on `m8.9`. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` in the netlog guard; a stored PR
+  URL column if an Enterprise host is ever supported; the 52 stale agent worktrees under `.claude/worktrees/`.
+

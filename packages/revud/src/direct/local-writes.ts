@@ -120,6 +120,7 @@
  */
 import type {
   GhUser,
+  LocalReviewSummary,
   ReactionKey,
   ReactionRollup,
   ReviewComment,
@@ -131,7 +132,7 @@ import type {
   SubmitResult,
   SubmitReviewInput,
 } from '@revu/shared'
-import { ApiError } from '@revu/shared'
+import { ApiError, archivedReviewRefusal } from '@revu/shared'
 import { mintLocalEntityId, mintLocalThreadId } from './local-ids'
 
 /**
@@ -146,6 +147,23 @@ import { mintLocalEntityId, mintLocalThreadId } from './local-ids'
  * surface that cannot rewrite a draft cannot silently mangle one either.
  */
 export interface LocalWriteStore {
+  /**
+   * The review row itself, or `null` when the store holds no such review.
+   *
+   * Read for ONE field: whether a pull request has superseded the review. Once
+   * one has, the review is read-only, and every verb here refuses before its
+   * first mutation with the one sentence every transport answers. The row is
+   * read through the port rather than remembered from an earlier call because
+   * the archive can land between any two calls — the sync that detects it is a
+   * separate path — and a verb that cached "live" would write into a review
+   * that had already been closed.
+   *
+   * `null` is a review the store does not hold, which the ownership guard ahead
+   * of these verbs has already refused; the sink treats it as no archive to
+   * enforce rather than minting a second, differently worded not-found for a
+   * state that guard owns.
+   */
+  getLocalReview(localId: number): LocalReviewSummary | null
   /**
    * The stored snapshot for a local review, or `null` when it has never been
    * synced. `null` is an answer, not a failure: a local review can exist with no
@@ -289,6 +307,34 @@ function timestamp(deps: LocalWriteDeps): string {
 }
 
 /**
+ * The refusal an archived review answers every write with, or null while the
+ * review is live.
+ *
+ * FIRST IN EVERY VERB, ahead of the snapshot read, the head guard and the
+ * thread lookup, and therefore ahead of every mutation. Once a pull request
+ * covers the review's branch pair the review is read-only whatever the caller
+ * aimed at, so a moved head or a thread the review does not hold is answered
+ * with this sentence rather than with its own refusal: the other answers
+ * describe a review that could still take the write once something changed,
+ * and nothing changes an archive. Reading the row here rather than trusting
+ * an earlier read is what lets a review archived between two calls refuse the
+ * second one.
+ *
+ * The sentence is the shared package's, so every transport and the in-browser
+ * mock answer the same words. It is built from the row's own refs and number,
+ * never from anything the caller sent.
+ */
+function archivedRefusal(deps: LocalWriteDeps, localId: number): string | null {
+  const review = deps.getLocalReview(localId)
+  if (review === null || review.archivedPr === null) return null
+  return archivedReviewRefusal({
+    archivedPr: review.archivedPr,
+    baseRef: review.baseRef,
+    headRef: review.headRef,
+  })
+}
+
+/**
  * The stored snapshot for a local review, or the typed refusal that names the
  * fix. Written as one helper because a submit reads it TWICE — once to refuse
  * before the head is resolved, and once after, so the envelope it writes is
@@ -365,6 +411,13 @@ export async function submitLocalReview(
 ): Promise<SubmitResult> {
   const localId = input.prNumber
   const humanId = deps.session.human.id
+
+  // 0. The archive. A RETURNED value, exactly as a moved head is: both say the
+  //    submit did not happen and why, and the caller renders the reason beside
+  //    an editor whose draft is still intact. Ahead of the snapshot read and the
+  //    head guard because an archived review refuses whatever those would say.
+  const archived = archivedRefusal(deps, localId)
+  if (archived !== null) return { status: 'forbidden', reason: archived }
 
   const snapshot = requireStoredSnapshot(deps, localId)
 
@@ -611,6 +664,12 @@ export async function replyToLocalThread(
   threadId: string,
   body: string,
 ): Promise<ReviewComment> {
+  // Ahead of the thread lookup: the review is read-only whatever the reply is
+  // aimed at, so a thread it does not hold is answered with the archive rather
+  // than with a not-found that would invite aiming again.
+  const archived = archivedRefusal(deps, localId)
+  if (archived !== null) throw new ApiError('forbidden', archived)
+
   // Read once before the branch is, so a thread this review does not hold
   // refuses without costing a git read. The read this reply is BUILT from is
   // taken again below, after the await.
@@ -706,6 +765,10 @@ export async function resolveLocalThread(
   threadId: string,
   resolved: boolean,
 ): Promise<ReviewThread> {
+  // Ahead of the thread lookup, for the reason the reply gives.
+  const archived = archivedRefusal(deps, localId)
+  if (archived !== null) throw new ApiError('forbidden', archived)
+
   const { snapshot, thread } = requireStoredThread(deps, localId, threadId)
   const updated: ReviewThread = {
     ...thread,
@@ -765,6 +828,10 @@ export async function addLocalReaction(
   commentId: number,
   reaction: ReactionKey,
 ): Promise<ReactionRollup> {
+  // Ahead of the comment lookup, for the reason the reply gives.
+  const archived = archivedRefusal(deps, localId)
+  if (archived !== null) throw new ApiError('forbidden', archived)
+
   const snapshot = deps.getLocalSnapshot(localId)
   const thread = snapshot?.mutable.threads.find((held) =>
     held.comments.some((comment) => comment.id === commentId),

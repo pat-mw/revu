@@ -110,6 +110,57 @@ export function rowIdentity(item: PullListItem): RowIdentity {
   return { kind: 'github', text: `#${item.pull.number}` }
 }
 
+/**
+ * One half of an `owner/name` repository identity: the characters GitHub
+ * issues for both halves, with the first one required to be alphanumeric.
+ *
+ * The anchored first character is the load-bearing half. Without it `.` and
+ * `..` are admissible halves, and both are path instructions rather than
+ * names once they reach a URL.
+ */
+const REPO_HALF = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+
+/**
+ * Where the pull request that superseded a local review can be read, or `null`
+ * when this workspace's repository identity cannot name one.
+ *
+ * DERIVED, never stored. A URL written down at the moment of archiving would
+ * be a second record of where the repository lives, kept beside the identity
+ * the store already holds and able to disagree with it forever after.
+ *
+ * The identity is only usable here when it is exactly `owner/name`, and the
+ * refusals are the whole point of the function rather than defensive noise. A
+ * workspace with no remote to push to records an ABSOLUTE PATH as its
+ * repository identity — so an unguarded template produces a link to a host the
+ * reader may never have visited, spelled out of their own home directory,
+ * which looks real, is not, and can never be. Anything that is not one
+ * separator with two halves GitHub could have issued is that case or an
+ * unknown one, and both are answered the same way: no link, and the number
+ * rendered as plain text.
+ *
+ * Counting the halves is not enough, which is why each one is matched against
+ * the character set instead. `owner/..` is one separator with two non-empty
+ * halves and yields `https://github.com/owner/../pull/N` — a path every
+ * browser resolves one level up, landing the reader on a pull request in a
+ * repository nobody here named. Requiring the first character to be
+ * alphanumeric is what refuses that, and `.` with it, without refusing the
+ * dots that real owners and repositories are spelled with.
+ *
+ * The number is checked for what a pull request number is, because it reaches
+ * a path segment. Nothing else needs escaping once both halves have matched:
+ * they can hold no separator, no dot-segment and no percent-escape to smuggle
+ * a separator back in, and the scheme and host are literals here rather than
+ * anything read from the workspace.
+ */
+export function archivedPrUrl(repoIdentity: string, prNumber: number): string | null {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return null
+  const halves = repoIdentity.split('/')
+  if (halves.length !== 2) return null
+  const [owner, name] = halves
+  if (!REPO_HALF.test(owner) || !REPO_HALF.test(name)) return null
+  return `https://github.com/${owner}/${name}/pull/${prNumber}`
+}
+
 /** The two refs a create request is built from, as the picker holds them. */
 export interface ReviewBranchPair {
   base: string

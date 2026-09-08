@@ -242,6 +242,28 @@ describe('what a review is called in its own header', () => {
     expect(visibleText(LOCAL_ROW)).toContain('in review')
   })
 
+  test('a pull request closed without landing is chipped as the alarm it may be', () => {
+    // The positive control for the assertion below: the danger tint is real,
+    // reachable from this component, and findable in its markup.
+    const closedPull = identityRow('github', {
+      ...GITHUB_PULL,
+      state: 'closed',
+      merged_at: null,
+    })
+    expect(closedPull).toContain('text-danger')
+  })
+
+  test('and an archived branch pair is chipped quietly instead', () => {
+    // A local review leaves the open state for exactly one reason — a pull
+    // request now covers the same branch pair — which is the work moving on
+    // rather than anything going wrong. In the alarm tint every archived
+    // review in the app would read as a failure, and a colour is a claim no
+    // sweep over wording would catch.
+    const archived = identityRow('local', { ...LOCAL_PULL, state: 'closed', merged_at: null })
+    expect(archived).toContain('archived')
+    expect(archived).not.toContain('text-danger')
+  })
+
   test('and both draw the title they were given', () => {
     expect(visibleText(GITHUB_ROW)).toContain(GITHUB_PULL.title)
     expect(visibleText(LOCAL_ROW)).toContain(LOCAL_PULL.title)

@@ -939,19 +939,45 @@ function truncatedTreeClient(state: { mergeBaseSha: string; unresolvedComments: 
 }
 
 /**
- * A local surface that serves `syncPull` and refuses everything else by name.
+ * A local surface that serves the sync path and refuses everything else by name.
  *
- * Only the sync is exercised here, and a double that answered the rest with
- * plausible values would let a leg drift onto a path it never meant to test
- * without saying so. The refusal names the method, so if that ever happens the
- * failure explains itself.
+ * The sync path is three members: the ownership-guarded row read the api makes
+ * before it syncs, the richer sync whose outcome says whether the repository
+ * was read, and the contract-shaped sync the richer one is built over. The row
+ * served is a LIVE one, so the api never treats a sync here as frozen and the
+ * reclamation these legs measure is always reached. A double that answered the
+ * rest with plausible values would let a leg drift onto a path it never meant
+ * to test without saying so; the refusal names the method, so if that ever
+ * happens the failure explains itself.
  */
 function localSurfaceDouble(syncPull: (localId: number) => Promise<Snapshot>): LocalReviewSurface {
+  const liveRow: LocalReviewSurface['getLocalReview'] = (localId) => ({
+    id: localId,
+    repo: LOCAL_REVIEW_INPUT.repo,
+    baseRef: LOCAL_REVIEW_INPUT.baseRef,
+    headRef: LOCAL_REVIEW_INPUT.headRef,
+    title: LOCAL_REVIEW_INPUT.title,
+    baseSha: null,
+    mergeBaseSha: null,
+    headSha: null,
+    dirty: false,
+    archivedPr: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    lastSyncedAt: null,
+  })
+  const syncLocalReview: LocalReviewSurface['syncLocalReview'] = async (localId) => ({
+    frozen: false,
+    snapshot: await syncPull(localId),
+    pin: { ok: true },
+  })
   return new Proxy({} as LocalReviewSurface, {
     get(_target, property) {
       if (property === 'syncPull') return syncPull
+      if (property === 'syncLocalReview') return syncLocalReview
+      if (property === 'getLocalReview') return liveRow
       return () => {
-        throw new Error(`the local double serves syncPull alone, not ${String(property)}`)
+        throw new Error(`the local double serves the sync path alone, not ${String(property)}`)
       }
     },
   })

@@ -1,11 +1,12 @@
 /**
  * Contract-conformance for the whole local-review loop — create, sync, draft,
- * submit, reply, resolve, react, restart — on the DIRECT transport, driven
- * against the real adapter (`createDirectApi`), the real local-review surface,
- * the real hardened git seam and a real store on disk, over a seeded
- * repository. The assertions themselves live in `@revu/shared/conformance` and
- * are run identically against the in-process mock by its own runner, so both
- * are held to one bar from one source of truth.
+ * submit, reply, resolve, react, restart — and for what happens once a pull
+ * request covers the reviewed pair, on the DIRECT transport, driven against the
+ * real adapter (`createDirectApi`), the real local-review surface, the real
+ * hardened git seam and a real store on disk, over a seeded repository. The
+ * assertions themselves live in `@revu/shared/conformance` and are run
+ * identically against the in-process mock by its own runner, so both are held
+ * to one bar from one source of truth.
  *
  * ## Why this suite is never credential-gated
  *
@@ -53,17 +54,42 @@
  * whatever a second, unrelated database happened to contain. Reopening the
  * same file on disk is what makes "survived a restart" a claim about
  * persistence.
+ *
+ * ## How the archive block gets a pull request without a network
+ *
+ * This engine learns about pull requests through ONE seam — a listing of the
+ * open pull requests for a single branch pair — and that seam is optional, so
+ * the archive block is served by a fake the file controls. It records every
+ * question it is asked and answers from a list a `appear` hook fills in, and it
+ * touches no `fetch`, so the tripwire above stays armed across the whole of it.
+ * The api the block drives is assembled WITH that seam; the api the suite above
+ * drives is assembled without one, so that suite's review can never archive and
+ * the seam records only the archive block's questions.
+ *
+ * The archive block also needs a pair of its own: creation is idempotent per
+ * pair, so sharing the seeded pair would hand it the suite's already-synced
+ * review. The fixture ships exactly one pair, so this file adds a second BASE
+ * branch at the base tip — the alternate pair therefore resolves to the same
+ * range as the seeded one and differs from it in nothing but its name. Both
+ * pairs live in the same repository and the same store, which is what the two
+ * blocks are entitled to share: their reviews are distinct rows under distinct
+ * ids.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runLocalReviewConformanceSuite } from '@revu/shared/conformance'
+import type { GhUser, PullListResponse, PullSummary } from '@revu/shared'
+import {
+  runLocalReviewArchiveConformance,
+  runLocalReviewConformanceSuite,
+} from '@revu/shared/conformance'
 import type { CommandRunner } from './command-runner'
 import { createBunCommandRunner } from './command-runner'
 import { CONFORMANCE_SESSION } from './conformance-fakes'
 import { createDirectApi, type DirectApi } from './direct-api'
 import { throwingGithubClient } from './github-write-stubs'
+import type { SupersedingPullSource } from './local-archive'
 import { createFixtureRepo, type FixtureRepo } from './local-fixture-repo'
 import { runGit } from './local-git'
 import { createLocalReviewSurface } from './local-surface'
@@ -71,6 +97,12 @@ import { openDirectStore, type DirectStore } from './store'
 
 /** The repository identity these reviews are scoped to. */
 const SERVED_REPO = 'acme/served'
+
+/** A second base branch at the base tip, so the archive block reviews its own pair. */
+const ARCHIVE_BASE = 'release/archive-conformance'
+
+/** The pull request the fake seam produces for that pair. */
+const ARCHIVE_PR_NUMBER = 4242
 
 // ————————————————————————————————————————————————————————————————
 // The network tripwire
@@ -99,6 +131,77 @@ function armFetchTripwire(): void {
 }
 
 // ————————————————————————————————————————————————————————————————
+// The pull requests the archive block's seam lists
+// ————————————————————————————————————————————————————————————————
+
+const PULL_AUTHOR: GhUser = {
+  login: 'octocat',
+  id: 1,
+  node_id: 'U_1',
+  avatar_url: '',
+  html_url: '',
+  type: 'User',
+}
+
+/**
+ * An open pull request over the alternate pair, as the hosted repository would
+ * list it: bare branch names on both sides, this repository on both sides, and
+ * SHAs that match nothing — the comparison that decides an archive is over
+ * repository and branch names, never over a SHA.
+ */
+function pullOverArchivePair(number: number): PullSummary {
+  const headRef = fixture.headBranch
+  return {
+    id: 1000 + number,
+    node_id: `PR_${number}`,
+    number,
+    state: 'open',
+    draft: false,
+    merged_at: null,
+    title: `pull ${number}`,
+    body: null,
+    user: PULL_AUTHOR,
+    labels: [],
+    requested_reviewers: [],
+    head: {
+      ref: headRef,
+      sha: 'a'.repeat(40),
+      label: `${SERVED_REPO}:${headRef}`,
+      repo: { full_name: SERVED_REPO, default_branch: 'main' },
+    },
+    base: {
+      ref: ARCHIVE_BASE,
+      sha: 'b'.repeat(40),
+      label: `${SERVED_REPO}:${ARCHIVE_BASE}`,
+      repo: { full_name: SERVED_REPO, default_branch: 'main' },
+    },
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-02T00:00:00.000Z',
+  }
+}
+
+/** The listing seam, with the questions it was asked and the answer it gives. */
+interface RecordingPullSource extends SupersedingPullSource {
+  readonly asked: { headRef: string; baseRef: string }[]
+  pulls: PullSummary[]
+}
+
+/**
+ * ONE instance, shared by every api the archive block is handed — the one it
+ * starts with and the one its restart returns — so a question asked before the
+ * restart and a question asked after it land in the same record. Nothing here
+ * touches `fetch`, so the tripwire stays armed while the block runs.
+ */
+const supersedingPulls: RecordingPullSource = {
+  asked: [],
+  pulls: [],
+  listOpenPullsForPair(pair: { headRef: string; baseRef: string }): Promise<PullSummary[]> {
+    supersedingPulls.asked.push({ headRef: pair.headRef, baseRef: pair.baseRef })
+    return Promise.resolve(supersedingPulls.pulls)
+  },
+}
+
+// ————————————————————————————————————————————————————————————————
 // The implementation under test
 // ————————————————————————————————————————————————————————————————
 
@@ -108,13 +211,23 @@ let store: DirectStore
 let runner: CommandRunner
 /** `git remote`'s output in the fixture, captured before any review exists. */
 let remotesOutput = ''
+/** The handle the archive block's conditional list reads go through. */
+let archiveHandle: DirectApi | null = null
 
 /**
  * The direct api over one store handle: the real local surface, the real git
  * seam, the fixture as the repository, and a GitHub client every method of
  * which throws.
+ *
+ * The listing seam is passed through rather than wired here, because it is what
+ * separates the two blocks this file runs: the suite over the seeded pair is
+ * assembled WITHOUT one, so nothing can archive its review, and the archive
+ * block is assembled with one.
  */
-function apiOver(handle: DirectStore): DirectApi {
+function apiOver(
+  handle: DirectStore,
+  extra: { supersedingPulls?: SupersedingPullSource } = {},
+): DirectApi {
   const localReviews = createLocalReviewSurface({
     store: handle,
     runner,
@@ -129,7 +242,16 @@ function apiOver(handle: DirectStore): DirectApi {
     cwd: fixture.dir,
     localReviews,
     github: throwingGithubClient(),
+    ...(extra.supersedingPulls === undefined
+      ? {}
+      : { supersedingPulls: extra.supersedingPulls }),
   })
+}
+
+/** The archive block's api, rebuilt over the current store handle. */
+function archiveApiOver(handle: DirectStore): DirectApi {
+  archiveHandle = apiOver(handle, { supersedingPulls })
+  return archiveHandle
 }
 
 beforeAll(async () => {
@@ -140,6 +262,18 @@ beforeAll(async () => {
   storeDir = mkdtempSync(join(tmpdir(), 'revu-local-conformance-'))
   store = openDirectStore({ dataDir: storeDir })
   runner = createBunCommandRunner()
+
+  // The alternate base sits at the base tip, so the archive block's pair
+  // resolves exactly as the seeded one does and differs from it only in name.
+  // Spawned through the raw runner rather than the hardened seam: that seam
+  // exists to keep caller-supplied values out of git's option parser on the
+  // production path, and this is fixture setup with two literals.
+  const made = await runner.run(['git', 'branch', ARCHIVE_BASE, fixture.baseSha], {
+    cwd: fixture.dir,
+  })
+  if (!made.ok) {
+    throw new Error(`could not create the fixture branch ${ARCHIVE_BASE}: ${made.stderr.trim()}`)
+  }
 
   const remotes = await runGit(runner, fixture.dir, { args: ['remote'] })
   if (!remotes.ok) {
@@ -202,6 +336,47 @@ describe('direct local review — contract conformance', () => {
       store = openDirectStore({ dataDir: storeDir })
       return apiOver(store)
     },
+  })
+})
+
+describe('direct local review — archive on pull-request appearance', () => {
+  runLocalReviewArchiveConformance({
+    label: 'direct engine in-process',
+    makeApi: () => archiveApiOver(store),
+    humanId: CONFORMANCE_SESSION.human.id,
+    superseded: () => ({
+      pair: { baseRef: ARCHIVE_BASE, headRef: fixture.headBranch },
+      prNumber: ARCHIVE_PR_NUMBER,
+      // The hosted repository gains a pull request over the pair. Nothing is
+      // asked of the seam until the next sync, so this is the whole of it.
+      appear: () => {
+        supersedingPulls.pulls = [pullOverArchivePair(ARCHIVE_PR_NUMBER)]
+      },
+    }),
+    listPulls: (etag): PullListResponse => {
+      if (archiveHandle === null) throw new Error('the list handle was read before it was built')
+      return archiveHandle.listPulls(etag)
+    },
+    restart: () => {
+      // The same SQLite file, reopened — and the same seam instance, so the
+      // record of what was asked spans the restart.
+      store.close()
+      store = openDirectStore({ dataDir: storeDir })
+      return archiveApiOver(store)
+    },
+  })
+})
+
+describe('the archive check asked the hosted repository exactly one question', () => {
+  test('it named the bare branch pair, once, and nothing re-asked after the archive', () => {
+    // Bare on both sides: the store holds `refs/heads/…`, and a pull request
+    // names branches with no namespace at all, so the qualification stops at
+    // the seam. Exactly one question, because detection never runs again on a
+    // review that already carries a number — every sync after the archiving
+    // one is frozen and asks nothing.
+    expect(supersedingPulls.asked).toEqual([
+      { headRef: fixture.headBranch, baseRef: ARCHIVE_BASE },
+    ])
   })
 })
 

@@ -101,8 +101,24 @@ const BASENAME_BAN_LABEL = 'a module whose basename contains "github"'
 const VOCABULARY_BAN_LABEL = 'a specifier outside { @revu/shared, bun:test }'
 const SCANNED_SET_BAN_LABEL = 'a relative specifier resolving outside the scanned file set'
 
-/** Sibling modules the local write path must never pull in, by resolved path. */
-const BANNED_SIBLINGS = ['./github-client', './write-decorator', './command-runner'] as const
+/**
+ * Sibling modules the local write path must never pull in, by resolved path.
+ *
+ * The archive detector is banned alongside the three egress seams even though
+ * it holds no client of its own: it is the module that READS the hosted
+ * repository through an injected seam to decide whether a pull request has
+ * superseded a review, and the write sink's only business with an archive is
+ * to refuse once one stands on the row. A sink that imported the detector
+ * would have a path to that seam — and from there, one injected member away
+ * from a client — sitting in the same file as the verbs the fence exists to
+ * keep away from one.
+ */
+const BANNED_SIBLINGS = [
+  './github-client',
+  './write-decorator',
+  './command-runner',
+  './local-archive',
+] as const
 
 const MODULE_EXTENSION = /\.(?:ts|tsx|mts|js|mjs)$/
 
@@ -372,6 +388,7 @@ describe('every banned specifier is proven able to fire', () => {
     // than assumed.
     ['./write-decorator', ['./write-decorator', SCANNED_SET_BAN_LABEL]],
     ['./command-runner', ['./command-runner', SCANNED_SET_BAN_LABEL]],
+    ['./local-archive', ['./local-archive', SCANNED_SET_BAN_LABEL]],
     ['./github-client', ['./github-client', BASENAME_BAN_LABEL, SCANNED_SET_BAN_LABEL]],
     [
       '../direct/github-client.ts',

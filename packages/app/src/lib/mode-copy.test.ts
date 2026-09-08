@@ -27,8 +27,11 @@ import {
   reconcileFailureCopy,
   reconcileSuccessCopy,
   stateChipCopy,
+  stateChipVariant,
   submitFailureCopy,
   submitSuccessCopy,
+  supersededBadgeCopy,
+  supersededBannerCopy,
   syncCostCopy,
   syncErrorCopy,
   tooLargeDiffCopy,
@@ -165,6 +168,116 @@ describe('what the state chip says a review is', () => {
     // function rather than growing a second one beside it.
     expect(stateChipCopy('local', 'closed')).toBe('archived')
     expect(stateChipCopy('local', 'merged')).toBe('archived')
+  })
+})
+
+/** The review a superseding pull request is numbered by, in every case below. */
+const SUPERSEDING_PR = 101
+
+/** Every line of the archived banner as one string, swept the same way. */
+function supersededText(mode: ReviewMode): string {
+  const copy = supersededBannerCopy(mode, SUPERSEDING_PR)
+  return copy === null ? '' : Object.values(copy).join(' ')
+}
+
+describe('the tint of the state chip', () => {
+  test('a closed pull request is drawn as the failure it may be', () => {
+    // Today's value, pinned because it is the reading the change below must
+    // not disturb: a pull request that closed without merging is the one state
+    // in this table a reader should look twice at.
+    expect(stateChipVariant('github', 'closed')).toBe('danger')
+  })
+
+  test('an archived branch pair is drawn neutrally instead', () => {
+    // The whole point of a variant that varies. A review superseded by a pull
+    // request is a review that ENDED WELL — the work moved on — so drawing it
+    // in the palette reserved for failure would have every archived review in
+    // the inbox read as something that went wrong.
+    expect(stateChipVariant('local', 'closed')).not.toBe('danger')
+    expect(stateChipVariant('local', 'closed')).toBe('default')
+  })
+
+  test('and a review still taking comments is drawn the same way on both', () => {
+    // The tint varies by mode only where the two states mean different things.
+    // A review that is live is live, and pinning both readings is what stops a
+    // later edit from splitting a distinction that does not exist.
+    expect(stateChipVariant('github', 'open')).toBe('add')
+    expect(stateChipVariant('local', 'open')).toBe('add')
+  })
+})
+
+describe('the badge on a row whose review a pull request has covered', () => {
+  test('a branch pair names the number that superseded it', () => {
+    // The literal, character for character. The row's identity slot shows a
+    // branch pair rather than a number, so this badge is the only place the
+    // number appears on that row.
+    expect(supersededBadgeCopy('local', SUPERSEDING_PR)).toBe('archived · superseded by #101')
+  })
+
+  test('a pull request has no such badge at all, rather than a reworded one', () => {
+    expect(supersededBadgeCopy('github', SUPERSEDING_PR)).toBeNull()
+  })
+})
+
+describe('the banner over a review a pull request has superseded', () => {
+  test('a branch pair is told what happened, and what is true of it now', () => {
+    // Both lines pinned character for character, and every clause in them is
+    // load-bearing: which pull request took over, that the review can no longer
+    // be written to, that what it shows is the last thing it read, that the
+    // work in it is still here, and that none of it ever left. A reader who is
+    // told only "archived" will assume the rest went with it.
+    //
+    // The number appears once, in the title. The banner draws the pull request
+    // as a place to go as well, and a second number beside that link reads as
+    // a second pull request.
+    const copy = supersededBannerCopy('local', SUPERSEDING_PR)
+    expect(copy?.title).toBe('Archived — superseded by pull request #101')
+    expect(copy?.hint).toBe(
+      'This review is read-only and frozen at its last sync. Every thread and draft in it is kept; nothing in it was sent to that pull request.',
+    )
+  })
+
+  test('a pull request has no such banner at all', () => {
+    // Nothing supersedes a pull request in this sense, so there is no softer
+    // sentence to fall back to — inventing one would invent the fact behind it.
+    expect(supersededBannerCopy('github', SUPERSEDING_PR)).toBeNull()
+  })
+
+  test('and it says nothing about approving', () => {
+    // The vocabulary of the self-approval refusal, which is the wrong
+    // explanation wearing the right shape: both say a control will not do what
+    // it looks like it does. Read as that one, an archived review becomes "you
+    // may not approve your own work, comment instead" — a live review with a
+    // narrowed verdict, which is not what this is.
+    expect(supersededText('local')).not.toMatch(/approv/i)
+  })
+
+  test('and nothing about who wrote it', () => {
+    // The other half of that vocabulary. Nothing here turns on whose branch it
+    // is; a review is archived because a pull request covers the same pair,
+    // whoever opened it.
+    expect(supersededText('local')).not.toMatch(/author/i)
+  })
+
+  test('and never says the review was lost', () => {
+    // The one word this banner must never carry. Every thread and draft is
+    // kept, and a reader who reads otherwise will go looking for a backup — or
+    // stop making local reviews at all.
+    expect(supersededText('local')).not.toMatch(/lost/i)
+  })
+
+  test('and sends nobody to check an installation', () => {
+    expect(supersededText('local')).not.toMatch(/installation/i)
+  })
+
+  test('while still naming the pull request that took over', () => {
+    // The control for the five absences above, which copy reduced to empty
+    // strings — or to the bare word "archived" — would satisfy for free. This
+    // is also the one local surface that legitimately names a pull request:
+    // the review is archived BECAUSE one exists, and a reader who cannot get
+    // to it has been told half a fact.
+    expect(supersededText('local')).toContain('#101')
+    expect(supersededText('local')).toMatch(/pull request/i)
   })
 })
 
@@ -738,6 +851,21 @@ const BOTH_READINGS: BothReadings[] = [
     name: 'paletteReviewHeading',
     github: paletteReviewHeading('github'),
     local: paletteReviewHeading('local'),
+  },
+  {
+    name: 'stateChipVariant',
+    github: stateChipVariant('github', 'closed'),
+    local: stateChipVariant('local', 'closed'),
+  },
+  {
+    name: 'supersededBadgeCopy',
+    github: supersededBadgeCopy('github', 101),
+    local: supersededBadgeCopy('local', 101),
+  },
+  {
+    name: 'supersededBannerCopy',
+    github: supersededBannerCopy('github', 101),
+    local: supersededBannerCopy('local', 101),
   },
 ]
 

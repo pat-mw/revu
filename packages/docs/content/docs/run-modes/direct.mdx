@@ -176,10 +176,11 @@ Three things differ from a pull-request review, and each is deliberate:
   all — the capability is structurally absent from the module rather than
   declined by a branch inside it — so a local comment cannot reach GitHub, no
   publish or export action exists, and nothing in a local review is ever copied
-  to a pull request. A local review is *designed* to be archived read-only,
-  keeping everything it holds, once a pull request for the same branch pair is
-  detected; that detection is not yet wired, so today a local review stays open
-  until you delete it.
+  to a pull request. A local review is archived read-only, keeping everything
+  it holds, when a sync finds an open pull request for the same branch pair in
+  the same repository; that check is a read of GitHub that runs only on sync,
+  and it is absent in a workspace with no remote, where a local review stays
+  open until you delete it.
 
 Local reviews persist to the same SQLite file as everything else, in their own
 tables. Full walkthrough:

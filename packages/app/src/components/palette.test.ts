@@ -76,7 +76,7 @@ describe('which group a review is offered in', () => {
     expect(paletteReviews(listed).pulls.length).toBeGreaterThan(0)
   })
 
-  test('a closed review is offered in neither group', () => {
+  test('a closed pull request is offered in neither group', () => {
     const closed: PullListItem = {
       ...localRow,
       pull: { ...localRow.pull, number: 482, state: 'closed' },
@@ -84,6 +84,21 @@ describe('which group a review is offered in', () => {
     const { pulls, local } = paletteReviews([closed])
     expect(pulls).toEqual([])
     expect(local).toEqual([])
+  })
+
+  test('an archived local review is still offered, in the local group', () => {
+    // Archiving closes a local review's row; the palette is how a review is
+    // reached from any screen, so the archived one must stay reachable. The
+    // closed pull request in the same list is the control that the state
+    // filter still exists for pull requests.
+    const archived: PullListItem = { ...localRow, pull: { ...localRow.pull, state: 'closed' } }
+    const closedPull: PullListItem = {
+      ...localRow,
+      pull: { ...localRow.pull, number: 482, state: 'closed' },
+    }
+    const { pulls, local } = paletteReviews([archived, closedPull])
+    expect(local.map((r) => r.number)).toEqual([localRow.pull.number])
+    expect(pulls).toEqual([])
   })
 })
 

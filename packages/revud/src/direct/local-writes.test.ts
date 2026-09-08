@@ -54,6 +54,7 @@ import { describe, expect, test } from 'bun:test'
 import type {
   CommitInfo,
   GhUser,
+  LocalReviewSummary,
   PendingComment,
   ReactionKey,
   ReactionRollup,
@@ -67,6 +68,7 @@ import type {
 } from '@revu/shared'
 import {
   ApiError,
+  archivedReviewRefusal,
   LOCAL_ENTITY_ID_BASE,
   LOCAL_REVIEW_ID_BASE,
   parsePrefixedBody,
@@ -157,6 +159,7 @@ const SUBMIT_INPUT: SubmitReviewInput = {
 const PORT_MEMBERS = [
   'deleteLocalDraft',
   'getLocalDraft',
+  'getLocalReview',
   'getLocalSnapshot',
   'nextEntityId',
   'now',
@@ -201,6 +204,7 @@ function makeLocalStore(options: FakeLocalStoreOptions = {}): FakeLocalStore {
  */
 function makeLocalDeps(store: FakeLocalStore = makeLocalStore()): LocalWriteDeps {
   return {
+    getLocalReview: (localId) => store.getLocalReview(localId),
     getLocalSnapshot: (localId) => store.getLocalSnapshot(localId),
     putLocalSnapshot: (snapshot) => {
       store.putLocalSnapshot(snapshot)
@@ -313,6 +317,7 @@ describe('the local write port carries exactly the members it was designed with'
     expect(Object.keys(makeLocalDeps()).sort()).toEqual([
       'deleteLocalDraft',
       'getLocalDraft',
+      'getLocalReview',
       'getLocalSnapshot',
       'nextEntityId',
       'now',
@@ -3599,5 +3604,278 @@ describe('two writes overlapping on one local review, neither erasing the other'
       expect(envelopeCommentIds(envelope)).toContain(id)
       expect(envelope.mutable.commentAuthors?.[id]).toBe(SESSION.human.id)
     }
+  })
+})
+
+// ————————————————————————————————————————————————————————————————————————————
+// An archived review refuses every write before its first mutation.
+// ————————————————————————————————————————————————————————————————————————————
+
+/**
+ * Once a pull request covers a local review's branch pair, the review is
+ * read-only: every write verb answers the one refusal sentence every transport
+ * shares, and it answers it BEFORE anything is read that could answer
+ * differently and before anything is written. The submit returns it as a value,
+ * exactly as it returns a moved head; the other three throw it typed.
+ *
+ * Every refusal here is measured against the WHOLE store, serialized before and
+ * after the call, rather than against the fields a refusal most obviously must
+ * not touch. A refusal that wrote somewhere unexpected — a summary row, an
+ * authorship entry, the draft — would pass a comparison of named fields and
+ * fail this one. Each verb carries its own control on the same seed with the
+ * archive absent, so "the store did not move" is measured against a verb that
+ * demonstrably moves it when allowed to.
+ *
+ * The seed is a review that has been LIVED IN: a synced snapshot holding one
+ * thread, a submitted summary and the reviewer's draft. That is the state an
+ * archive lands on in practice, and it is the state in which every verb has
+ * something to find and something to write — a bare review would let a verb
+ * refuse for the wrong reason and pass.
+ */
+describe('an archived review refuses every write verb, and the refusal writes nothing', () => {
+  const ARCHIVED_PR = 41
+  const SEEDED_COMMENT_ID = LOCAL_ENTITY_ID_BASE
+  const SEEDED_SUMMARY_ID = LOCAL_ENTITY_ID_BASE + 9
+  const MOVED_HEAD_SHA = 'c'.repeat(40)
+  const UNKNOWN_THREAD_ID = `local:${LOCAL_ID}:${LOCAL_ENTITY_ID_BASE + 500}`
+
+  const reviewRow = (archivedPr: number | null): LocalReviewSummary => ({
+    id: LOCAL_ID,
+    repo: 'acme/widgets',
+    baseRef: 'refs/heads/main',
+    headRef: 'refs/heads/feature/x',
+    title: 'feature/x',
+    baseSha: BASE_SHA,
+    mergeBaseSha: BASE_SHA,
+    headSha: HEAD_SHA,
+    dirty: false,
+    archivedPr,
+    createdAt: FIXED_NOW,
+    updatedAt: FIXED_NOW,
+    lastSyncedAt: FIXED_NOW,
+  })
+
+  /** The sentence the seeded row's pair and number produce. */
+  const REFUSAL = archivedReviewRefusal({
+    archivedPr: ARCHIVED_PR,
+    baseRef: 'refs/heads/main',
+    headRef: 'refs/heads/feature/x',
+  })
+
+  /** A synced review holding one thread, one submitted summary and the draft. */
+  function seededStore(archivedPr: number | null): FakeLocalStore {
+    const store = createFakeLocalStore({
+      reviews: [reviewRow(archivedPr)],
+      snapshots: [
+        localSnapshot({
+          localId: LOCAL_ID,
+          headSha: HEAD_SHA,
+          at: FIXED_NOW,
+          threads: [
+            {
+              id: THREAD_ID,
+              comments: [{ id: SEEDED_COMMENT_ID, reviewId: SEEDED_SUMMARY_ID }],
+            },
+          ],
+          commentAuthors: { [SEEDED_COMMENT_ID]: SESSION.human.id },
+        }),
+      ],
+      drafts: [SEEDED_DRAFT],
+    })
+    store.putLocalReviewSummary(LOCAL_ID, {
+      id: SEEDED_SUMMARY_ID,
+      node_id: `seeded-review-${SEEDED_SUMMARY_ID}`,
+      user: SEEDED_AUTHOR,
+      body: 'The review the seeded thread was opened by.',
+      state: 'COMMENTED',
+      submitted_at: FIXED_NOW,
+      commit_id: HEAD_SHA,
+    })
+    return store
+  }
+
+  const submitWithAComment = (expectedHeadSha: string): SubmitReviewInput => ({
+    ...SUBMIT_INPUT,
+    expectedHeadSha,
+    comments: [
+      {
+        key: 'archived-one',
+        path: 'src/a.ts',
+        side: 'RIGHT',
+        start_side: null,
+        line: 3,
+        start_line: null,
+        body: 'A comment that must never be materialized.',
+        createdAt: FIXED_NOW,
+        updatedAt: FIXED_NOW,
+        anchor: { lineText: '', contextBefore: [], contextAfter: [] },
+      },
+    ],
+  })
+
+  /**
+   * The three verbs that refuse by throwing, each aimed at the seeded thread
+   * and comment so that, with the archive absent, every one of them has a real
+   * target and really writes.
+   */
+  const THROWING_VERBS: readonly (readonly [string, (deps: LocalWriteDeps) => Promise<unknown>])[] =
+    [
+      [
+        'replyToLocalThread',
+        (deps) => localWrites.replyToLocalThread(deps, LOCAL_ID, THREAD_ID, 'Agreed.'),
+      ],
+      ['resolveLocalThread', (deps) => localWrites.resolveLocalThread(deps, LOCAL_ID, THREAD_ID, true)],
+      [
+        'addLocalReaction',
+        (deps) => localWrites.addLocalReaction(deps, LOCAL_ID, SEEDED_COMMENT_ID, '+1'),
+      ],
+    ]
+
+  /** How a throwing verb answered: the typed code and sentence, or what else happened. */
+  const outcomeOf = (run: () => Promise<unknown>): Promise<string> =>
+    run().then(
+      () => 'answered',
+      (error: unknown) =>
+        error instanceof ApiError ? `${error.code}: ${error.message}` : 'threw an untyped error',
+    )
+
+  test('the seed is the lived-in review the cases below assume', () => {
+    // Pinned so a seed that quietly lost its thread, its summary or its draft
+    // would not let a verb refuse for a reason other than the archive.
+    const store = seededStore(ARCHIVED_PR)
+    expect(store.getLocalReview(LOCAL_ID)?.archivedPr).toBe(ARCHIVED_PR)
+    expect(store.getLocalSnapshot(LOCAL_ID)?.mutable.threads.map((t) => t.id)).toEqual([THREAD_ID])
+    expect(store.listLocalSubmittedReviews(LOCAL_ID).map((r) => r.id)).toEqual([SEEDED_SUMMARY_ID])
+    expect(store.getLocalDraft(SESSION.human.id, LOCAL_ID)).toEqual(SEEDED_DRAFT)
+  })
+
+  test('a submit answers forbidden as a value carrying the refusal sentence, and writes nothing', async () => {
+    const store = seededStore(ARCHIVED_PR)
+    const before = store.serialize()
+    const result = await localWrites.submitLocalReview(
+      makeLocalDeps(store),
+      submitWithAComment(HEAD_SHA),
+    )
+    expect(result).toEqual({ status: 'forbidden', reason: REFUSAL })
+    expect(store.serialize()).toBe(before)
+  })
+
+  test('the control: the same submit on the same seed with the review live lands and moves the store', async () => {
+    const store = seededStore(null)
+    const before = store.serialize()
+    const result = await localWrites.submitLocalReview(
+      makeLocalDeps(store),
+      submitWithAComment(HEAD_SHA),
+    )
+    expect(result.status).toBe('ok')
+    expect(store.serialize()).not.toBe(before)
+  })
+
+  for (const [verb, call] of THROWING_VERBS) {
+    test(`${verb} throws a typed forbidden carrying the refusal sentence, and writes nothing`, async () => {
+      const store = seededStore(ARCHIVED_PR)
+      const before = store.serialize()
+      expect(await outcomeOf(() => call(makeLocalDeps(store)))).toBe(`forbidden: ${REFUSAL}`)
+      expect(store.serialize()).toBe(before)
+    })
+
+    test(`the control: ${verb} on the same seed with the review live answers and moves the store`, async () => {
+      const store = seededStore(null)
+      const before = store.serialize()
+      expect(await outcomeOf(() => call(makeLocalDeps(store)))).toBe('answered')
+      expect(store.serialize()).not.toBe(before)
+    })
+  }
+
+  test('the refusal precedes the head guard: a submit quoting a moved head is forbidden, not head_moved', async () => {
+    // The head guard is the first read that could answer something other than
+    // the refusal. Against the live seed the same input IS a moved head, which
+    // is what makes the archived answer evidence of ordering rather than of a
+    // guard that never ran.
+    const archived = await localWrites.submitLocalReview(
+      makeLocalDeps(seededStore(ARCHIVED_PR)),
+      submitWithAComment(MOVED_HEAD_SHA),
+    )
+    expect(archived).toEqual({ status: 'forbidden', reason: REFUSAL })
+    const live = await localWrites.submitLocalReview(
+      makeLocalDeps(seededStore(null)),
+      submitWithAComment(MOVED_HEAD_SHA),
+    )
+    expect(live.status).toBe('head_moved')
+  })
+
+  test('the refusal precedes the thread lookup: a reply to a thread the review does not hold is forbidden, not not_found', async () => {
+    const archived = await outcomeOf(() =>
+      localWrites.replyToLocalThread(
+        makeLocalDeps(seededStore(ARCHIVED_PR)),
+        LOCAL_ID,
+        UNKNOWN_THREAD_ID,
+        'Aimed at nothing.',
+      ),
+    )
+    expect(archived).toBe(`forbidden: ${REFUSAL}`)
+    // The live seed answers the lookup's own refusal for the same thread id.
+    const live = await outcomeOf(() =>
+      localWrites.replyToLocalThread(
+        makeLocalDeps(seededStore(null)),
+        LOCAL_ID,
+        UNKNOWN_THREAD_ID,
+        'Aimed at nothing.',
+      ),
+    )
+    expect(live.startsWith('not_found: ')).toBe(true)
+  })
+
+  test('every read still answers what it answered before the archive, after all four refusals', async () => {
+    const store = seededStore(null)
+    const deps = makeLocalDeps(store)
+    const snapshotBefore = deps.getLocalSnapshot(LOCAL_ID)
+    const draftBefore = deps.getLocalDraft(SESSION.human.id, LOCAL_ID)
+    const threadsBefore = store.listLocalThreads(LOCAL_ID)
+
+    store.markLocalReviewArchived(LOCAL_ID, ARCHIVED_PR)
+    // The mark landed, so the reads below are reads of an archived review.
+    expect(deps.getLocalReview(LOCAL_ID)?.archivedPr).toBe(ARCHIVED_PR)
+
+    expect(await localWrites.submitLocalReview(deps, submitWithAComment(HEAD_SHA))).toEqual({
+      status: 'forbidden',
+      reason: REFUSAL,
+    })
+    for (const [, call] of THROWING_VERBS) {
+      expect(await outcomeOf(() => call(deps))).toBe(`forbidden: ${REFUSAL}`)
+    }
+
+    expect(deps.getLocalSnapshot(LOCAL_ID)).toEqual(snapshotBefore)
+    expect(deps.getLocalDraft(SESSION.human.id, LOCAL_ID)).toEqual(draftBefore)
+    expect(store.listLocalThreads(LOCAL_ID)).toEqual(threadsBefore)
+    // The reads compared above are reads of something: the seed was not empty.
+    expect(snapshotBefore).not.toBeNull()
+    expect(draftBefore).not.toBeNull()
+    expect(threadsBefore).toHaveLength(1)
+  })
+
+  test('a review with no row reads as live, which is the state every earlier case ran in', () => {
+    expect(makeLocalStore().getLocalReview(LOCAL_ID)).toBeNull()
+  })
+
+  test('the harness archive mark is write-once, as the durable column is', () => {
+    const store = seededStore(null)
+    store.markLocalReviewArchived(LOCAL_ID, ARCHIVED_PR)
+    store.markLocalReviewArchived(LOCAL_ID, ARCHIVED_PR + 1)
+    expect(store.getLocalReview(LOCAL_ID)?.archivedPr).toBe(ARCHIVED_PR)
+  })
+
+  test('the harness serialization stands still across reads and moves on a write', () => {
+    // Without this, "serialized identically" would also hold over a
+    // serialization that never changes — the byte comparisons above rest on
+    // the string moving when, and only when, something was written.
+    const store = seededStore(ARCHIVED_PR)
+    const before = store.serialize()
+    store.getLocalSnapshot(LOCAL_ID)
+    store.getLocalDraft(SESSION.human.id, LOCAL_ID)
+    store.listLocalThreads(LOCAL_ID)
+    expect(store.serialize()).toBe(before)
+    store.putLocalThread(LOCAL_ID, localThread({ id: UNKNOWN_THREAD_ID, comments: [] }, { headSha: HEAD_SHA, at: FIXED_NOW }))
+    expect(store.serialize()).not.toBe(before)
   })
 })

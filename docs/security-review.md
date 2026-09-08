@@ -74,6 +74,20 @@ depth zero and at every depth below, with the scanned file set and the ban list
 each separately proved non-vacuous
 (`packages/revud/src/direct/local-write-isolation.test.ts`).
 
+One thing on the local path does read GitHub, and it is worth stating exactly
+what it is. When a pull request appears for the same repository and branch pair,
+the local review is archived — read-only, frozen at its last sync, linked to
+the pull request — and finding that pull request is a **read** of GitHub: an
+optional one-method listing seam, consulted on each sync of a live review,
+absent altogether in a workspace with no origin or token. The detector behind
+it (`packages/revud/src/direct/local-archive.ts`) sits outside the write sink,
+and the sink's banned-specifier list names it, so the same source scan that
+keeps a GitHub client out of the local write path keeps the detector out too.
+What detection writes is one column of one row, `local_reviews.archived_pr`;
+the real pull request number it holds never reaches `snapshots.pr_number`,
+`audit_log.pr`, or `pr_author.pr`, and nothing in the archived review — no
+thread, draft, verdict, or reaction — is copied to the pull request.
+
 Local reviews are also **not journaled.** Nothing on the local path appends to
 `audit_log`, and no locally minted identifier is ever written to
 `snapshots.pr_number`, `audit_log.pr`, or `pr_author.pr` — local reviews live in

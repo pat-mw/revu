@@ -51,7 +51,8 @@ import { throwingGithubClient } from './direct/github-write-stubs'
 import { listBranches as readGitBranches } from './direct/local-git'
 import type { LocalRange, LocalRangeFailure } from './direct/local-sync'
 import { detectDirtyWorktree, resolveLocalRange } from './direct/local-sync'
-import type { LocalReviewSurface } from './direct/local-surface'
+import type { LocalReviewSurface, LocalSyncOutcome } from './direct/local-surface'
+import { createLocalReviewSurface } from './direct/local-surface'
 import type { RepoRef } from './direct/repo'
 import type { DirectStore } from './direct/store'
 import { openDirectStore, StoreWriteError } from './direct/store'
@@ -886,7 +887,18 @@ function localSurfaceOver(
       calls.push('listBranches')
       return readGitBranches(runner, LOCAL_CWD)
     },
-    syncLocalReview: () => unused('syncLocalReview'),
+    getLocalReview(localId: number): LocalReviewSummary {
+      calls.push('getLocalReview')
+      const review = store.getLocalReview(localId)
+      if (review === null || review.repo !== LOCAL_REPO) {
+        throw new ApiError('not_found', `No local review #${localId}.`)
+      }
+      return review
+    },
+    async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
+      calls.push('syncLocalReview')
+      return { frozen: false, snapshot: await this.syncPull(localId), pin: { ok: true } }
+    },
 
     async syncPull(localId: number): Promise<Snapshot> {
       calls.push('syncPull')
@@ -1487,6 +1499,7 @@ function listOnlyLocalSurface(world: LocalListWorld): LocalReviewSurface {
     listLocalReviews: (): LocalReviewSummary[] => world.reviews.map((r) => ({ ...r })),
     listThreads: (localId: number): ReviewThread[] => world.threads.get(localId) ?? [],
     getSnapshot: (localId: number): Snapshot | null => world.snapshots.get(localId) ?? null,
+    getLocalReview: () => unused('getLocalReview'),
     createLocalReview: () => unused('createLocalReview'),
     listBranches: () => unused('listBranches'),
     syncPull: () => unused('syncPull'),
@@ -1760,6 +1773,70 @@ describe('handleDirectApi: the pull list', () => {
     expect(after.headers.get('etag')).not.toBe(etag1)
     const body = validatePullListResponse(await after.json())
     expect(body.items[0].pull.title).toBe('renamed review')
+    store.close()
+  })
+
+  test('an archive moves the etag: the pre-archive etag replays as a full 200 showing the review closed', async () => {
+    // The REAL surface over the store, not the list-only world: the archive is
+    // a store column the list reads, and only a surface reading the store can
+    // show the etag following it. The list touches no git, so the runner is
+    // one that fails loudly if anything asks.
+    const store = openDirectStore({ dataDir: ':memory:' })
+    const noGit: CommandRunner = {
+      run: () => Promise.reject(new Error('the review list must not run git')),
+    }
+    const localId = store.createLocalReview({
+      repo: LOCAL_REPO,
+      baseRef: MAIN_REF,
+      headRef: FEATURE_REF,
+      title: 'a review a pull request will supersede',
+    }).id
+    const api = createDirectApi({
+      session: SESSION,
+      github: throwingGithubClient(),
+      repo: LOCAL_REPO_REF,
+      store,
+      localReviews: createLocalReviewSurface({
+        store,
+        runner: noGit,
+        toplevel: LOCAL_CWD,
+        repo: LOCAL_REPO,
+        session: SESSION,
+      }),
+    })
+
+    const first = await getList(api)
+    expect(first.status).toBe(200)
+    const etag = first.headers.get('etag') as string
+    expect(etag).toBeTruthy()
+    const before = validatePullListResponse(await first.json())
+    expect(before.items.map((it) => [it.pull.number, it.pull.state])).toEqual([[localId, 'open']])
+
+    // The pin: nothing has moved, so the replay is a bodiless 304.
+    const replay = await getList(api, etag)
+    expect(replay.status).toBe(304)
+    expect(await replay.text()).toBe('')
+
+    // The archive is ONE column of one row; no sha, no title, no thread moves.
+    store.markLocalReviewArchived(localId, 9)
+
+    // The SAME pre-archive etag now replays as a full list, because the served
+    // row is not the row that etag was computed over: it reads closed.
+    const after = await getList(api, etag)
+    expect(after.status).toBe(200)
+    const etag2 = after.headers.get('etag') as string
+    expect(etag2).not.toBe(etag)
+    const body = validatePullListResponse(await after.json())
+    expect(body.items.map((it) => [it.pull.number, it.pull.state])).toEqual([[localId, 'closed']])
+    // Everything but the state is the row the first etag was computed over,
+    // which is what makes "the etag followed the archive" a claim about the
+    // archive rather than about some other input that happened to move.
+    expect(body.items[0]).toEqual({
+      ...before.items[0],
+      pull: { ...before.items[0].pull, state: 'closed' },
+    })
+    // And the moved etag is stable in its own turn.
+    expect((await getList(api, etag2)).status).toBe(304)
     store.close()
   })
 
@@ -2159,10 +2236,13 @@ function servingLocalSurface(calls: string[]): LocalReviewSurface {
         { ref: FEATURE_REF, name: 'feature/x', kind: 'local', isDefault: false },
       ]
     },
-    syncLocalReview: (): never => {
-      // Never driven through this double: the real surface's `syncPull`
-      // delegates here, but a double implements `syncPull` directly.
-      throw new Error('these tests do not exercise syncLocalReview')
+    getLocalReview(localId: number): LocalReviewSummary {
+      calls.push('getLocalReview')
+      return localRow(localId)
+    },
+    async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
+      calls.push('syncLocalReview')
+      return { frozen: false, snapshot: localSnapshotOf(localId, 1), pin: { ok: true } }
     },
 
     async syncPull(localId: number): Promise<Snapshot> {
@@ -2375,9 +2455,12 @@ const NO_GITHUB_NOT_IMPLEMENTED: readonly NoGithubRow[] = [
 ]
 
 /** The band-shared routes with a LOCAL review id, and the method each must enter. */
-const NO_GITHUB_LOCAL_BAND: readonly { row: NoGithubRow; surfaceCall: string }[] = [
-  { row: { name: 'syncPull', status: 200 }, surfaceCall: 'syncPull' },
-  { row: { name: 'getSnapshot', status: 200 }, surfaceCall: 'getSnapshot' },
+const NO_GITHUB_LOCAL_BAND: readonly { row: NoGithubRow; surfaceCalls: readonly string[] }[] = [
+  // A sync enters the surface twice: the ownership-guarded row read that decides
+  // whether the hosted repository is asked about the review, then the richer
+  // sync whose outcome says whether the repository was read at all.
+  { row: { name: 'syncPull', status: 200 }, surfaceCalls: ['getLocalReview', 'syncLocalReview'] },
+  { row: { name: 'getSnapshot', status: 200 }, surfaceCalls: ['getSnapshot'] },
   {
     row: {
       name: 'submitReview',
@@ -2390,15 +2473,15 @@ const NO_GITHUB_LOCAL_BAND: readonly { row: NoGithubRow; surfaceCall: string }[]
       },
       status: 200,
     },
-    surfaceCall: 'submitReview',
+    surfaceCalls: ['submitReview'],
   },
   {
     row: { name: 'replyToThread', body: { body: 'agreed' }, status: 200 },
-    surfaceCall: 'replyToThread',
+    surfaceCalls: ['replyToThread'],
   },
   {
     row: { name: 'resolveThread', body: { resolved: true }, status: 200 },
-    surfaceCall: 'resolveThread',
+    surfaceCalls: ['resolveThread'],
   },
   {
     row: {
@@ -2407,13 +2490,13 @@ const NO_GITHUB_LOCAL_BAND: readonly { row: NoGithubRow; surfaceCall: string }[]
       body: { reaction: '+1' },
       status: 200,
     },
-    surfaceCall: 'addReaction',
+    surfaceCalls: ['addReaction'],
   },
   // The removal reaches the surface for its OWNERSHIP read: ids are minted from
   // one mark shared by every repository using the data directory, so the row an
   // id names may belong to a repository this daemon does not serve, and the
   // listing scoped to this one is what settles that.
-  { row: { name: 'deleteLocalReview', status: 200 }, surfaceCall: 'listLocalReviews' },
+  { row: { name: 'deleteLocalReview', status: 200 }, surfaceCalls: ['listLocalReviews'] },
 ]
 
 describe('handleDirectApi: a daemon with no GitHub repository', () => {
@@ -2491,13 +2574,13 @@ describe('handleDirectApi: a daemon with no GitHub repository', () => {
   })
 
   test('a local review id still reaches the local surface on every band-shared route', async () => {
-    for (const { row, surfaceCall } of NO_GITHUB_LOCAL_BAND) {
+    for (const { row, surfaceCalls } of NO_GITHUB_LOCAL_BAND) {
       const h = noGithubHarness()
       const res = await handleDirectApi(requestFor(row, NO_GH_LOCAL_PARAMS), SESSION, h.api)
       expect([row.name, res?.status]).toEqual([row.name, row.status])
       // The status alone cannot say the feature survived: a degradation that
-      // answered 200 with a plausible body would pass it. The entered method can.
-      expect([row.name, h.calls]).toEqual([row.name, [surfaceCall]])
+      // answered 200 with a plausible body would pass it. The entered methods can.
+      expect([row.name, h.calls]).toEqual([row.name, [...surfaceCalls]])
       h.close()
     }
   })

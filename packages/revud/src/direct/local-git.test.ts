@@ -1062,6 +1062,7 @@ describe('listBranches against real repositories', () => {
  * it is wrong on the read side, and the guard should not have to be told twice.
  */
 const CWD_SCANNED_MODULES = [
+  'local-archive.ts',
   'local-git-argv.ts',
   'local-git.ts',
   'local-ids.ts',

@@ -521,6 +521,7 @@ describe('the write port is mapped member by member, never spread', () => {
     expect(Object.keys(buildLocalWriteDeps(harness.deps, review.id)).sort()).toEqual([
       'deleteLocalDraft',
       'getLocalDraft',
+      'getLocalReview',
       'getLocalSnapshot',
       'nextEntityId',
       'now',
@@ -1180,6 +1181,7 @@ describe('a review answers only the repository that owns it', () => {
     // other way round, so an ownership check placed only on `syncPull` would
     // leave this one open.
     syncLocalReview: (surface, id) => surface.syncLocalReview(id),
+    getLocalReview: (surface, id) => surface.getLocalReview(id),
     getSnapshot: (surface, id) => surface.getSnapshot(id),
     getDraft: (surface, id) => surface.getDraft(id),
     saveDraft: (surface, id) =>
@@ -1663,7 +1665,7 @@ describe('a sync pins the objects it is about to read', () => {
       headRef: fixture.headBranch,
     })
     const outcome = await harness.surface.syncLocalReview(review.id)
-    expect(outcome.pin.ok).toBe(true)
+    expect(outcome.pin?.ok).toBe(true)
     harness.store.close()
   }, 30_000)
 
@@ -1676,8 +1678,8 @@ describe('a sync pins the objects it is about to read', () => {
       headRef: fixture.headBranch,
     })
     const outcome = await harness.surface.syncLocalReview(review.id)
-    expect(outcome.pin.ok).toBe(false)
-    expect(outcome.pin.reason).toBe('git-failed')
+    expect(outcome.pin?.ok).toBe(false)
+    expect(outcome.pin?.reason).toBe('git-failed')
     // The snapshot is complete regardless: the pin buys retention, not content.
     expect(outcome.snapshot.partial).toBeNull()
     harness.store.close()
@@ -1706,7 +1708,7 @@ describe('a sync pins the objects it is about to read', () => {
     expect(unpinnedOut.snapshot.partial).toEqual(pinnedOut.snapshot.partial)
     expect(unpinnedOut.snapshot.immutable).toEqual(pinnedOut.snapshot.immutable)
     // ...and the two runs genuinely differ on the field that should differ.
-    expect(unpinnedOut.pin.ok).not.toBe(pinnedOut.pin.ok)
+    expect(unpinnedOut.pin?.ok).not.toBe(pinnedOut.pin?.ok)
     pinned.store.close()
     unpinned.store.close()
   }, 30_000)

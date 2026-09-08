@@ -27,7 +27,8 @@ import { Input } from '@/components/ui/input'
 import { Kbd } from '@/components/ui/kbd'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useShortcut } from '@/lib/keyboard'
-import { reviewMode } from '@/lib/review-mode'
+import { reviewMode, supersededBadgeShown } from '@/lib/review-mode'
+import { supersededBadgeCopy } from '@/lib/mode-copy'
 import { relativeTime, minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 import { flattenPullTree } from '@/lib/pull-tree'
@@ -38,6 +39,7 @@ import {
   buildInboxTree,
   enterTarget,
   nextFocusIndex,
+  showsInInbox,
 } from '@/lib/inbox-sections'
 import type { InboxRow } from '@/lib/inbox-sections'
 import { isLocalReviewItem, rowIdentity } from '@/lib/local-reviews'
@@ -113,6 +115,18 @@ export function InboxPage() {
   const hasLocalReviews = hasAnyLocalReview(localAnnotations)
   const dirtyReviews = useMemo(
     () => new Set((localAnnotations ?? []).filter((s) => s.dirty).map((s) => s.id)),
+    [localAnnotations],
+  )
+  // Review id → the pull request that superseded it. Only the archived ones
+  // are in the map, so a lookup that misses is a live review rather than an
+  // unknown one, and a row drawn before this read lands says nothing at all.
+  const archivedReviews = useMemo(
+    () =>
+      new Map(
+        (localAnnotations ?? [])
+          .filter((s) => s.archivedPr !== null)
+          .map((s) => [s.id, s.archivedPr]),
+      ),
     [localAnnotations],
   )
 
@@ -258,10 +272,14 @@ export function InboxPage() {
     )
   }
 
-  const totalOpen = items.filter((it) => it.pull.state === 'open').length
+  // Counted through the same predicate the sections are built from. Counting
+  // open rows instead would send an inbox holding nothing but archived local
+  // reviews to the empty screen — announcing there is nothing here over rows
+  // that exist, and offering to start a review as if none had ever been made.
+  const totalListed = items.filter(showsInInbox).length
 
   // ——— nothing at all ———
-  if (totalOpen === 0) {
+  if (totalListed === 0) {
     return (
       <div className="h-full overflow-y-auto">
         <div className="mx-auto max-w-5xl px-4 py-4">
@@ -320,6 +338,7 @@ export function InboxPage() {
                       row={row}
                       showUnresolvedNumber={false}
                       dirty={dirtyReviews.has(row.item.pull.number)}
+                      archivedPr={archivedReviews.get(row.item.pull.number) ?? null}
                       focused={index === focusIndex}
                       onFocus={() => setFocusIndex(index)}
                     />
@@ -350,6 +369,7 @@ export function InboxPage() {
                           }}
                           showUnresolvedNumber={false}
                           dirty={dirtyReviews.has(node.item.pull.number)}
+                          archivedPr={archivedReviews.get(node.item.pull.number) ?? null}
                           focused={index === focusIndex}
                           onFocus={() => setFocusIndex(index)}
                           depth={node.depth}
@@ -388,8 +408,8 @@ export function InboxPage() {
                   <section key={section.id}>
                     <SectionHeader title={section.title} count={0} />
                     <p className="px-1 py-2 text-sm text-ink-mut">
-                      Nothing open here — every local review you have is either closed or
-                      filtered out.
+                      Nothing to show here — every local review you have is filtered out, or
+                      has not reached this list yet.
                     </p>
                   </section>
                 )
@@ -413,6 +433,7 @@ export function InboxPage() {
                         row={row}
                         showUnresolvedNumber={isWaiting}
                         dirty={dirtyReviews.has(row.item.pull.number)}
+                        archivedPr={archivedReviews.get(row.item.pull.number) ?? null}
                         focused={index === focusIndex}
                         onFocus={() => setFocusIndex(index)}
                       />
@@ -570,14 +591,38 @@ export function RowIdentity({ item }: { item: PullListItem }) {
  * approvability flag says only that nothing local forbids a verdict — so the
  * organizational claim is withheld rather than repeated.
  *
+ * One badge here is a claim about a pull request that a local review DOES
+ * have: the one that came to cover its branch pair and archived it. That is
+ * the row's only sign the review can no longer be written to, and the only
+ * number on a row whose identity slot draws a branch pair.
+ *
  * The cluster is a component of its own for the same reason the identity slot
  * is: an absence has to be assertable. Left inline in the row it could only be
  * checked by reading the code, and the badge it must not draw is exactly the
  * kind of thing a later edit re-enables without noticing.
  */
-export function RowBadges({ row, dirty = false }: { row: InboxRow; dirty?: boolean }) {
+export function RowBadges({
+  row,
+  dirty = false,
+  archivedPr = null,
+}: {
+  row: InboxRow
+  dirty?: boolean
+  /**
+   * The pull request that came to cover this review's branch pair, or null
+   * while it is live and while the annotations carrying it are unread. Both
+   * non-answers draw nothing, so a row cannot flicker a supersession it turns
+   * out not to have.
+   */
+  archivedPr?: number | null
+}) {
   const { broker } = row.item
   const isLocal = isLocalReviewItem(row.item)
+  // The same fact the seal above draws, in the vocabulary the copy module and
+  // its gates take. Both resolve through the one reading of the band, so they
+  // cannot disagree about the row they are both about.
+  const mode = reviewMode(row.item.pull.number)
+  const superseded = { mode, archivedPr }
   return (
     <>
       {row.draft && (
@@ -591,6 +636,15 @@ export function RowBadges({ row, dirty = false }: { row: InboxRow; dirty?: boole
       {isLocal && (
         <Badge variant="outline" className="shrink-0">
           local
+        </Badge>
+      )}
+
+      {/* What ended this review, where a reader is looking for what to open
+          next. Drawn as the quiet outline rather than an alarm: a review a
+          pull request took over from is work that moved on. */}
+      {supersededBadgeShown(superseded) && (
+        <Badge variant="outline" className="shrink-0">
+          {supersededBadgeCopy(mode, superseded.archivedPr)}
         </Badge>
       )}
 
@@ -677,6 +731,13 @@ const InboxRowView = forwardRef<
      * changed anyway.
      */
     dirty?: boolean
+    /**
+     * The pull request that came to cover this local review's branch pair, or
+     * null while it is live. Read from the same annotations the dirty flag is,
+     * and for the same reason: the list payload is frozen and carries no such
+     * field.
+     */
+    archivedPr?: number | null
     focused: boolean
     onFocus: () => void
     /**
@@ -686,7 +747,10 @@ const InboxRowView = forwardRef<
      */
     depth?: number
   }
->(({ row, showUnresolvedNumber, dirty = false, focused, onFocus, depth = 0 }, ref) => {
+>((
+  { row, showUnresolvedNumber, dirty = false, archivedPr = null, focused, onFocus, depth = 0 },
+  ref,
+) => {
   const session = useSession()
   const { pull, broker } = row.item
   const parsed = parseCommentIdentity(
@@ -752,7 +816,7 @@ const InboxRowView = forwardRef<
           </div>
 
           <div className="flex shrink-0 items-center gap-2.5">
-            <RowBadges row={row} dirty={dirty} />
+            <RowBadges row={row} dirty={dirty} archivedPr={archivedPr} />
 
             {showUnresolvedNumber ? (
               <div className="flex w-16 shrink-0 flex-col items-end leading-none">

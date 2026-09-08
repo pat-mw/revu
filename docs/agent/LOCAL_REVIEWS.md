@@ -324,10 +324,13 @@ advanced, head moved — is **correct as-is locally**. It is the strongest reuse
 ### Archive (D1)
 20. Detection is on repo + head ref + **base ref**, and must compare `head.repo.full_name` too — a fork can
     have an identically named branch.
-21. Direct mode's `listPulls` is currently 501, so detection needs a PR listing that direct mode does not
-    have yet.
+21. Direct mode has no pull listing of its own (its inbox list is the local one), so detection is a
+    targeted read — the open pull requests for one head/base pair — behind an optional seam that is absent
+    in a workspace with no origin or token, and it runs on each sync of that review.
 22. Archiving is read-only, never destructive: threads, drafts and history stay visible, with a link to the
-    PR. A PR closed without merging does not un-archive; a new local review can be created.
+    PR, and the review freezes at the sync that found the PR. A PR closed without merging does not
+    un-archive; the branch pair is a one-way door — creating the same pair again returns the archived review
+    (the store ruling that shaped v4's unique key).
 
 ### Retention
 23. **Zero eviction exists anywhere in the store today** — the only `DELETE` is `deleteDraft`. PRs made that

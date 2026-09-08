@@ -40,6 +40,7 @@
  */
 import type {
   GhUser,
+  LocalReviewSummary,
   PullDetail,
   ReactionRollup,
   ReviewComment,
@@ -321,6 +322,14 @@ export function localSnapshot(seed: LocalSnapshotSeed): Snapshot {
 export type LocalStoreMethod = keyof LocalWriteStore
 
 export interface FakeLocalStoreOptions {
+  /**
+   * Review rows present before any write, each keyed by its own `id`. A row is
+   * what carries the archive: a seed that names a pull request in `archivedPr`
+   * starts the review read-only, and a seed with `null` there starts it live.
+   * A review with no row reads as no archive to enforce, which is the state
+   * every case that seeds no row has always run in.
+   */
+  readonly reviews?: readonly LocalReviewSummary[]
   /** Snapshots present before any write, each keyed by its own `prNumber`. */
   readonly snapshots?: readonly Snapshot[]
   /** Drafts present before any write, each keyed by its own `humanId` and `prNumber`. */
@@ -350,9 +359,29 @@ export interface FakeLocalStore extends LocalWriteStore {
    * against a never-synced review is observable rather than lost.
    */
   listLocalThreads(localId: number): ReviewThread[]
+  /**
+   * Record that a pull request now covers the review's branch pair, exactly as
+   * durable storage does it: ONE column of one row, write-once, so a second
+   * number never replaces the first; nothing else the review holds is read,
+   * rewritten or removed. A review with no row is left alone. This is the
+   * mutation the write verbs must observe and refuse on — not a port member,
+   * because no write verb archives anything; only a sync does.
+   */
+  markLocalReviewArchived(localId: number, prNumber: number): void
+  /**
+   * The whole of the store's state as one string, byte-comparable before and
+   * after a call. What a refusal must leave untouched is EVERYTHING — every
+   * row, every draft, every summary — and a comparison of the fields a test
+   * happened to name would pass over a refusal that wrote somewhere else. Two
+   * calls with no write between them serialize identically; a write of any
+   * kind changes the string.
+   */
+  serialize(): string
 }
 
 interface LocalReviewRows {
+  /** The review row, or null for a review no seed and no mark ever described. */
+  review: LocalReviewSummary | null
   /** The snapshot envelope, held with its thread list emptied — threads are rows. */
   envelope: Snapshot | null
   threads: Map<string, ReviewThread>
@@ -378,7 +407,12 @@ export function createFakeLocalStore(options: FakeLocalStoreOptions = {}): FakeL
   const rowsFor = (localId: number): LocalReviewRows => {
     const held = reviews.get(localId)
     if (held !== undefined) return held
-    const created: LocalReviewRows = { envelope: null, threads: new Map(), summaries: [] }
+    const created: LocalReviewRows = {
+      review: null,
+      envelope: null,
+      threads: new Map(),
+      summaries: [],
+    }
     reviews.set(localId, created)
     return created
   }
@@ -403,12 +437,18 @@ export function createFakeLocalStore(options: FakeLocalStoreOptions = {}): FakeL
     rows.envelope = held
   }
 
+  for (const review of options.reviews ?? []) rowsFor(review.id).review = copy(review)
   for (const snapshot of options.snapshots ?? []) storeSnapshot(snapshot)
   for (const draft of options.drafts ?? []) {
     drafts.set(draftKey(draft.humanId, draft.prNumber), copy(draft))
   }
 
   return {
+    getLocalReview: (localId) => {
+      failIfConfigured('getLocalReview')
+      const held = reviews.get(localId)?.review
+      return held === undefined || held === null ? null : copy(held)
+    },
     getLocalSnapshot: (localId) => {
       failIfConfigured('getLocalSnapshot')
       const rows = reviews.get(localId)
@@ -440,6 +480,25 @@ export function createFakeLocalStore(options: FakeLocalStoreOptions = {}): FakeL
     },
     listLocalSubmittedReviews: (localId) => copy(reviews.get(localId)?.summaries ?? []),
     listLocalThreads: (localId) => copy([...(reviews.get(localId)?.threads.values() ?? [])]),
+    markLocalReviewArchived: (localId, prNumber) => {
+      const held = reviews.get(localId)?.review
+      // Write-once, decided on the row as durable storage decides it in the
+      // statement's own predicate: a number already standing is the one that
+      // stays. A review with no row is a plain no-op, not an error.
+      if (held === undefined || held === null || held.archivedPr !== null) return
+      held.archivedPr = prNumber
+    },
+    serialize: () =>
+      JSON.stringify({
+        reviews: [...reviews.entries()].map(([localId, rows]) => ({
+          localId,
+          review: rows.review,
+          envelope: rows.envelope,
+          threads: [...rows.threads.entries()],
+          summaries: rows.summaries,
+        })),
+        drafts: [...drafts.entries()],
+      }),
   }
 }
 

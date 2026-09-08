@@ -9,8 +9,9 @@
  * assertion the contract leaves to the transport; everything else is shared.
  *
  * `runLocalReviewConformanceSuite` is the block for the whole review loop over
- * a branch pair with no pull request behind it, and
- * `runLocalReviewDeleteConformance` the block for deleting one. Both are
+ * a branch pair with no pull request behind it, `runLocalReviewDeleteConformance`
+ * the block for deleting one, and `runLocalReviewArchiveConformance` the block
+ * for what happens once a pull request covers the pair. All three are
  * registered separately because they need a branch pair the implementation can
  * review rather than a fixture pull number, so a runner whose implementation
  * serves local reviews adds them beside the main suite.
@@ -36,6 +37,12 @@ export type {
   LocalDeletePair,
   LocalReviewRowCounts,
 } from './local-delete.ts'
+export { runLocalReviewArchiveConformance } from './local-archive.ts'
+export type {
+  LocalArchiveApi,
+  LocalArchiveConformanceConfig,
+  SupersededPair,
+} from './local-archive.ts'
 export { runLocalReviewConformanceSuite } from './local-suite.ts'
 export type {
   LocalCompareShape,

@@ -45,13 +45,17 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { StaticRouter } from 'react-router'
 import {
   conversationSections,
+  forbiddenSubmitRerouteAllowed,
   matchPrNumber,
   prPaletteCommands,
   redirectTargetFor,
+  reviewArchived,
+  reviewComposerHidden,
   reviewMode,
   reviewTabs,
   showRateChip,
   showSelfReviewLock,
+  supersededBadgeShown,
   useRouteReviewMode,
 } from './review-mode'
 
@@ -214,6 +218,102 @@ describe('whether the verdict picker locks its approving segments', () => {
   })
 })
 
+describe('whether a review has been superseded and gone read-only', () => {
+  test('a local review whose row reports it closed is archived', () => {
+    // The positive leg. Every case below is a refusal, and a predicate that
+    // refused everything would satisfy all of them at once.
+    expect(reviewArchived({ mode: 'local', state: 'closed' })).toBe(true)
+  })
+
+  test('and one still taking comments is not', () => {
+    expect(reviewArchived({ mode: 'local', state: 'open' })).toBe(false)
+  })
+
+  test('and one whose row has not been read yet is not either', () => {
+    // The state of every review on first paint, and of any review for good
+    // after a list error. "Not known yet" is not evidence that a review was
+    // superseded, so it takes the same path as a live one — the refusal at the
+    // other end of the write is what makes that safe rather than optimistic.
+    expect(reviewArchived({ mode: 'local', state: undefined })).toBe(false)
+  })
+
+  test('a closed pull request is never archived in this sense', () => {
+    // A pull request closes for its own reasons and none of them are this one.
+    // Asserted across all three readings of the state, because a gate that
+    // tested only the state would pass the first of them.
+    expect(reviewArchived({ mode: 'github', state: 'closed' })).toBe(false)
+    expect(reviewArchived({ mode: 'github', state: 'open' })).toBe(false)
+    expect(reviewArchived({ mode: 'github', state: undefined })).toBe(false)
+  })
+})
+
+describe('whether the review bar offers a way to write', () => {
+  test('an archived local review is offered none', () => {
+    expect(reviewComposerHidden({ mode: 'local', state: 'closed' })).toBe(true)
+  })
+
+  test('and a live one keeps every one of them', () => {
+    // The control: a gate that hid the composer everywhere would satisfy the
+    // case above and leave no review anywhere writable.
+    expect(reviewComposerHidden({ mode: 'local', state: 'open' })).toBe(false)
+  })
+
+  test('and one whose row has not arrived keeps them too', () => {
+    // Deliberately permissive while the row is unknown. A composer that
+    // vanished on every first paint would be worse than one offered on a
+    // review that turns out to refuse the write, which is answered where the
+    // write is answered.
+    expect(reviewComposerHidden({ mode: 'local', state: undefined })).toBe(false)
+  })
+
+  test('a closed pull request keeps them as well', () => {
+    // Commenting on a closed pull request is ordinary and still goes through.
+    expect(reviewComposerHidden({ mode: 'github', state: 'closed' })).toBe(false)
+  })
+})
+
+describe('whether a refused submit may rewrite the verdict the draft holds', () => {
+  test('a refused pull request review is moved to Comment', () => {
+    // What the reroute was written for. A pull request opened by the shared
+    // identity cannot be approved by it, so the verdict the draft holds is one
+    // the far end will refuse again on every retry; moving it to the verdict
+    // that can go through is the remedy the refusal itself names, applied.
+    expect(forbiddenSubmitRerouteAllowed('github')).toBe(true)
+  })
+
+  test('and a refused local review keeps whatever verdict it holds', () => {
+    // A local review is refused for one reason only — a pull request came to
+    // cover its branch pair, so it is read-only — and no verdict would have
+    // been accepted. Rewriting the draft's here would be the refusal quietly
+    // editing the one thing that survives everything else: an author who asked
+    // for changes would find a comment in its place, with nothing on the
+    // screen having said so and nothing to undo it with.
+    expect(forbiddenSubmitRerouteAllowed('local')).toBe(false)
+  })
+})
+
+describe('whether a row says which pull request superseded it', () => {
+  test('a local review carrying a number says so', () => {
+    expect(supersededBadgeShown({ mode: 'local', archivedPr: 101 })).toBe(true)
+  })
+
+  test('and one carrying none does not', () => {
+    expect(supersededBadgeShown({ mode: 'local', archivedPr: null })).toBe(false)
+  })
+
+  test('and neither does one whose annotations have not been read', () => {
+    expect(supersededBadgeShown({ mode: 'local', archivedPr: undefined })).toBe(false)
+  })
+
+  test('a pull request never says it, even holding a number', () => {
+    // The reading that matters most. The annotation this is drawn from is
+    // local-only, so a pull request should never carry one at all — and a gate
+    // that trusted the number alone would put "superseded by #101" on a pull
+    // request the moment anything upstream started sending one.
+    expect(supersededBadgeShown({ mode: 'github', archivedPr: 101 })).toBe(false)
+  })
+})
+
 describe('whether the topbar draws the shared-budget chip', () => {
   test('a workspace with a budget to report gets one', () => {
     expect(showRateChip({ rateAvailable: true })).toBe(true)
@@ -266,6 +366,99 @@ const REVIEW_BAR_SOURCE = readFileSync(
   new URL('../components/review/review-bar.tsx', import.meta.url),
   'utf8',
 )
+
+describe('the review bar consults the archived gate', () => {
+  test('the bar imports the gate by name', () => {
+    // PRESENCE, not execution. The predicate is asserted directly above; what
+    // this turns red is the gate tidied away and the writing controls drawn
+    // again on a review that can no longer take them — a change every
+    // behavioural test in this file would stay green through, because none of
+    // them can render the bar.
+    const imported =
+      /import\s*\{[^}]*\breviewComposerHidden\b[^}]*\}\s*from\s*'@\/lib\/review-mode'/
+    expect(imported.test(REVIEW_BAR_SOURCE)).toBe(true)
+  })
+
+  test('and reads it exactly once, into the name its surfaces are drawn behind', () => {
+    // One read is the read the whole bar branches on. A second is a second
+    // opinion that can disagree with the first, and the disagreement would show
+    // as one control still live on a review where its neighbours are gone.
+    const reads = REVIEW_BAR_SOURCE.match(/reviewComposerHidden\(/g) ?? []
+    expect(reads.length).toBe(1)
+    expect(REVIEW_BAR_SOURCE).toContain('const writesHidden = reviewComposerHidden(')
+  })
+
+  test('and three drawn ways of writing a review are withheld behind that answer', () => {
+    // The count is a literal taken from the surfaces themselves — the summary
+    // composer, the verdict picker and Submit — rather than derived from
+    // anything that moves with the file, so dropping a guard is a number that
+    // changed rather than a green run over one fewer control. The fourth way
+    // in, Start review, is unreachable instead: the bar draws nothing at all on
+    // an archived review with no draft on it.
+    const drawn = REVIEW_BAR_SOURCE.match(/\{!writesHidden/g) ?? []
+    expect(drawn.length).toBe(3)
+  })
+
+  test('and the two keys that reach those controls are gated as well', () => {
+    // A control that is not drawn is still reachable by the chord that opens
+    // it: the summary key and the submit chord are registered globally and
+    // would otherwise open a composer on a review with none, and send a draft
+    // the far end refuses. Counted separately from the drawn surfaces above,
+    // because these are the half no amount of looking at the strip would show.
+    const keyed = REVIEW_BAR_SOURCE.match(/&& !writesHidden/g) ?? []
+    expect(keyed.length).toBe(2)
+  })
+
+  test('and an archived review with no draft draws no bar at all', () => {
+    // The other half of the same rule. Left in, the strip would say a review is
+    // not in progress and offer to start one, on a review that would refuse it.
+    expect(REVIEW_BAR_SOURCE).toContain('if (writesHidden && !active) return null')
+  })
+})
+
+/** The review bar's source with runs of whitespace flattened to single spaces. */
+const REVIEW_BAR_FLAT = REVIEW_BAR_SOURCE.replace(/\s+/g, ' ')
+
+describe('what the review bar does with a submit the far end refused', () => {
+  test('the bar imports the reroute gate by name', () => {
+    // PRESENCE, not execution. The predicate is asserted directly above; what
+    // this turns red is the gate tidied away and the verdict rewritten on
+    // every refusal again, which no behavioural test in this file can see
+    // because none of them renders the bar.
+    //
+    // Anchored to the import STATEMENT and the module it comes from, so a
+    // mention of the name in a comment or a leftover local does not satisfy it.
+    const imported =
+      /import\s*\{[^}]*\bforbiddenSubmitRerouteAllowed\b[^}]*\}\s*from\s*'@\/lib\/review-mode'/
+    expect(imported.test(REVIEW_BAR_SOURCE)).toBe(true)
+  })
+
+  test('and the one verdict rewrite in it happens only behind that gate', () => {
+    // The rewrite is persisted into the draft, so an ungated one is a silent
+    // edit to a document the author never touched. The count is what makes the
+    // guard above mean anything: a second rewrite somewhere else in the file
+    // would restore the behaviour the gate replaced while the gate itself
+    // stayed green beside it.
+    expect(REVIEW_BAR_FLAT).toContain(
+      "if (forbiddenSubmitRerouteAllowed(mode)) actions.setEvent('COMMENT')",
+    )
+    const rewrites = REVIEW_BAR_SOURCE.match(/setEvent\('COMMENT'\)/g) ?? []
+    expect(rewrites.length).toBe(1)
+  })
+
+  test('and the refusal sentence is the toast body, never its title', () => {
+    // The refusals this branch renders are whole sentences — one names the
+    // pull request that superseded the review, its branch pair, and what did
+    // not reach it. A title is set in medium weight and given no room to wrap
+    // to; the body below it is where a sentence that long is legible.
+    //
+    // The control sits in this body rather than another, because "no sentence
+    // in the title" is equally what a branch that dropped the reason entirely
+    // would produce, and the two have to be told apart by one reading.
+    expect(REVIEW_BAR_FLAT).toContain('detail: result.reason')
+    expect(/title:\s*result\.reason/.test(REVIEW_BAR_SOURCE)).toBe(false)
+  })
+})
 
 describe('the verdict picker consults the lock decision', () => {
   test('the read is looking at the bar it names', () => {

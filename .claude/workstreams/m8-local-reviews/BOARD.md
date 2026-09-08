@@ -10,13 +10,28 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing is running.** Three tickets are In Review, all gated, reviewed and pushed.
+**Nothing is running.** Four tickets are In Review, all gated, reviewed and pushed. M8.12 is next.
 
 | ticket | state | branch / PR | gate |
 | --- | --- | --- | --- |
 | **M8.8** re-sync, rebase safety, object pinning | In Review, 8/8, **`Verify` green**, adversarial pass done | `m8.8/resync-and-pinning` · [#78](https://github.com/pat-mw/revu/pull/78) | 2741 · 1 · 0 · 100, **CI green** |
 | **M8.10** retention and GC | In Review, **8/8, `Verify` green** | `m8.10/retention-and-gc` · [#79](https://github.com/pat-mw/revu/pull/79) | 2919 · 1 · 0 · 103, **CI green** |
 | **M8.11** conformance leg, e2e, docs | In Review, **8/8, `Verify` green**, adversarial pass done | `m8.11/conformance-e2e-docs` · [#80](https://github.com/pat-mw/revu/pull/80) | 2998 · 1 · 0 · 111, **CI green** (check · conformance-matrix · e2e · docs-build) |
+| **M8.9** archive when a PR appears | In Review, **8/8, `Verify` run**, adversarial pass done (five findings landed) | `m8.9/archive-on-pr` · [#82](https://github.com/pat-mw/revu/pull/82) | 3276 · 1 · 0 · 116, matrix A/B/E/F/G PASS, e2e ×2 PASSED — **CI pending at hand-off** |
+
+**M8.9 lands D1** (in review on #82): a local review is archived on the sync that finds an open pull request
+on its branch pair — read-only through the write sink's own port, frozen at its last successful sync, linked
+from a banner, badged in the inbox, and never copied anywhere. The predicate is **shared** so the mock (the
+spec) and the daemon run one code path; a **three-transport conformance block** (M8.9.8, appended) pins the
+archived semantics on E/F/G. The `?mock=1` walk found the one defect the unit tests could not — the sync
+mutation refreshed nothing the archive changes, so the page stayed live until a reload — fixed with a
+mode-gated refresh, and the adversarial review found five more (a malformed pull number 500-ing a sync, a
+review left half-archived when git failed after the mark, a case-sensitive repo compare, the bar rerouting an
+archived draft's verdict, a one-column pin that only saw `updated_at`), all landed before the PR opened.
+Decisions recorded at the ticket's open questions: targeted `state=open` query, `pull.state` stays `closed`
+and the inbox learns it, a derived link, no archive on a different base, freeze. Two pre-existing contract
+facts surfaced by the block and pinned, not changed: `createLocalReview` answers `headSha: null` everywhere,
+and `RevuApi.listPulls` / `DirectApi.listPulls` take different shapes (the router bridges them).
 
 **M8.11 closes the milestone's proof** (in review on #80): the local-review conformance suite, written once,
 runs as three **required** matrix legs (E mock in-process · F revud-mock over HTTP · G the direct engine over a
@@ -91,7 +106,7 @@ unreachable, so M8.10 may start.
 Rebased onto the `m8.5` tip, **re-gated under `TZ=UTC` (2646 pass · 1 skip · 0 fail · 95 files)** rather than
 trusting the clean rebase, and force-pushed. `m8.8` branches from it, so the chain is one line up from `main`.
 
-**The stack, bottom-up — twelve PRs, none merged:** `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
+**The stack, bottom-up — thirteen PRs, none merged** (#82, M8.9, now sits above #80): `main` → #69 → #70 → #71 → #72 → #73 → #74 → #75 → #76
 (M8.5) → #77 (a store fix, not M8) → [#78](https://github.com/pat-mw/revu/pull/78) (M8.8, 8/8) →
 [#79](https://github.com/pat-mw/revu/pull/79) (M8.10, 8/8) → [#80](https://github.com/pat-mw/revu/pull/80)
 (M8.11, 8/8). `main` is untouched at `177068a`.
@@ -107,7 +122,7 @@ opened. CI is green on all nine PRs.
 
 ## Tickets
 
-**98 units across 12 tickets** (M8.10.8 was appended at integration when a recorded owner ruling turned out to have no unit). Dependencies below are the **post-review** graph — two adversarial passes over
+**99 units across 12 tickets** (M8.10.8 was appended at integration when a recorded owner ruling turned out to have no unit; M8.9.8 was appended for the same reason in reverse — archive changes what four contract methods mean, and a method without a parity leg is how a ruling goes unimplemented). Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
 count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
 from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14), and from 95 as three more
@@ -125,7 +140,7 @@ is derived from it, never the other way round.**
 | [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
 | [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Review | 13 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | [#72](https://github.com/pat-mw/revu/pull/72) |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | **In Review** (8/8, `Verify` green) | 8 | revud, app | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | [#78](https://github.com/pat-mw/revu/pull/78) |
-| [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
+| [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | **In Review** (8/8, `Verify` run) | 8 | revud, app, shared | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | [#82](https://github.com/pat-mw/revu/pull/82) |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | **In Review** (4/7) | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | [#79](https://github.com/pat-mw/revu/pull/79) |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | **In Review** (8/8, `Verify` green) | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | [#80](https://github.com/pat-mw/revu/pull/80) |
 | [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |

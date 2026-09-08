@@ -3,6 +3,7 @@ import type { PullListItem } from '@revu/shared'
 import { LOCAL_REVIEW_ID_BASE } from '@revu/shared'
 import type { RowIdentity } from './local-reviews'
 import {
+  archivedPrUrl,
   createReviewIssue,
   isLocal,
   isLocalReviewItem,
@@ -153,6 +154,91 @@ describe('the identity a row renders', () => {
 
     const found = renderedIdentity(identity).flatMap((text) => idTraces(item.pull.number, text))
     expect(found).toContain('482')
+  })
+})
+
+describe('the link to the pull request that superseded a review', () => {
+  test('an owner and a name become a link to that pull request', () => {
+    // The positive leg, pinned as the whole URL. Every case below is a refusal,
+    // and a function that refused everything would satisfy all of them at once.
+    expect(archivedPrUrl('meridian-labs/atlas', 101)).toBe(
+      'https://github.com/meridian-labs/atlas/pull/101',
+    )
+  })
+
+  test('a workspace with no remote has a path where the owner would be', () => {
+    // The case this function exists for. A workspace with nothing to push to
+    // records an absolute path as its repository identity, and interpolating
+    // that into a URL produces a link that looks real, is not, and 404s on a
+    // site the reader may never have visited.
+    expect(archivedPrUrl('/Users/x/repo', 101)).toBeNull()
+  })
+
+  test('and an identity with no owner and name in it at all is refused', () => {
+    expect(archivedPrUrl('', 101)).toBeNull()
+  })
+
+  test('and one with more than the two halves is refused', () => {
+    // Not narrowed to the first two: a three-part identity is not an owner and
+    // a name with something after it, it is a shape this function does not
+    // recognise, and guessing at it is how the path case above would slip back
+    // in through its front half.
+    expect(archivedPrUrl('a/b/c', 101)).toBeNull()
+  })
+
+  test('and a two-segment path, which is the same shape one separator away', () => {
+    // The shortest form of the no-remote case, and the one a rule reading only
+    // the LAST two segments would happily turn into a link.
+    expect(archivedPrUrl('/a/b', 101)).toBeNull()
+  })
+
+  test('and one whose name half is missing is refused', () => {
+    expect(archivedPrUrl('owner/', 101)).toBeNull()
+  })
+
+  test('a dot-segment where a half belongs is refused', () => {
+    // Why the halves are checked for what they are made of and not merely
+    // counted. `owner/..` is one separator with two non-empty halves, so a rule
+    // that counted them builds `https://github.com/owner/../pull/101` — which
+    // every browser resolves one level up, sending the reader to a pull request
+    // in a repository this workspace never named. The shape reads the same
+    // whichever half it lands in.
+    expect(archivedPrUrl('owner/..', 101)).toBeNull()
+    expect(archivedPrUrl('../name', 101)).toBeNull()
+  })
+
+  test('and a single dot, which is the same trick one level shorter', () => {
+    expect(archivedPrUrl('owner/.', 101)).toBeNull()
+  })
+
+  test('and a half holding a character no repository identity holds', () => {
+    // A space is not part of any owner or repository name. A percent-escape is
+    // worse than that: `na%2Fme` is `na/me` to the site that receives it, so a
+    // half waved through on the grounds that it contains no separator would
+    // carry one to GitHub regardless.
+    expect(archivedPrUrl('own er/name', 101)).toBeNull()
+    expect(archivedPrUrl('owner/na%2Fme', 101)).toBeNull()
+  })
+
+  test('and the ordinary punctuation real identities carry still links', () => {
+    // The control for the refusals above, and the reason the rule is a
+    // character set with an anchored first character rather than a ban on the
+    // dot: dots, dashes and underscores are what owners and repositories are
+    // actually spelled with. A rule that took `..` by refusing every dot would
+    // pass all four cases above and quietly drop the link from a large share of
+    // real workspaces.
+    expect(archivedPrUrl('my-org.io/re.po_1', 101)).toBe(
+      'https://github.com/my-org.io/re.po_1/pull/101',
+    )
+  })
+
+  test('and a number no pull request could have is refused', () => {
+    // The number reaches the path segment, so it is checked for what a pull
+    // request number is rather than assumed to be one.
+    expect(archivedPrUrl('meridian-labs/atlas', 0)).toBeNull()
+    expect(archivedPrUrl('meridian-labs/atlas', -1)).toBeNull()
+    expect(archivedPrUrl('meridian-labs/atlas', 1.5)).toBeNull()
+    expect(archivedPrUrl('meridian-labs/atlas', Number.NaN)).toBeNull()
   })
 })
 

@@ -8,6 +8,7 @@ import {
   enterTarget,
   matchesFilter,
   nextFocusIndex,
+  showsInInbox,
 } from './inbox-sections'
 import { buildPullTree, flattenPullTree } from './pull-tree'
 import type { PullTreeNode } from './pull-tree'
@@ -256,13 +257,57 @@ describe('sorting reviews into the intent buckets', () => {
 })
 
 describe('what the inbox refuses to show', () => {
-  test('a closed review appears in no section at all', () => {
-    // The open-only rule is a property of this function, not an assumption
-    // about the component that calls it: a later exemption for one kind of
-    // review has to prove the filter still drops everything else, and this is
-    // the row that proves it.
+  test('a closed pull request appears in no section at all', () => {
+    // The drop is a property of this function, not an assumption about the
+    // component that calls it. It is now specific to pull requests — a review
+    // that went read-only is kept — so this row is what proves the exemption
+    // did not widen into "every closed review stays".
     const sections = build({ items: [item(6, { state: 'closed' })] })
     expect(sections.flatMap((s) => s.rows)).toEqual([])
+  })
+})
+
+describe('deciding whether a row belongs in the inbox at all', () => {
+  test('an open pull request belongs, and a closed one does not', () => {
+    // A closed pull request is finished somewhere the reader can still reach —
+    // it is on GitHub, with its own page — so the inbox stops carrying it.
+    expect(showsInInbox(item(1))).toBe(true)
+    expect(showsInInbox(item(1, { state: 'closed' }))).toBe(false)
+  })
+
+  test('a local review belongs whichever state it is in', () => {
+    // The asymmetry the predicate exists for. A review of two branches lives
+    // only here: archiving it takes away the right to write to it, not the
+    // threads and drafts already in it, and dropping the row would leave the
+    // only copy of that work unreachable from the screen that lists reviews.
+    expect(showsInInbox(localItem(1))).toBe(true)
+    expect(showsInInbox(localItem(2, { state: 'closed' }))).toBe(true)
+  })
+})
+
+describe('a local review that a pull request came to cover', () => {
+  test('is listed in exactly one section, and that section is the local one', () => {
+    const archived = localItem(4, { state: 'closed' })
+    const sections = build({ items: [archived], hasLocalReviews: true })
+    const carrying = sections.filter((s) =>
+      s.rows.some((r) => r.item.pull.number === archived.pull.number),
+    )
+    expect(carrying.map((s) => s.id)).toEqual(['local'])
+  })
+
+  test('and the arrangement by stack keeps it, in the group drawn beside the tree', () => {
+    // The two arrangements are two ways of grouping one set of reviews, never
+    // two selections of which reviews count. The stack arrangement holds local
+    // reviews back from the tree itself — nothing points at a branch pair and
+    // it points at nothing — and the caller draws them as their own group, so
+    // BOTH halves are asserted: absent from the roots, present in the group.
+    const archived = localItem(5, { state: 'closed' })
+    const open = item(11, { authorHumanId: OTHER })
+    const roots = buildInboxTree({ items: [archived, open], needle: '', botLogin: BOT })
+    expect(flattenPullTree(roots).map((n) => n.item.pull.number)).toEqual([11])
+
+    const sections = build({ items: [archived, open], hasLocalReviews: true })
+    expect(shape(sections).local).toEqual([archived.pull.number])
   })
 })
 
@@ -423,6 +468,7 @@ describe('the derivation loses nothing and invents nothing', () => {
     item(3, { authorHumanId: OTHER }),
     localItem(1),
     localItem(2),
+    localItem(3, { state: 'closed' }),
     item(7, { state: 'closed' }),
   ]
   const sections = build({
@@ -432,10 +478,18 @@ describe('the derivation loses nothing and invents nothing', () => {
   })
   const listed = new Set(sections.flatMap((s) => s.rows.map((r) => r.item.pull.number)))
 
-  test('every open row reaches at least one section', () => {
-    for (const it of items.filter((i) => i.pull.state === 'open')) {
-      expect(listed.has(it.pull.number)).toBe(true)
-    }
+  test('every row but the closed pull request reaches at least one section', () => {
+    // The expectation is written out rather than derived from the same
+    // predicate the derivation uses: a check that asks the code under test
+    // which rows it should have kept agrees with itself whatever it does.
+    expect([...listed].sort((a, b) => a - b)).toEqual([
+      1,
+      2,
+      3,
+      LOCAL_REVIEW_ID_BASE + 1,
+      LOCAL_REVIEW_ID_BASE + 2,
+      LOCAL_REVIEW_ID_BASE + 3,
+    ])
   })
 
   test('no section lists a review that was never input', () => {

@@ -89,6 +89,17 @@ export interface LocalReviewSurface {
   listLocalReviews(): LocalReviewSummary[]
 
   /**
+   * One review row, owned by this repository, or the typed not-found an absent
+   * id answers. The row is what says whether a pull request has superseded the
+   * review, and a caller deciding whether to ask the hosted repository about
+   * a review must read it HERE rather than off the store: the store reads by id
+   * alone, so a row belonging to another repository would come back with its
+   * own branch pair, and that pair would then be asked about against this
+   * repository's pull requests.
+   */
+  getLocalReview(localId: number): LocalReviewSummary
+
+  /**
    * The branches the repository can offer as either side of a new review —
    * local branches and remote-tracking refs both, since a base is often tracked
    * rather than checked out.
@@ -215,11 +226,34 @@ export interface LocalPinOutcome {
   readonly reason?: PinFailureReason
 }
 
-/** A completed local sync: the stored snapshot, and the pin it attempted. */
-export interface LocalSyncOutcome {
+/** A sync that read the repository: the snapshot it stored, and the pin it attempted. */
+export interface LocalSyncPerformed {
+  readonly frozen: false
   readonly snapshot: Snapshot
   readonly pin: LocalPinOutcome
 }
+
+/**
+ * A sync that read nothing, because the review is archived and already holds
+ * the snapshot it froze at. The snapshot is the stored one, byte for byte; no
+ * pin was attempted, so none is reported — `null` rather than a vacuous
+ * success, because the objects behind a frozen snapshot were pinned, or not, by
+ * the sync that stored it, and that outcome was reported then.
+ */
+export interface LocalSyncFrozen {
+  readonly frozen: true
+  readonly snapshot: Snapshot
+  readonly pin: null
+}
+
+/**
+ * A completed local sync, discriminated on whether it read the repository.
+ *
+ * `frozen` is what a caller that prunes after a sync reads: a frozen sync
+ * stranded no half and minted no compare key, so there is nothing new to
+ * reclaim and a prune keyed on it would sweep for no reason.
+ */
+export type LocalSyncOutcome = LocalSyncPerformed | LocalSyncFrozen
 
 export interface LocalReviewSurfaceDeps {
   store: DirectStore
@@ -396,6 +430,12 @@ export function buildLocalWriteDeps(
     // that point, and a reader told nothing was found resubmits and gets both a
     // second time.
     getLocalSnapshot: (id) => rebuildable(id, () => store.getLocalSnapshot(id)),
+    // Untranslated: the row is not content a re-sync rebuilds, and the sink
+    // reads it for one field — whether a pull request has superseded the
+    // review — ahead of every mutation. Ownership was settled by the guard
+    // that let the verb reach the sink at all, so the id here names a row this
+    // repository owns.
+    getLocalReview: (id) => store.getLocalReview(id),
     putLocalSnapshot: (snapshot) => {
       store.putLocalSnapshot(snapshot)
     },
@@ -638,6 +678,169 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
   const now = clockOf(deps)
 
   /**
+   * The stored snapshot, or null when there is none OR when the store cannot
+   * read the one it has. Used by the freeze alone, which is the one reader for
+   * whom an unreadable snapshot and a missing one call for the same move — a
+   * full sync that rebuilds it — rather than for the not-found that every
+   * other snapshot read translates the corruption into.
+   */
+  const storedIfReadable = (localId: number): Snapshot | null => {
+    try {
+      return store.getLocalSnapshot(localId)
+    } catch (cause) {
+      if (cause instanceof StoreUnreadableError) return null
+      throw cause
+    }
+  }
+
+  /**
+   * One real sync of one review: resolve the pair, pin what it will read, build
+   * the snapshot, store the envelope and stamp the row.
+   *
+   * Extracted from `syncLocalReview` so the freeze can decide whether to run it
+   * AND what to do when it fails, without a second copy of any of it. Every
+   * refusal it raises is typed and names its own repair.
+   */
+  const performSync = async (review: LocalReviewSummary): Promise<LocalSyncPerformed> => {
+    const localId = review.id
+    const resolved = await resolveLocalRange(deps.runner, deps.toplevel, {
+      baseRef: review.baseRef,
+      headRef: review.headRef,
+    })
+    if (!resolved.ok) throw rangeRefusal(localId, resolved)
+    const { range } = resolved
+
+    // Pinned BEFORE the first object is read, and the ordering is the whole
+    // point. The diff produces the blob names and the cat-file reads fetch
+    // their bytes; a collection landing between the two turns every one of
+    // those names into a missing entry, with no hosted tier able to supply
+    // them. Pinning first closes that window. Pinning afterwards would leave
+    // it exactly as wide as it is now.
+    //
+    // The outcome is carried, never thrown: the objects are demonstrably
+    // present — the snapshot below is built from them — so a review whose pin
+    // failed is completely readable today and merely unguaranteed tomorrow.
+    const pinned = await pinSnapshotObjects(deps.runner, deps.toplevel, localId, {
+      mergeBaseSha: range.mergeBaseSha,
+      headSha: range.headSha,
+    })
+    const pin: LocalPinOutcome = pinned.ok
+      ? { ok: true }
+      : { ok: false, reason: pinned.reason }
+
+    const built = await readLocalSnapshotImmutable(deps.runner, deps.toplevel, range)
+    if (!built.ok) throw readRefusal(localId, built)
+    const { immutable } = built.snapshot
+
+    // The hosted client and the repository it would address are OMITTED, not
+    // passed as undefined values a branch might later read: with no hosted
+    // tier present at all, an object the clone cannot produce is reported by
+    // name in `partial` instead of being fetched over a network this path must
+    // never touch.
+    const blobs = await provisionBlobs(
+      { store, runner: deps.runner, cwd: deps.toplevel },
+      immutable.blobIndex,
+    )
+
+    const worktree = await detectDirtyWorktree(deps.runner, deps.toplevel)
+    const defaultBranch = await readDefaultBranchName(deps)
+    // The repository's own display name when it records one. The session's is
+    // the fallback rather than a fabricated string, because this value is
+    // rendered and an invented name is indistinguishable from a real one.
+    const authorName =
+      (await readLocalAuthorName(deps.runner, deps.toplevel)) ?? deps.session.human.name
+
+    // Read AFTER every await above, so a write that landed while git was being
+    // read is not republished away by the envelope written below.
+    // The authorship map is read on its own rather than off a whole snapshot.
+    // A re-sync is the documented repair for a data directory that lost its
+    // immutable rows, and the full read throws in exactly that state — so
+    // taking the map from it would make the repair impossible to perform, or,
+    // if softened, would make it destroy the one field it cannot rebuild.
+    const previousCommentAuthors = store.getLocalCommentAuthors(localId)
+    const threads = store.listLocalThreads(localId)
+    const reviewComments = threads.reduce((total, thread) => total + thread.comments.length, 0)
+
+    const pull = synthesizeLocalPullDetail({
+      review: {
+        id: review.id,
+        repo: review.repo,
+        defaultBranch,
+        baseRef: review.baseRef,
+        headRef: review.headRef,
+        title: review.title,
+        archivedPr: review.archivedPr,
+        createdAt: review.createdAt,
+        updatedAt: review.updatedAt,
+      },
+      authorName,
+      range,
+      immutable,
+      reviewComments,
+    })
+
+    const syncedAt = now()
+    const snapshot: Snapshot = {
+      prNumber: localId,
+      syncedAt,
+      partial:
+        blobs.missing.length === 0
+          ? null
+          : {
+              missingBlobShas: [...blobs.missing],
+              reason:
+                `${blobs.missing.length} blob(s) could not be produced by this git clone, ` +
+                'and nothing else can supply them; re-sync once the objects are reachable again.',
+            },
+      // Not one request is spent anywhere on this path, so the count is zero
+      // as a measured fact rather than as a field nobody filled in.
+      syncStats: {
+        blobsFetched: blobs.stats.blobsFetched,
+        blobsReused: blobs.stats.blobsReused,
+        requests: 0,
+      },
+      immutable,
+      mutable: {
+        fetchedAt: syncedAt,
+        pull,
+        // The durable thread table is the source: threads outlive any one
+        // snapshot, and rebuilding the list from anywhere else would drop
+        // every thread written since the previous envelope.
+        threads,
+        // Both permanently empty on a local review. A submitted summary is
+        // stored in its own table and never appended here, and there is no
+        // conversation tab for an issue comment to live on. Several surfaces
+        // read these two being empty as "this review has only threads".
+        issueComments: [],
+        reviews: [],
+        checks: [],
+        // Carried forward, because this map has no other durable home. It is
+        // the only signal that can decide whether a local comment is the
+        // reader's own — nothing is stamped into a body, and no forge login
+        // stands behind a synthesized author — so a comment whose entry is
+        // dropped here can never be attributed by anything again.
+        commentAuthors: previousCommentAuthors,
+      },
+    }
+
+    store.putLocalSnapshot(snapshot)
+    store.patchLocalReviewSync(localId, {
+      baseSha: range.baseSha,
+      mergeBaseSha: range.mergeBaseSha,
+      headSha: range.headSha,
+      // The column holds a flag while the reading has three states, so the
+      // collapse is decided here in the open: only a positive reading sets it.
+      // The claim the flag makes is "there is work here the review does not
+      // cover", and a probe that could not be answered is not evidence for
+      // that claim — asserting it would raise the warning on every repository
+      // whose worktree cannot be inspected at all.
+      dirty: worktree === 'dirty',
+      lastSyncedAt: syncedAt,
+    })
+    return { frozen: false, snapshot, pin }
+  }
+
+  /**
    * Reconcile's three reads, re-pointed at the local keyspace.
    *
    * The classification itself is NOT reimplemented here. It is the same module a
@@ -707,6 +910,10 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       return store.listLocalReviews(deps.repo)
     },
 
+    getLocalReview(localId: number): LocalReviewSummary {
+      return requireReview(deps, localId)
+    },
+
     async listBranches(): Promise<BranchRef[]> {
       // A git read, never a store read: the store records reviews, and a branch
       // that has never been reviewed still has to be offerable as a side.
@@ -740,141 +947,74 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
       const review = requireReview(deps, localId)
 
-      const resolved = await resolveLocalRange(deps.runner, deps.toplevel, {
-        baseRef: review.baseRef,
-        headRef: review.headRef,
-      })
-      if (!resolved.ok) throw rangeRefusal(localId, resolved)
-      const { range } = resolved
-
-      // Pinned BEFORE the first object is read, and the ordering is the whole
-      // point. The diff produces the blob names and the cat-file reads fetch
-      // their bytes; a collection landing between the two turns every one of
-      // those names into a missing entry, with no hosted tier able to supply
-      // them. Pinning first closes that window. Pinning afterwards would leave
-      // it exactly as wide as it is now.
+      // THE FREEZE. A review a pull request has superseded stands at its last
+      // sync: the stored snapshot is answered as it is, no git is run, no half
+      // is minted, no pin is written and the row is not re-stamped. What a
+      // reader sees is the branch pair as it stood when the pull request was
+      // found, not as it stands now.
       //
-      // The outcome is carried, never thrown: the objects are demonstrably
-      // present — the snapshot below is built from them — so a review whose pin
-      // failed is completely readable today and merely unguaranteed tomorrow.
-      const pinned = await pinSnapshotObjects(deps.runner, deps.toplevel, localId, {
-        mergeBaseSha: range.mergeBaseSha,
-        headSha: range.headSha,
-      })
-      const pin: LocalPinOutcome = pinned.ok
-        ? { ok: true }
-        : { ok: false, reason: pinned.reason }
+      // The freeze keys on the stored snapshot AGREEING with the row — an
+      // envelope whose synthesized pull already reads `closed` — and not on
+      // the row alone. The pull's state is derived from the archive number at
+      // the moment the envelope is built, so `closed` says precisely that the
+      // snapshot postdates the archive. A row marked while the stored snapshot
+      // still reads `open` has therefore been archived SINCE its last sync —
+      // by the detection that runs ahead of this call, by another daemon over
+      // the same data directory, or by hand — and gets exactly one more full
+      // sync so that the snapshot it freezes at describes the review as the
+      // row does; the sync after that is frozen. Keying on the row alone would
+      // freeze such a review onto a snapshot still claiming `open`, with
+      // nothing left to ever rewrite it.
+      //
+      // A stored snapshot that cannot be read counts as absent here for the
+      // same reason an absent one does: the repair every snapshot read names
+      // is re-syncing, and a freeze that served nothing readable would take
+      // that repair away from exactly the reviews that can never be re-synced
+      // by hand.
+      if (review.archivedPr !== null) {
+        const stored = storedIfReadable(localId)
+        if (stored !== null && stored.mutable.pull.state === 'closed') {
+          return { frozen: true, snapshot: stored, pin: null }
+        }
 
-      const built = await readLocalSnapshotImmutable(deps.runner, deps.toplevel, range)
-      if (!built.ok) throw readRefusal(localId, built)
-      const { immutable } = built.snapshot
-
-      // The hosted client and the repository it would address are OMITTED, not
-      // passed as undefined values a branch might later read: with no hosted
-      // tier present at all, an object the clone cannot produce is reported by
-      // name in `partial` instead of being fetched over a network this path must
-      // never touch.
-      const blobs = await provisionBlobs(
-        { store, runner: deps.runner, cwd: deps.toplevel },
-        immutable.blobIndex,
-      )
-
-      const worktree = await detectDirtyWorktree(deps.runner, deps.toplevel)
-      const defaultBranch = await readDefaultBranchName(deps)
-      // The repository's own display name when it records one. The session's is
-      // the fallback rather than a fabricated string, because this value is
-      // rendered and an invented name is indistinguishable from a real one.
-      const authorName =
-        (await readLocalAuthorName(deps.runner, deps.toplevel)) ?? deps.session.human.name
-
-      // Read AFTER every await above, so a write that landed while git was being
-      // read is not republished away by the envelope written below.
-      // The authorship map is read on its own rather than off a whole snapshot.
-      // A re-sync is the documented repair for a data directory that lost its
-      // immutable rows, and the full read throws in exactly that state — so
-      // taking the map from it would make the repair impossible to perform, or,
-      // if softened, would make it destroy the one field it cannot rebuild.
-      const previousCommentAuthors = store.getLocalCommentAuthors(localId)
-      const threads = store.listLocalThreads(localId)
-      const reviewComments = threads.reduce((total, thread) => total + thread.comments.length, 0)
-
-      const pull = synthesizeLocalPullDetail({
-        review: {
-          id: review.id,
-          repo: review.repo,
-          defaultBranch,
-          baseRef: review.baseRef,
-          headRef: review.headRef,
-          title: review.title,
-          archivedPr: review.archivedPr,
-          createdAt: review.createdAt,
-          updatedAt: review.updatedAt,
-        },
-        authorName,
-        range,
-        immutable,
-        reviewComments,
-      })
-
-      const syncedAt = now()
-      const snapshot: Snapshot = {
-        prNumber: localId,
-        syncedAt,
-        partial:
-          blobs.missing.length === 0
-            ? null
-            : {
-                missingBlobShas: [...blobs.missing],
-                reason:
-                  `${blobs.missing.length} blob(s) could not be produced by this git clone, ` +
-                  'and nothing else can supply them; re-sync once the objects are reachable again.',
+        // THE CATCH-UP THAT CANNOT RUN. The one further sync described above is
+        // read out of a repository that has meanwhile stopped being able to
+        // answer for this pair — the head branch deleted once the pull request
+        // was open is the ordinary way of it. Left to fail, the review is
+        // stranded forever: the row says archived, the stored snapshot still
+        // says open, and every later sync repeats the same failing git, so the
+        // snapshot never closes and a review nobody can restore the branch for
+        // can never be read again.
+        //
+        // So the catch-up is attempted, and its failure closes the stored
+        // snapshot instead. The review then stands at its last SUCCESSFUL sync,
+        // which is what an archived review is promised to stand at; what changes
+        // is one field, the state a fresh sync would have derived from the row
+        // anyway. From here the freeze above answers, so this runs once.
+        //
+        // The failure is deliberately not re-raised and not inspected: every way
+        // this sync can fail leaves exactly the same stranded review, and a
+        // reader of an archived review has no repair to be told about. A store
+        // that cannot be written to still fails loudly, because the write below
+        // is outside the attempt.
+        if (stored !== null) {
+          try {
+            return await performSync(review)
+          } catch {
+            const closed: Snapshot = {
+              ...stored,
+              mutable: {
+                ...stored.mutable,
+                pull: { ...stored.mutable.pull, state: 'closed' },
               },
-        // Not one request is spent anywhere on this path, so the count is zero
-        // as a measured fact rather than as a field nobody filled in.
-        syncStats: {
-          blobsFetched: blobs.stats.blobsFetched,
-          blobsReused: blobs.stats.blobsReused,
-          requests: 0,
-        },
-        immutable,
-        mutable: {
-          fetchedAt: syncedAt,
-          pull,
-          // The durable thread table is the source: threads outlive any one
-          // snapshot, and rebuilding the list from anywhere else would drop
-          // every thread written since the previous envelope.
-          threads,
-          // Both permanently empty on a local review. A submitted summary is
-          // stored in its own table and never appended here, and there is no
-          // conversation tab for an issue comment to live on. Several surfaces
-          // read these two being empty as "this review has only threads".
-          issueComments: [],
-          reviews: [],
-          checks: [],
-          // Carried forward, because this map has no other durable home. It is
-          // the only signal that can decide whether a local comment is the
-          // reader's own — nothing is stamped into a body, and no forge login
-          // stands behind a synthesized author — so a comment whose entry is
-          // dropped here can never be attributed by anything again.
-          commentAuthors: previousCommentAuthors,
-        },
+            }
+            store.putLocalSnapshot(closed)
+            return { frozen: true, snapshot: closed, pin: null }
+          }
+        }
       }
 
-      store.putLocalSnapshot(snapshot)
-      store.patchLocalReviewSync(localId, {
-        baseSha: range.baseSha,
-        mergeBaseSha: range.mergeBaseSha,
-        headSha: range.headSha,
-        // The column holds a flag while the reading has three states, so the
-        // collapse is decided here in the open: only a positive reading sets it.
-        // The claim the flag makes is "there is work here the review does not
-        // cover", and a probe that could not be answered is not evidence for
-        // that claim — asserting it would raise the warning on every repository
-        // whose worktree cannot be inspected at all.
-        dirty: worktree === 'dirty',
-        lastSyncedAt: syncedAt,
-      })
-      return { snapshot, pin }
+      return performSync(review)
     },
 
     getSnapshot(localId: number): Snapshot | null {
