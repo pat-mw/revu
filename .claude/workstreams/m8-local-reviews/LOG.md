@@ -192,3 +192,45 @@ exhaustiveness guard is red-first.
 - **The owner will be interviewed on the open questions rather than having recommendations applied.** The next
   session opens by putting decision package #1 — plus the two rulings the adversarial review surfaced — to the
   owner interactively, and records each answer as a standing ruling.
+
+---
+
+**update — 2026-08-14 (Session 2 — the app)**
+
+**Done**
+- **The owner interview ran first, before anything was dispatched, and decision package #1 is now closed.**
+  14 questions, one decision at a time, each with its tradeoff and its downstream cost. Every answer is a
+  standing ruling in `HANDOVER.md`'s top entry; **Session 3 is unblocked.** The roadmap's pre-flight defaults
+  for M8.6/M8.7 were deliberately **not** applied — each of those questions was put to the owner too.
+- **M8.1.9 landed** (`4fbc5fb`, unit count 8 → 9) — submitting before the first sync is now refused with
+  `unprocessable`. This reopened a ticket already in review because the mock is the specification and the
+  ruling changed it; PR #70 is unmerged, so it is an added commit, not rewritten history. Genuine observed red
+  (`Received: null` — the old success was reachable), two positive controls replaying the identical input
+  after a sync, gate exit 0 at 1246 pass · 1 skip · 0 fail · 68 files.
+- Board brought into line with the rulings: `M8.6`/`M8.7` each carry a new `## Rulings` section stating what
+  each ruling **overrides** in the units below, rather than the units' careful prose being rewritten in place.
+- `.claude/worktrees/` gitignored — the hazard Session 1 flagged and appended. Sessions 3 and 4 use worktree
+  isolation in five waves; without this an agent worktree can be staged into a PR.
+
+**Decisions**
+- Sixteen standing rulings, listed in full in `HANDOVER.md`. The four that shape other sessions: local-only is
+  switched on by an **explicit** flag; the commit-delta rewrite **does** land on the shipped GitHub PR path;
+  blob prune is **off by default, delete-only, with a confirm**; an archived triple is a **one-way door**.
+- Two rulings changed work that was already planned. Refusing submit-before-sync forced **M8.1.9** into a
+  ticket in review. Workspace-scoped rate-chip suppression **amends the roadmap's S2 exit condition** — under
+  `?mock=1` the workspace genuinely has GitHub, so the chip legitimately renders and asserting its absence
+  would be asserting a falsehood.
+- Deviation from the roadmap's S2 wave plan, recorded with its reason: **W1 was M8.6.7 ∥ M8.7.10; it runs as
+  M8.6.7 alone.** M8.7.10's files belong to `m8.7`, which branches off `m8.6` and does not exist yet, so
+  running it now means holding an uncommitted diff across all seven M8.6 units — exactly the unlanded work
+  §7 says to discard rather than archaeologize. M8.7.10 runs first thing on `m8.7` instead; it is a compact
+  unit and the wall-clock cost is small against the resumability risk.
+
+**Blockers**
+- **M8.12 open question 1 is a real one and it is not this session's to answer:** the frozen route set has
+  `DELETE /api/local-reviews/:n` with no body and no query parameter, so a **server-authoritative** delete
+  force has nowhere to live. Either the confirmation is purely client-side (weaker), or it is a frozen-contract
+  change — a §5.2 stop. **Must be settled with M8.10 before either ticket dispatches.**
+
+**Next**
+- Finish M8.6's waves, open its PR the moment its Verify is green, then `m8.7` off it starting with M8.7.10.

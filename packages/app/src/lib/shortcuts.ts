@@ -23,6 +23,7 @@ export const SHORTCUT_CATALOG: ShortcutDef[] = [
   { id: 'go-inbox', keys: ['g', 'i'], label: 'Go to inbox', group: 'Global' },
   { id: 'go-files', keys: ['g', 'f'], label: 'Go to files', group: 'Global' },
   { id: 'go-conversation', keys: ['g', 'c'], label: 'Go to conversation', group: 'Global' },
+  { id: 'new-local-review', keys: ['g', 'l'], label: 'New local review', group: 'Global' },
   { id: 'resync', keys: 'shift+r', label: 'Re-sync snapshot', group: 'Global' },
   { id: 'toggle-theme', keys: 'mod+shift+l', label: 'Toggle light / dark theme', group: 'Global' },
 

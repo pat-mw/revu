@@ -5,6 +5,152 @@ act from it alone.
 
 ---
 
+## 2026-08-14 — Session 2 (the app) — **decision package #1 is RULED; 16 standing rulings below**
+
+> **These rulings are settled. No later session relitigates them.** Decision package #1 is complete, so
+> **Session 3 is unblocked** and can start on another machine immediately. Where a ruling changes a ticket's
+> text or the roadmap's exit condition, the amendment is stated under _Amendments the rulings force_ — the
+> ruling wins over the ticket, exactly as M8.1.8's ruling superseded M8.1.5's text.
+
+### State
+
+Branch `m8.1/contract-and-mock`; `main` untouched at `177068a`; PRs [#69](https://github.com/pat-mw/revu/pull/69)
+(design/board, base `main`) and [#70](https://github.com/pat-mw/revu/pull/70) (M8.1, base
+`m8/local-reviews-design`) open, neither merged. The merge protocol in the entry below is unchanged: nothing
+merges until the whole workstream lands.
+
+### Standing rulings — owner, 2026-08-14
+
+**Decision package #1 (was blocking Session 3 — now closed).**
+
+1. **M8.5 OQ1 — local-only is switched on by an EXPLICIT flag/env.** Never automatic-on-resolution-failure.
+   The rejected option turns a transient `gh` failure — expired token, flaky network, misconfigured remote —
+   into a silently local-only daemon: the human keeps working, comments land nowhere near GitHub, and nothing
+   says so. **Consumed by M8.5.4**, which shapes its option around this.
+2. **M8.8 OQ2 — YES, the commit-delta rewrite lands on the shipped GitHub PR path**, rewriting
+   `reconcile.test.ts:428`'s expectations in the same commit. One delta implementation, imported by both
+   paths. A local-only fork would violate the standing hard constraint that reconcile logic is shared and not
+   duplicated. **Must be in hand before M8.8.3 dispatches — it is the point of no return.**
+3. **M8.10 OQ1/OQ2/OQ3 — prune default OFF; pruning runs only inside `deleteLocalReview`; deleting a review
+   that holds an unsubmitted draft requires an explicit force / a confirmation.** Blobs are content-addressed
+   and shared, so an unattended sweep can degrade another snapshot's comments to `lost`. The confirm dialog is
+   **new scope** — appended to the board as its own ticket (below), never absorbed into M8.10.
+4. **M8.2 OQ1 (behavioral half) — the ONE-WAY DOOR.** An archived triple does not mint a successor; the
+   archived review stays the review for that `(repo, base, head)`. This is what the mock does today, so it
+   costs zero mock change. The generation discriminator stays in the unique key as a no-migration escape hatch
+   for a later milestone.
+
+**Surfaced by M8.1's adversarial review.**
+
+5. **The local reaction rollup stays SHARED per review**, exactly as pinned. A duplicate emoji from a second
+   human is a silent no-op. **M8.4 reproduces it.** In the single-human local case — the overwhelmingly common
+   one — shared and per-human are the same thing, and per-human simulation remains a thing this project does
+   not build.
+6. **Submitting before the first sync is REFUSED**, with `unprocessable` (422) and a message naming sync as
+   the fix. ⚠️ **This changes the mock, which is the specification** — so it lands as **appended unit M8.1.9**
+   on `m8.1/contract-and-mock`, inside M8.1's own Goal (same precedent as M8.1.8; existing units are not
+   renumbered). PR #70 is unmerged, so this is an added commit, not rewritten history. It gets its own
+   fable-tier review. **M8.4's sink must refuse identically.**
+
+**M8.6 / M8.7 — the app's own questions (the roadmap's pre-flight defaults were NOT applied; each was put to
+the owner).**
+
+7. **M8.6 OQ2 — the `Local reviews` section renders iff `listLocalReviews()` returns ANYTHING**, archived and
+   closed rows included. Position is conditional: **above `Waiting on you` when it has open rows, below every
+   other section when it is empty**, and absent entirely when the human has no local reviews at all. The
+   literal "show only if ever used" was rejected *by me, not by the owner*: it needs persisted per-human state,
+   whose only sanctioned home is `HumanPreferences` in the frozen `types.ts` — a contract amendment and a §5.2
+   stop. The `listLocalReviews` derivation captures the same intent with no contract change; its only gap is
+   that deleting every local review removes the section again, which is correct behaviour rather than a gap.
+8. **M8.7 OQ1 — `/pr/<local>/checks` and `/pr/<local>/description` REDIRECT to `files`.** The decision is the
+   pure `redirectTargetFor(mode, tab)`, never an inline ternary, and `App.tsx` carries a `readFileSync` pin
+   that it imports the function. This closes the bookmark hole that otherwise leaves the two worst strings in
+   the inventory one URL away.
+9. **M8.7 OQ2 — the rate chip is suppressed WORKSPACE-scoped, not route-scoped**: it disappears when the
+   workspace has no GitHub at all, not merely when a local review is open. The owner ruled this **with the
+   consequence made explicit**: under `?mock=1` the workspace *does* have GitHub, so the chip still renders on
+   the fixture local review, and the roadmap's S2 exit condition is amended accordingly (below). The M8.7 work
+   is therefore `showRateChip({ rateAvailable })` plus the real fix — **distinguishing *loading* from
+   *unavailable* so the chip OMITS rather than skeletons forever**. **New M8.5 obligation, appended below.**
+10. **M8.7 OQ3(a) — the local marker is `Badge variant="outline"`, not a second `.seal`.** Violet is reserved
+    for pending work and gold for "time moved"; a local marker is a provenance fact. No new CSS class —
+    `globals.css` stays a read-only shared input.
+11. **M8.7 OQ3(b) — the `open`/`closed` state chip KEEPS rendering, with local wording**, via a pure
+    `stateChipCopy(mode, state)` in `lib/mode-copy.ts`. M8.7 owns the `open` branch; **M8.9.6 owns the
+    archived branch and reconciles with this function rather than adding a second one.**
+12. **M8.7 OQ4 — the author row RENDERS the local human plainly** (initials disc, no org ring, no github.com
+    title). The org-member treatment that the sentinel author drags in is killed separately in M8.7.6, and
+    that fix is load-bearing for this ruling — if it regresses, this row is where it shows.
+13. **M8.7 OQ5 — the Walk-threads action SURVIVES on a local review, under local copy**; only the "You
+    authored this PR" framing is suppressed. A contractor walking the reviewer's feedback on their own branch
+    is the most valuable local flow and this is its only discoverable door.
+14. **M8.7 OQ8 — the local submit toast is "Review saved — N comments on this branch."** Claims no API call,
+    no post; "on this branch" is the honest noun. Summary-only submits take the parallel form.
+15. **M8.7 OQ6 — the Conversation tab STAYS on a local review**, threads-only, with an empty state that is an
+    invitation pointing at Files (asserted to match `/files/i`, so a sweep cannot reduce it to a bare noun).
+    Keeping it also keeps the `go-conversation` chord un-orphaned, which M8.7.7 asserts.
+
+**Orchestrator ruling forced by #12 + #13 (recorded, not owner-asked, because it is a derived consequence).**
+
+16. **The author-banner slot becomes a vertical STACK, ordered superseded → dirty worktree → walk threads.**
+    Three components now want that one `empty:hidden` slot. Each is props-only and decides its own visibility,
+    so M8.7.8's `toBe('')` assertions still hold per component, and **M8.9.6's superseded banner appends to the
+    stack rather than displacing anything.**
+
+**Implementer calls made this session** (each was explicitly an implementer call in its ticket, so they were
+decided rather than put to the owner):
+
+- **M8.6 OQ4 (tree)** — local reviews are EXCLUDED from `buildPullTree`'s input and rendered as their own
+  group above the roots. A local review can never *steal* a parent (`byHead` resolves ties by lowest number and
+  a ≥1e9 id always loses) but it CAN become one, nesting a real PR under something that does not exist on
+  GitHub. The Tree arrangement therefore shows the same reviews as List, just grouped — which is what
+  `inbox.tsx:419` promises.
+- **M8.6 OQ5 (chord)** — **`g l`**, registered SHELL-side, catalog group `Global`. `g i`/`g f`/`g c` are the
+  live `g` prefixes and `l` is free; the shortcuts test asserts no two entries claim the same keys, so a
+  collision is caught in-gate rather than by eye. Shell-side registration makes the chord work from a PR page,
+  matching the palette entry's global reach, and lifts the dialog into the shell's existing three-overlay set.
+- **M8.6 OQ6 (title editable after creation)** — **NO.** M8.1 froze the route set at `GET /api/branches`,
+  `POST /api/local-reviews`, `GET /api/local-reviews`, `DELETE /api/local-reviews/:n`. There is no update verb,
+  so the title is chosen once, in the dialog, forever. This is a fact about the frozen contract, not a
+  preference; the dialog's docstring says so.
+- **M8.7 OQ7 (unresolved-thread count badge)** — **keep reading `item.broker.unresolvedThreads`**; do not
+  compute it client-side. The mock populates it on a local row (M8.1.6's walk observed it at `1` after a
+  submit), and D6 binds the daemon to match. **New M8.5 obligation, appended below.**
+
+### Amendments the rulings force
+
+Each of these is a ticket or roadmap text that a ruling above now overrides. **The ruling wins.**
+
+1. **`ROADMAP.md` → S2 exit condition: "no rate chip" LEAVES the recorded `?mock=1` walk** (ruling 9 — the
+   mock workspace has GitHub, so the chip legitimately renders there). It is replaced by the in-gate predicate
+   assertion on `showRateChip({ rateAvailable })` in both states. Everything else in the S2 exit condition
+   stands.
+2. **M8.6.4's Check "the local section is first" becomes CONDITIONAL** (ruling 7): first when the section has
+   open rows, LAST when it is empty, absent when there are no local reviews at all. Section *position* is now a
+   property of the pure `buildInboxSections` and is asserted in all three states.
+3. **M8.6.2's annotation query gains one more reader — section PRESENCE** (ruling 7). This is deliberately not
+   a two-truths violation: the annotation query supplies a boolean about existence, never a row, a title, a ref
+   pair or a `broker.*` field. `usePullList` remains the sole row source. Say so in the docstring, because the
+   next reader will check.
+4. **M8.7.6's rate-chip gate is `showRateChip({ rateAvailable })`, not `showRateChip(mode)`** (ruling 9), and
+   the unit's real work is the loading-vs-unavailable distinction, not a mode branch.
+5. **M8.7.3 gains `stateChipCopy`** (ruling 11) and **renders the author row** (ruling 12) rather than
+   suppressing it; **M8.7.3/M8.7.8 share the banner slot as a stack** (ruling 16).
+6. **M8.1 gains unit M8.1.9** (ruling 6). Units are appended, never renumbered.
+
+### New scope appended to the board — NOT absorbed
+
+- **M8.12 — delete-confirm for a local review holding an unsubmitted draft** (ruling 3). The API force flag is
+  M8.10's; the dialog and its copy are net-new UI that no ticket owns.
+- **M8.5 obligation — a local-only daemon must make `getRateLimit` UNAVAILABLE** (a typed error / 501), never
+  fabricate a bucket (ruling 9). Without it the app cannot tell "no GitHub" from "still loading" and the chip
+  skeletons forever.
+- **M8.5 obligation — local list items must carry a populated `broker.unresolvedThreads`** (OQ7 call). If the
+  daemon ships local rows with an unpopulated broker block, the badge silently never appears — and the same
+  block feeds `useStaleness`, which has no fallback, so a quiet seal would look like a fresh snapshot.
+
+---
+
 ## 2026-08-13 — Session 1 (the spec) — M8.1 landed; **decision package #1 below needs your rulings**
 
 > **Read the four rulings in "Decision package #1" first if you read nothing else.** Session 3 ends blocked on

@@ -10,9 +10,73 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 
 ## In flight right now
 
-**Nothing.** No unit is dispatched, no agent is running. **M8.1 is `In Review`** — all 8 units landed, its
-`Verify` ran green, PR open. Session 1 is complete; the next session picks up from
-[`HANDOVER.md`](./HANDOVER.md)'s top entry, which carries **decision package #1 awaiting the owner's rulings**.
+| ticket · unit | branch | tier | isolation | what it is |
+| --- | --- | --- | --- | --- |
+| **M8.7.10** — the static-render harness | `m8.7/app-local-chrome` | opus | worktree | W1; nothing render-shaped in M8.7 is assertable without it |
+
+**The `m8.1` → `m8.6` rebase is DONE.** `m8.1` gained `8b73a77` (the adversarial review's fixes) and is pushed;
+`m8.6` was rebased onto it and verified — `git merge-base --is-ancestor` confirms `m8.6` contains the `m8.1`
+tip, and `main` is still `177068a`. The only conflict was one `.gitignore` line, resolved in favour of the
+fuller comment. **Every `m8.6` sha below the rebase point changed**; the table below carries the new ones.
+
+**Landed this session, in chain order:**
+
+| unit | commit | branch | gate at that commit |
+| --- | --- | --- | --- |
+| M8.1.9 — refuse submit before first sync | `4fbc5fb` | `m8.1` (pushed → [#70](https://github.com/pat-mw/revu/pull/70)) | 1246 pass · 1 skip · 0 fail · 68 files |
+| **M8.1.9 review fixes** — docstring seam, guard-key pin, false sentence | `8b73a77` | `m8.1` (pushed → #70) | 1247 pass · 1 skip · 0 fail · 68 files |
+| board — the owner's rulings + M8.12 + `.gitignore` | `1ce09ef` | `m8.6` | — (no code) |
+| M8.6.7 — the headless-render seam | `440aa74` | `m8.6` | 1251 pass · 1 skip · 0 fail · 69 files |
+| board — harness landing + wave deviations | `db168db` | `m8.6` | — (no code) |
+| M8.6.1 — pure view-model | `8385bdf` | `m8.6` | 1263 pass · 1 skip · 0 fail · 70 files |
+| M8.6.2 — query layer | `113aee8` | `m8.6` | 1269 pass · 1 skip · 0 fail · 71 files |
+| board — the adversarial review record | `2c0538c` | `m8.6` | — (no code) |
+| M8.6.3 — the create dialog | `eb20f17` | `m8.6` | 1277 pass · 1 skip · 0 fail · 72 files |
+| M8.6.4 — inbox section + local row variant | `be9442a` | `m8.6` | 1310 pass · 1 skip · 0 fail · 74 files |
+| M8.6.5 — entry points + the `g l` chord | `836b841` | `m8.6` | 1323 pass · 1 skip · 0 fail · 75 files |
+| M8.6.6 — tree exclusion + filter widening | `59e3e75` | `m8.6` | 1335 pass · 1 skip · 0 fail · 75 files |
+| **M8.6 review fixes** — palette id, filter token, gate pin, dismiss guard, docstring | `a637522` | `m8.6` | 1362 pass · 1 skip · 0 fail · 76 files |
+| M8.6 Verify — the walk + one copy fix it found | `de14043` | `m8.6` | **1362 pass · 1 skip · 0 fail · 76 files** |
+
+**✅ M8.6 is `In Review` — PR [#71](https://github.com/pat-mw/revu/pull/71) is open on base `m8.1`.** Its
+`Verify` ran green, including the recorded browser walk. `main` remains `177068a`; nothing merged.
+
+**Every gate above was re-run by the orchestrator in the main tree**, never trusted from a worker's isolated
+one. **Worktree hazard, now in the memories and in every dispatch brief:** an isolated agent worktree is created
+at the repo's **base** commit, not the branch tip, and carries no `node_modules` — two agents lost real time to
+it before the brief was fixed. Any worker result produced before a fast-forward + `bun install` is void.
+
+**Two deviations from the roadmap's S2 wave plan, both recorded with reasons.**
+1. **W1 was M8.6.7 ∥ M8.7.10; it ran as M8.6.7 alone.** M8.7.10's files belong to `m8.7`, which branches off
+   `m8.6` and does not exist yet — running it now means holding an uncommitted diff across all seven M8.6
+   units, which is exactly the unlanded work §7 says to discard rather than archaeologize. M8.7.10 runs first
+   on `m8.7` instead; it is compact and the wall-clock cost is small against the resumability risk.
+2. **W2 runs with worktree isolation, which the roadmap marks "none".** Two agents sharing one tree cannot each
+   run `bun run check` — the gate ends in `vite build`, and concurrent builds race on the same `dist`. The
+   roadmap's "none" assumed the wave was sequenced; per-unit gating is the harder requirement, so the units are
+   isolated instead. M8.6.1 additionally needs nothing from M8.6.7's shim, so it started before it landed.
+3. **A third hazard, found by a red gate rather than by reading:** `.gitignore` covered `.claude/worktrees/`
+   only on `m8.6`, so gating on `m8.1` **linted a running agent's half-finished `inbox.tsx`** and failed on
+   work that branch does not contain. The ignore entry now lives on `m8.1`, at the bottom of the chain where
+   every branch inherits it. A lint pass does not respect a `.gitignore` that is not on the branch being
+   gated — which is exactly the kind of thing only a real red surfaces.
+4. **W4 is SERIALIZED, where the roadmap has M8.6.5 ∥ M8.6.6 under worktree isolation.** The roadmap flagged
+   one shared file (`inbox.tsx`); there are in fact **three** — `inbox.tsx`, `lib/inbox-sections.ts` and
+   `lib/inbox-sections.test.ts` — and the shared **test** file is what makes "different regions, trivial merge
+   expected" stop holding. Two workers restructuring the same helper is a **§5.5 semantic conflict**, which is
+   a stop condition; buying one unit of wall-clock at the price of a stop the orchestrator manufactured itself
+   is exactly the trade the roadmap's own critical-path note warns against. M8.6.5 runs first — it carries the
+   inherited `onCreate` obligation and the larger file set — then M8.6.6.
+
+**Session 2 (the app) is running.** The owner interview completed first and **decision package #1 is ruled** —
+16 standing rulings in [`HANDOVER.md`](./HANDOVER.md)'s top entry. **Session 3 is therefore unblocked** and may
+start concurrently on another machine.
+
+M8.1 is still `In Review` with PR [#70](https://github.com/pat-mw/revu/pull/70) open; **its unit count is
+8 → 9**. Ruling 6 (submit-before-first-sync is refused) changes the mock, and the mock is the specification, so
+the change belongs inside M8.1's own Goal — appended as M8.1.9, existing units not renumbered, same precedent
+as M8.1.8. #70 is unmerged, so this is an added commit rather than rewritten history, and it gets its own
+fable-tier review.
 
 _When work starts, list here exactly what is actually running — ticket, unit, branch, agent — and remove each
 line the moment it lands. This section is the first thing an interrupted session re-checks._
@@ -73,23 +137,25 @@ line the moment it lands. This section is the first thing an interrupted session
 
 ## Tickets
 
-**87 units across 11 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
+**91 units across 12 tickets.** Dependencies below are the **post-review** graph — two adversarial passes over
 the ticket set corrected several of them, so this table is authoritative over any earlier sketch. The unit
-count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner.
+count grew from 74 when a test-first audit added thirteen units carrying test work that had no owner, then
+from 87 when the owner's rulings appended M8.1.9 and the M8.12 ticket (2026-08-14).
 
 | ID | Ticket | State | Units | Surface | Depends | Branch | PR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 8 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
+| [M8.1](./tickets/M8.1-contract-and-mock.md) | Contract additions + the mock as the spec | In Review | 9 | shared, app, revud | — | `m8.1/contract-and-mock` | [#70](https://github.com/pat-mw/revu/pull/70) |
 | [M8.2](./tickets/M8.2-store-v4.md) | Store v4: `local_*` tables | Todo | 7 | revud | M8.1 | `m8.2/store-v4` | — |
 | [M8.3](./tickets/M8.3-local-snapshot-builder.md) | Local snapshot builder (git-only) | Todo | 9 | revud | M8.1 | `m8.3/local-snapshot-builder` | — |
 | [M8.4](./tickets/M8.4-local-write-sink.md) | Local write sink | Todo | 9 | revud | M8.1 | `m8.4/local-write-sink` | — |
 | [M8.5](./tickets/M8.5-daemon-wiring.md) | Daemon wiring: dispatch, routes, `listPulls`, boot relaxation | Todo | 8 | revud | M8.1, M8.2, M8.3, M8.4 | `m8.5/daemon-wiring` | — |
-| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | Todo | 7 | app | M8.1 | `m8.6/app-creation-flow` | — |
-| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | Todo | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
+| [M8.6](./tickets/M8.6-app-creation-flow.md) | App: creation flow + inbox surface | In Review | 7 | app | M8.1 | `m8.6/app-creation-flow` | [#71](https://github.com/pat-mw/revu/pull/71) |
+| [M8.7](./tickets/M8.7-app-local-chrome.md) | App: local-mode chrome + copy correctness | In Progress | 10 | app | M8.1, M8.6 | `m8.7/app-local-chrome` | — |
 | [M8.8](./tickets/M8.8-resync-and-pinning.md) | Re-sync, rebase safety, and object pinning | Todo | 8 | revud | M8.2, M8.3, M8.5 | `m8.8/resync-and-pinning` | — |
 | [M8.9](./tickets/M8.9-archive-on-pr.md) | Archive when a PR appears | Todo | 7 | revud, app | M8.4, M8.5, M8.6, M8.7 | `m8.9/archive-on-pr` | — |
 | [M8.10](./tickets/M8.10-retention-and-gc.md) | Retention and GC | Todo | 7 | revud | M8.2, M8.5 | `m8.10/retention-and-gc` | — |
 | [M8.11](./tickets/M8.11-conformance-e2e-docs.md) | Conformance leg, e2e, and docs | Todo | 8 | all | M8.5, M8.6, M8.7, M8.8, M8.9, M8.10 | `m8.11/conformance-e2e-docs` | — |
+| [M8.12](./tickets/M8.12-delete-confirm.md) | Delete confirmation for a review holding a draft | Todo | 3 | app | M8.6, M8.10 | `m8.12/delete-confirm` | — |
 
 ## Dependency graph
 

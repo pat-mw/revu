@@ -41,6 +41,14 @@ export const qk = {
   /** Per-human workspace preferences — not scoped to any PR. */
   preferences: ['preferences'] as const,
   rate: ['rate'] as const,
+  /** The branches this workspace can offer as review sides. */
+  branches: ['branches'] as const,
+  /**
+   * Local-only reviews, read for the annotations the frozen list-item type
+   * cannot carry. Deliberately its own entry: `pulls` stays the one source of
+   * rendered rows, so no review is ever described by two cached truths.
+   */
+  localReviews: ['local-reviews'] as const,
 }
 
 /**
