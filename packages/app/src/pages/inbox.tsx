@@ -27,6 +27,7 @@ import { Input } from '@/components/ui/input'
 import { Kbd } from '@/components/ui/kbd'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useShortcut } from '@/lib/keyboard'
+import { reviewMode } from '@/lib/review-mode'
 import { relativeTime, minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
 import { flattenPullTree } from '@/lib/pull-tree'
@@ -730,7 +731,7 @@ const InboxRowView = forwardRef<
           )}
           <RowIdentity item={row.item} />
 
-          <IdentityAvatar identity={parsed.identity} size="sm" />
+          <IdentityAvatar identity={parsed.identity} mode={reviewMode(pull.number)} size="sm" />
 
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
             <div className="flex min-w-0 items-center gap-2">

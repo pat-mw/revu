@@ -4,6 +4,7 @@ import { identityName } from '@revu/shared'
 import { useSnapshot } from '@/state/queries'
 import { useSession } from '@/state/session'
 import { readPullDescription } from '@/lib/pull-description'
+import { reviewMode } from '@/lib/review-mode'
 import { relativeTime } from '@/lib/time'
 import { IdentityAvatar } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
@@ -76,7 +77,7 @@ export function DescriptionPage() {
         ) : (
           <article className="rounded-(--radius-sm) border border-line bg-panel">
             <header className="hairline-b flex min-w-0 items-center gap-2 px-3 py-2">
-              <IdentityAvatar identity={description.identity} size="xs" />
+              <IdentityAvatar identity={description.identity} mode={reviewMode(prNumber)} size="xs" />
               <span className="truncate text-sm font-medium text-ink">
                 {identityName(description.identity)}
               </span>

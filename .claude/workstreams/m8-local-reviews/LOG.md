@@ -234,3 +234,76 @@ exhaustiveness guard is red-first.
 
 **Next**
 - Finish M8.6's waves, open its PR the moment its Verify is green, then `m8.7` off it starting with M8.7.10.
+
+---
+
+**update — 2026-08-14 (Session 2 — the app) — paused at a unit boundary**
+
+**Done**
+- **The owner interview ran first and decision package #1 is closed** — 14 decisions, each with its tradeoff
+  and downstream cost, all recorded as standing rulings. **Session 3 is unblocked.** The roadmap's pre-flight
+  defaults for M8.6/M8.7 were deliberately not applied; each of those questions went to the owner too.
+- **M8.6 complete, PR [#71](https://github.com/pat-mw/revu/pull/71) open** on base `m8.1` — 7 units, Verify
+  green including a recorded browser walk.
+- **M8.1 reopened to 9 units** (`4fbc5fb`, `8b73a77`) — a ruling changed the mock, and the mock is the spec.
+- **M8.7 at 6 of 12 units**, branch pushed, **no PR** — its Verify has not run.
+- Gate green after every unit, never batched: **1246 → 1440 pass · 1 skip · 0 fail · 81 files**, each re-run
+  in the main tree rather than trusted from a worker's isolated one.
+
+**Decisions**
+- Sixteen owner rulings plus R11–R15 from the work itself. Three rulings were later **corrected by the units
+  that consumed them** — R11 missed a file inside its own scope, R6 was not expressible in the signature it
+  prescribed, and **R14's banned-regex list contained a member that never fires**.
+- Five recorded deviations from the roadmap's S2 plan, each with its reason (see HANDOVER).
+
+**Blockers**
+- **M8.12 OQ1** — the frozen route set gives `DELETE /api/local-reviews/:n` no body and no query parameter, so
+  a server-authoritative delete force has nowhere to live. Client-side-only (weaker) or a frozen-contract
+  change and a §5.2 stop. **Settle with M8.10 before either dispatches.**
+
+**Next**
+- Finish M8.7: **M8.7.5 → .6 → .8 → .7**, plus appended **M8.7.11** and **M8.7.12**. Then Verify, a fable
+  review of the full diff, and the PR on base `m8.6`. R14/R15 bind every one of those units.
+
+---
+
+**update — 2026-08-17**
+
+**Done**
+- **M8.7 is COMPLETE and `In Review` on PR #72** (base `m8.6`). Seven units landed this session in one serial
+  chain — **M8.7.5 → .6 → .8 → .12 → .11 → .7**, then the review fixes and the appended **M8.7.13** — each
+  dispatched to an isolated worktree, integrated by copying whole files back, and **gated in the main tree**
+  rather than trusted from the worker's.
+- **Gate green after every single unit, never batched: 1440 → 1611 pass · 1 skip · 0 fail · 83 files** (+171
+  tests, +2 files).
+- **M8.7's `Verify` ran green**: the unit-check set at 232 pass · 0 fail across 8 files, the six-control ledger
+  complete, and the `?mock=1` walk driven from the orchestrator's tree — tab set, header identity, redirects,
+  verdict picker, submit toast, the inbox rows, the whole pull-request path, and all four seal states.
+- **A fable-tier adversarial review of the full diff found NO blockers** and verified all fifteen rulings as
+  implemented rather than taking them on trust. Its four `should-fix` findings are closed.
+- **The two live defects M8.7 owned are dead and controlled**: the local rows now carry zero `title`
+  attributes while a genuine org member still carries `org member · reviews on github.com`; and the rate chip
+  omits on an unavailable workspace instead of shimmering forever.
+
+**Decisions**
+- **Execution order was decided once and recorded rather than re-derived**: serial by file contention, with
+  M8.7.12 before M8.7.7 because the closing proof must run after the last `pr-layout.tsx` writer, and M8.7.11
+  placed second-to-last purely to keep M8.7.7 last (it is genuinely disjoint from everything).
+- **M8.7.13 was appended, not absorbed** — the palette's "This PR" heading is a live false claim in no copy
+  inventory, and folding it into an existing unit is how a ticket's scope stops meaning anything.
+- **The palette placeholder takes no mode**, deliberately: the palette opens with no review at all, so there is
+  no mode to scope it and inventing one would state a fact the surface does not have.
+
+**Blockers**
+- **M8.12 OQ1 is unchanged and still live** — the frozen route set gives `DELETE /api/local-reviews/:n` no body
+  and no query parameter, so a server-authoritative delete force has nowhere to live. **Settle with M8.10
+  before either ticket dispatches.**
+- **Two findings handed to M8.1 (the mock is the spec), neither absorbed:** the mock emits a session shape the
+  daemon never produces (`viewerLogin` omitted while `brokerLogin` is set); and **`dirty: true` is
+  unrepresentable** — no fixture or dev control sets it, so the container half of the dirty banner has never
+  executed against a `true` anywhere, and M8.7's own Verify text asks for a leg that is not runnable.
+
+**Next**
+- The app track is finished through M8.7. The daemon track is untouched and unblocked: **M8.2, M8.3, M8.4 are
+  mutually independent** and all three need only M8.1. M8.5 needs all four.
+- Nothing merges until the whole workstream lands; `main` stays at `177068a`.

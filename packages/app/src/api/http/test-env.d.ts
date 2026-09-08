@@ -55,6 +55,23 @@ declare module 'node:fs' {
    * `import.meta.url` rather than by counting directories up from the root.
    */
   export function readFileSync(path: string | URL, encoding: 'utf8'): string
+  /**
+   * Checked by the suites that scan a NAMED set of source files, before any of
+   * them is read. Every assertion such a scan makes holds an absence, and an
+   * absence is satisfied for free by a file that is no longer there — so the
+   * existence check is what turns a renamed or moved file into a loud failure
+   * instead of a green run over a shorter list than anyone believes.
+   */
+  export function existsSync(path: string | URL): boolean
+  /**
+   * Read by the suites that assert over a whole SOURCE TREE rather than one
+   * file — structural rules that hold an absence, where the set of files to
+   * check is exactly what must not be written down by hand. Only the recursive
+   * form is declared: it returns every descendant as a path relative to the
+   * root it was given, which is both the walk and the identity a failure
+   * reports, so no separate directory test is needed.
+   */
+  export function readdirSync(path: string, options: { recursive: true }): string[]
 }
 
 declare module 'node:os' {

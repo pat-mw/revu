@@ -15,6 +15,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { CommentComposer } from '@/components/threads/composer'
 import { cn } from '@/lib/cn'
 import { useShortcut } from '@/lib/keyboard'
+import { draftSavedCopy, submitFailureCopy, submitSuccessCopy } from '@/lib/mode-copy'
+import { reviewMode, showSelfReviewLock } from '@/lib/review-mode'
 import { relativeTime } from '@/lib/time'
 import { useDraft, useDraftActions, useDraftDirty, useSubmitReview } from '@/state/drafts'
 import { useFilesView } from '@/state/files-view'
@@ -26,12 +28,19 @@ import { firstBodyLine, PendingList } from './pending-list'
 import { ReconcileDialog } from './reconcile-dialog'
 
 /**
- * The persistent bottom strip of every PR view — the draft's home. Quiet
+ * The persistent bottom strip of every review — the draft's home. Quiet
  * one-liner while no review is in progress; once a draft holds a comment or a
  * summary it grows the violet rail, the pending roster, the verdict picker,
  * the persistence whisper, and the atomic Submit. Submit routes its three
- * non-throwing outcomes explicitly: posted, forbidden (self-review), or
+ * non-throwing outcomes explicitly: accepted, forbidden (self-review), or
  * head-moved into the reconcile flow.
+ *
+ * What the strip SAYS about two of those — where a submitted review went, and
+ * where the draft behind it lives — depends on which kind of review is open,
+ * because a review of two local branches publishes nothing and is held nowhere
+ * but here. Those sentences come from one copy module so the bar and its tests
+ * cannot end up reading different words, and the verdict picker's lock is
+ * decided the same way rather than from the approval flag alone.
  *
  * Keyboard: `s` expands/focuses the summary composer; `mod+enter` submits
  * when pressed outside a text field (inside the composer, the composer's own
@@ -58,7 +67,14 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
   } | null>(null)
   const [reconcileReport, setReconcileReport] = useState<ReconcileReport | null>(null)
 
-  const canApprove = item?.broker.canApprove ?? false
+  // Derived from the number this bar is already about, so the strings it draws
+  // and the verdicts it offers cannot disagree with the review above them.
+  const mode = reviewMode(prNumber)
+  const savedCopy = draftSavedCopy(mode)
+  const selfReviewLocked = showSelfReviewLock({
+    mode,
+    canApprove: item?.broker.canApprove ?? false,
+  })
   const pendingCount = draft?.comments.length ?? 0
   // A cached-but-empty draft (never typed into) does not count as a review in
   // progress; it is also never persisted, so nothing is at stake.
@@ -108,16 +124,7 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
       })
       if (result.status === 'ok') {
         setBodyExpanded(false)
-        toast({
-          kind: 'success',
-          title: 'Review posted',
-          detail:
-            pendingCount === 0
-              ? 'Summary posted in one API call.'
-              : `${pendingCount} ${
-                  pendingCount === 1 ? 'comment' : 'comments'
-                } in one API call.`,
-        })
+        toast({ kind: 'success', ...submitSuccessCopy(mode, pendingCount) })
       } else if (result.status === 'forbidden') {
         actions.setEvent('COMMENT')
         toast({ kind: 'error', title: result.reason })
@@ -131,7 +138,7 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
       toast({
         kind: 'error',
         title: describeApiError(error),
-        detail: 'Your draft is untouched on the broker — nothing was lost.',
+        ...submitFailureCopy(mode),
       })
     }
   }
@@ -233,7 +240,7 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
 
             <EventPicker
               value={draft.event}
-              canApprove={canApprove}
+              selfReviewLocked={selfReviewLocked}
               onChange={(event) => actions.setEvent(event)}
             />
 
@@ -244,13 +251,11 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span className="cursor-default text-2xs text-ink-faint" tabIndex={0}>
-                      saved · broker
+                      {savedCopy.label}
                     </span>
                   </TooltipTrigger>
                   <TooltipContent side="top" className="max-w-64">
-                    Drafts live on the broker, keyed to you — invisible to GitHub and to
-                    other contractors. They survive reloads, tomorrow, and a workspace
-                    rebuild.
+                    {savedCopy.tooltip}
                   </TooltipContent>
                 </Tooltip>
               )}
@@ -354,19 +359,28 @@ export function ReviewBar({ prNumber }: { prNumber: number }) {
 ReviewBar.displayName = 'ReviewBar'
 
 /**
- * Comment / Approve / Request changes as a segmented control. When the App
- * identity authored the PR, GitHub will refuse APPROVE and REQUEST_CHANGES —
- * those segments carry a lock and open an explanation with a way forward
- * instead of selecting, because a control that silently no-ops teaches
- * distrust.
+ * Comment / Approve / Request changes as a segmented control.
+ *
+ * `selfReviewLocked` says whether the two approving segments can do anything.
+ * When they cannot, they carry a lock and open an explanation with a way
+ * forward instead of selecting, because a control that silently no-ops teaches
+ * distrust. That situation is specific: a pull request opened by the shared
+ * identity every contractor writes through cannot be approved by that same
+ * identity, and the explanation says who can approve it instead.
+ *
+ * When they can, the whole explanation is absent rather than merely unopenable
+ * — it is written about a mediated pull request and would be a set of
+ * instructions no reader of an unlocked picker could act on. The decision is
+ * taken outside this component and handed in, because the flag it used to be
+ * read from defaults to "locked" while the review's list entry loads.
  */
 function EventPicker({
   value,
-  canApprove,
+  selfReviewLocked,
   onChange,
 }: {
   value: ReviewDraft['event']
-  canApprove: boolean
+  selfReviewLocked: boolean
   onChange: (event: ReviewDraft['event']) => void
 }) {
   const [lockOpen, setLockOpen] = useState(false)
@@ -377,38 +391,42 @@ function EventPicker({
     { value: 'REQUEST_CHANGES', label: 'Request changes' },
   ]
 
+  const group = (
+    <div
+      role="radiogroup"
+      aria-label="Review verdict"
+      className="flex h-6 shrink-0 items-center overflow-hidden rounded-(--radius-sm) border border-line"
+    >
+      {options.map((option, index) => {
+        const locked = option.value !== 'COMMENT' && selfReviewLocked
+        const selected = value === option.value
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            onClick={() => (locked ? setLockOpen(true) : onChange(option.value))}
+            className={cn(
+              'flex h-full items-center gap-1 whitespace-nowrap px-2 text-2xs transition-colors',
+              index > 0 && 'border-l border-line',
+              selected ? 'bg-raised text-ink' : 'text-ink-mut hover:bg-raised/60 hover:text-ink',
+              locked && 'text-ink-faint hover:text-ink-mut',
+            )}
+          >
+            {locked && <Lock size={11} strokeWidth={1.5} aria-hidden />}
+            {option.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+
+  if (!selfReviewLocked) return group
+
   return (
     <Popover open={lockOpen} onOpenChange={setLockOpen}>
-      <PopoverAnchor asChild>
-        <div
-          role="radiogroup"
-          aria-label="Review verdict"
-          className="flex h-6 shrink-0 items-center overflow-hidden rounded-(--radius-sm) border border-line"
-        >
-          {options.map((option, index) => {
-            const locked = option.value !== 'COMMENT' && !canApprove
-            const selected = value === option.value
-            return (
-              <button
-                key={option.value}
-                type="button"
-                role="radio"
-                aria-checked={selected}
-                onClick={() => (locked ? setLockOpen(true) : onChange(option.value))}
-                className={cn(
-                  'flex h-full items-center gap-1 whitespace-nowrap px-2 text-2xs transition-colors',
-                  index > 0 && 'border-l border-line',
-                  selected ? 'bg-raised text-ink' : 'text-ink-mut hover:bg-raised/60 hover:text-ink',
-                  locked && 'text-ink-faint hover:text-ink-mut',
-                )}
-              >
-                {locked && <Lock size={11} strokeWidth={1.5} aria-hidden />}
-                {option.label}
-              </button>
-            )
-          })}
-        </div>
-      </PopoverAnchor>
+      <PopoverAnchor asChild>{group}</PopoverAnchor>
       <PopoverContent align="end" side="top" className="w-72">
         <p className="text-sm font-medium text-ink">GitHub refuses self-review</p>
         <p className="mt-1 text-xs leading-relaxed text-ink-mut">
