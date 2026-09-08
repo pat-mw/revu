@@ -56,6 +56,38 @@ export interface FixtureSeeds {
   blobs?: FileBlob[]
 }
 
+/**
+ * A local-only review the workspace already holds: a review of a branch pair
+ * that has no pull request and never touches GitHub. Alone among the fixtures
+ * it describes no remote side — there is nothing on github.com to describe —
+ * so the store seeds it as the same kind of record a review created at runtime
+ * becomes, and it reaches the pull list by that one path.
+ *
+ * `repo` is deliberately absent: repo identity is the workspace's to derive,
+ * exactly as it is on a creation request, so no fixture can name another
+ * repository's namespace.
+ */
+export interface LocalReviewFixture {
+  /** The review id, taken from the reserved local-review band. */
+  id: number
+  /**
+   * The two sides, fully qualified (`refs/heads/…`, `refs/remotes/…`) — the
+   * only unambiguous spelling, and the uniqueness key alongside the repo.
+   */
+  baseRef: string
+  headRef: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  /**
+   * The snapshot this review's last sync produced, keyed by `id`. The synced
+   * SHAs and the last-synced time are read back off it rather than repeated
+   * alongside, so no fixture can describe a review whose record and snapshot
+   * disagree about what was synced.
+   */
+  snapshot: Snapshot
+}
+
 export interface FixtureDB {
   repo: { full_name: string; default_branch: string }
   humans: Human[]
@@ -64,6 +96,8 @@ export interface FixtureDB {
   orgMembers: GhUser[]
   brokerBot: GhUser
   pulls: RemotePull[]
+  /** Local-only reviews that exist before the app ever loads. */
+  localReviews: LocalReviewFixture[]
   /** Pre-synced snapshots (some deliberately behind the remote). */
   seededSnapshots: Snapshot[]
   /** Broker-side drafts that exist before the app ever loads. */

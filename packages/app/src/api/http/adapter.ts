@@ -1,8 +1,11 @@
 import type {
+  BranchRef,
+  CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
   HttpErrorBody,
   HumanPreferences,
+  LocalReviewSummary,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -22,11 +25,14 @@ import {
   ROUTES,
   apiErrorFromHttp,
   fillPath,
+  validateBranchRefs,
   validateDraftResponse,
   validateFileBlob,
   validateFileViewedState,
   validateHttpErrorBody,
   validateHumanPreferences,
+  validateLocalReviewSummaries,
+  validateLocalReviewSummary,
   validatePullListResponse,
   validateRateLimitInfo,
   validateReactionRollup,
@@ -312,6 +318,27 @@ export function createHttpApi(baseUrl: string): RevuApi {
     async getRateLimit(): Promise<RateLimitInfo> {
       const body = await send('getRateLimit', {})
       return dev ? validateRateLimitInfo(body) : (body as RateLimitInfo)
+    },
+
+    async listBranches(): Promise<BranchRef[]> {
+      const body = await send('listBranches', {})
+      return dev ? validateBranchRefs(body) : (body as BranchRef[])
+    },
+
+    async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
+      // Branch names ride in the JSON body; the path carries no ref segment.
+      const res = await send('createLocalReview', {}, { body: input })
+      return dev ? validateLocalReviewSummary(res) : (res as LocalReviewSummary)
+    },
+
+    async listLocalReviews(): Promise<LocalReviewSummary[]> {
+      const body = await send('listLocalReviews', {})
+      return dev ? validateLocalReviewSummaries(body) : (body as LocalReviewSummary[])
+    },
+
+    async deleteLocalReview(reviewId: number): Promise<void> {
+      // The daemon answers with `{ ok: true }`; the return value is discarded.
+      await send('deleteLocalReview', { n: reviewId })
     },
   }
   return api

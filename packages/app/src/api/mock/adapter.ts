@@ -1,11 +1,12 @@
-import type { AnchorResult, CommitInfo, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
-import { ApiError, prefixBody, blobContentToLines, classifyPendingComment } from '@revu/shared'
+import type { AnchorResult, BranchRef, CommitInfo, CreateLocalReviewInput, FileBlob, FileViewedState, Human, HumanPreferences, IssueComment, LocalReviewSummary, PullDetail, PullFile, PullListItem, PullListResponse, PullSummary, RateLimitInfo, ReactionKey, ReactionRollup, ReconcileReport, ReviewComment, ReviewDraft, ReviewSummary, ReviewThread, Session, Snapshot, SubmitResult, SubmitReviewInput } from '@revu/shared'
+import { ApiError, prefixBody, blobContentToLines, classifyPendingComment, isLocalReviewId } from '@revu/shared'
 import type { RevuApi } from '@revu/shared'
 import type { FixtureDB, RemotePull } from '@/fixtures/contract'
 import { fixtureDB } from '@/fixtures'
 import { buildSnapshot, emptyReactions, nodeId } from '@/fixtures/helpers'
 import { rollupChecks } from '@/lib/checks-rollup'
 import { store } from './store'
+import * as local from './local'
 import { delay, localDelay } from './latency'
 
 /**
@@ -25,6 +26,15 @@ import { delay, localDelay } from './latency'
  * - Writes are applied to the remote-mutation overlay AND to the cached
  *   snapshot's mutable half, so the UI reflects them without a re-sync and
  *   they survive a reload.
+ * - A review id in the reserved local band is answered by the local engine,
+ *   and the branch is taken ABOVE every remote lookup: sync, submit, reply,
+ *   resolve and reactions each dispatch before a remote pull is resolved, and
+ *   the pull list carries local reviews alongside pull requests. No call on
+ *   that path spends the rate bucket, because none of it reaches GitHub.
+ *   Everything else keyed by a review id — cached snapshots and threads,
+ *   drafts, viewed state, reconcile — is stored under that id for both kinds
+ *   of review and needs no branch at all: one keyspace, which is the whole
+ *   point of keeping a local review's identity a positive integer.
  */
 
 const db = fixtureDB as FixtureDB
@@ -83,6 +93,16 @@ function failSync(): void {
 // Shared lookups
 // ————————————————————————————————————————————————————————————————
 
+/**
+ * The GitHub-shaped pull behind a review id, or a typed `not_found`.
+ *
+ * A local review has no remote side at all, so every caller sends a local id
+ * to the local engine BEFORE reaching here — this lookup could only ever
+ * answer `not_found` for one. Taking that branch above this lookup, rather
+ * than inside a method that has already resolved a remote, is what makes
+ * locality a property of the code's shape: the local path never holds a remote
+ * pull, instead of holding one and being trusted not to use it.
+ */
 function requireRemote(prNumber: number): RemotePull {
   const remote = store.effectiveRemote(prNumber)
   if (!remote) {
@@ -246,6 +266,16 @@ export function createMockApi(): RevuApi {
           },
         }
       })
+      // Local reviews are rows in this same list: it is the row source every
+      // review is resolved out of, and one that is missing from it renders as
+      // "not in this installation". They arrive by exactly this one call —
+      // every local review is a record in the store whether it was seeded or
+      // created at runtime — so no review can be listed twice. They cost the
+      // shared bucket nothing, and the etag below covers them because it is
+      // computed over the whole item list.
+      for (const row of local.listLocalPullRows()) {
+        items.push({ pull: toSummary(row.detail), broker: row.broker })
+      }
       items.sort((a, b) => b.pull.updated_at.localeCompare(a.pull.updated_at))
       const etag = `W/"${djb2(JSON.stringify(items)).toString(16)}"`
       if (opts?.etag !== undefined && opts.etag === etag) {
@@ -266,6 +296,9 @@ export function createMockApi(): RevuApi {
         throw new DOMException('The sync was aborted.', 'AbortError')
       }
       failSync()
+      // A local review is synced from the workspace's own refs: no blob
+      // transfer, no request count, nothing charged to the shared bucket.
+      if (isLocalReviewId(prNumber)) return local.syncLocalReview(prNumber)
       const remote = requireRemote(prNumber)
       const attempt = store.getSyncAttempts(prNumber)
       store.bumpSyncAttempts(prNumber)
@@ -362,6 +395,9 @@ export function createMockApi(): RevuApi {
     ): Promise<ReviewComment> {
       await delay('write')
       failWrites('The broker did not answer — your reply was not posted.')
+      if (isLocalReviewId(prNumber)) {
+        return local.replyToLocalThread(prNumber, threadId, body)
+      }
       const remote = requireRemote(prNumber)
       const thread = remote.threads.find((t) => t.id === threadId)
       if (!thread || thread.comments.length === 0) {
@@ -422,6 +458,9 @@ export function createMockApi(): RevuApi {
     ): Promise<ReviewThread> {
       await delay('write')
       failWrites('The broker did not answer — the thread state was not changed.')
+      if (isLocalReviewId(prNumber)) {
+        return local.resolveLocalThread(prNumber, threadId, resolved)
+      }
       const remote = requireRemote(prNumber)
       const thread = remote.threads.find((t) => t.id === threadId)
       if (!thread) {
@@ -454,6 +493,9 @@ export function createMockApi(): RevuApi {
     ): Promise<ReactionRollup> {
       await delay('write')
       failWrites('The broker did not answer — the reaction was not saved.')
+      if (isLocalReviewId(prNumber)) {
+        return local.addLocalReaction(prNumber, commentId, reaction)
+      }
       const remote = requireRemote(prNumber)
       const target = findReactable(remote, commentId)
       if (!target) {
@@ -491,6 +533,7 @@ export function createMockApi(): RevuApi {
       failWrites(
         'The broker did not answer — your review was not submitted. The draft is untouched.',
       )
+      if (isLocalReviewId(input.prNumber)) return local.submitLocalReview(input)
       const remote = requireRemote(input.prNumber)
       const currentHeadSha = remote.detail.head.sha
 
@@ -709,6 +752,38 @@ export function createMockApi(): RevuApi {
       await delay('read')
       failReads()
       return store.rateInfo()
+    },
+
+    // ——— local-only reviews ———
+    //
+    // Every method here fronts the local-review engine with transport shape
+    // only: a delay, and the failure gate that matches the kind of call.
+    // Reads of local state are treated exactly like drafts and viewed state —
+    // a short local delay, never a failure — because nothing they read lives
+    // behind the network. None of them spends the shared rate bucket: no call
+    // on this path reaches GitHub, so charging it would be a lie the UI then
+    // renders as a rate estimate.
+
+    async listBranches(): Promise<BranchRef[]> {
+      await localDelay()
+      return local.listBranches()
+    },
+
+    async createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary> {
+      await delay('write')
+      failWrites('The broker did not answer — the local review was not created.')
+      return local.createLocalReview(input)
+    },
+
+    async listLocalReviews(): Promise<LocalReviewSummary[]> {
+      await localDelay()
+      return local.listLocalReviews()
+    },
+
+    async deleteLocalReview(reviewId: number): Promise<void> {
+      await delay('write')
+      failWrites('The broker did not answer — the local review was not deleted.')
+      local.deleteLocalReview(reviewId)
     },
   }
   return api

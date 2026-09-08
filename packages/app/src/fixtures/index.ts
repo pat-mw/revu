@@ -1,5 +1,6 @@
 import type { FixtureDB, FixtureSeeds } from './contract'
 import { BROKER_BOT, DEFAULT_HUMAN_ID, HUMANS, ORG_MEMBERS, REPO } from './cast'
+import { localReview } from './local/local-review'
 import { pr101 } from './prs/pr101-cache-ttl'
 import { pr204, pr204Seeds } from './prs/pr204-ingestion'
 import { pr312, pr312Seeds } from './prs/pr312-rate-limiting'
@@ -17,6 +18,10 @@ import { pr415, pr415Seeds } from './prs/pr415-webhook-signatures'
  * drafts, viewed files, orphaned blobs) contributed by individual PR modules.
  * PRs without seeds are the first-sync demonstrations — the adapter must see
  * them as never-synced.
+ *
+ * Local-only reviews sit beside the pulls rather than among them: they have no
+ * remote side at all, so the store seeds each as a review record of its own and
+ * the pull list reaches them through that single path.
  */
 
 const allSeeds: FixtureSeeds[] = [
@@ -41,6 +46,7 @@ export const fixtureDB: FixtureDB = {
   orgMembers: ORG_MEMBERS,
   brokerBot: BROKER_BOT,
   pulls: [pr101, pr204, pr312, pr347, pr355, pr362, pr389, pr401, pr410, pr415],
+  localReviews: [localReview],
   seededSnapshots: collect((s) => s.snapshots),
   seededDrafts: collect((s) => s.drafts),
   seededViewed: collect((s) => s.viewed),

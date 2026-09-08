@@ -19,10 +19,12 @@
 
 import type {
   AnchorResult,
+  BranchRef,
   BrokerPullMeta,
   CheckRun,
   ChecksRollup,
   CommitInfo,
+  CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
   GhLabel,
@@ -31,6 +33,7 @@ import type {
   Human,
   HumanPreferences,
   IssueComment,
+  LocalReviewSummary,
   PendingComment,
   PullDetail,
   PullFile,
@@ -495,6 +498,41 @@ export const vPullListResponse: Validator<PullListResponse> = vObject({
   rateLimit: vRateLimitInfo,
 })
 
+// Broker-shaped: local-only reviews
+
+export const vBranchRef: Validator<BranchRef> = vObject({
+  ref: vString,
+  name: vString,
+  kind: vLiteral('local', 'remote'),
+  isDefault: vBoolean,
+})
+
+export const vCreateLocalReviewInput: Validator<CreateLocalReviewInput> = vObject({
+  baseRef: vString,
+  headRef: vString,
+  title: vOptional(vString),
+})
+
+// Every nullable store column is a REQUIRED nullable key on the wire, so a
+// serialized summary always carries the full column set — `dirty` and
+// `archivedPr` included — and a missing key is a validation error, never a
+// silently-defaulted absence.
+export const vLocalReviewSummary: Validator<LocalReviewSummary> = vObject({
+  id: vNumber,
+  repo: vString,
+  baseRef: vString,
+  headRef: vString,
+  title: vString,
+  baseSha: vNullable(vString),
+  mergeBaseSha: vNullable(vString),
+  headSha: vNullable(vString),
+  dirty: vBoolean,
+  archivedPr: vNullable(vNumber),
+  createdAt: vString,
+  updatedAt: vString,
+  lastSyncedAt: vNullable(vString),
+})
+
 // Broker-shaped: the snapshot
 
 export const vFileBlob: Validator<FileBlob> = vObject({
@@ -696,10 +734,28 @@ export const validateRateLimitInfo: Validator<RateLimitInfo> = vRateLimitInfo
 /** `resolveThread` response body. */
 export const validateReviewThread: Validator<ReviewThread> = vReviewThread
 
+/** One branch entry; `listBranches` responds with an array of these. */
+export const validateBranchRef: Validator<BranchRef> = vBranchRef
+
+/** `listBranches` response body. */
+export const validateBranchRefs: Validator<BranchRef[]> = vArray(vBranchRef)
+
+/** `createLocalReview` response body — also each element of `listLocalReviews`. */
+export const validateLocalReviewSummary: Validator<LocalReviewSummary> =
+  vLocalReviewSummary
+
+/** `listLocalReviews` response body. */
+export const validateLocalReviewSummaries: Validator<LocalReviewSummary[]> =
+  vArray(vLocalReviewSummary)
+
 // Request-body validators
 
 /** `submitReview` request body. */
 export const validateSubmitReviewInput: Validator<SubmitReviewInput> = vSubmitReviewInput
+
+/** `createLocalReview` request body. */
+export const validateCreateLocalReviewInput: Validator<CreateLocalReviewInput> =
+  vCreateLocalReviewInput
 
 /** `replyToThread` request body. */
 export const validateReplyBody: Validator<{ body: string }> = vObject({ body: vString })
@@ -749,6 +805,7 @@ export const validateHttpErrorBody: Validator<HttpErrorBody> = vObject({
     'not_found',
     'forbidden',
     'conflict',
+    'unprocessable',
     'broker_unreachable',
     'persist_failed',
   ),

@@ -56,14 +56,19 @@ describe('session & list', () => {
     expect(session.human.id).toBe('h-priya')
   })
 
-  it('list has 10 pulls', async () => {
+  it('list has 11 rows: 10 pulls and the seeded local review', async () => {
     list = await api.listPulls()
-    expect(list.items).toHaveLength(10)
+    expect(list.items).toHaveLength(11)
   })
 
   it('pull numbers complete', () => {
+    // The last entry is the seeded local-only review: the pull list is the row
+    // source every review is resolved out of, so a local review belongs in it
+    // beside the pull requests. Both this array and the count above are exact
+    // pins on the whole fixture set — an unintended fixture is meant to fail
+    // here, so they move deliberately and are never loosened.
     const numbers = list.items.map((i) => i.pull.number).sort((a, b) => a - b)
-    expect(numbers).toEqual([101, 204, 312, 347, 355, 362, 389, 401, 410, 415])
+    expect(numbers).toEqual([101, 204, 312, 347, 355, 362, 389, 401, 410, 415, 1_000_000_001])
   })
 
   it('etag match → notModified', async () => {
