@@ -688,3 +688,20 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
 - **Blockers:** the owner's rulings (OQ10; ruling 4's live-pin bound; archived delete; pre- or post-merge for
   the majors).
 - **Next:** rulings, then one unit per major with a control seen red, then one docs commit for the drift.
+
+**update — 2026-09-02 (close-out plan)**
+- **Done:** the owner asked for the whole workstream sealed with no tech debt, so the landing audit became a
+  plan. The audit is now durable in the repo in full — `AUDIT-2026-09-02.md` (613 audited items, 99 gaps,
+  every refuter's reasoning) and its machine-readable twin `AUDIT-2026-09-02.json`, with stable ids
+  (`<audit>-g<n>` / `<audit>-i<n>`). Every one of the 146 findings has a written disposition in
+  `AUDIT-DISPOSITION.md`. Five close-out tickets seeded and adversarially reviewed: **M8.13** behaviour fixes
+  (9 units), **M8.14** proof debt (37), **M8.15** owner rulings (24 = twelve questions × two answers),
+  **M8.16** docs and board drift (25), **M8.17** close-out (9). 104 units, every assigned id closed exactly
+  once, verified mechanically. Each ticket was reviewed by an adversarial pass (71 findings, two of them
+  blockers — a Check whose red was unobtainable, and a seam that did not exist) and every finding was applied.
+  `docs/agent/MILESTONES.md` gained seeds for M8.12–M8.17, so the doc and the board no longer drift.
+- **Decisions:** none taken. **M8.15 holds twelve questions the owner must answer**, each with both answers
+  written as executable units.
+- **Blockers:** M8.15's rulings gate six of M8.16's units and the whole of M8.17.
+- **Next:** the owner answers M8.15's twelve questions; then M8.13/M8.14/M8.16 run in parallel, M8.15's kept
+  halves land, and M8.17 seals the workstream.
