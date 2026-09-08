@@ -1,7 +1,10 @@
 import type {
+  BranchRef,
+  CreateLocalReviewInput,
   FileBlob,
   FileViewedState,
   HumanPreferences,
+  LocalReviewSummary,
   PullListResponse,
   RateLimitInfo,
   ReactionKey,
@@ -113,4 +116,56 @@ export interface RevuApi {
 
   /** Current shared-bucket status, for honest error copy. */
   getRateLimit(): Promise<RateLimitInfo>
+
+  // ——— local-only reviews (a branch pair with no pull request; nothing reaches GitHub) ———
+
+  /**
+   * The branches this workspace can review: local branches AND remote-tracking
+   * refs, because a base is often only tracked, never checked out. Exactly one
+   * entry carries `isDefault`. Reading them costs nothing against the shared
+   * bucket — it is a read of the local repository, not of GitHub.
+   */
+  listBranches(): Promise<BranchRef[]>
+
+  /**
+   * Open a review of `headRef` against `baseRef` with no pull request behind it.
+   * Idempotent per branch pair: creating the same one twice returns the review
+   * that already exists rather than a second one. The repository identity is
+   * derived server-side, never sent by the client.
+   *
+   * Once created, the review is addressed by its id through the ordinary PR
+   * methods above — `syncPull`, `getSnapshot`, `submitReview` and the rest all
+   * take a local id unchanged.
+   */
+  createLocalReview(input: CreateLocalReviewInput): Promise<LocalReviewSummary>
+
+  /**
+   * Every local review in this workspace, carrying the annotations that exist
+   * only locally (`dirty`, `archivedPr`). The PR list remains the row source
+   * for rendering; this is the management and annotation surface.
+   */
+  listLocalReviews(): Promise<LocalReviewSummary[]>
+
+  /**
+   * Delete a local review and everything synthesized for it, including every
+   * human's draft and viewed state. The id is never minted again, so nothing
+   * can inherit what is gone.
+   *
+   * Server-authoritative, and the reason unsubmitted text is still safe: this
+   * REFUSES with `unprocessable` while any human holds a draft on the review
+   * that carries text — a pending comment, or a body with anything in it. The
+   * caller discards that draft explicitly and then repeats this call unchanged.
+   * So a delete never destroys writing that someone did; discarding it stays a
+   * separate, deliberate act, and only an editor-created empty draft is ever
+   * removed alongside the review.
+   *
+   * The refusal is a precondition, not a partial delete: a refused call leaves
+   * every row it would have removed exactly where it was.
+   *
+   * An id this workspace holds no review for — never created, already deleted,
+   * or belonging to another repository sharing the data directory — is
+   * `not_found`, and all three answer alike so the difference cannot reveal
+   * that an id exists somewhere else.
+   */
+  deleteLocalReview(reviewId: number): Promise<void>
 }

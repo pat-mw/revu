@@ -22,12 +22,18 @@ import {
   validateHumanPreferences,
   validateSetPreferencesBody,
   validateReconcileReport,
+  validateBranchRef,
+  validateCreateLocalReviewInput,
+  validateLocalReviewSummary,
   vAnchorResult,
   ValidationError,
 } from '@revu/shared'
 import type {
   AnchorResult,
+  BranchRef,
+  CreateLocalReviewInput,
   HumanPreferences,
+  LocalReviewSummary,
   PendingComment,
   ReconcileReport,
   ReviewSummary,
@@ -213,6 +219,91 @@ describe('human preferences validators', () => {
       diffMode: 'unified',
     })
     expect(() => validateSetPreferencesBody({ diffMode: 'nope' })).toThrow(ValidationError)
+  })
+})
+
+describe('local-review wire types round-trip losslessly', () => {
+  const branch: BranchRef = {
+    ref: 'refs/heads/feature/x',
+    name: 'feature/x',
+    kind: 'local',
+    isDefault: false,
+  }
+
+  const input: CreateLocalReviewInput = {
+    baseRef: 'refs/heads/main',
+    headRef: 'refs/heads/feature/x',
+    title: 'A local review',
+  }
+
+  // A created-but-never-synced review: the three SHAs and lastSyncedAt are
+  // null, dirty is false, and archivedPr is null — all REQUIRED nullable keys,
+  // so the wire form must carry each key explicitly rather than omitting it.
+  const summary: LocalReviewSummary = {
+    id: 1_000_000_001,
+    repo: 'acme/widgets',
+    baseRef: 'refs/heads/main',
+    headRef: 'refs/heads/feature/x',
+    title: 'A local review',
+    baseSha: null,
+    mergeBaseSha: null,
+    headSha: null,
+    dirty: false,
+    archivedPr: null,
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+    lastSyncedAt: null,
+  }
+
+  test('a BranchRef round-trips unchanged', () => {
+    const wire = JSON.parse(JSON.stringify(branch))
+    expect(validateBranchRef(wire)).toStrictEqual(wire)
+  })
+
+  test('a CreateLocalReviewInput round-trips unchanged, with and without title', () => {
+    const wire = JSON.parse(JSON.stringify(input))
+    expect(validateCreateLocalReviewInput(wire)).toStrictEqual(wire)
+
+    // `title` is the only optional key: absent means "default to the head
+    // branch name" server-side, and the validator must not invent the key.
+    const untitled = { baseRef: input.baseRef, headRef: input.headRef }
+    const untitledWire = JSON.parse(JSON.stringify(untitled))
+    const validated = validateCreateLocalReviewInput(untitledWire)
+    expect(validated).toStrictEqual(untitledWire)
+    expect(Object.prototype.hasOwnProperty.call(validated, 'title')).toBe(false)
+  })
+
+  test('a LocalReviewSummary round-trips with dirty and archivedPr present as keys', () => {
+    const wire = JSON.parse(JSON.stringify(summary))
+    const validated = validateLocalReviewSummary(wire)
+    expect(validated).toStrictEqual(wire)
+    // toStrictEqual over the wire form already distinguishes a missing key
+    // from a null value, but the two local-only annotations are the fields a
+    // shape-stripping validator would silently drop — assert them by name.
+    expect(Object.prototype.hasOwnProperty.call(validated, 'dirty')).toBe(true)
+    expect(Object.prototype.hasOwnProperty.call(validated, 'archivedPr')).toBe(true)
+    expect(validated.dirty).toBe(false)
+    expect(validated.archivedPr).toBeNull()
+  })
+
+  test('a tampered BranchRef throws ValidationError', () => {
+    const tampered = JSON.parse(JSON.stringify(branch)) as Record<string, unknown>
+    tampered.kind = 'upstream'
+    expect(() => validateBranchRef(tampered)).toThrow(ValidationError)
+  })
+
+  test('a tampered CreateLocalReviewInput throws ValidationError', () => {
+    const tampered = JSON.parse(JSON.stringify(input)) as Record<string, unknown>
+    delete tampered.baseRef
+    expect(() => validateCreateLocalReviewInput(tampered)).toThrow(ValidationError)
+  })
+
+  test('a tampered LocalReviewSummary throws ValidationError (no coercion)', () => {
+    const tampered = JSON.parse(JSON.stringify(summary)) as Record<string, unknown>
+    // The store column is INTEGER 0/1, but the wire carries a boolean; a raw
+    // 0/1 leaking through a transport must be rejected, never coerced.
+    tampered.dirty = 0
+    expect(() => validateLocalReviewSummary(tampered)).toThrow(ValidationError)
   })
 })
 

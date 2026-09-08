@@ -2,6 +2,7 @@ import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'r
 import { Link, useNavigate } from 'react-router'
 import { useQueries } from '@tanstack/react-query'
 import {
+  ArrowLeft,
   ArrowRight,
   CircleCheck,
   CircleDot,
@@ -12,6 +13,7 @@ import {
 
 import { api } from '@/api'
 import { qk, usePullList, useRateLimit } from '@/state/queries'
+import { hasAnyLocalReview, useLocalReviewAnnotations } from '@/state/local-reviews'
 import { usePreferences, useSetPreferences } from '@/state/preferences'
 import { useSession } from '@/state/session'
 import type { PullListItem, ReviewDraft } from '@revu/shared'
@@ -25,11 +27,23 @@ import { Input } from '@/components/ui/input'
 import { Kbd } from '@/components/ui/kbd'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useShortcut } from '@/lib/keyboard'
+import { reviewMode, supersededBadgeShown } from '@/lib/review-mode'
+import { supersededBadgeCopy } from '@/lib/mode-copy'
 import { relativeTime, minutesUntil } from '@/lib/time'
 import { cn } from '@/lib/cn'
-import { buildPullTree, flattenPullTree } from '@/lib/pull-tree'
+import { flattenPullTree } from '@/lib/pull-tree'
 import { buildPullTooltip } from '@/lib/pull-tooltip'
 import type { PullTooltip } from '@/lib/pull-tooltip'
+import {
+  buildInboxSections,
+  buildInboxTree,
+  enterTarget,
+  nextFocusIndex,
+  showsInInbox,
+} from '@/lib/inbox-sections'
+import type { InboxRow } from '@/lib/inbox-sections'
+import { isLocalReviewItem, rowIdentity } from '@/lib/local-reviews'
+import { useCreateLocalReviewControl } from '@/components/create-local-review'
 import { Button } from '@/components/ui/button'
 
 /**
@@ -37,7 +51,9 @@ import { Button } from '@/components/ui/button'
  * list. It sorts every open PR into four intent-ordered buckets — what's waiting
  * on you, what you owe a review, what you've left half-written, and everything
  * else — and makes the one number that matters (unresolved comments on your own
- * PRs) the loudest thing on the screen.
+ * PRs) the loudest thing on the screen. Reviews of a branch pair with no pull
+ * request behind them get a section of their own, because they answer to
+ * nobody's attention but the reader's.
  *
  * The PR list is the app's single live surface: it polls on a schedule, so the
  * whisper under the title states liveness and freshness quietly rather than
@@ -45,36 +61,6 @@ import { Button } from '@/components/ui/button'
  * concern and stays out of the copy — the only budget the reader can act on is
  * the one the rate chip shows.
  */
-
-/** A row as it will render, carrying the section it belongs to and any draft. */
-interface InboxRow {
-  item: PullListItem
-  draft?: ReviewDraft | null
-}
-
-interface Section {
-  id: SectionId
-  title: string
-  rows: InboxRow[]
-}
-
-type SectionId = 'waiting' | 'review' | 'drafts' | 'everything'
-
-/** Case-insensitive match over a PR's title, number, and author display name. */
-function matchesFilter(item: PullListItem, needle: string, botLogin: string): boolean {
-  if (!needle) return true
-  const { identity } = parseCommentIdentity(
-    {
-      user: item.pull.user,
-      body: item.pull.body ?? '',
-    },
-    botLogin,
-  )
-  const authorName =
-    identity.kind === 'human' ? identity.name : item.pull.user.login
-  const haystack = `${item.pull.title} #${item.pull.number} ${authorName}`.toLowerCase()
-  return haystack.includes(needle)
-}
 
 export function InboxPage() {
   const navigate = useNavigate()
@@ -118,43 +104,44 @@ export function InboxPage() {
     [items, human.id],
   )
 
-  const sections = useMemo<Section[]>(() => {
-    const open = items.filter((it) => it.pull.state === 'open')
-    const filtered = open.filter((it) => matchesFilter(it, needle, session.brokerLogin))
+  // What only a local review has, and what the list row cannot carry: whether
+  // its worktree is dirty, and whether the reader holds any local review at
+  // all. Its own read on purpose, and one that must stay eager — the list's
+  // ETag is a function of the reviews' compare keys, so a worktree picking up
+  // uncommitted changes does not move it and no amount of polling the list
+  // would ever reveal one.
+  const annotations = useLocalReviewAnnotations()
+  const localAnnotations = annotations.data
+  const hasLocalReviews = hasAnyLocalReview(localAnnotations)
+  const dirtyReviews = useMemo(
+    () => new Set((localAnnotations ?? []).filter((s) => s.dirty).map((s) => s.id)),
+    [localAnnotations],
+  )
+  // Review id → the pull request that superseded it. Only the archived ones
+  // are in the map, so a lookup that misses is a live review rather than an
+  // unknown one, and a row drawn before this read lands says nothing at all.
+  const archivedReviews = useMemo(
+    () =>
+      new Map(
+        (localAnnotations ?? [])
+          .filter((s) => s.archivedPr !== null)
+          .map((s) => [s.id, s.archivedPr]),
+      ),
+    [localAnnotations],
+  )
 
-    const waiting = filtered.filter(
-      (it) =>
-        it.broker.authorHumanId === human.id && it.broker.unresolvedThreads > 0,
-    )
-    const toReview = filtered.filter(
-      (it) =>
-        it.broker.authorHumanId !== human.id &&
-        it.broker.assignedReviewerHumanIds.includes(human.id),
-    )
-    const drafts = filtered.filter((it) => draftByNumber.has(it.pull.number))
-
-    // "Everything else" is what none of the intent buckets claimed. A PR can be
-    // both a draft-in-progress and something you owe a review; it appears in
-    // every bucket it qualifies for but is excluded from the catch-all once any
-    // earlier bucket named it.
-    const claimed = new Set<number>()
-    for (const it of [...waiting, ...toReview, ...drafts]) {
-      claimed.add(it.pull.number)
-    }
-    const everything = filtered.filter((it) => !claimed.has(it.pull.number))
-
-    const toRow = (it: PullListItem): InboxRow => ({
-      item: it,
-      draft: draftByNumber.get(it.pull.number) ?? null,
-    })
-
-    return [
-      { id: 'waiting' as const, title: 'Waiting on you', rows: waiting.map(toRow) },
-      { id: 'review' as const, title: 'To review', rows: toReview.map(toRow) },
-      { id: 'drafts' as const, title: 'Drafts in progress', rows: drafts.map(toRow) },
-      { id: 'everything' as const, title: 'Everything else', rows: everything.map(toRow) },
-    ]
-  }, [items, needle, human.id, draftByNumber, session.brokerLogin])
+  const sections = useMemo(
+    () =>
+      buildInboxSections({
+        items,
+        needle,
+        humanId: human.id,
+        botLogin: session.brokerLogin,
+        draftByNumber,
+        hasLocalReviews,
+      }),
+    [items, needle, human.id, draftByNumber, session.brokerLogin, hasLocalReviews],
+  )
 
   // How the inbox is arranged is a per-human preference, persisted behind the
   // adapter like the diff layout, so it survives a reload and a rebuild.
@@ -168,27 +155,47 @@ export function InboxPage() {
     [view, setPreferencesMutate],
   )
 
-  // The same open PRs the sections draw from, arranged by what they are stacked
-  // on. Built from the list already in hand — a stack's shape is implied by
-  // every PR's base ref, so this costs no request.
-  const treeRoots = useMemo(() => {
-    const open = items.filter((it) => it.pull.state === 'open')
-    const filtered = open.filter((it) => matchesFilter(it, needle, session.brokerLogin))
-    return buildPullTree(filtered)
-  }, [items, needle, session.brokerLogin])
+  // The same open reviews the sections draw from, arranged by what they are
+  // stacked on. Built from the list already in hand — a stack's shape is
+  // implied by every PR's base ref, so this costs no request.
+  const treeRoots = useMemo(
+    () => buildInboxTree({ items, needle, botLogin: session.brokerLogin }),
+    [items, needle, session.brokerLogin],
+  )
 
-  // A single flat list of every visible row, in section order, so keyboard
-  // navigation crosses section boundaries as one continuous column.
+  // The reviews the tree does not draw, taken from the same derivation the list
+  // arrangement uses so the two cannot come to different answers about which
+  // rows exist. Read here rather than derived again: one source, two layouts.
+  const localRows = useMemo(
+    () => sections.find((s) => s.id === 'local')?.rows ?? [],
+    [sections],
+  )
+
+  // A single flat list of every visible row, in the order it is drawn, so
+  // keyboard navigation crosses group boundaries as one continuous column. In
+  // the tree arrangement the local group is drawn first and so comes first
+  // here — a row the column skipped would be unreachable by keyboard alone.
   const flatRows = useMemo(
     () =>
       view === 'tree'
-        ? flattenPullTree(treeRoots).map((n) => ({
-            item: n.item,
-            draft: draftByNumber.get(n.item.pull.number) ?? null,
-          }))
+        ? [
+            ...localRows,
+            ...flattenPullTree(treeRoots).map((n) => ({
+              item: n.item,
+              draft: draftByNumber.get(n.item.pull.number) ?? null,
+            })),
+          ]
         : sections.flatMap((s) => s.rows),
-    [view, treeRoots, sections, draftByNumber],
+    [view, treeRoots, localRows, sections, draftByNumber],
   )
+
+  // Starting a review is offered from two places on this screen, and both raise
+  // the shell's single dialog. While it is up the inbox is covered, so its bare
+  // keys must decide nothing — the guard that makes shortcuts inert while
+  // typing exempts text fields only, and the focus inside a modal is usually on
+  // a button.
+  const create = useCreateLocalReviewControl()
+  const blocked = create.isOpen
 
   const [focusIndex, setFocusIndex] = useState(0)
   const rowRefs = useRef<Array<HTMLAnchorElement | null>>([])
@@ -204,21 +211,30 @@ export function InboxPage() {
   const moveFocus = useCallback(
     (delta: number) => {
       setFocusIndex((i) => {
-        if (flatRows.length === 0) return 0
-        const next = Math.max(0, Math.min(flatRows.length - 1, i + delta))
-        rowRefs.current[next]?.scrollIntoView({ block: 'nearest' })
+        const next = nextFocusIndex(i, delta, flatRows.length, { blocked })
+        // Only when it actually moved: the column is scrolled to follow the
+        // cursor, and a cursor that stayed put has nothing to follow.
+        if (next !== i) rowRefs.current[next]?.scrollIntoView({ block: 'nearest' })
         return next
       })
     },
-    [flatRows.length],
+    [flatRows.length, blocked],
   )
 
-  useShortcut('j', () => moveFocus(1))
-  useShortcut('k', () => moveFocus(-1))
-  useShortcut('enter', () => {
-    const row = flatRows[focusIndex]
-    if (row) navigate(`/pr/${row.item.pull.number}`)
-  })
+  // Two layers, deliberately. The `enabled` option keeps the handlers from
+  // firing at all while the create dialog is up; the same flag reaches the
+  // decision itself, so the column stays inert even if that option is ever
+  // dropped.
+  useShortcut('j', () => moveFocus(1), { enabled: !blocked })
+  useShortcut('k', () => moveFocus(-1), { enabled: !blocked })
+  useShortcut(
+    'enter',
+    () => {
+      const to = enterTarget(flatRows, focusIndex, { blocked })
+      if (to) navigate(to)
+    },
+    { enabled: !blocked },
+  )
 
   // ——— loading ———
   if (pulls.isLoading) {
@@ -243,6 +259,7 @@ export function InboxPage() {
             onFilter={setFilter}
             view={view}
             onView={setView}
+            onCreate={create.open}
           />
           <ErrorState
             className="mt-4"
@@ -255,10 +272,14 @@ export function InboxPage() {
     )
   }
 
-  const totalOpen = items.filter((it) => it.pull.state === 'open').length
+  // Counted through the same predicate the sections are built from. Counting
+  // open rows instead would send an inbox holding nothing but archived local
+  // reviews to the empty screen — announcing there is nothing here over rows
+  // that exist, and offering to start a review as if none had ever been made.
+  const totalListed = items.filter(showsInInbox).length
 
   // ——— nothing at all ———
-  if (totalOpen === 0) {
+  if (totalListed === 0) {
     return (
       <div className="h-full overflow-y-auto">
         <div className="mx-auto max-w-5xl px-4 py-4">
@@ -269,13 +290,9 @@ export function InboxPage() {
             rateResetAt={rate.data?.remaining === 0 ? rate.data.reset : undefined}
             view={view}
             onView={setView}
+            onCreate={create.open}
           />
-          <EmptyState
-            className="mt-6"
-            icon={<Inbox strokeWidth={1.5} />}
-            title="Nothing open right now"
-            hint="No open pull requests — when a contractor pushes a branch, it lands here."
-          />
+          <InboxZeroState onCreate={create.open} />
         </div>
       </div>
     )
@@ -297,9 +314,39 @@ export function InboxPage() {
           onFilter={setFilter}
           view={view}
           onView={setView}
+          onCreate={create.open}
         />
 
         <div className="mt-3 flex flex-col gap-5">
+          {/* Above the stacks rather than inside one. A review of two local
+              branches is not stacked on anything and nothing is stacked on it,
+              so it is its own group — and grouping it separately is also what
+              keeps each group's identity column one width instead of two. */}
+          {view === 'tree' && localRows.length > 0 && (
+            <section>
+              <SectionHeader title="Local reviews" count={localRows.length} />
+              <div className="hairline-t">
+                {localRows.map((row) => {
+                  const index = runningIndex
+                  runningIndex += 1
+                  return (
+                    <InboxRowView
+                      key={row.item.pull.number}
+                      ref={(el) => {
+                        rowRefs.current[index] = el
+                      }}
+                      row={row}
+                      showUnresolvedNumber={false}
+                      dirty={dirtyReviews.has(row.item.pull.number)}
+                      archivedPr={archivedReviews.get(row.item.pull.number) ?? null}
+                      focused={index === focusIndex}
+                      onFocus={() => setFocusIndex(index)}
+                    />
+                  )
+                })}
+              </div>
+            </section>
+          )}
           {view === 'tree' &&
             treeRoots.map((root) => {
               const nodes = flattenPullTree([root])
@@ -321,6 +368,8 @@ export function InboxPage() {
                             draft: draftByNumber.get(node.item.pull.number) ?? null,
                           }}
                           showUnresolvedNumber={false}
+                          dirty={dirtyReviews.has(node.item.pull.number)}
+                          archivedPr={archivedReviews.get(node.item.pull.number) ?? null}
                           focused={index === focusIndex}
                           onFocus={() => setFocusIndex(index)}
                           depth={node.depth}
@@ -333,14 +382,16 @@ export function InboxPage() {
             })}
           {view === 'tree' && treeRoots.length === 0 && (
             <p className="px-1 py-2 text-sm text-ink-mut">
-              No open pull requests match the filter.
+              Nothing open matches the filter.
             </p>
           )}
           {view === 'list' &&
             sections.map((section) => {
             const isWaiting = section.id === 'waiting'
             // Empty sections are omitted — except "Waiting on you", which stays
-            // as a quiet reassurance when the human has authored open PRs.
+            // as a quiet reassurance when the human has authored open PRs, and
+            // "Local reviews", which the derivation only includes when there
+            // are some to account for and which then says where they went.
             if (section.rows.length === 0) {
               if (isWaiting && hasAuthored) {
                 return (
@@ -348,6 +399,17 @@ export function InboxPage() {
                     <SectionHeader title={section.title} count={0} />
                     <p className="px-1 py-2 text-sm text-ink-mut">
                       Nothing waiting on you — no unresolved comments on your PRs.
+                    </p>
+                  </section>
+                )
+              }
+              if (section.id === 'local') {
+                return (
+                  <section key={section.id}>
+                    <SectionHeader title={section.title} count={0} />
+                    <p className="px-1 py-2 text-sm text-ink-mut">
+                      Nothing to show here — every local review you have is filtered out, or
+                      has not reached this list yet.
                     </p>
                   </section>
                 )
@@ -370,6 +432,8 @@ export function InboxPage() {
                         }}
                         row={row}
                         showUnresolvedNumber={isWaiting}
+                        dirty={dirtyReviews.has(row.item.pull.number)}
+                        archivedPr={archivedReviews.get(row.item.pull.number) ?? null}
                         focused={index === focusIndex}
                         onFocus={() => setFocusIndex(index)}
                       />
@@ -385,7 +449,10 @@ export function InboxPage() {
   )
 }
 
-/** The title row: name of the surface, the live-ness whisper, and the filter. */
+/**
+ * The title row: name of the surface, the live-ness whisper, the way to start a
+ * review of two branches, the arrangement control, and the filter.
+ */
 function InboxHeader({
   dataUpdatedAt,
   filter,
@@ -393,6 +460,7 @@ function InboxHeader({
   rateResetAt,
   view,
   onView,
+  onCreate,
 }: {
   dataUpdatedAt: number
   filter: string
@@ -400,6 +468,8 @@ function InboxHeader({
   rateResetAt?: string
   view: 'list' | 'tree'
   onView: (v: 'list' | 'tree') => void
+  /** Raise the shared create-review dialog. */
+  onCreate: () => void
 }) {
   const updated = dataUpdatedAt
     ? relativeTime(new Date(dataUpdatedAt).toISOString())
@@ -415,6 +485,17 @@ function InboxHeader({
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        {/* Reviewing is what this screen is for, so the way to start one that
+            needs no pull request sits in the row rather than behind the
+            palette. Quiet rather than violet: violet means pending work. */}
+        <Button
+          size="sm"
+          onClick={onCreate}
+          title="Compare two branches in this workspace — nothing is pushed"
+        >
+          <GitBranch strokeWidth={1.5} aria-hidden />
+          New local review
+        </Button>
         {/* List groups by what each PR needs from you; tree groups by what each
             PR is stacked on. Neither is a filter — both show the same PRs. */}
         <div
@@ -449,8 +530,8 @@ function InboxHeader({
           type="search"
           value={filter}
           onChange={(e) => onFilter(e.target.value)}
-          placeholder="filter by title, number, author…"
-          aria-label="Filter pull requests"
+          placeholder="filter by title, branch, author…"
+          aria-label="Filter reviews"
         />
         <span className="hidden items-center gap-1 text-2xs text-ink-faint sm:inline-flex">
           <Kbd keys={['j']} />
@@ -459,6 +540,160 @@ function InboxHeader({
         </span>
       </div>
     </div>
+  )
+}
+
+/**
+ * What a row is called, in the narrow slot at its left edge.
+ *
+ * A pull request is called by its number. A local review has no pull request
+ * and no GitHub number — only a synthetic key from a reserved band, which
+ * exists so routes and cache keys can stay plain integers and means nothing to
+ * anyone reading the screen. So a local row is called by the branch pair it
+ * compares, and the key is never drawn.
+ *
+ * The slot routes entirely through one pure reading of the row. That is what
+ * makes "the synthetic key is never on screen" something a test can hold,
+ * rather than a branch inside a component that a later edit can quietly widen.
+ */
+export function RowIdentity({ item }: { item: PullListItem }) {
+  const identity = rowIdentity(item)
+  if (identity.kind === 'github') {
+    return (
+      <span className="w-12 shrink-0 font-mono text-xs text-ink-faint">
+        {identity.text}
+      </span>
+    )
+  }
+  // Named as one thing rather than read out piecemeal: the arrow carries the
+  // direction, and an arrow has no spoken form, so the pair is labelled as a
+  // sentence and its parts are left to the eye.
+  return (
+    <span
+      role="img"
+      aria-label={`Local review of ${identity.head} against ${identity.base}`}
+      className="flex w-40 shrink-0 items-center gap-1 font-mono text-xs text-ink-faint"
+    >
+      <span className="min-w-0 truncate">{identity.base}</span>
+      <ArrowLeft size={11} strokeWidth={1.5} className="shrink-0" aria-hidden />
+      <span className="min-w-0 truncate">{identity.head}</span>
+    </span>
+  )
+}
+
+/**
+ * What a row claims about itself, in the cluster at its right edge.
+ *
+ * Every badge here is a claim someone could act on, and one of them is a claim
+ * about GitHub: that this is a pull request in an organization the reader is
+ * allowed to approve. A review of two local branches is not that. No pull
+ * request was opened, no organization ever saw the branch, and the row's own
+ * approvability flag says only that nothing local forbids a verdict — so the
+ * organizational claim is withheld rather than repeated.
+ *
+ * One badge here is a claim about a pull request that a local review DOES
+ * have: the one that came to cover its branch pair and archived it. That is
+ * the row's only sign the review can no longer be written to, and the only
+ * number on a row whose identity slot draws a branch pair.
+ *
+ * The cluster is a component of its own for the same reason the identity slot
+ * is: an absence has to be assertable. Left inline in the row it could only be
+ * checked by reading the code, and the badge it must not draw is exactly the
+ * kind of thing a later edit re-enables without noticing.
+ */
+export function RowBadges({
+  row,
+  dirty = false,
+  archivedPr = null,
+}: {
+  row: InboxRow
+  dirty?: boolean
+  /**
+   * The pull request that came to cover this review's branch pair, or null
+   * while it is live and while the annotations carrying it are unread. Both
+   * non-answers draw nothing, so a row cannot flicker a supersession it turns
+   * out not to have.
+   */
+  archivedPr?: number | null
+}) {
+  const { broker } = row.item
+  const isLocal = isLocalReviewItem(row.item)
+  // The same fact the seal above draws, in the vocabulary the copy module and
+  // its gates take. Both resolve through the one reading of the band, so they
+  // cannot disagree about the row they are both about.
+  const mode = reviewMode(row.item.pull.number)
+  const superseded = { mode, archivedPr }
+  return (
+    <>
+      {row.draft && (
+        <Badge variant="draft" className="shrink-0">
+          {row.draft.comments.length} pending · {relativeTime(row.draft.updatedAt)}
+        </Badge>
+      )}
+
+      {/* Where this review came from, not what it is waiting for — so a quiet
+          outline rather than the violet that means pending work. */}
+      {isLocal && (
+        <Badge variant="outline" className="shrink-0">
+          local
+        </Badge>
+      )}
+
+      {/* What ended this review, where a reader is looking for what to open
+          next. Drawn as the quiet outline rather than an alarm: a review a
+          pull request took over from is work that moved on. */}
+      {supersededBadgeShown(superseded) && (
+        <Badge variant="outline" className="shrink-0">
+          {supersededBadgeCopy(mode, superseded.archivedPr)}
+        </Badge>
+      )}
+
+      {dirty && (
+        <Badge
+          variant="stale"
+          className="shrink-0"
+          title="The worktree had uncommitted changes at the last sync — they are not in this review."
+        >
+          worktree dirty
+        </Badge>
+      )}
+
+      {!isLocal && broker.canApprove && (
+        <Badge variant="outline" className="shrink-0">
+          org PR — approvable
+        </Badge>
+      )}
+    </>
+  )
+}
+
+/**
+ * The inbox with nothing open in it.
+ *
+ * The reason there is nothing open is not always that nobody has pushed yet:
+ * a workspace may have no remote at all, and promising that a branch will
+ * "land here" describes an arrival that is never coming. So the copy names
+ * what this workspace can do on its own, and offers it.
+ *
+ * The action is required rather than optional. This is the screen where it
+ * matters most — an empty inbox is the first thing a new workspace shows — so
+ * a call site that has no way to honour it should not be rendering the
+ * invitation at all, and cannot quietly drop it.
+ */
+export function InboxZeroState({ onCreate }: { onCreate: () => void }) {
+  return (
+    <EmptyState
+      className="mt-6"
+      icon={<Inbox strokeWidth={1.5} />}
+      title="Nothing open right now"
+      hint="No open pull requests — a review can compare any two branches in this workspace, with or without one."
+      action={
+        <Button onClick={onCreate}>
+          <GitBranch size={14} strokeWidth={1.5} aria-hidden />
+          New local review
+        </Button>
+      }
+    />
   )
 }
 
@@ -488,6 +723,21 @@ const InboxRowView = forwardRef<
   {
     row: InboxRow
     showUnresolvedNumber: boolean
+    /**
+     * The workspace had uncommitted changes when this local review last synced,
+     * so what it shows is behind what is on disk. Read from the local-review
+     * annotations rather than from the row: the list payload is frozen and
+     * carries no such field, and its ETag would not move when a worktree
+     * changed anyway.
+     */
+    dirty?: boolean
+    /**
+     * The pull request that came to cover this local review's branch pair, or
+     * null while it is live. Read from the same annotations the dirty flag is,
+     * and for the same reason: the list payload is frozen and carries no such
+     * field.
+     */
+    archivedPr?: number | null
     focused: boolean
     onFocus: () => void
     /**
@@ -497,7 +747,10 @@ const InboxRowView = forwardRef<
      */
     depth?: number
   }
->(({ row, showUnresolvedNumber, focused, onFocus, depth = 0 }, ref) => {
+>((
+  { row, showUnresolvedNumber, dirty = false, archivedPr = null, focused, onFocus, depth = 0 },
+  ref,
+) => {
   const session = useSession()
   const { pull, broker } = row.item
   const parsed = parseCommentIdentity(
@@ -540,11 +793,9 @@ const InboxRowView = forwardRef<
               └
             </span>
           )}
-          <span className="w-12 shrink-0 font-mono text-xs text-ink-faint">
-            #{pull.number}
-          </span>
+          <RowIdentity item={row.item} />
 
-          <IdentityAvatar identity={parsed.identity} size="sm" />
+          <IdentityAvatar identity={parsed.identity} mode={reviewMode(pull.number)} size="sm" />
 
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
             <div className="flex min-w-0 items-center gap-2">
@@ -565,17 +816,7 @@ const InboxRowView = forwardRef<
           </div>
 
           <div className="flex shrink-0 items-center gap-2.5">
-            {hasDraft && row.draft && (
-              <Badge variant="draft" className="shrink-0">
-                {row.draft.comments.length} pending · {relativeTime(row.draft.updatedAt)}
-              </Badge>
-            )}
-
-            {broker.canApprove && (
-              <Badge variant="outline" className="shrink-0">
-                org PR — approvable
-              </Badge>
-            )}
+            <RowBadges row={row} dirty={dirty} archivedPr={archivedPr} />
 
             {showUnresolvedNumber ? (
               <div className="flex w-16 shrink-0 flex-col items-end leading-none">
@@ -671,7 +912,15 @@ function InboxSkeleton() {
             <h1 className="font-display text-base font-semibold text-ink">Inbox</h1>
             <Skeleton className="h-3 w-48" />
           </div>
-          <Skeleton className="h-7 w-56" />
+          {/* One placeholder per header control, at its size. The header is the
+              one part of this screen that does not change between loading and
+              loaded, so a placeholder short of a control makes the whole row
+              shift sideways the moment the list arrives. */}
+          <div className="flex shrink-0 items-center gap-2">
+            <Skeleton className="h-6 w-32" />
+            <Skeleton className="h-6 w-20" />
+            <Skeleton className="h-7 w-56" />
+          </div>
         </div>
 
         <div className="mt-3 flex flex-col gap-5">

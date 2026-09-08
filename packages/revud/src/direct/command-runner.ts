@@ -21,6 +21,25 @@ export interface CommandResult {
   stderr: string
 }
 
+/** Options one invocation may carry. */
+export interface CommandOptions {
+  /** The working directory to spawn in. Always passed explicitly, never assumed. */
+  cwd?: string
+  /**
+   * Bytes to write to the process's standard input, which is then closed. A
+   * command reading its work from stdin keeps that work out of the argv, where
+   * git's option parser would still be running — so a value that must not be
+   * mistaken for a flag has somewhere safe to travel. It is also the only way
+   * to reach the batch forms of git's plumbing, whose whole value is that a
+   * batch either applies completely or not at all.
+   *
+   * Omitted means the child gets no stdin rather than the parent's, so a
+   * command that unexpectedly reads from it fails instead of hanging on a
+   * terminal the daemon does not own.
+   */
+  stdin?: string
+}
+
 /**
  * Runs one external command and resolves its captured result. `args[0]` is the
  * executable and the rest are literal arguments — no shell, so no interpolation
@@ -29,7 +48,7 @@ export interface CommandResult {
  * executable itself cannot be located or spawned.
  */
 export interface CommandRunner {
-  run(args: string[], opts?: { cwd?: string }): Promise<CommandResult>
+  run(args: string[], opts?: CommandOptions): Promise<CommandResult>
 }
 
 /**
@@ -41,10 +60,17 @@ export interface CommandRunner {
  */
 export function createBunCommandRunner(): CommandRunner {
   return {
-    async run(args: string[], opts?: { cwd?: string }): Promise<CommandResult> {
+    async run(args: string[], opts?: CommandOptions): Promise<CommandResult> {
       try {
         const proc = Bun.spawn(args, {
           ...(opts?.cwd !== undefined ? { cwd: opts.cwd } : {}),
+          // A string here is written to the child and the pipe is then closed,
+          // so a command waiting on end-of-input proceeds. Without the key the
+          // child gets no stdin at all, which is what keeps a command that
+          // reads it unexpectedly from blocking forever.
+          ...(opts?.stdin !== undefined
+            ? { stdin: new TextEncoder().encode(opts.stdin) }
+            : {}),
           stdout: 'pipe',
           stderr: 'pipe',
         })

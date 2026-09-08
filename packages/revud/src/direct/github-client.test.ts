@@ -579,3 +579,112 @@ describe('createGithubClient.getPullFacts (batched per-pull facts)', () => {
     expect(captured).toHaveLength(0)
   })
 })
+
+describe('createGithubClient.listOpenPullsForPair (the branch-pair archive check)', () => {
+  /** One list row over `head` → `base`, in the shape GitHub returns. */
+  const pairRow = (headRef: string, baseRef: string) => ({
+    id: 91,
+    node_id: 'PR_91',
+    number: 91,
+    state: 'open',
+    draft: false,
+    merged_at: null,
+    title: 'Rewrite the widget',
+    body: null,
+    user: { login: 'a', id: 1, node_id: 'U_1', type: 'User' },
+    labels: [],
+    requested_reviewers: [],
+    head: {
+      ref: headRef,
+      sha: 'HEAD91',
+      label: `o:${headRef}`,
+      repo: { full_name: 'o/r', default_branch: 'main' },
+    },
+    base: {
+      ref: baseRef,
+      sha: 'BASE91',
+      label: `o:${baseRef}`,
+      repo: { full_name: 'o/r', default_branch: 'main' },
+    },
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-02T00:00:00.000Z',
+  })
+
+  test('queries one page of open pulls filtered to the exact branch pair', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, [], captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.listOpenPullsForPair('o', 'r', { headRef: 'topic', baseRef: 'main' })
+    expect(captured[0].url).toBe(
+      'https://api.github.test/repos/o/r/pulls?state=open&head=o:topic&base=main&per_page=100',
+    )
+  })
+
+  test('encodes a slash in either branch name the way every other piece is encoded', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, [], captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.listOpenPullsForPair('o', 'r', {
+      headRef: 'feature/x',
+      baseRef: 'release/2.0',
+    })
+    expect(captured[0].url).toBe(
+      'https://api.github.test/repos/o/r/pulls?state=open&head=o:feature%2Fx' +
+        '&base=release%2F2.0&per_page=100',
+    )
+  })
+
+  test('sends no conditional header — an archive check is not a poll', async () => {
+    const captured: Captured[] = []
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, [], captured),
+      baseUrl: 'https://api.github.test',
+    })
+    await client.listOpenPullsForPair('o', 'r', { headRef: 'topic', baseRef: 'main' })
+    const headers = captured[0].init?.headers as Record<string, string>
+    expect(headers['if-none-match']).toBeUndefined()
+  })
+
+  test('maps the rows to PullSummary values', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, [pairRow('feature/x', 'main')], []),
+      baseUrl: 'https://api.github.test',
+    })
+    const pulls = await client.listOpenPullsForPair('o', 'r', {
+      headRef: 'feature/x',
+      baseRef: 'main',
+    })
+    expect(pulls).toHaveLength(1)
+    expect(pulls[0].number).toBe(91)
+    expect(pulls[0].state).toBe('open')
+    expect(pulls[0].head.ref).toBe('feature/x')
+    expect(pulls[0].head.repo.full_name).toBe('o/r')
+    expect(pulls[0].base.ref).toBe('main')
+  })
+
+  test('a body that is not an array maps to no pulls rather than throwing', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(200, { message: 'not a list' }, []),
+    })
+    expect(await client.listOpenPullsForPair('o', 'r', { headRef: 'a', baseRef: 'b' })).toEqual([])
+  })
+
+  test('a non-2xx throws GithubRequestError', async () => {
+    const client = createGithubClient({
+      tokenSource: staticToken('t'),
+      fetchImpl: fakeFetch(404, { message: 'Not Found' }, []),
+    })
+    await expect(
+      client.listOpenPullsForPair('o', 'r', { headRef: 'a', baseRef: 'b' }),
+    ).rejects.toBeInstanceOf(GithubRequestError)
+  })
+})

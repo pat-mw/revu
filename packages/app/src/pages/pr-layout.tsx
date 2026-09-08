@@ -1,12 +1,36 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Link, NavLink, Outlet, useParams } from 'react-router'
-import { Download, Inbox, RefreshCw } from 'lucide-react'
-import type { ApiError, Snapshot, StalenessInfo } from '@revu/shared'
-import { identityName, parseCommentIdentity } from '@revu/shared'
+import { Link, NavLink, Outlet, useNavigate, useParams } from 'react-router'
+import { Download, Inbox, RefreshCw, Trash2 } from 'lucide-react'
+import type {
+  ApiError,
+  CommentIdentity,
+  PullDetail,
+  PullSummary,
+  ReviewDraft,
+  Snapshot,
+  StalenessInfo,
+} from '@revu/shared'
+import { draftHoldsText, identityName, parseCommentIdentity } from '@revu/shared'
 import { usePullList, useSnapshot, useStaleness, useSyncPull } from '@/state/queries'
+import { useDraft, useDraftActions } from '@/state/drafts'
+import { useDeleteLocalReview } from '@/state/local-reviews'
 import { useSession } from '@/state/session'
 import { countChecks } from '@/lib/checks-rollup'
+import type { CheckCounts } from '@/lib/checks-rollup'
+import { rowIdentity } from '@/lib/local-reviews'
+import type { RowIdentity } from '@/lib/local-reviews'
+import {
+  deleteLocalReviewCopy,
+  deleteLocalReviewFailedCopy,
+  notFoundCopy,
+  stateChipCopy,
+  stateChipVariant,
+  syncCostCopy,
+} from '@/lib/mode-copy'
+import type { DeleteDraftSummary, ReviewState } from '@/lib/mode-copy'
+import { reviewMode, reviewTabs } from '@/lib/review-mode'
+import type { ReviewMode, ReviewTab } from '@/lib/review-mode'
 import { minutesUntil, relativeTime, shortSha } from '@/lib/time'
 import { useShortcut } from '@/lib/keyboard'
 import { cn } from '@/lib/cn'
@@ -19,7 +43,15 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { useToast } from '@/components/ui/toast'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { ConfirmDeleteLocalReviewDialog } from '@/components/confirm-delete-local-review'
+import type {
+  DeleteAttemptAnswer,
+  DeleteDraftRead,
+} from '@/components/confirm-delete-local-review'
+import { describeApiError } from '@/components/review/error-copy'
 import { ReviewBar } from '@/components/review/review-bar'
+import { ReviewDirtyBanner } from '@/components/review/dirty-banner'
+import { ReviewSupersededBanner } from '@/components/review/superseded-banner'
 import { AuthorBanner } from '@/components/author/author-banner'
 
 /**
@@ -115,13 +147,32 @@ export function SyncEmptyState({
 // The snapshot seal
 // ————————————————————————————————————————————————————————————————
 
-function SnapshotSeal({
+/**
+ * What the header says about the snapshot the review is being read from: that
+ * nothing has been read yet, that a read is running, that one died partway, or
+ * that time moved underneath what was read.
+ *
+ * Props-only and exported for the reason the three header rows are: the layout
+ * around it needs a query client, a session and a loaded pull list before it
+ * renders a single element, while the seal needs only a snapshot and a
+ * staleness report — so what each of its readings says is assertable against
+ * real markup.
+ *
+ * Only the sync's cost differs by the kind of review. Everything the seal says
+ * about time having moved is a fact about what a repository did to a branch,
+ * which is as true of two local branches as of a mediated pull request, so
+ * those readings are deliberately identical and are asserted to stay so.
+ */
+export function SnapshotSeal({
+  mode,
   snapshot,
   loading,
   staleness,
   syncing,
   onSync,
 }: {
+  /** Which kind of review the seal is on — only the sync's cost differs by it. */
+  mode: ReviewMode
   /** `undefined` while the snapshot query loads; `null` means never synced. */
   snapshot: Snapshot | null | undefined
   loading: boolean
@@ -151,10 +202,7 @@ function SnapshotSeal({
               Sync
             </Button>
           </TooltipTrigger>
-          <TooltipContent>
-            Pulls the whole PR down in one burst (~3 + 2 requests per changed file), then
-            review is fully local.
-          </TooltipContent>
+          <TooltipContent>{syncCostCopy(mode)}</TooltipContent>
         </Tooltip>
       </span>
     )
@@ -193,7 +241,10 @@ function SnapshotSeal({
             </TooltipTrigger>
             <TooltipContent>
               The base branch moved, so the three-dot compare changed even though head
-              didn't. The diff is keyed merge_base…head.
+              didn't. The diff is keyed merge_base…head. A local review recomputes that
+              merge base against the live base branch tip on every sync; a pull request
+              reads GitHub's pull.base.sha, which only refreshes on a synchronize event
+              — so the two really can disagree about what changed.
             </TooltipContent>
           </Tooltip>
           <Button size="sm" onClick={onSync}>
@@ -232,6 +283,25 @@ function SnapshotSeal({
 // Tab strip — NavLinks styled like the underline TabsTrigger.
 // ————————————————————————————————————————————————————————————————
 
+/** What each section is called where a reader can see it. */
+const TAB_LABELS: Record<ReviewTab, string> = {
+  description: 'Description',
+  conversation: 'Conversation',
+  files: 'Files',
+  commits: 'Commits',
+  checks: 'Checks',
+}
+
+/**
+ * The strip's accessible name. It is the header's only landmark, so it keeps
+ * one in both kinds of review — a review of two local branches simply has no
+ * pull request to name.
+ */
+const TAB_STRIP_LABEL: Record<ReviewMode, string> = {
+  github: 'Pull request sections',
+  local: 'Review sections',
+}
+
 function TabLink({ to, label, count }: { to: string; label: string; count?: number }) {
   return (
     <NavLink
@@ -262,6 +332,352 @@ function TabLink({ to, label, count }: { to: string; label: string; count?: numb
   )
 }
 
+/**
+ * The section tabs for one review.
+ *
+ * Props-only and exported on purpose: the layout around it needs a query
+ * client, a session and a loaded pull list before it renders anything, while
+ * the strip needs the mode and two counts — so which sections a review offers
+ * is assertable against real markup rather than against a promise.
+ *
+ * Which tabs exist is read from `reviewTabs`, the same table the route guard
+ * consults, so a section the strip omits and a section the router redirects
+ * away from can never disagree.
+ */
+export function PrTabs({
+  mode,
+  changedFiles,
+  unresolved,
+}: {
+  mode: ReviewMode
+  /** Files in the diff, or `undefined` until the snapshot has been read. */
+  changedFiles: number | undefined
+  /** Threads still open. Zero draws no chip — a quiet tab is not a busy one. */
+  unresolved: number
+}) {
+  const countFor = (tab: ReviewTab): number | undefined => {
+    if (tab === 'files') return changedFiles
+    if (tab === 'conversation') return unresolved > 0 ? unresolved : undefined
+    return undefined
+  }
+  return (
+    <nav className="-mb-px flex items-end gap-4" aria-label={TAB_STRIP_LABEL[mode]}>
+      {reviewTabs(mode).map((tab) => (
+        <TabLink key={tab} to={tab} label={TAB_LABELS[tab]} count={countFor(tab)} />
+      ))}
+    </nav>
+  )
+}
+PrTabs.displayName = 'PrTabs'
+
+// ————————————————————————————————————————————————————————————————
+// Identity row — what the review is, at the top of the header.
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * Which of the three states a review is in, read off the review itself. A
+ * merge timestamp is the only evidence one landed — a merged pull request also
+ * reports `state: 'closed'`, so the timestamp is checked first.
+ */
+function reviewState(pull: PullSummary): ReviewState {
+  if (pull.merged_at) return 'merged'
+  return pull.state === 'open' ? 'open' : 'closed'
+}
+
+/**
+ * What a review is called, in the slot at the head of its identity row.
+ *
+ * A pull request is called by its number. A review of two local branches has
+ * no pull request and so no number a reader could use — only a synthetic key
+ * from a reserved band, which exists so every route and cache entry can stay a
+ * plain integer and means nothing to anyone reading the screen. So it is
+ * called by the branch pair it compares, and the key is never drawn.
+ *
+ * The pair is named as one thing rather than read out piecemeal: the arrow
+ * carries the direction and an arrow has no spoken form, so the whole slot is
+ * labelled as a sentence and its parts are left to the eye.
+ */
+function IdentitySlot({ mode, pull }: { mode: ReviewMode; pull: PullSummary }) {
+  if (mode === 'github') {
+    return <span className="shrink-0 font-mono text-ink-faint">#{pull.number}</span>
+  }
+  return (
+    <span
+      role="img"
+      aria-label={`Local review of ${pull.head.ref} against ${pull.base.ref}`}
+      className="flex max-w-64 shrink-0 items-center gap-1 font-mono text-ink-faint"
+    >
+      <span className="min-w-0 truncate">{pull.base.ref}</span>
+      <span aria-hidden>←</span>
+      <span className="min-w-0 truncate">{pull.head.ref}</span>
+    </span>
+  )
+}
+
+/**
+ * Row 1 of the review header: the way back, what the review is, what it is
+ * called, and what it claims about itself.
+ *
+ * Props-only and exported for the reason the tab strip is: the layout around
+ * it needs a query client, a session and a loaded list before it renders a
+ * single element, while this row needs only the mode and the review itself —
+ * so "the synthetic key never reaches a screen" is a property assertable
+ * against real markup rather than a promise about a branch buried in a page.
+ *
+ * The local marker is the quiet outline chip, not the seal one row below and
+ * not the violet: where a review came from is a fact about its provenance,
+ * while the seal reports that time moved underneath a snapshot and violet is
+ * reserved for work that is still pending.
+ */
+export function PrIdentityRow({ mode, pull }: { mode: ReviewMode; pull: PullSummary }) {
+  const state = reviewState(pull)
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <Link to="/" className="shrink-0 text-2xs text-ink-faint hover:text-ink-mut">
+        ← inbox
+      </Link>
+      <IdentitySlot mode={mode} pull={pull} />
+      <h1 className="min-w-0 truncate text-base font-semibold text-ink" title={pull.title}>
+        {pull.title}
+      </h1>
+      {mode === 'local' && (
+        <Badge className="shrink-0" variant="outline">
+          local
+        </Badge>
+      )}
+      <Badge className="shrink-0" variant={stateChipVariant(mode, state)}>
+        {stateChipCopy(mode, state)}
+      </Badge>
+      {pull.draft && (
+        <Badge className="shrink-0" variant="draft">
+          draft
+        </Badge>
+      )}
+    </div>
+  )
+}
+PrIdentityRow.displayName = 'PrIdentityRow'
+
+// ————————————————————————————————————————————————————————————————
+// Deleting the review — the one action that ends a branch pair
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * What the confirmation needs to know about a draft, or null when it holds no
+ * text at all.
+ *
+ * Null is the same answer for "no draft" and "a draft an editor made on its own
+ * and nobody typed into", because the two are the same fact to everything
+ * downstream: the delete is not refused for either, no discard is sent, and the
+ * confirmation promises none. What counts as text is asked of the one shared
+ * definition rather than re-derived here — a second reading of that question is
+ * a second answer, and the wrong one either destroys text without a word or
+ * makes a review nobody has touched undeletable.
+ */
+function heldText(draft: ReviewDraft | null): DeleteDraftSummary | null {
+  if (draft === null || !draftHoldsText(draft)) return null
+  return { pendingCount: draft.comments.length, hasBody: draft.body.length > 0 }
+}
+
+/**
+ * The header's way of ending a review of two local branches.
+ *
+ * Offered on a branch pair only, and on an archived one as much as a live one:
+ * a review superseded by work that moved on is exactly the review someone wants
+ * to clear out, and withholding the action there would leave it with no way to
+ * go at all.
+ *
+ * Quiet until it is reached — a bare control in the header, taking its red only
+ * on hover and keyboard focus — because the header is somewhere a reader passes
+ * through constantly and this is the one thing on it that cannot be undone. The
+ * confirmation behind it is where the act is spelled out.
+ *
+ * The control waits for the draft read to SUCCEED before it will confirm
+ * anything, and that is a correctness matter rather than polish: whether this
+ * reader's own draft is discarded on the way is decided from that read, and
+ * deciding it from a read that is still in flight — or from one that failed,
+ * which answers with the same empty-looking absence — would send a delete that
+ * leaves their own text in the way and then explain the refusal as somebody
+ * else's.
+ *
+ * The discard itself is the editing surface's own, not a bare request. That
+ * surface holds a debounced save and a retry behind it, and a discard that
+ * skipped them would race a timer that re-creates the draft between the discard
+ * and the delete.
+ */
+function DeleteLocalReviewAction({
+  prNumber,
+  identity,
+}: {
+  prNumber: number
+  identity: RowIdentity
+}) {
+  const navigate = useNavigate()
+  const draft = useDraft(prNumber)
+  const draftActions = useDraftActions(prNumber)
+  const remove = useDeleteLocalReview()
+  const { toast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [attempt, setAttempt] = useState<DeleteAttemptAnswer | null>(null)
+
+  const held = heldText(draft.data ?? null)
+  const draftRead: DeleteDraftRead = draft.isSuccess
+    ? 'read'
+    : draft.isError
+      ? 'unreadable'
+      : 'reading'
+  // The trigger says exactly what the plain confirmation's own control says,
+  // read from the one place either sentence is decided. It stays the plain
+  // wording whatever the draft holds: the escalation belongs in the
+  // confirmation, where the consequence is spelled out beside it.
+  const label = deleteLocalReviewCopy('local', null)?.confirm ?? ''
+
+  const confirm = () => {
+    setAttempt(null)
+    remove.mutate(
+      { reviewId: prNumber, discard: held === null ? null : draftActions.discard },
+      {
+        onSuccess: (result) => {
+          if (result.outcome === 'deleted') {
+            setOpen(false)
+            navigate('/')
+            return
+          }
+          // Kept open, holding whatever the far end answered: there is nothing
+          // this reader can do about it here, and closing onto an unchanged
+          // header would say nothing happened at all. A failure is reported in
+          // the toast as well, because the dialog can be dismissed and the fact
+          // that a draft was discarded on the way must outlive it.
+          if (result.outcome === 'failed') {
+            const detail = describeApiError(result.error)
+            setAttempt({ kind: 'failed', detail, discarded: result.discarded })
+            toast({
+              kind: 'error',
+              title: deleteLocalReviewFailedCopy('local', result) ?? '',
+              detail,
+            })
+            return
+          }
+          setAttempt({ kind: 'refused', detail: result.reason, discarded: result.discarded })
+        },
+      },
+    )
+  }
+
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="shrink-0 hover:bg-danger/12 hover:text-danger focus-visible:bg-danger/12 focus-visible:text-danger"
+        onClick={() => {
+          setAttempt(null)
+          setOpen(true)
+        }}
+      >
+        <Trash2 strokeWidth={1.5} aria-hidden />
+        {label}
+      </Button>
+      <ConfirmDeleteLocalReviewDialog
+        open={open}
+        onOpenChange={setOpen}
+        identity={identity}
+        draft={held}
+        draftRead={draftRead}
+        busy={remove.isPending}
+        attempt={attempt}
+        onConfirm={confirm}
+        onCancel={() => setOpen(false)}
+      />
+    </>
+  )
+}
+DeleteLocalReviewAction.displayName = 'DeleteLocalReviewAction'
+
+// ————————————————————————————————————————————————————————————————
+// Meta row — who wrote it and how big it is, under the identity row.
+// ————————————————————————————————————————————————————————————————
+
+/**
+ * The dot beside the check tally. Precedence is failure → still running →
+ * success, because a red run matters even while others are still going.
+ */
+function checksDotClass(checks: CheckCounts): string {
+  if (checks.failed > 0) return 'bg-danger'
+  if (checks.running > 0) return 'animate-pulse bg-stale'
+  return 'bg-add'
+}
+
+/**
+ * Row 2 of the review header: who wrote it, which branches it compares, how it
+ * merges, how its checks are doing and how big its diff is.
+ *
+ * Props-only and exported for the reason the tab strip and the identity row
+ * are: the layout around it needs a query client, a session and a loaded pull
+ * list before it renders a single element, while this row needs only the mode,
+ * the review and what the snapshot said — so which of these facts a given kind
+ * of review states is assertable against real markup rather than promised.
+ *
+ * The branch pair is drawn here ONLY for a pull request. A pull request is
+ * called by its number one row above, so this is the only place it says which
+ * branches it compares. A review of two local branches has no number and is
+ * called by the pair itself, so the row above already carries it — repeating it
+ * here would say the same thing twice in one header, and the row that says it
+ * is the one the reader reads as the review's name.
+ */
+export function PrMetaRow({
+  mode,
+  pull,
+  author,
+  detail,
+  checks,
+}: {
+  mode: ReviewMode
+  pull: PullSummary
+  /** Who wrote the review, already resolved against the session's write identity. */
+  author: CommentIdentity
+  /** The snapshot's fuller reading of the review, or `undefined` until it is read. */
+  detail: PullDetail | undefined
+  /** The snapshot's check runs bucketed, or `null` while there is no snapshot. */
+  checks: CheckCounts | null
+}) {
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-mut">
+      <span className="inline-flex min-w-0 items-center gap-1.5">
+        <IdentityAvatar identity={author} mode={mode} size="xs" />
+        <span className="truncate">{identityName(author)}</span>
+      </span>
+      {mode === 'github' && (
+        <span className="font-mono">
+          {pull.base.ref} ← {pull.head.ref}
+        </span>
+      )}
+      {detail?.mergeable === false ? (
+        <Badge variant="danger">merge conflict</Badge>
+      ) : detail?.mergeable_state === 'blocked' ? (
+        <Badge variant="outline">review required</Badge>
+      ) : null}
+      {checks !== null && checks.total > 0 && (
+        <Link
+          to="checks"
+          className="inline-flex items-center gap-1.5 text-ink-mut hover:text-ink"
+        >
+          <span className={cn('size-1.5 rounded-full', checksDotClass(checks))} aria-hidden />
+          {checks.passed}/{checks.total} checks
+        </Link>
+      )}
+      {detail && (
+        <span className="inline-flex items-center gap-1.5 font-mono">
+          {detail.changed_files} files
+          <span className="text-add">+{detail.additions}</span>
+          <span className="text-del">−{detail.deletions}</span>
+        </span>
+      )}
+    </div>
+  )
+}
+PrMetaRow.displayName = 'PrMetaRow'
+
 // ————————————————————————————————————————————————————————————————
 // Layout
 // ————————————————————————————————————————————————————————————————
@@ -269,6 +685,9 @@ function TabLink({ to, label, count }: { to: string; label: string; count?: numb
 export function PrLayout() {
   const params = useParams<{ n: string }>()
   const prNumber = Number(params.n)
+  // Derived once for the whole subtree and threaded down as a prop, so no two
+  // surfaces inside one review can disagree about which kind it is.
+  const mode = reviewMode(prNumber)
 
   const session = useSession()
   const list = usePullList()
@@ -334,8 +753,12 @@ export function PrLayout() {
     )
   }
 
-  // The list is loaded and this PR genuinely isn't in it.
+  // The list is loaded and this review genuinely isn't in it. Which sentence
+  // explains that depends on the kind of review the path named, so the copy is
+  // read from the mode rather than from the one kind that has an installation
+  // behind it.
   if (!item) {
+    const copy = notFoundCopy(mode, params.n ?? '')
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="hairline-b px-4 py-2">
@@ -346,11 +769,11 @@ export function PrLayout() {
         <div className="flex flex-1 items-center justify-center">
           <EmptyState
             icon={<Inbox size={20} strokeWidth={1.5} />}
-            title={`PR #${params.n} isn't in this installation`}
-            hint="The broker only sees pull requests in repos this GitHub App is installed on."
+            title={copy.title}
+            hint={copy.hint}
             action={
               <Button asChild variant="outline" size="sm">
-                <Link to="/">Back to inbox</Link>
+                <Link to="/">{copy.action}</Link>
               </Button>
             }
           />
@@ -366,86 +789,47 @@ export function PrLayout() {
   )
   const detail = snapshot?.mutable.pull
   const rollup = snapshot ? countChecks(snapshot.mutable.checks) : null
-  const checksDot =
-    rollup === null
-      ? ''
-      : rollup.failed > 0
-        ? 'bg-danger'
-        : rollup.running > 0
-          ? 'animate-pulse bg-stale'
-          : 'bg-add'
-  const stateBadge = pull.merged_at
-    ? { label: 'merged', variant: 'default' as const }
-    : pull.state === 'open'
-      ? { label: 'open', variant: 'add' as const }
-      : { label: 'closed', variant: 'danger' as const }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="hairline-b px-4 pt-3">
-        {/* Row 1 — identity of the PR itself */}
-        <div className="flex min-w-0 items-center gap-2">
-          <Link to="/" className="shrink-0 text-2xs text-ink-faint hover:text-ink-mut">
-            ← inbox
-          </Link>
-          <span className="shrink-0 font-mono text-ink-faint">#{pull.number}</span>
-          <h1
-            className="min-w-0 truncate text-base font-semibold text-ink"
-            title={pull.title}
-          >
-            {pull.title}
-          </h1>
-          <Badge className="shrink-0" variant={stateBadge.variant}>
-            {stateBadge.label}
-          </Badge>
-          {pull.draft && (
-            <Badge className="shrink-0" variant="draft">
-              draft
-            </Badge>
+        {/* Row 1 — identity of the review itself, and (on a branch pair) the
+            one action that ends it */}
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <PrIdentityRow mode={mode} pull={pull} />
+          {mode === 'local' && (
+            <DeleteLocalReviewAction prNumber={prNumber} identity={rowIdentity(item)} />
           )}
         </div>
 
         {/* Row 2 — meta: author, refs, mergeability, checks, diff size */}
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-mut">
-          <span className="inline-flex min-w-0 items-center gap-1.5">
-            <IdentityAvatar identity={author.identity} size="xs" />
-            <span className="truncate">{identityName(author.identity)}</span>
-          </span>
-          <span className="font-mono">
-            {pull.base.ref} ← {pull.head.ref}
-          </span>
-          {detail?.mergeable === false ? (
-            <Badge variant="danger">merge conflict</Badge>
-          ) : detail?.mergeable_state === 'blocked' ? (
-            <Badge variant="outline">review required</Badge>
-          ) : null}
-          {rollup !== null && rollup.total > 0 && (
-            <Link
-              to="checks"
-              className="inline-flex items-center gap-1.5 text-ink-mut hover:text-ink"
-            >
-              <span className={cn('size-1.5 rounded-full', checksDot)} aria-hidden />
-              {rollup.passed}/{rollup.total} checks
-            </Link>
-          )}
-          {detail && (
-            <span className="inline-flex items-center gap-1.5 font-mono">
-              {detail.changed_files} files
-              <span className="text-add">+{detail.additions}</span>
-              <span className="text-del">−{detail.deletions}</span>
-            </span>
-          )}
-        </div>
+        <PrMetaRow
+          mode={mode}
+          pull={pull}
+          author={author.identity}
+          detail={detail}
+          checks={rollup}
+        />
 
-        {/* PR-author banner: its own logic decides whether it shows anything. */}
-        <div className="pt-2 empty:hidden">
-          <AuthorBanner prNumber={prNumber} />
+        {/* The header's banner stack. Each member decides its own visibility
+            and renders nothing when it has none, so the slot collapses
+            entirely when they all do and a member can be added without any of
+            the others knowing about it.
+
+            The order is fixed rather than incidental, from the widest claim
+            about the review down to the narrowest: what has superseded it,
+            then what it does not cover, then what it is waiting on. */}
+        <div className="flex flex-col gap-2 py-2 empty:hidden">
+          <ReviewSupersededBanner prNumber={prNumber} mode={mode} />
+          <ReviewDirtyBanner prNumber={prNumber} mode={mode} />
+          <AuthorBanner prNumber={prNumber} mode={mode} />
         </div>
 
         {/* Row 3 — the seal on the left, section tabs on the right */}
         <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
           <div className="pb-1.5">
             <SnapshotSeal
+              mode={mode}
               snapshot={snapshot}
               loading={snapshotQuery.isPending}
               staleness={staleness}
@@ -453,21 +837,11 @@ export function PrLayout() {
               onSync={runSync}
             />
           </div>
-          <nav className="-mb-px flex items-end gap-4" aria-label="Pull request sections">
-            <TabLink to="description" label="Description" />
-            <TabLink
-              to="conversation"
-              label="Conversation"
-              count={
-                item.broker.unresolvedThreads > 0
-                  ? item.broker.unresolvedThreads
-                  : undefined
-              }
-            />
-            <TabLink to="files" label="Files" count={detail?.changed_files} />
-            <TabLink to="commits" label="Commits" />
-            <TabLink to="checks" label="Checks" />
-          </nav>
+          <PrTabs
+            mode={mode}
+            changedFiles={detail?.changed_files}
+            unresolved={item.broker.unresolvedThreads}
+          />
         </div>
       </header>
 

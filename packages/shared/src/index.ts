@@ -6,7 +6,11 @@
  */
 export * from './api/types'
 export * from './api/client'
+export * from './api/ids'
 export * from './lib/anchor'
+export * from './lib/drafts'
 export * from './lib/identity'
+export * from './lib/local-archive'
+export * from './lib/refs'
 export * from './http'
 export * from './http-validators'

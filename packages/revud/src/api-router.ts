@@ -5,6 +5,7 @@ import {
   ValidationError,
   errorBodyFromApiError,
   statusForApiError,
+  validateCreateLocalReviewInput,
   validateReactionBody,
   validateReplyBody,
   validateResolveBody,
@@ -369,6 +370,30 @@ export async function handleApi(
 
       case 'getRateLimit':
         return json(await api.getRateLimit())
+
+      case 'listBranches':
+        return json(await api.listBranches())
+
+      case 'createLocalReview': {
+        // Untrusted HTTP input whose two ref fields become git arguments
+        // downstream, so the shape is validated at the door rather than
+        // trusted — a non-string ref would otherwise reach the syntactic ref
+        // validator as a runtime fault instead of a typed rejection.
+        const input = validateCreateLocalReviewInput(await readJsonBody(req))
+        const summary = await api.createLocalReview(input)
+        flushDurable(store)
+        return json(summary)
+      }
+
+      case 'listLocalReviews':
+        return json(await api.listLocalReviews())
+
+      case 'deleteLocalReview': {
+        if (n === null) return badRequest('Malformed local review id.')
+        await api.deleteLocalReview(n)
+        flushDurable(store)
+        return json({ ok: true })
+      }
 
       default: {
         // Exhaustiveness guard: every RouteName above is handled.

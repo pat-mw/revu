@@ -1,0 +1,284 @@
+import { describe, expect, test } from 'bun:test'
+import type { PullListItem } from '@revu/shared'
+import { LOCAL_REVIEW_ID_BASE } from '@revu/shared'
+import type { RowIdentity } from './local-reviews'
+import {
+  archivedPrUrl,
+  createReviewIssue,
+  isLocal,
+  isLocalReviewItem,
+  localReviewLabel,
+  partitionInbox,
+  rowIdentity,
+} from './local-reviews'
+
+/**
+ * A listed review reduced to what this module reads: its number, the branch it
+ * comes FROM, and the branch it points TO. Everything else is filler.
+ *
+ * The band is what decides local from remote, so the same helper builds both
+ * kinds — a local review is a pull-shaped row with a number above the base, not
+ * a differently shaped object.
+ */
+function pr(number: number, head: string, base: string): PullListItem {
+  const ref = (r: string) => ({
+    ref: r,
+    sha: `sha-${r}`,
+    label: `o:${r}`,
+    repo: { full_name: 'o/r', default_branch: 'main' },
+  })
+  return {
+    pull: {
+      id: number,
+      node_id: `n${number}`,
+      number,
+      state: 'open',
+      draft: false,
+      merged_at: null,
+      title: `Review ${number}`,
+      body: null,
+      user: {
+        login: 'someone',
+        id: 1,
+        node_id: '',
+        avatar_url: '',
+        html_url: '',
+        type: 'User',
+      },
+      labels: [],
+      requested_reviewers: [],
+      head: ref(head),
+      base: ref(base),
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    },
+    broker: {
+      authorHumanId: null,
+      canApprove: true,
+      unresolvedThreads: 0,
+      assignedReviewerHumanIds: [],
+      compareKey: `${base}...${head}`,
+      commitCount: 1,
+    },
+  } as PullListItem
+}
+
+/** Review numbers, in the order they came out. */
+const numbers = (items: readonly PullListItem[]) => items.map((it) => it.pull.number)
+
+/** Review numbers, ascending — order-independent, for a set comparison. */
+const sorted = (items: readonly PullListItem[]) => [...numbers(items)].sort((a, b) => a - b)
+
+describe('telling a local review from a pull request', () => {
+  test('the reserved band begins exactly at its base', () => {
+    expect(isLocal(LOCAL_REVIEW_ID_BASE)).toBe(true)
+    expect(isLocal(LOCAL_REVIEW_ID_BASE - 1)).toBe(false)
+    expect(isLocal(482)).toBe(false)
+  })
+
+  test('a listed row is judged by the same band', () => {
+    expect(isLocalReviewItem(pr(LOCAL_REVIEW_ID_BASE, 'release/0.41', 'main'))).toBe(true)
+    expect(isLocalReviewItem(pr(482, 'feature/y', 'main'))).toBe(false)
+  })
+})
+
+describe('splitting the inbox into its two kinds', () => {
+  // Interleaved on purpose, and with the local pair DESCENDING, so a result
+  // that merely happens to be sorted cannot pass for one that preserved order.
+  const items = [
+    pr(482, 'feature/y', 'main'),
+    pr(LOCAL_REVIEW_ID_BASE + 1, 'feature/x', 'main'),
+    pr(347, 'feature/z', 'main'),
+    pr(LOCAL_REVIEW_ID_BASE, 'release/0.41', 'main'),
+  ]
+
+  test('each side keeps the order it arrived in', () => {
+    const { local, github } = partitionInbox(items)
+    expect(numbers(local)).toEqual([LOCAL_REVIEW_ID_BASE + 1, LOCAL_REVIEW_ID_BASE])
+    expect(numbers(github)).toEqual([482, 347])
+  })
+
+  test('the split is total — nothing is dropped and nothing is counted twice', () => {
+    const { local, github } = partitionInbox(items)
+    expect(local.length + github.length).toBe(items.length)
+    expect(sorted([...local, ...github])).toEqual(sorted(items))
+  })
+
+  test('an empty inbox yields two empty sides rather than a missing one', () => {
+    expect(partitionInbox([])).toEqual({ local: [], github: [] })
+  })
+})
+
+/**
+ * Everything the identity slot would draw, whichever variant it is — the one
+ * extraction both the absence assertion below and its positive control search,
+ * so neither can be looking at a different string from the other.
+ */
+function renderedIdentity(identity: RowIdentity): string[] {
+  return identity.kind === 'local' ? [identity.head, identity.base] : [identity.text]
+}
+
+/** Every contiguous run of characters in `s`, including the whole of it. */
+function substrings(s: string): string[] {
+  const out: string[] = []
+  for (let start = 0; start < s.length; start++) {
+    for (let end = start + 1; end <= s.length; end++) out.push(s.slice(start, end))
+  }
+  return out
+}
+
+/** The pieces of `number` that appear in `text`; empty means none of it leaked. */
+function idTraces(number: number, text: string): string[] {
+  return substrings(String(number)).filter((piece) => text.includes(piece))
+}
+
+describe('the identity a row renders', () => {
+  test('a local review shows its branch pair and no fragment of its number', () => {
+    const item = pr(LOCAL_REVIEW_ID_BASE + 1, 'feature/x', 'main')
+    const identity = rowIdentity(item)
+    expect(identity.kind).toBe('local')
+
+    for (const text of renderedIdentity(identity)) {
+      expect(idTraces(item.pull.number, text)).toEqual([])
+    }
+
+    // The exact pair, not "a string with no `#` in it" — an empty string would
+    // satisfy that and render an identity slot with nothing in it.
+    expect(localReviewLabel(item.pull)).toEqual({ head: 'feature/x', base: 'main' })
+  })
+
+  test('a pull request shows its number — the control that the search finds digits', () => {
+    const item = pr(482, 'feature/y', 'main')
+    const identity = rowIdentity(item)
+    expect(identity).toEqual({ kind: 'github', text: '#482' })
+
+    const found = renderedIdentity(identity).flatMap((text) => idTraces(item.pull.number, text))
+    expect(found).toContain('482')
+  })
+})
+
+describe('the link to the pull request that superseded a review', () => {
+  test('an owner and a name become a link to that pull request', () => {
+    // The positive leg, pinned as the whole URL. Every case below is a refusal,
+    // and a function that refused everything would satisfy all of them at once.
+    expect(archivedPrUrl('meridian-labs/atlas', 101)).toBe(
+      'https://github.com/meridian-labs/atlas/pull/101',
+    )
+  })
+
+  test('a workspace with no remote has a path where the owner would be', () => {
+    // The case this function exists for. A workspace with nothing to push to
+    // records an absolute path as its repository identity, and interpolating
+    // that into a URL produces a link that looks real, is not, and 404s on a
+    // site the reader may never have visited.
+    expect(archivedPrUrl('/Users/x/repo', 101)).toBeNull()
+  })
+
+  test('and an identity with no owner and name in it at all is refused', () => {
+    expect(archivedPrUrl('', 101)).toBeNull()
+  })
+
+  test('and one with more than the two halves is refused', () => {
+    // Not narrowed to the first two: a three-part identity is not an owner and
+    // a name with something after it, it is a shape this function does not
+    // recognise, and guessing at it is how the path case above would slip back
+    // in through its front half.
+    expect(archivedPrUrl('a/b/c', 101)).toBeNull()
+  })
+
+  test('and a two-segment path, which is the same shape one separator away', () => {
+    // The shortest form of the no-remote case, and the one a rule reading only
+    // the LAST two segments would happily turn into a link.
+    expect(archivedPrUrl('/a/b', 101)).toBeNull()
+  })
+
+  test('and one whose name half is missing is refused', () => {
+    expect(archivedPrUrl('owner/', 101)).toBeNull()
+  })
+
+  test('a dot-segment where a half belongs is refused', () => {
+    // Why the halves are checked for what they are made of and not merely
+    // counted. `owner/..` is one separator with two non-empty halves, so a rule
+    // that counted them builds `https://github.com/owner/../pull/101` — which
+    // every browser resolves one level up, sending the reader to a pull request
+    // in a repository this workspace never named. The shape reads the same
+    // whichever half it lands in.
+    expect(archivedPrUrl('owner/..', 101)).toBeNull()
+    expect(archivedPrUrl('../name', 101)).toBeNull()
+  })
+
+  test('and a single dot, which is the same trick one level shorter', () => {
+    expect(archivedPrUrl('owner/.', 101)).toBeNull()
+  })
+
+  test('and a half holding a character no repository identity holds', () => {
+    // A space is not part of any owner or repository name. A percent-escape is
+    // worse than that: `na%2Fme` is `na/me` to the site that receives it, so a
+    // half waved through on the grounds that it contains no separator would
+    // carry one to GitHub regardless.
+    expect(archivedPrUrl('own er/name', 101)).toBeNull()
+    expect(archivedPrUrl('owner/na%2Fme', 101)).toBeNull()
+  })
+
+  test('and the ordinary punctuation real identities carry still links', () => {
+    // The control for the refusals above, and the reason the rule is a
+    // character set with an anchored first character rather than a ban on the
+    // dot: dots, dashes and underscores are what owners and repositories are
+    // actually spelled with. A rule that took `..` by refusing every dot would
+    // pass all four cases above and quietly drop the link from a large share of
+    // real workspaces.
+    expect(archivedPrUrl('my-org.io/re.po_1', 101)).toBe(
+      'https://github.com/my-org.io/re.po_1/pull/101',
+    )
+  })
+
+  test('and a number no pull request could have is refused', () => {
+    // The number reaches the path segment, so it is checked for what a pull
+    // request number is rather than assumed to be one.
+    expect(archivedPrUrl('meridian-labs/atlas', 0)).toBeNull()
+    expect(archivedPrUrl('meridian-labs/atlas', -1)).toBeNull()
+    expect(archivedPrUrl('meridian-labs/atlas', 1.5)).toBeNull()
+    expect(archivedPrUrl('meridian-labs/atlas', Number.NaN)).toBeNull()
+  })
+})
+
+/**
+ * The pre-flight's complaint about `pair`, asserted to be real text: a non-null
+ * empty string would satisfy "returns something" while telling the reader
+ * nothing.
+ */
+function refusal(pair: { base: string; head: string }): string {
+  const issue = createReviewIssue(pair)
+  expect(typeof issue).toBe('string')
+  expect((issue ?? '').trim().length).toBeGreaterThan(0)
+  return issue ?? ''
+}
+
+describe('refusing a branch pair before it is sent', () => {
+  test('one branch cannot be reviewed against itself', () => {
+    refusal({ base: 'main', head: 'main' })
+  })
+
+  test('a missing side is refused', () => {
+    refusal({ base: '', head: 'f' })
+  })
+
+  test('a ref git would read as an option is refused', () => {
+    refusal({ base: '--upload-pack=x', head: 'f' })
+  })
+
+  // Without this the whole describe passes against a `() => 'no'` stub: it is
+  // what separates a pre-flight from a refusal of everything.
+  test('a valid pair passes', () => {
+    expect(createReviewIssue({ base: 'main', head: 'feature/x' })).toBeNull()
+  })
+
+  test('each refused shape gets its own sentence', () => {
+    const said = [
+      refusal({ base: 'main', head: 'main' }),
+      refusal({ base: '', head: 'f' }),
+      refusal({ base: '--upload-pack=x', head: 'f' }),
+    ]
+    expect(new Set(said).size).toBe(said.length)
+  })
+})
