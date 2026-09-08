@@ -1,3 +1,66 @@
+## 2026-09-08 (M8.18) — the chain merged; the broker boot now assembles the local surface
+
+### Orient
+1. `git checkout m8.18/broker-local-surface` — based on **`main`**, which is the merged chain (#73–#84 and
+   #69). This is the only branch in flight.
+2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check`, then `bun run conformance:matrix` — the matrix now
+   has a required leg **H**.
+3. `gh pr list` → this ticket's PR against `main`, and **#85 still open** (`board/m8-closeout`). #85 carries
+   M8.13–M8.17, `AUDIT-2026-09-02.*` and `AUDIT-DISPOSITION.md`, none of which are on `main` — so a branch cut
+   from `main` (this one included) does not see those tickets. Expect a small conflict on `BOARD.md`, `LOG.md`
+   and `HANDOVER.md` when #85 and this PR both land; both edit their own regions and the resolution is
+   mechanical.
+4. Read `BOARD.md` → this entry → `tickets/M8.18-broker-local-surface.md`.
+
+### What this session did
+One ticket, raised from outside the board: a client workspace running **broker mode** went to pull the
+local-review pipeline in and found nothing there. **Broker mode served no reviews of local branches at all** —
+`mainDirect` discovered a repository and built a `createLocalReviewSurface`, `mainBroker` built none, so every
+id in the reserved band answered `not_found` and `POST /api/local-reviews` answered "this daemon does not serve
+local reviews". Nothing else was missing: the store is open there, the runner is the same, the session is real
+from boot, and the branch-pair listing the archive check reads was already passed in.
+
+The fix is structural rather than one call site. The assembly moved into an exported **`createBootApi`** that
+both boots call: it discovers the repository toplevel from the context's working directory, builds the surface
+over the DISCOVERED root, and passes the GitHub half through exactly as the context holds it. Each boot now
+brings only what is genuinely its own — broker its poll cache, its credential-bound branch-pair listing and its
+write decorator; direct nothing at all.
+
+Around it: the `--local-only` refusal now names the requirement it lifts (a resolvable GitHub repository, which
+only the direct boot consults) rather than claiming the capability is direct's alone; ten tests pin the shared
+assembly in `local-boot.test.ts`, each falsified by mutating the assembler; a **broker leg (H)** of the
+local-review conformance suite drives `createBootApi` over a seeded clone that has an origin remote, under the
+`fetch` tripwire plus a git-subcommand recorder; and five published surfaces that said "direct mode alone" were
+corrected — the run-mode overview, the local-review guide (twice), the broker page and the operator runbook.
+
+**Proven live**, on a reads-only broker daemon booted against this repository with no credential file at all:
+branches listed, a local review created against the discovered identity `pat-mw/revu`, synced to a full
+two-half snapshot with `syncStats.requests: 0`, snapshot read back, listing served. Every one of those answered
+`not_found` before.
+
+### Decisions not to relitigate
+- **The surface is assembled where the api is assembled.** A boot may pass its own poll cache, branch-pair
+  listing and write decorator; it may not pass its own local surface. That is what stops the same omission
+  recurring one boot away, and it is what `docs/agent/LOCAL_REVIEWS.md` D5 already said.
+- **Local writes stay outside the broker write decorator.** Nothing about them reaches GitHub, so there is no
+  shared account to stamp a display name for and no mediated write to journal. Leg H asserts the decorator is
+  never consulted, against an api whose `brokerWritesEnabled` is true.
+- **Neither startup line gained a `local=` fact.** The direct line is pinned byte-for-byte by a test that other
+  daemon-spawning suites read the bound port out of. Recorded as an open question on the ticket instead.
+
+### Hazards
+- **A cold poll cache hides the local rows.** `GET /api/pulls` on a broker answers `broker_unreachable` until
+  the credential poll has succeeded, and the local reviews go with it though they need no credential. Observed
+  live. Not fixed: serving the local half alone would silently drop the pull requests, which is the degradation
+  this codebase refuses everywhere else. The owner's call — it is the ticket's first open question.
+- Leg H's fixture repository deliberately HAS an `origin` (a broker workspace's clone does, and the archive
+  detector skips any review whose identity is not `owner/name` shaped). "No network" there is therefore a claim
+  about the subcommands that ran, not about a remote that does not exist — the file asserts both halves.
+
+### Next
+The close-out plan on #85: the owner's twelve rulings in `M8.15-owner-rulings.md`, then M8.13, M8.14 and M8.16
+in parallel, then M8.17. Nothing in M8.18 blocks any of them.
+
 ## 2026-09-02 (audit) — "did every M8 milestone land?": yes on the tip, with four majors and a ruling without a unit
 
 ### Verdict

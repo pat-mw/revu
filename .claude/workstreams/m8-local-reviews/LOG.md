@@ -688,3 +688,24 @@ then **M8.12**. Follow-ups on the board: `scripts/` into `tsc -b`; `Bun.fetch` u
 - **Blockers:** the owner's rulings (OQ10; ruling 4's live-pin bound; archived delete; pre- or post-merge for
   the majors).
 - **Next:** rulings, then one unit per major with a control seen red, then one docs commit for the drift.
+
+**update — 2026-09-08 (M8.18, broker boot)**
+- **Done:** the chain merged to `main` (#73–#84 and #69); the close-out plan is still open on #85. Then one
+  ticket, from outside the board: a client workspace running **broker mode** could not reach the local-review
+  pipeline at all, because the surface was assembled inside `mainDirect` and `mainBroker` built none — every id
+  in the reserved band answered `not_found` there. Fixed by moving the assembly into an exported
+  `createBootApi` both boots call, so the omission cannot recur one boot away; the `--local-only` refusal was
+  reworded to name the requirement it lifts rather than the capability broker now shares; ten tests pin the
+  shared assembly (each falsified by mutating the assembler); a broker leg of the local-review conformance
+  suite drives that assembler over a seeded repository and is required in the matrix; five published surfaces
+  that said "direct mode alone" were corrected. Proven live on a reads-only broker daemon with no credential
+  file: branches listed, review created, synced with a real diff at `requests: 0`, snapshot read back.
+- **Decisions:** the surface is assembled where the api is assembled — a boot may pass its own poll cache,
+  branch-pair listing and write decorator, but never its own local surface. Local writes stay outside the
+  broker write decorator: nothing reaches GitHub, so there is no shared account to stamp for and nothing to
+  journal. Neither startup line gained a `local=` fact — the direct line is pinned byte-for-byte by a test other
+  suites read the bound port out of.
+- **Blockers:** none for this ticket. `GET /api/pulls` on a broker still answers `broker_unreachable` while the
+  poll cache is cold, and the local rows go with it; recorded as an open question rather than fixed, because
+  serving the local half alone would silently drop the pull requests.
+- **Next:** the close-out plan on #85 — the owner's twelve rulings, then M8.13–M8.17.
