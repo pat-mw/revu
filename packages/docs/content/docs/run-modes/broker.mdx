@@ -38,6 +38,19 @@ How the design differs from direct mode:
    request until the credential lands, rather than failing to start.
 3. The server binds `127.0.0.1`, not `0.0.0.0`.
 
+## Reviews of local branches are served here too
+
+A [local review](/docs/guides/local-review) is a review of two branches in the
+workspace, and a broker workspace is an ordinary clone with branches in it — so
+the same surface is assembled here as in direct mode, over the repository the
+daemon discovers at boot. Nothing about it is mediated: no local comment reaches
+GitHub, so no local body is stamped with a display name and no local write is
+journaled to the audit log, because there is no shared account to attribute
+them to. For the same reason they are not gated on the bot identity — a
+reads-only broker serves the whole local loop while still refusing every write
+to a pull request. The one thing the mode adds is the list: a local review is
+merged into the live pull-request rows, so it appears in the inbox beside them.
+
 ## Host-injected, short-lived App token
 
 The host-side broker mints a **short-lived** GitHub App installation token and
