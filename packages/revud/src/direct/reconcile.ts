@@ -6,7 +6,12 @@ import type {
   ReviewDraft,
   Snapshot,
 } from '@revu/shared'
-import { ApiError, blobContentToLines, classifyPendingComment } from '@revu/shared'
+import {
+  ApiError,
+  blobContentToLines,
+  classifyPendingComment,
+  selectAnchorBlobSha,
+} from '@revu/shared'
 
 /**
  * Draft reconcile — the crown-jewel read path. After a force-push (or a base
@@ -48,6 +53,13 @@ export interface ReconcileStore {
   getSnapshot(prNumber: number): Snapshot | null
   /** One blob from the content-addressed cache, or `null` when it is absent. */
   getBlob(sha: string): FileBlob | null
+  /**
+   * Whether the store holds an object at all, independent of what can be read
+   * out of it. Distinct from `getBlob` returning non-null on purpose: a binary
+   * blob is present and yields no lines, so existence and readability are
+   * different questions and the pre-flight asks the first one.
+   */
+  hasBlob(sha: string): boolean
 }
 
 /** Everything reconcile reads from, injected so the core is unit-testable with fakes. */
@@ -90,6 +102,36 @@ export function reconcileDraft(deps: ReconcileDeps, prNumber: number): Reconcile
   }
   const { files, blobIndex, commits, headSha } = snap.immutable
 
+  // Pre-flight: every object this classification will read must actually be in
+  // the store, and the check is on the OBJECT's existence rather than on
+  // whether lines could be produced from it.
+  //
+  // Without it, a blob the store cannot produce resolves to null, the
+  // classifier reads that as "no content to match", and the comment is reported
+  // as `lost` with reason `line-deleted`. A human acting on that discards a
+  // comment whose line is still exactly where they left it. Absence of the
+  // object and absence of the line are different facts, and only one of them is
+  // repaired by syncing again — so the two must not share an answer.
+  //
+  // `hasBlob` rather than a null-lines probe, deliberately: a binary blob is
+  // perfectly present and yields no lines, and re-syncing would not change
+  // that. The side selection is the SHARED selector, never re-implemented, so
+  // this refusal and the dialog's preview can never disagree about which object
+  // a comment depends on.
+  const missing = new Set<string>()
+  for (const comment of draft.comments) {
+    const sha = selectAnchorBlobSha(blobIndex[comment.path], comment.side)
+    if (sha !== null && !store.hasBlob(sha)) missing.add(sha)
+  }
+  if (missing.size > 0) {
+    throw new ApiError(
+      'not_found',
+      `${missing.size} object(s) this draft's comments are anchored against are no longer in ` +
+        `the local store, so their positions cannot be checked. Re-sync pull #${prNumber} to ` +
+        'rebuild them, then reconcile again. The draft is untouched.',
+    )
+  }
+
   // Each comment is classified against the side its anchor lives on (base for
   // LEFT, head for RIGHT), resolving blob lines from the content-addressed
   // store. This is the SAME shared decision the reconcile dialog previews with,
@@ -108,18 +150,24 @@ export function reconcileDraft(deps: ReconcileDeps, prNumber: number): Reconcile
     }),
   )
 
-  // Commits that landed after the draft was written — the ones the force-push /
-  // base-advance added. Preferred: find the draft's head in the fresh snapshot's
-  // base→head commit list and slice everything after it. When the draft's head
-  // predates the whole list (it fell out of the rewritten compare entirely),
-  // approximate by author date newer than the draft's creation. Matches the mock
-  // oracle's semantics exactly (`src/api/mock/adapter.ts` reconcileDraft); the
-  // count is what the UI communicates as "N new commits".
+  // Commits that landed after the draft was written — the ones a force-push or a
+  // base advance added.
+  //
+  // When the draft's head is still in the fresh base→head list, the answer is
+  // exact: slice everything after it.
+  //
+  // When it is absent, the branch was rewritten and the head this draft was
+  // written against exists nowhere in the compare any more. Every commit now in
+  // the range is new relative to a head that is gone, so the whole list is the
+  // answer. The alternative — keeping commits whose author date postdates the
+  // draft — under-reports by construction, because a rebase rewrites committer
+  // dates and PRESERVES author dates: every rewritten commit keeps a date older
+  // than the draft, and the filter yields nothing on precisely the rewrite that
+  // moved the most work. The count is what the UI communicates as "N new
+  // commits", and zero is the one answer a rewrite must never produce.
   const draftHeadIndex = commits.findIndex((c) => c.sha === draft.headSha)
   const newCommits: CommitInfo[] =
-    draftHeadIndex >= 0
-      ? commits.slice(draftHeadIndex + 1)
-      : commits.filter((c) => c.commit.author.date > draft.createdAt)
+    draftHeadIndex >= 0 ? commits.slice(draftHeadIndex + 1) : [...commits]
 
   return {
     prNumber,

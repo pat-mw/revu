@@ -25,6 +25,8 @@ import type {
   MalformedCommitLog,
   MalformedDiff,
 } from './local-sync'
+import type { PinFailureReason } from './local-pins'
+import { pinSnapshotObjects } from './local-pins'
 import {
   detectDirtyWorktree,
   readLocalAuthorName,
@@ -43,6 +45,7 @@ import {
 import type { ReconcileStore } from './reconcile'
 import { reconcileDraft as runReconcileDraft } from './reconcile'
 import type { DirectStore } from './store'
+import { StoreUnreadableError } from './store'
 
 /**
  * The operations a locally created review supports, as one narrow interface the
@@ -92,8 +95,26 @@ export interface LocalReviewSurface {
    */
   listBranches(): Promise<BranchRef[]>
 
-  /** Recompute the diff between the pair's current tips and persist a snapshot. */
+  /**
+   * Recompute the diff between the pair's current tips and persist a snapshot.
+   *
+   * The contract-shaped verb: it answers with exactly the wire type and nothing
+   * beside it. Anything a sync learns that the wire type has no field for is
+   * reached through `syncLocalReview`.
+   */
   syncPull(localId: number): Promise<Snapshot>
+
+  /**
+   * The same sync, plus what it learned that the snapshot shape cannot carry.
+   *
+   * The snapshot is a frozen wire type shared with the hosted path, so a local
+   * detail cannot be added to it — and the pin outcome is exactly such a detail.
+   * It is deliberately not folded into `partial`, which means content is
+   * missing: an unpinned snapshot is complete, it simply has no guarantee that
+   * it will still be readable after the branch moves. Collapsing the two would
+   * make a retention failure and an unreadable object indistinguishable.
+   */
+  syncLocalReview(localId: number): Promise<LocalSyncOutcome>
 
   /**
    * The stored snapshot, or `null` when this review has never been synced.
@@ -178,6 +199,28 @@ export interface LocalReviewSurface {
  * by name instead of being bought back over a network — and no code path below
  * has a client to mis-call even if one were wanted.
  */
+/**
+ * Whether a sync managed to pin the objects it read.
+ *
+ * A pin failure is not a sync failure. The objects are present right now — that
+ * is how the snapshot was built — and the pin only decides whether they survive
+ * the branch moving. So the sync completes, the snapshot is stored, and the
+ * outcome travels here for a caller that has somewhere to put it. Nothing
+ * renders it yet, which is why it is a record of what happened rather than a
+ * classification of what to do about it.
+ */
+export interface LocalPinOutcome {
+  readonly ok: boolean
+  /** Present only on failure, naming the class of failure rather than its text. */
+  readonly reason?: PinFailureReason
+}
+
+/** A completed local sync: the stored snapshot, and the pin it attempted. */
+export interface LocalSyncOutcome {
+  readonly snapshot: Snapshot
+  readonly pin: LocalPinOutcome
+}
+
 export interface LocalReviewSurfaceDeps {
   store: DirectStore
   runner: CommandRunner
@@ -335,7 +378,24 @@ export function buildLocalWriteDeps(
 ): LocalWriteDeps {
   const { store } = deps
   return {
-    getLocalSnapshot: (id) => store.getLocalSnapshot(id),
+    // The one member here that is translated, and translating it is what makes
+    // the four write verbs answer a data directory that lost its content the way
+    // the read verbs already do — a `not_found` naming the re-sync that rebuilds
+    // it — instead of the store's corruption error, which the transport reports
+    // as a broken daemon. All four reach the snapshot through this member, a
+    // submit twice and the other three once each, so there is one place to
+    // translate rather than four that must be kept in step.
+    //
+    // ONLY THE READ IS WRAPPED, and a wrapper around a whole verb would look
+    // equivalent without being it. The durable store re-raises an unreadable row
+    // out of a WRITE unchanged, on the ground that a corrupt row is not the same
+    // failure as a mutation that never reached disk — so a snapshot write refused
+    // because the immutable row it has to carry forward is corrupt would be
+    // translated too. Answering "not found, re-sync to rebuild" there is false
+    // twice over: a submit has already written its threads and its summary by
+    // that point, and a reader told nothing was found resubmits and gets both a
+    // second time.
+    getLocalSnapshot: (id) => rebuildable(id, () => store.getLocalSnapshot(id)),
     putLocalSnapshot: (snapshot) => {
       store.putLocalSnapshot(snapshot)
     },
@@ -513,6 +573,65 @@ async function qualifyRef(
  * would happen to come back empty anyway, because "empty for the wrong
  * repository" and "empty for this one" must not be distinguishable answers.
  */
+/**
+ * Runs a SNAPSHOT read and turns the store's corruption error into an answer the
+ * reader can act on: a `not_found` naming the re-sync that rebuilds it.
+ *
+ * The store is right to throw. Its envelope names a compare key with no
+ * immutable row, and returning a snapshot with an empty immutable half would
+ * report a broken store as an ordinary one — so it must not be softened, and a
+ * test asserts it still throws when called directly.
+ *
+ * But the two states that produce that throw are not equally hopeless. A
+ * genuinely corrupt row and a data directory that was moved, restored from a
+ * partial backup, or pruned out from under a review are indistinguishable at
+ * the store, and the second is repaired completely by syncing again. Answering
+ * a 500 for both tells the reader their daemon is broken when their review is
+ * one command from working. So the throw is kept and translated here, at the
+ * edge, where "re-sync to rebuild" is a thing a client can render and act on.
+ *
+ * WRAP ONLY A READ OF CONTENT A RE-SYNC CAN REBUILD. The message this helper
+ * mints makes two promises, and both are false the moment it is widened past
+ * that: it names re-syncing as the remedy, and it promises that drafts, threads
+ * and viewed marks were not touched. A snapshot read earns both — a sync
+ * upserts the envelope row and the immutable half it names, and neither is
+ * anything a human typed. A draft read earns neither: nothing reconstructs
+ * unsubmitted text from a repository, and the message would be reassuring the
+ * reader about the very row that is corrupt. A blob read fails the first
+ * promise on its own, since provisioning skips SHAs already present and the
+ * insert does nothing on conflict, so a corrupt blob row outlives every sync.
+ * Those failures are honest `StoreUnreadableError`s: the store really is
+ * corrupt and the operator has to repair the row.
+ *
+ * The same rule excludes WRITES, for a reason of its own. The store re-raises
+ * an unreadable row out of a write unchanged — a corrupt row and a mutation
+ * that never reached disk are different failures and a caller answers them
+ * differently — so a write refused on that ground would be turned into "nothing
+ * was found here" for a verb that may already have persisted part of what it
+ * was asked to write.
+ *
+ * WRAP THE READ, NEVER THE VERB THAT MAKES IT. A verb reads several things, and
+ * a wrapper placed outside it cannot tell which read failed — it would re-label
+ * a draft or a blob failure with the snapshot's remedy. Wrapped around the read
+ * itself, whether that read sits in a verb or behind a port another module
+ * calls through, the translation reaches exactly what it is about.
+ */
+function rebuildable<T>(localId: number, read: () => T): T {
+  try {
+    return read()
+  } catch (cause) {
+    if (cause instanceof StoreUnreadableError) {
+      throw new ApiError(
+        'not_found',
+        `The stored content for local review #${localId} is no longer in this data directory, ` +
+          'so it cannot be opened. Re-sync it to rebuild from the repository. Nothing written ' +
+          'against it — drafts, threads, viewed marks — has been touched.',
+      )
+    }
+    throw cause
+  }
+}
+
 export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalReviewSurface {
   const { store } = deps
   const humanId = deps.session.human.id
@@ -529,9 +648,32 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
    * implementations would disagree in exactly the cases hardest to notice.
    */
   const reconcileStore: ReconcileStore = {
+    // Untranslated, and that is the point: this read is the DRAFT, and a draft
+    // is the one thing in this store nothing can rebuild. Telling a reader whose
+    // draft row is corrupt to re-sync would name a remedy that does not exist —
+    // no sync reconstructs unsubmitted text from a repository — and the same
+    // message goes on to promise that drafts were not touched, which is exactly
+    // backwards when the draft is the corrupt thing. A corrupt draft row is a
+    // genuinely corrupt store, so it travels as `StoreUnreadableError` and the
+    // operator is told to repair the row.
     getDraft: (who, localId) => store.getLocalDraft(who, localId),
-    getSnapshot: (localId) => store.getLocalSnapshot(localId),
+    // Translated, because this read is the SNAPSHOT: derived content that one
+    // sync rewrites in full — both the envelope row and the immutable half it
+    // names are upserted — so "re-sync to rebuild" is advice that works. The
+    // same wiring the write port and the snapshot verb already carry: each of
+    // the three places this store's snapshot read leaves the surface wraps that
+    // read alone, and nothing wider.
+    getSnapshot: (localId) => rebuildable(localId, () => store.getLocalSnapshot(localId)),
+    // Untranslated for the same reason as the draft, arrived at differently: a
+    // blob row that is present but unparseable survives a sync untouched,
+    // because provisioning skips every SHA already in the content-addressed
+    // table and the insert that would replace it does nothing on conflict.
+    // Re-syncing is not a remedy for it, so it must not be offered as one.
     getBlob: (sha) => store.getBlob(sha),
+    // The same content-addressed table `getBlob` reads. Blobs are shared
+    // between both producers, so there is one existence question and one
+    // answer to it.
+    hasBlob: (sha) => store.hasBlob(sha),
   }
 
   return {
@@ -592,6 +734,10 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
     },
 
     async syncPull(localId: number): Promise<Snapshot> {
+      return (await this.syncLocalReview(localId)).snapshot
+    },
+
+    async syncLocalReview(localId: number): Promise<LocalSyncOutcome> {
       const review = requireReview(deps, localId)
 
       const resolved = await resolveLocalRange(deps.runner, deps.toplevel, {
@@ -600,6 +746,24 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       })
       if (!resolved.ok) throw rangeRefusal(localId, resolved)
       const { range } = resolved
+
+      // Pinned BEFORE the first object is read, and the ordering is the whole
+      // point. The diff produces the blob names and the cat-file reads fetch
+      // their bytes; a collection landing between the two turns every one of
+      // those names into a missing entry, with no hosted tier able to supply
+      // them. Pinning first closes that window. Pinning afterwards would leave
+      // it exactly as wide as it is now.
+      //
+      // The outcome is carried, never thrown: the objects are demonstrably
+      // present — the snapshot below is built from them — so a review whose pin
+      // failed is completely readable today and merely unguaranteed tomorrow.
+      const pinned = await pinSnapshotObjects(deps.runner, deps.toplevel, localId, {
+        mergeBaseSha: range.mergeBaseSha,
+        headSha: range.headSha,
+      })
+      const pin: LocalPinOutcome = pinned.ok
+        ? { ok: true }
+        : { ok: false, reason: pinned.reason }
 
       const built = await readLocalSnapshotImmutable(deps.runner, deps.toplevel, range)
       if (!built.ok) throw readRefusal(localId, built)
@@ -625,7 +789,12 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
 
       // Read AFTER every await above, so a write that landed while git was being
       // read is not republished away by the envelope written below.
-      const previous = store.getLocalSnapshot(localId)
+      // The authorship map is read on its own rather than off a whole snapshot.
+      // A re-sync is the documented repair for a data directory that lost its
+      // immutable rows, and the full read throws in exactly that state — so
+      // taking the map from it would make the repair impossible to perform, or,
+      // if softened, would make it destroy the one field it cannot rebuild.
+      const previousCommentAuthors = store.getLocalCommentAuthors(localId)
       const threads = store.listLocalThreads(localId)
       const reviewComments = threads.reduce((total, thread) => total + thread.comments.length, 0)
 
@@ -687,7 +856,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
           // reader's own — nothing is stamped into a body, and no forge login
           // stands behind a synthesized author — so a comment whose entry is
           // dropped here can never be attributed by anything again.
-          commentAuthors: previous?.mutable.commentAuthors ?? {},
+          commentAuthors: previousCommentAuthors,
         },
       }
 
@@ -705,7 +874,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
         dirty: worktree === 'dirty',
         lastSyncedAt: syncedAt,
       })
-      return snapshot
+      return { snapshot, pin }
     },
 
     getSnapshot(localId: number): Snapshot | null {
@@ -713,7 +882,7 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
       // never been synced; an id it does not own is refused before the read,
       // exactly as an absent one is.
       requireReview(deps, localId)
-      return store.getLocalSnapshot(localId)
+      return rebuildable(localId, () => store.getLocalSnapshot(localId))
     },
 
     getDraft(localId: number): ReviewDraft | null {
@@ -742,6 +911,13 @@ export function createLocalReviewSurface(deps: LocalReviewSurfaceDeps): LocalRev
 
     reconcileDraft(localId: number): ReconcileReport {
       requireReview(deps, localId)
+      // Undecorated on purpose. Reconcile reads the snapshot too, so it meets
+      // the same absence and owes the same answer — but the translation belongs
+      // to that one read and is wired into `reconcileStore.getSnapshot`, not
+      // wrapped around the delegate. Reconcile reads the DRAFT first and blobs
+      // after, and neither is content a re-sync rebuilds; a wrapper out here
+      // could not tell those failures apart from the snapshot's and would answer
+      // all three with a remedy that works for only one.
       return runReconcileDraft({ store: reconcileStore, humanId }, localId)
     },
 

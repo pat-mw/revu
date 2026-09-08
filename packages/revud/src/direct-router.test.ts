@@ -873,6 +873,8 @@ function localSurfaceOver(
       calls.push('listBranches')
       return readGitBranches(runner, LOCAL_CWD)
     },
+    syncLocalReview: () => unused('syncLocalReview'),
+
     async syncPull(localId: number): Promise<Snapshot> {
       calls.push('syncPull')
       const review = store.getLocalReview(localId)
@@ -1379,6 +1381,7 @@ function listOnlyLocalSurface(world: LocalListWorld): LocalReviewSurface {
     createLocalReview: () => unused('createLocalReview'),
     listBranches: () => unused('listBranches'),
     syncPull: () => unused('syncPull'),
+    syncLocalReview: () => unused('syncLocalReview'),
     getDraft: () => unused('getDraft'),
     saveDraft: () => unused('saveDraft'),
     discardDraft: () => unused('discardDraft'),
@@ -2047,6 +2050,12 @@ function servingLocalSurface(calls: string[]): LocalReviewSurface {
         { ref: FEATURE_REF, name: 'feature/x', kind: 'local', isDefault: false },
       ]
     },
+    syncLocalReview: (): never => {
+      // Never driven through this double: the real surface's `syncPull`
+      // delegates here, but a double implements `syncPull` directly.
+      throw new Error('these tests do not exercise syncLocalReview')
+    },
+
     async syncPull(localId: number): Promise<Snapshot> {
       calls.push('syncPull')
       return localSnapshotOf(localId, 1)

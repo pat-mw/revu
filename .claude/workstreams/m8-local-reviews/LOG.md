@@ -408,3 +408,76 @@ rebased and **re-gated under `TZ=UTC`**.
 session** and need the owner — see the handover's interview list.
 
 **Next.** M8.8, M8.9 and M8.10 are mutually independent and all unblocked by M8.5; M8.11 closes the milestone.
+
+**update — 2026-08-19**
+
+**Done.** The owner was interviewed on the four questions the previous handover flagged as blocking dispatch,
+and **all four are answered**. Each ruling is written into the Open question it closes — the ticket file is
+authoritative — and indexed on `BOARD.md`. Ruling 3 was re-asked with the schema in front of it after the
+owner said the first framing was unclear; the second framing named `blobs` as `(sha, data)` keyed by git blob
+SHA and shared between GitHub and local snapshots, which is the fact the question actually turns on.
+
+The stack was **re-linearized** before `m8.8` branched. #77 had forked at `0b32368` and never picked up
+`048638c`, so what the last handover called a chain was a fork. Rebased onto the `m8.5` tip, **re-gated under
+`TZ=UTC`** (2646 · 1 · 0 · 95) rather than trusting the clean rebase, force-pushed. `m8.8/resync-and-pinning`
+branches from it. Baseline on the `m8.5` tip re-confirmed first at **2645 · 1 · 0 · 95**, exactly as the
+handover predicted.
+
+**Decisions.**
+1. **Delete + draft: the server refuses.** Server-authoritative, no contract change. A `force` parameter on
+   the frozen `DELETE /api/local-reviews/:n` was put to the owner as the §5.2 stop condition it is, and
+   declined. M8.10.1's delete keeps a precondition, never a partial delete; M8.12 renders the two-step
+   discard-then-delete against that refusal instead of guessing.
+2. **Archive detection fires on each sync of that review.** No direct-mode timer, no GitHub work on an inbox
+   poll. The accepted cost — a branch nobody re-syncs stays un-archived, so the user can keep commenting while
+   a PR is open — is recorded as M8.9.6 copy, not hidden.
+3. **The blob prune is off by default, behind an explicit policy flag.** The immutable prune bounds the churn
+   and runs live; the blob walk ships dark. The decisive argument was recovery asymmetry, not size: a PR's
+   blob is re-fetchable, a local review's blob can be the only copy once its branch is rewritten and its pins
+   dropped. M8.10.5's on/off assertion pair is now load-bearing — it is what stops "off by default" decaying
+   into "never worked".
+4. **Every pin is kept** — unbounded but correct, explicitly conditional on **M8.10 landing in the same
+   session as M8.8**. That coupling is a scope fact for this session, not a preference.
+
+**Blockers.** None. **M8.10 OQ2 (when the prune runs) is narrowed by ruling 3 but not answered by it** and
+must be settled before M8.10.6 wires a call site — it was deliberately not raised in this interview, which was
+scoped to the four questions that blocked dispatch.
+
+**Next.** M8.8 is In Progress. M8.10 is in scope for the same session by ruling 4. M8.9 is independent.
+
+**update — 2026-08-19 (later the same session)**
+
+**Done.** **M8.8 is 6/8** on `m8.8/resync-and-pinning`, pushed, no PR. M8.8.1 (`9522087`), M8.8.2 (`4d73d69`),
+M8.8.3 (`7ed601d`), M8.8.4 (`048ea90`), M8.8.5 (`b52f181`), M8.8.8 (`cb2c5a0`). Gate at the tip
+**2702 pass · 1 skip · 0 fail · 98 files** under `TZ=UTC`, re-run in the main tree after every unit. Only the
+two app-side units remain, and they share `reconcile-dialog.tsx` so they run 6 then 7.
+
+**Six git facts were verified against real git 2.50.1 before the pin seam was written**, not taken on trust:
+the literal `<id>/<compareKey>` ref form is rejected; the substituted form is accepted; `update-ref --stdin`
+is atomic (one bad entry ⇒ zero refs); two separate invocations leave a **half-write**; a ref at
+`refs/revu/reviews/<id>` cannot exist while children do; `for-each-ref` accepts `--end-of-options`. The
+atomicity asymmetry is now a permanent test in both directions.
+
+**Decisions.**
+1. **`syncPull` stays contract-shaped.** The pin outcome cannot ride `Snapshot` (frozen, shared with the
+   hosted path), so `syncLocalReview` carries `{ snapshot, pin }` and `syncPull` delegates. Asserted: the
+   object `syncPull` returns has no `pin` key. M8.8 OQ3 should read from there when answered.
+2. **The pin outcome is not `partial`.** Held apart by comparing a pinned and a pin-blind run — same
+   `partial`, same `immutable`, different `pin.ok` — rather than by prose.
+3. **`CommandRunner` gained an optional `stdin`.** Additive; nothing broke. It is a security improvement:
+   **no object name occupies an argv slot**, asserted.
+4. **Validation is `isLocalReviewId`**, not "a positive integer" — a pull request number is one too.
+5. **The rewrite fix changes the hosted PR path as well**, deliberately: `reconcile.ts` is shared, and a
+   force-push on a pull request carries the identical defect.
+
+**Two findings.** (a) The author-date fallback did not under-report, it reported **zero** on a faithful
+rebase — author dates are preserved by a rebase, so every rewritten commit filters out. (b) M8.8.4's "re-sync
+to rebuild" message **could not be acted on**: the sync read the whole snapshot to carry the authorship map
+forward, which is the read that throws in that state. Caught only by an assertion the ticket did not ask for.
+Recorded as a durable memory.
+
+**Blockers.** None. **⚠️ This branch has never seen CI** — `ci.yml` triggers on `pull_request` and pushes to
+`main` only, so a PR-less branch gets no runner. Local `TZ=UTC` runs are the only evidence.
+
+**Next.** M8.8.6 → M8.8.7 → Verify → adversarial pass → PR. **M8.10 belongs to the same session as M8.8**
+(ruling 4); its OQ2 needs the owner first. M8.9 is independent and unblocked.

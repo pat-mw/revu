@@ -222,7 +222,10 @@ export function SnapshotSeal({
             </TooltipTrigger>
             <TooltipContent>
               The base branch moved, so the three-dot compare changed even though head
-              didn't. The diff is keyed merge_base…head.
+              didn't. The diff is keyed merge_base…head. A local review recomputes that
+              merge base against the live base branch tip on every sync; a pull request
+              reads GitHub's pull.base.sha, which only refreshes on a synchronize event
+              — so the two really can disagree about what changed.
             </TooltipContent>
           </Tooltip>
           <Button size="sm" onClick={onSync}>

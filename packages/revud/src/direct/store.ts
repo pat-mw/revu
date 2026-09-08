@@ -415,6 +415,22 @@ export interface DirectStore {
    */
   putLocalSnapshot(snapshot: Snapshot): void
   /**
+   * The authorship map recorded on a local review's last envelope, or `{}` when
+   * it has never been synced.
+   *
+   * Deliberately narrower than reading the whole snapshot, and deliberately
+   * unable to fail the way that read can. The map lives in the envelope, while
+   * `getLocalSnapshot` also needs the immutable half a compare key names — so a
+   * data directory that lost its immutable rows makes the full read throw while
+   * this map is sitting there intact. Since the map is the one thing a re-sync
+   * must carry forward rather than rebuild, reading it through the failing path
+   * would make the rebuild destroy exactly what it cannot recreate: nothing is
+   * stamped into a comment body and no forge login stands behind a synthesized
+   * author, so an authorship entry dropped here can never be recovered.
+   */
+  getLocalCommentAuthors(localId: number): Record<number, string>
+
+  /**
    * One human's review draft on one local review, or `null` when that human has
    * no draft on it — the correct empty answer, and never another human's draft.
    *
@@ -1331,6 +1347,19 @@ export function openDirectStore(
         immutable: stored.immutable,
         mutable: envelope.mutable,
       }
+    },
+
+    getLocalCommentAuthors(localId: number): Record<number, string> {
+      const row = db
+        .query('SELECT data FROM local_snapshots WHERE local_id = ?')
+        .get(localId) as { data: string } | null
+      if (!row) return {}
+      const envelope = parseRow<StoredSnapshotEnvelope>(
+        'local_snapshots',
+        String(localId),
+        row.data,
+      )
+      return envelope.mutable.commentAuthors ?? {}
     },
 
     getLocalDraft(humanId: string, localId: number): ReviewDraft | null {

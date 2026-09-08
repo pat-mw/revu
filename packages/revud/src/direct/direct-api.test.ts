@@ -331,6 +331,12 @@ function fakeLocalSurface(): { surface: LocalReviewSurface; spy: SurfaceSpy } {
       spy.calls.push('listBranches')
       return [LOCAL_BRANCH]
     },
+    syncLocalReview: (): never => {
+      // Never driven through this double: the real surface's `syncPull`
+      // delegates here, but a double implements `syncPull` directly.
+      throw new Error('these tests do not exercise syncLocalReview')
+    },
+
     async syncPull(localId: number): Promise<Snapshot> {
       spy.calls.push(`syncPull:${localId}`)
       return LOCAL_SNAPSHOT

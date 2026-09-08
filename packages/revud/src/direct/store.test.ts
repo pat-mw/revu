@@ -2682,6 +2682,7 @@ const LOCAL_STORE_METHODS: Record<LocalStoreMethod, true> = {
   nextLocalEntityId: true,
   getLocalSnapshot: true,
   putLocalSnapshot: true,
+  getLocalCommentAuthors: true,
   getLocalDraft: true,
   putLocalDraft: true,
   deleteLocalDraft: true,
@@ -2951,6 +2952,10 @@ describe('local writes never touch a PR-keyed table', () => {
     store.putLocalSnapshot(snapshot(id, 'base...head'))
     expect(store.getLocalSnapshot(id)!.immutable.compareKey).toBe('base...head')
 
+    // Reads the envelope alone, so it answers for a review whose immutable half
+    // is gone — the state a re-sync is the documented repair for.
+    expect(store.getLocalCommentAuthors(id)).toEqual({})
+
     store.putLocalDraft(draft('h1', id, 'unsubmitted text on a local review'))
     expect(store.getLocalDraft('h1', id)!.body).toBe('unsubmitted text on a local review')
 
@@ -2989,12 +2994,12 @@ describe('local writes never touch a PR-keyed table', () => {
     expect(onTheStore).toEqual(declaredLocalMethods())
   })
 
-  test('the local surface is seventeen methods', () => {
+  test('the local surface is eighteen methods', () => {
     // An independent literal, not another expression over the same map. Every
     // other coverage check here compares two derived sets, and derived sets stay
     // in agreement through a method deleted from the interface, the map and the
     // sweep together — a hardcoded count is the only one of these that notices
     // the swept surface silently shrinking. Changing it is a deliberate act.
-    expect(declaredLocalMethods()).toHaveLength(17)
+    expect(declaredLocalMethods()).toHaveLength(18)
   })
 })

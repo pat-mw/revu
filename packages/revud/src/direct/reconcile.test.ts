@@ -102,11 +102,14 @@ function fakeStore(opts: {
     getDraft: () => opts.draft,
     getSnapshot: () => opts.snapshot,
     getBlob: (sha: string) => opts.blobs[sha] ?? null,
+    // The one record, read by both. A second, independent map here would let
+    // the pre-flight and the classifier disagree about what the store holds,
+    // which is precisely the divergence the pre-flight exists to prevent.
+    hasBlob: (sha: string) => opts.blobs[sha] !== undefined,
     // Everything below is off-limits to reconcile; touching it is a bug.
     getImmutable: unexpected('getImmutable'),
     putImmutable: unexpected('putImmutable'),
     putSnapshot: unexpected('putSnapshot'),
-    hasBlob: unexpected('hasBlob'),
     putBlobs: unexpected('putBlobs'),
     putDraft: unexpected('putDraft'),
     deleteDraft: unexpected('deleteDraft'),
@@ -124,6 +127,7 @@ function fakeStore(opts: {
     patchLocalReviewSync: unexpected('patchLocalReviewSync'),
     nextLocalEntityId: unexpected('nextLocalEntityId'),
     getLocalSnapshot: unexpected('getLocalSnapshot'),
+    getLocalCommentAuthors: unexpected('getLocalCommentAuthors'),
     putLocalSnapshot: unexpected('putLocalSnapshot'),
     getLocalDraft: unexpected('getLocalDraft'),
     putLocalDraft: unexpected('putLocalDraft'),
@@ -431,6 +435,68 @@ describe('reconcileDraft — classification against the fresh snapshot', () => {
   })
 })
 
+describe('reconcileDraft — missing objects are reported, never classified', () => {
+  test('an absent anchor blob is a typed re-syncable answer, not a deleted line', () => {
+    // The lie this replaces: a blob the store cannot produce resolves to null,
+    // which the classifier reads as "no content to match" and reports as
+    // `lost` / `line-deleted`. A human acting on that drops a comment whose
+    // line is still there. Absence of the OBJECT and absence of the LINE are
+    // different facts and only one of them is recoverable by re-syncing.
+    const { draft, snapshot, blobs } = forcePushFixture()
+    delete blobs['sha-head']
+    const store = fakeStore({ draft, snapshot, blobs })
+
+    let thrown: unknown
+    try {
+      reconcileDraft({ store, humanId: HUMAN }, 5)
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(ApiError)
+    expect((thrown as ApiError).code).toBe('not_found')
+    expect((thrown as ApiError).message).toMatch(/re-sync/i)
+  })
+
+  test('nothing is classified when an object is missing', () => {
+    // The absence half, stated separately so it cannot be satisfied by the
+    // throw alone. Its permanent negative control is the genuine
+    // `lost` / `line-deleted` case elsewhere in this file, which runs in the
+    // same gate with every blob present — so "no line-deleted was reported"
+    // cannot rot into "nothing classifies at all".
+    const { draft, snapshot, blobs } = forcePushFixture()
+    delete blobs['sha-head']
+    const store = fakeStore({ draft, snapshot, blobs })
+    let report: ReturnType<typeof reconcileDraft> | null = null
+    try {
+      report = reconcileDraft({ store, humanId: HUMAN }, 5)
+    } catch {
+      report = null
+    }
+    expect(report).toBeNull()
+  })
+
+  test('a binary anchor blob is present, not missing', () => {
+    // A pre-flight written against "did resolveBlobLines return null" instead
+    // of "does the object exist" is red here and green nowhere else: a binary
+    // blob yields no lines and is nonetheless perfectly present, so re-syncing
+    // would fix nothing and the report must be produced normally.
+    const { draft, snapshot, blobs } = forcePushFixture()
+    blobs['sha-head'] = { ...blobs['sha-head'], binary: true, content: '' }
+    const store = fakeStore({ draft, snapshot, blobs })
+    const report = reconcileDraft({ store, humanId: HUMAN }, 5)
+    expect(report.results).toHaveLength(draft.comments.length)
+  })
+
+  test('the draft is untouched by the refusal', () => {
+    const { draft, snapshot, blobs } = forcePushFixture()
+    delete blobs['sha-head']
+    const before = structuredClone(draft)
+    const store = fakeStore({ draft, snapshot, blobs })
+    expect(() => reconcileDraft({ store, humanId: HUMAN }, 5)).toThrow(ApiError)
+    expect(store.getDraft(HUMAN, 5)).toStrictEqual(before)
+  })
+})
+
 describe('reconcileDraft — newCommits from the snapshot delta', () => {
   test('slices the commits after the draft head when it is still in the list', () => {
     const { draft, snapshot, blobs } = forcePushFixture()
@@ -442,18 +508,34 @@ describe('reconcileDraft — newCommits from the snapshot delta', () => {
     expect(report.currentHeadSha).toBe('NEW-HEAD')
   })
 
-  test('falls back to author-date when the draft head fell out of the rewritten compare', () => {
+  test('reports every commit when the draft head fell out of the rewritten compare', () => {
     const { draft, snapshot, blobs } = forcePushFixture()
     // A hard force-push that dropped OLD-HEAD entirely from the fresh list.
+    // Every author date here PREDATES the draft, which is what a rebase
+    // actually produces: it rewrites committer dates and preserves author
+    // dates. The head the draft was written against exists nowhere in this
+    // list, so every commit in it is new relative to a head that is gone.
     snapshot.immutable.commits = [
-      commit('X0', '2026-01-10T00:00:00.000Z'), // before the draft was written
-      commit('X1', '2026-01-16T00:00:00.000Z'), // after → counts as new
-      commit('X2', '2026-01-17T00:00:00.000Z'), // after → counts as new
+      commit('X0', '2026-01-10T00:00:00.000Z'),
+      commit('X1', '2026-01-11T00:00:00.000Z'),
+      commit('X2', '2026-01-12T00:00:00.000Z'),
     ]
     const store = fakeStore({ draft, snapshot, blobs })
     const report = reconcileDraft({ store, humanId: HUMAN }, 5)
-    // draft.createdAt is 2026-01-15; only X1 and X2 postdate it.
-    expect(report.newCommits.map((c) => c.sha)).toEqual(['X1', 'X2'])
+    expect(report.newCommits.map((c) => c.sha)).toEqual(['X0', 'X1', 'X2'])
+    // The property rather than the literal, so a fixture change cannot satisfy
+    // it: with the draft head absent, the count IS the list length.
+    expect(report.newCommits).toHaveLength(snapshot.immutable.commits.length)
+
+    // The old heuristic, computed inline and asserted strictly worse. This is
+    // the regression guard: restoring the author-date fallback makes it red,
+    // and on this fixture that fallback reports ZERO — the under-report at its
+    // worst, on exactly the rewrite that moved the most work.
+    const byAuthorDate = snapshot.immutable.commits.filter(
+      (c) => c.commit.author.date > draft.createdAt,
+    )
+    expect(byAuthorDate).toHaveLength(0)
+    expect(byAuthorDate.length).toBeLessThan(report.newCommits.length)
   })
 })
 
