@@ -155,6 +155,76 @@ assignments file lives in the same directory.
 
 Source: `packages/revud/src/direct/store.ts` — `resolveDirectDataDir`.
 
+## Retention and reclaiming disk
+
+Nothing is removed on a timer. There is no TTL anywhere in the store: what a
+table holds is judged against what still references it, or against an explicit
+act of removal, and never against how old a row is.
+
+**Deleting a local review** (`DELETE /api/local-reviews/:n`) is **refused
+outright** — a `422 unprocessable` whose message names the remedy — while any
+human's draft on that review holds text: a pending comment, or a body with
+anything in it. There is no flag to force it; the draft's own human discards
+it, then the identical delete goes through. The empty draft an editor creates
+the moment a review is opened does not block. Once it proceeds, the delete
+removes, in one transaction, that review's row and every row keyed to it — its
+snapshot envelope, its threads, its submitted review summaries, and the (by
+then empty) drafts and viewed marks **every** human holds on it. That is the
+only path that removes a draft row by anyone other than its own human, and the
+refusal is what keeps it from ever removing text: unsubmitted text is
+irreplaceable, so no reclamation running on its own may reach one. The delete
+then drops the git refs pinning the objects that review's snapshot was read
+from, and finally prunes whatever the removal has just left unreferenced — in
+that order, because dropping refs after a prune leaves the object database
+pinned for data that no longer exists, and pruning before the rows are gone
+reads the doomed review's comparison as still live. An id that names no review
+this daemon serves — never created, already deleted, or belonging to another
+repository sharing the data directory — is a `404 not_found`, in the same
+words for all three, and a refusal of either kind touches nothing: no row, no
+ref, no prune.
+
+**Never removed.** The write audit journal (`audit_log`) is append-only and has
+no delete counterpart by design, so it stays ground truth for "who wrote this"
+even across a workspace-username rename. The pull-request author map
+(`pr_author`) is first-write-wins and permanent. Neither those, nor any other
+pull-request-keyed row (`snapshots`), is touched when a local review is
+removed: a review that never reached the client repository has no standing to
+remove a fact about it.
+
+**Pruning runs after a delete, and after every successful sync of a local
+review.** It reclaims cached snapshot halves (`immutables`) that no stored
+snapshot references any more — the halves a rebased branch leaves behind on
+every re-sync. A sync that fails or is refused prunes nothing, and a prune
+stands aside entirely, removing nothing at all, while any sync is still
+writing.
+
+**Blob reclamation is off by default**, behind an explicit policy flag a
+deployment has to set. Leaving it off costs real disk: `blobs` is the largest
+table in the store and grows **monotonically**, because every re-sync of a
+rebased branch mints a fresh compare key and stores that branch's file contents
+again, and nothing ever shrinks it. That cost is accepted deliberately. A blob
+row is content-addressed and therefore shared by every review naming that SHA,
+across pull requests and local reviews alike; a local review's bytes were read
+out of one clone with no second source to fetch them back from, and removing
+one wrongly makes a reviewer's pending comments classify as lost, with no error
+anywhere.
+
+**Disk does not come back on its own.**
+
+- The SQLite file **does not shrink** when rows are deleted. The space is
+  released inside the file and re-used by later writes, and the file's size on
+  disk stays where its high-water mark left it. revu never runs a whole-file
+  rewrite to reclaim it: that operation cannot run inside a transaction and
+  takes an exclusive lock on the file every unsubmitted draft lives in.
+- Dropping a review's pins makes its git objects **collectable**, not
+  collected. Reclaiming that space is `git gc`'s job and **revu does not run
+  it** — not at boot, not on a timer, and not as part of a delete. Run it
+  yourself, in the repository, when you want the space back.
+
+Source: `packages/revud/src/direct/retention.ts` — `dropPinnedRefs`,
+`pruneImmutables`, `pruneBlobs`; `packages/revud/src/direct/store.ts` —
+`deleteLocalReview`.
+
 ---
 
 ## Host collector

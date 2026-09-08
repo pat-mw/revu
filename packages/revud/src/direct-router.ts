@@ -74,14 +74,18 @@ import { StoreUnreadableError, StoreWriteError } from './direct/store'
  *     check included — reads that one binding, never the comment id and never a
  *     second parse of the request.
  *
- * Three of the four local-review routes are served here — `GET /api/branches`,
- * `POST /api/local-reviews` and `GET /api/local-reviews` — against the local
- * surface the api was assembled with, and a typed `not_found` (404) when it was
- * assembled without one. `DELETE /api/local-reviews/:n` is deliberately NOT
- * served and keeps its honest `not_implemented` (501): deleting a local review
- * means deciding what becomes of its snapshot, its cached blobs, and every
- * human's draft and viewed marks on it, which is a retention policy rather than
- * a row delete.
+ * All four local-review routes are served here — `GET /api/branches`,
+ * `POST /api/local-reviews`, `GET /api/local-reviews` and
+ * `DELETE /api/local-reviews/:n` — against the local surface the api was
+ * assembled with, and a typed `not_found` (404) when it was assembled without
+ * one. The delete is dispatched on the REVIEW id like every other id-keyed
+ * route rather than on the path it arrived by: an id outside the local band is
+ * refused by name, since a pull request number is a positive integer too and a
+ * clean success for one would report a pull request removed as a review of a
+ * branch pair. An id INSIDE the band that carries no review answers a clean
+ * `{ ok: true }` and never a 404 — a removal whose answer was lost has to be
+ * safe to repeat, and a 404 on the retry would report a failure for the state
+ * the first call produced.
  *
  * Both refs of a creation request are validated and fully qualified HERE, before
  * the request reaches anything that can run git. The shared body validator
@@ -685,6 +689,28 @@ export async function handleDirectApi(
     if (method === ROUTES.createLocalReview.method && path === ROUTES.createLocalReview.path) {
       const input = validateCreateLocalReviewInput(await readJsonBody(req))
       return json(await api.createLocalReview(qualifiedCreateInput(input)))
+    }
+
+    // ——— deleteLocalReview: DELETE /api/local-reviews/:n ———
+    // The id is parsed here and the band is read on the surface, so this route
+    // holds no rule of its own about which reviews may be removed — the same
+    // dispatch every id-keyed surface goes through decides that.
+    //
+    // Every refusal is the surface's typed answer, serialized to its own
+    // status by the catch below: a review still holding a draft with text is
+    // a 422 `unprocessable` whose message names the remedy, and an id that
+    // carries no review this daemon serves is a 404 `not_found`. There is no
+    // body and no query parameter on this route, so nothing here can force
+    // its way past either. An unparseable `:n` is a different thing — nothing
+    // was named at all — and is refused before the surface is reached.
+    if (method === ROUTES.deleteLocalReview.method) {
+      const params = matchRoute(ROUTES.deleteLocalReview.path, path)
+      if (params) {
+        const n = prNumberOf(params)
+        if (n === null) return errorJson('not_found', `Bad local review id "${params.n}".`, 404)
+        await api.deleteLocalReview(n)
+        return json({ ok: true })
+      }
     }
 
     // ——— submitReview: POST /api/pulls/:n/review ———

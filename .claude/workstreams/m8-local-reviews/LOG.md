@@ -481,3 +481,95 @@ Recorded as a durable memory.
 
 **Next.** M8.8.6 → M8.8.7 → Verify → adversarial pass → PR. **M8.10 belongs to the same session as M8.8**
 (ruling 4); its OQ2 needs the owner first. M8.9 is independent and unblocked.
+
+**update — 2026-08-20**
+
+**Done.** M8.8 completed at 8/8 and had its owed full-diff adversarial pass; M8.10 opened at 3/7.
+
+- **M8.8.6** (`bc847ad`) — the rewrite the UI must not miscount, plus D8 base advance. **The unit's Check
+  was wrong twice**, and either error would have shipped a green test that proves nothing: `isRewritten`
+  asked of `newCommits` reports *every* fast-forward as a rewrite (that list is the slice **after** the
+  draft head, so the head is never in it), and "commit on the base branch only" does **not** move
+  `compareKey` at all — the base tip is explicitly not part of the key, which moves only when the base
+  absorbs a commit the head already carries.
+- **M8.8.7** (`407911a`) — a refused submit now leaves the draft describing its own head. `headSha` and
+  `compareKey` move as one argument; no signature in the app takes one without the other.
+- **The adversarial pass** (`bbc4bc6`) — 16 raw findings → 5 survived independent refutation → 4 fixed,
+  1 recorded as M8.8 OQ8. Verdict on the pre-fix tree was **not safe to push**.
+- **M8.10.1 / .2 / .3** (`3423324`) — the store's second `DELETE`, the only ref-deletion path in the
+  milestone, and the fail-closed live-`compareKey` read.
+
+**Decisions.**
+- **Ruling 5 (owner):** the retention prune runs **after every successful local sync** — the tightest
+  growth bound, pruning where the churn is created. M8.10.7's gate spends the in-flight-sync objection.
+  Binds M8.10.6 to drive the prune **at a real sync**, not by calling it directly.
+- **M8.10 OQ4 resolved from the repo, not the owner** — M8.2 shipped the high-water mark, so the id-reuse
+  class is unreachable and the hold on the whole ticket is lifted.
+- **Blobs are deliberately left untranslated** by `rebuildable`: provisioning skips SHAs the store claims
+  to hold, so a present-but-corrupt blob survives every sync and "re-sync" would be a second false remedy.
+
+**Blockers.** None. M8.10 OQ2 and OQ4 are both closed.
+
+**Next.** M8.10.4 → M8.10.7 → M8.10.5 → M8.10.6, in that order (the gate must exist before any caller is
+wired). Then **M8.9**, independent and unblocked. **M8.11 remains the real critical path** — it gates 3 of
+the 6 exit criteria and has not started; unit percentage does not close the milestone, the criteria do.
+
+**update — 2026-08-20 (later)**
+
+**Done.** M8.10 reached 7/7 units on #79: the immutable sweep (`974513a`), the in-flight gate (`4a73b36`),
+the blob walk shipping dark (`566539e`), and the wiring plus the operator policy (`16c3c87`). Gate at the
+tip **2888 pass · 1 skip · 0 fail · 101 files**.
+
+**Decisions.**
+- **The gate default moved into the scripts, not `bunfig.toml`.** Bun ignores a `timeout` key there
+  (verified against 1.3.11), so `test` and `check` now pass `--timeout=20000`. CI went red on a
+  pre-existing allocator case that runs **437ms locally and 9372ms on a runner** — a factor of twenty-one —
+  so a limit tuned to local timings is a coin flip on someone else's hardware. Roughly half the
+  sync-driving tests in one file carry no explicit budget, so per-test patching would not have converged.
+- **Prune failures are logged, not raised**, so one corrupt row belonging to an unrelated review cannot
+  turn a sync whose snapshot is already on disk into a permanent 500.
+- **`syncGate` stays optional**: both the wrapper and every prune read one binding inside
+  `createDirectApi`, so the pairing cannot come apart by omission; requiring it would touch 40 construction
+  sites for no safety gain.
+
+**Blockers.** **M8.10 is not done at 7/7.** Owner ruling 1 was recorded at an Open question and never
+became a unit, so the delete has no draft precondition in either transport; the mock and direct also
+disagree on whether a delete destroys unsubmitted text and on a repeated delete. All three passed the gate
+because `deleteLocalReview` has **no conformance coverage**. Appended as **M8.10.8**.
+
+**Next.** M8.10.8 (mock first), then M8.10's `Verify` and M8.8's. Then **M8.9**, independent and unblocked.
+**M8.11 remains the real critical path** — 3 of the 6 exit criteria, not started.
+
+**update — 2026-08-20 (close)**
+
+**Done.** **M8.10 is complete at 8/8 with its `Verify` green**, and **M8.8's `Verify` is green** with its
+owed adversarial pass discharged. Both PRs are pushed and **CI is green on both**.
+
+- **M8.10.8** (`faa1ad6`) — the owner's ruling 1 implemented in both transports: a delete **refuses** with
+  `unprocessable` while any human holds a draft carrying text, as a precondition that leaves every row in
+  place. `draftHoldsText` is **one shared predicate** both transports import, because two definitions of
+  "has the reviewer written anything" is how the divergence started. The mock moved first.
+- **A three-transport conformance leg for `deleteLocalReview`** — in-process mock, mock over real HTTP, and
+  the direct engine on a real repository witnessed through a raw handle over all six local tables. Its
+  absence is what let three wire-level divergences ship green.
+
+**Decisions.**
+- **`unprocessable`, not `conflict` or `not_found`** — its own docstring in the frozen contract describes
+  this exact case: the target exists, its state cannot honour the request, and the caller can put it in one
+  that can and retry unchanged.
+- **The mock moved to delete drafts; direct was right.** "Drafts survive everything" is preserved by the
+  refusal, not by orphaning — only an editor-created empty draft can now be removed, which destroys nothing.
+- **An unknown id answers `not_found` alike** whether never created, already deleted, or belonging to
+  another repository sharing the data directory — a distinguishable answer would confirm an id exists
+  elsewhere. **Cost taken:** a "not found" call now has no side effects, so it no longer opportunistically
+  tidies refs left by a drop that failed part-way; that belongs to an explicit operator action.
+
+**Deviation, recorded not buried.** M8.10's `Verify` says no file under `packages/shared/src/api/` may be
+modified; `client.ts`'s `deleteLocalReview` docstring was corrected, because the ruling made its claim that
+drafts are "deliberately left behind" false in both transports. Comment-only — no type, shape, field or
+signature moved. Splitting it into its own contract commit is one command if the owner prefers.
+
+**Blockers.** None.
+
+**Next.** **M8.9** — independent and unblocked. Then **M8.11, the real critical path**: it gates **3 of the
+6 exit criteria** and has not started.

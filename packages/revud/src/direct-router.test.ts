@@ -243,6 +243,9 @@ function fakeApi(overrides: Partial<DirectApi> = {}): DirectApi {
     listLocalReviews(): LocalReviewSummary[] {
       throw new ApiError('not_found', 'This daemon does not serve local reviews.')
     },
+    async deleteLocalReview(): Promise<void> {
+      throw new ApiError('not_found', 'This daemon does not serve local reviews.')
+    },
     ...overrides,
   }
 }
@@ -750,6 +753,16 @@ function fakeGit(world: GitWorld): RecordingRunner {
         if (operands.includes(ORPHAN_SHA)) return exited(1)
         return exited(0, `${MERGE_BASE_SHA}\n`)
       }
+      if (sub === 'for-each-ref' && args.includes('--format=%(refname)')) {
+        // The pin namespace of this fake world is empty. Nothing here has ever
+        // synced a review, so a drop over it discovers nothing and deletes
+        // nothing — which is the ordinary answer for an unpinned review, not a
+        // failure. The refname format is what distinguishes this listing from
+        // the branch listing below; they are different reads of the same
+        // command and answering one with the other's output would hand the
+        // drop a set of branch names to delete.
+        return exited(0, '')
+      }
       if (sub === 'for-each-ref') {
         return exited(
           0,
@@ -941,15 +954,22 @@ function localHarness(world: Partial<GitWorld> = {}): LocalHarness {
     github: throwingGithubClient(),
     repo: LOCAL_REPO_REF,
     store,
+    // The same git seam the surface runs on, wired to the api as boot wires it.
+    // Removing a review has to reach the object database to drop its pins, and
+    // an api holding no runner and no directory could not — so a harness that
+    // omitted them would be exercising a shape no daemon is ever assembled in.
+    runner,
+    cwd: LOCAL_CWD,
     localReviews: localSurfaceOver(store, runner, surfaceCalls),
   })
   return { api, store, runner, surfaceCalls, close: () => store.close() }
 }
 
 /**
- * The routes this router serves for local reviews. `deleteLocalReview` is NOT
- * one of them — it keeps its honest known-route 501, pinned separately below —
- * so it is deliberately absent from this table rather than listed and skipped.
+ * The routes this router serves for local reviews, each driven with a request
+ * that carries no review id. `deleteLocalReview` is served too, but its answer
+ * depends on the id in the path rather than on the route alone, so it is
+ * exercised on its own below instead of being folded in here with a made-up id.
  */
 const SERVED_LOCAL_ROUTES = [
   {
@@ -1245,24 +1265,113 @@ describe('handleDirectApi: local reviews', () => {
     h.close()
   })
 
-  test('DELETE /api/local-reviews/:n is a known route that answers 501', async () => {
+  test('DELETE /api/local-reviews/:n is served, and the review is gone afterwards', async () => {
     const h = localHarness()
     const created = (await (
       await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
     ).json()) as LocalReviewSummary
+    // The precondition, pinned rather than assumed: the row is there to be
+    // removed, so an absence afterwards is the delete's doing and not a review
+    // that was never recorded.
+    expect(h.store.getLocalReview(created.id)).not.toBeNull()
+
     const res = await handleDirectApi(
       req('DELETE', `/api/local-reviews/${created.id}`),
       SESSION,
       h.api,
     )
-    // Deliberately unserved: removing a local review means deciding what becomes
-    // of its snapshot, its cached blobs, and every human's draft and viewed
-    // marks on it — a retention policy, not a row delete. An honest 501 is the
-    // interim answer, and the review is still there afterwards.
-    expect(res?.status).toBe(501)
-    const body = (await res?.json()) as { code: string }
-    expect(body.code).toBe('not_implemented')
+
+    expect(res?.status).toBe(200)
+    expect(await res?.json()).toEqual({ ok: true })
+    expect(h.store.getLocalReview(created.id)).toBeNull()
+    // The status alone cannot say the pins were dealt with: a delete that
+    // removed the row and reached no git would answer 200 just the same. The
+    // discovery argv is the evidence that the drop really ran, over this
+    // review's own namespace and no other.
+    expect(h.runner.argvs).toContainEqual([
+      'git',
+      'for-each-ref',
+      '--format=%(refname)',
+      '--end-of-options',
+      `refs/revu/reviews/${created.id}/`,
+    ])
+    h.close()
+  })
+
+  test('deleting an id that was never created is a 404, and spawns nothing', async () => {
+    const h = localHarness()
+    const neverCreated = LOCAL_REVIEW_ID_BASE + 4242
+    // The control for the answer below: this id really does name nothing, so
+    // the refusal is about the review's absence and not about the id's shape.
+    expect(h.store.getLocalReview(neverCreated)).toBeNull()
+    const spawnedBefore = h.runner.argvs.length
+
+    const res = await handleDirectApi(
+      req('DELETE', `/api/local-reviews/${neverCreated}`),
+      SESSION,
+      h.api,
+    )
+
+    // A removal is a named act on a review that exists, so an absent one is a
+    // missing resource — the same typed answer a review deleted a moment ago
+    // gets, and the same one a review of some other repository sharing the
+    // data directory gets, so the answer confirms nothing about the id.
+    expect(res?.status).toBe(404)
+    const body = (await res?.json()) as { code: string; message: string }
+    expect(body.code).toBe('not_found')
+    expect(body.message).toContain('this workspace')
+    // An answer of "not found" has no side effect: no ref was discovered, let
+    // alone dropped, on the strength of an id that names nothing here.
+    expect(h.runner.argvs.length).toBe(spawnedBefore)
+    h.close()
+  })
+
+  test('a review whose draft holds text is refused 422 through the route, with every row in place', async () => {
+    const h = localHarness()
+    const created = (await (
+      await createLocal(h.api, { baseRef: MAIN_REF, headRef: FEATURE_REF })
+    ).json()) as LocalReviewSummary
+    const text = 'unsubmitted text the route must refuse to destroy'
+    h.store.putLocalDraft({ ...noGithubDraft(created.id), body: text })
+    // The controls: the row is there, the draft really holds text, and the
+    // success case above proves this same harness DOES reach git on a delete
+    // that goes through — so a spawn count that stands still below is the
+    // refusal's doing.
     expect(h.store.getLocalReview(created.id)).not.toBeNull()
+    expect(h.store.getLocalDraft(SESSION.human.id, created.id)?.body).toBe(text)
+    const spawnedBefore = h.runner.argvs.length
+
+    const res = await handleDirectApi(
+      req('DELETE', `/api/local-reviews/${created.id}`),
+      SESSION,
+      h.api,
+    )
+
+    // The surface's typed refusal, at its own status, with the remedy named.
+    expect(res?.status).toBe(422)
+    const body = (await res?.json()) as { code: string; message: string }
+    expect(body.code).toBe('unprocessable')
+    expect(body.message).toMatch(/discard/i)
+    // A precondition, not a partial delete: the row and the text both stand,
+    // and nothing reached git.
+    expect(h.store.getLocalReview(created.id)).not.toBeNull()
+    expect(h.store.getLocalDraft(SESSION.human.id, created.id)?.body).toBe(text)
+    expect(h.runner.argvs.length).toBe(spawnedBefore)
+    h.close()
+  })
+
+  test('deleting a pull request number on the local route is refused by name', async () => {
+    const h = localHarness()
+    const res = await handleDirectApi(req('DELETE', '/api/local-reviews/204'), SESSION, h.api)
+
+    // The other side of the idempotence above, and the reason it is not simply
+    // "every id answers ok". A pull request number is a positive integer too,
+    // so a clean success here would report a pull request removed as a review
+    // of a branch pair — the mistake is named instead of absorbed.
+    expect(res?.status).toBe(404)
+    const body = (await res?.json()) as { code: string; message: string }
+    expect(body.code).toBe('not_found')
+    expect(body.message).toContain('local-review band')
     h.close()
   })
 })
@@ -2140,6 +2249,11 @@ function noGithubHarness(): NoGithubHarness {
     session: SESSION,
     github: throwingGithubClient(),
     store,
+    // A daemon with no repository on GitHub still has one on disk — that is the
+    // whole deployment — so the git seam is wired here exactly as boot wires it.
+    // Without it a removal could not drop a review's pins and would refuse.
+    runner: fakeGit({ shallow: false, worktree: 'clean' }),
+    cwd: LOCAL_CWD,
     localReviews: servingLocalSurface(calls),
   })
   return { api, store, calls, close: () => store.close() }
@@ -2225,9 +2339,13 @@ const NO_GITHUB_DEGRADED: readonly NoGithubRow[] = [
  * they are driven with a PULL REQUEST id deliberately: their answer does not
  * depend on the band either.
  *
- * Two rows answer a typed `not_found` (404) rather than a 200, and both are the
- * route's ordinary contract answer for the state this daemon is in — an absent
- * blob, and a reconcile of a review that has no draft — never a refusal.
+ * Three rows answer a typed `not_found` (404) rather than a 200, and each is
+ * the route's ordinary contract answer for the request as driven here — an
+ * absent blob, a reconcile of a review that has no draft, and a delete naming a
+ * PULL REQUEST number on the route that removes reviews of local branch pairs.
+ * None of the three is a refusal, and none of them turns on the missing
+ * repository: the delete is served in full for an id in the local band, which
+ * the band-shared table below drives and asserts.
  */
 const NO_GITHUB_SERVED: readonly NoGithubRow[] = [
   { name: 'getSession', status: 200 },
@@ -2244,17 +2362,16 @@ const NO_GITHUB_SERVED: readonly NoGithubRow[] = [
   { name: 'listBranches', status: 200 },
   { name: 'createLocalReview', body: { baseRef: MAIN_REF, headRef: FEATURE_REF }, status: 200 },
   { name: 'listLocalReviews', status: 200 },
+  { name: 'deleteLocalReview', status: 404, code: 'not_found' },
 ]
 
 /**
  * The routes nobody has implemented, whether or not a repository is configured.
- * Their 501 predates this degradation and says something different: the GraphQL
- * thread read has not landed, and deleting a local review is a retention policy
- * nobody has written. Neither message may claim a missing repository.
+ * The 501 predates this degradation and says something different: the GraphQL
+ * thread read has not landed. Its message may not claim a missing repository.
  */
 const NO_GITHUB_NOT_IMPLEMENTED: readonly NoGithubRow[] = [
   { name: 'listReviewThreads', status: 501, code: 'not_implemented' },
-  { name: 'deleteLocalReview', status: 501, code: 'not_implemented' },
 ]
 
 /** The band-shared routes with a LOCAL review id, and the method each must enter. */
@@ -2292,6 +2409,11 @@ const NO_GITHUB_LOCAL_BAND: readonly { row: NoGithubRow; surfaceCall: string }[]
     },
     surfaceCall: 'addReaction',
   },
+  // The removal reaches the surface for its OWNERSHIP read: ids are minted from
+  // one mark shared by every repository using the data directory, so the row an
+  // id names may belong to a repository this daemon does not serve, and the
+  // listing scoped to this one is what settles that.
+  { row: { name: 'deleteLocalReview', status: 200 }, surfaceCall: 'listLocalReviews' },
 ]
 
 describe('handleDirectApi: a daemon with no GitHub repository', () => {

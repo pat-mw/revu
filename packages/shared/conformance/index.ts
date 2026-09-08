@@ -7,6 +7,11 @@
  * A runner may also declare how ITS transport surfaces a sync that dies
  * mid-transfer, using one of the `expectPartialSync*` builders. That is the one
  * assertion the contract leaves to the transport; everything else is shared.
+ *
+ * `runLocalReviewDeleteConformance` is the block for deleting a local review.
+ * It is registered separately because it needs a branch pair the
+ * implementation can review rather than a fixture pull number, so a runner
+ * whose implementation serves local reviews adds it beside the main suite.
  */
 export {
   expectPartialSyncResolves,
@@ -20,3 +25,12 @@ export type {
   PartialSyncOutcome,
   PartialSyncSurfacing,
 } from './suite.ts'
+export { runLocalReviewDeleteConformance } from './local-delete.ts'
+export type {
+  Lazy,
+  LocalDeleteAnchor,
+  LocalDeleteApi,
+  LocalDeleteConformanceConfig,
+  LocalDeletePair,
+  LocalReviewRowCounts,
+} from './local-delete.ts'

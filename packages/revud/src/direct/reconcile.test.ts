@@ -132,6 +132,7 @@ function fakeStore(opts: {
     getLocalDraft: unexpected('getLocalDraft'),
     putLocalDraft: unexpected('putLocalDraft'),
     deleteLocalDraft: unexpected('deleteLocalDraft'),
+    listLocalDrafts: unexpected('listLocalDrafts'),
     getLocalViewed: unexpected('getLocalViewed'),
     setLocalViewed: unexpected('setLocalViewed'),
     listLocalThreads: unexpected('listLocalThreads'),
@@ -139,6 +140,13 @@ function fakeStore(opts: {
     putLocalThread: unexpected('putLocalThread'),
     listLocalSubmittedReviews: unexpected('listLocalSubmittedReviews'),
     putLocalSubmittedReview: unexpected('putLocalSubmittedReview'),
+    deleteLocalReview: unexpected('deleteLocalReview'),
+    listLiveCompareKeys: unexpected('listLiveCompareKeys'),
+    listImmutableKeys: unexpected('listImmutableKeys'),
+    deleteImmutables: unexpected('deleteImmutables'),
+    listBlobShas: unexpected('listBlobShas'),
+    listReferencedBlobShas: unexpected('listReferencedBlobShas'),
+    deleteBlobs: unexpected('deleteBlobs'),
     close: () => {},
   }
 }

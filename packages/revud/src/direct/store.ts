@@ -32,13 +32,21 @@ import {
  * The tables split state by how it is keyed and how long it lives:
  *
  *   - `immutables` — the immutable half of a snapshot, keyed by
- *     `compareKey = merge_base…head` (NOT by head alone), append-only and
- *     cache-forever with no TTL. This is what lets `syncPull` skip the diff/base-
- *     tree/commits work on a warm re-sync of an unchanged comparison.
+ *     `compareKey = merge_base…head` (NOT by head alone), cache-forever with no
+ *     TTL. This is what lets `syncPull` skip the diff/base-tree/commits work on a
+ *     warm re-sync of an unchanged comparison. Nothing records when a row here
+ *     was written, so what the table holds can only ever be judged against what
+ *     still references it, never against its age. The one statement that removes
+ *     a row does so because no stored snapshot names its key; there is no age at
+ *     which a row a snapshot still names becomes removable.
  *   - `snapshots` — the per-PR assembled snapshot (mutable half + a reference to
  *     the immutable half's compareKey). Overwritten on every sync.
- *   - `blobs` — content-addressed by git blob SHA, append-only, cache-forever,
- *     no TTL: identical SHA ⇒ identical bytes.
+ *   - `blobs` — content-addressed by git blob SHA, cache-forever, no TTL:
+ *     identical SHA ⇒ identical bytes. Nothing records when a row was written,
+ *     so what the table holds can only be judged against what still names it.
+ *     The one statement that removes a row does so because no stored comparison
+ *     references the SHA on either side of any path; there is no age at which a
+ *     referenced blob becomes removable, and no ordinary path removes one at all.
  *   - `drafts` — per-human, per-PR review drafts. The irreplaceable local work;
  *     they must survive a version bump and a restart.
  *   - `viewed` — per-human, per-PR per-file viewed state.
@@ -79,6 +87,40 @@ import {
  *     review, keyed by `(local_id, review_id)`.
  *   - `meta` — the `store_version` row that drives migrate-in-place, plus the
  *     monotonic id high-water marks the local keyspace allocates from.
+ *
+ * ## What can be removed, and on what rule
+ *
+ * Three statements in this file remove a row, and no others do. They are worth
+ * reading together, because "which tables can shrink" is a question about the
+ * store rather than about whichever caller happens to ask:
+ *
+ *   - `local_reviews`, with the five tables keyed to a local review —
+ *     `local_snapshots`, `local_threads`, `local_reviews_submitted`,
+ *     `local_drafts` and `local_viewed` — go together, by id, in one
+ *     transaction, when a caller asks for that review to be removed. The rule is
+ *     an explicit act and nothing else: no age, no last-sync time, no cap on how
+ *     many reviews may be kept. It takes every human's drafts on that review
+ *     with it, which is the only removal of unsubmitted text anywhere here, and
+ *     it happens because someone asked for the review itself to go.
+ *   - `immutables` gives up a row when no snapshot in EITHER snapshot table
+ *     names its compare key. Reference-based and never age-based — the table
+ *     records nothing about when a row was written, so there is no clock to
+ *     consult even if one were wanted, and a half a live snapshot names is
+ *     needed however long ago its review was last synced.
+ *   - `blobs` gives up a row when no stored comparison names its SHA on either
+ *     side of any path, AND only when a deployment has explicitly asked for the
+ *     bytes to be reclaimed. Left alone, which is the default, the table only
+ *     grows: every re-sync of a rebased branch mints a fresh compare key and
+ *     stores that branch's file contents again.
+ *
+ * Everything else is permanent. `snapshots`, `audit_log` and `pr_author` are
+ * keyed by a real pull-request number and this surface offers no way to remove a
+ * row from any of them — the journal in particular is append-only by design, and
+ * a delete counterpart would turn it from evidence of what was written into
+ * evidence of what was not later removed. `prefs` belongs to a human rather than
+ * to any review. And nothing here reclaims the FILE: deleted rows release their
+ * space inside it for later writes, and the file on disk stays the size its
+ * high-water mark left it.
  *
  * The local tables carry a repository identity and the pull-request tables do
  * not, which looks inconsistent until the keys are compared. Two repositories
@@ -257,6 +299,66 @@ export interface LocalReviewSyncState {
   headSha: string | null
   dirty: boolean
   lastSyncedAt: string | null
+}
+
+/**
+ * How many rows one `deleteLocalReview` removed, counted per table.
+ *
+ * Per table rather than as a total, because the six tables ARE the claim. A
+ * single number cannot tell a review whose threads went from one whose threads
+ * stayed while something else was counted twice, and a sum is the one summary
+ * shaped so that a partial delete can hide inside it. A caller asserting what a
+ * delete did needs the shape of what it did.
+ *
+ * Every field is zero when the id names no review: an unmatched statement is the
+ * idempotent outcome, not a failure.
+ */
+export interface LocalReviewDeletion {
+  reviewsDeleted: number
+  snapshotsDeleted: number
+  threadsDeleted: number
+  submittedReviewsDeleted: number
+  draftsDeleted: number
+  viewedDeleted: number
+}
+
+/**
+ * What one `deleteImmutables` call removed from the content cache.
+ *
+ * The keys as well as the count, because a count on its own cannot tell a call
+ * that removed the two unreferenced halves it proposed from one that removed two
+ * halves a snapshot still needed. Both report `2`, and only one of them has
+ * broken a review. A caller reconciling its own view of the cache needs the
+ * names, and so does any assertion that a referenced half was left alone.
+ *
+ * `removed` names the rows that are GONE, not the keys that were proposed. A
+ * proposed key that named no row, and one that turned out to be referenced after
+ * all, are both absent from it — so the count and the list always agree with the
+ * table rather than with the request.
+ */
+export interface ImmutableDeletion {
+  count: number
+  removed: string[]
+}
+
+/**
+ * What one `deleteBlobs` call removed from the content-addressed blob table.
+ *
+ * The same shape as a cached-half removal and for the same reason: a count on
+ * its own cannot tell a call that removed the bytes it proposed from one that
+ * removed bytes a stored comparison still names. `removed` lists the SHAs whose
+ * rows are GONE, so a proposed SHA that named no row, and one that turned out to
+ * be referenced after all, are both absent from it — the report always agrees
+ * with the table rather than with the request.
+ *
+ * The names matter more here than anywhere else in this file. Blob bytes are
+ * content-addressed, so one row is shared by every comparison whose index names
+ * that SHA, and a removal that was wrong is not confined to the review it was
+ * reclaiming for. A count cannot say which review's content went; a list can.
+ */
+export interface BlobDeletion {
+  count: number
+  removed: string[]
 }
 
 /**
@@ -468,6 +570,22 @@ export interface DirectStore {
    */
   deleteLocalDraft(humanId: string, localId: number): void
   /**
+   * Every human's draft on one local review, ordered by human id so the
+   * answer is stable between calls.
+   *
+   * The one draft read that is not scoped to a human, and it exists for a
+   * decision about the REVIEW: whether removing it would take text somebody
+   * has not submitted. It is a listing for a precondition, never a surface a
+   * caller renders — a draft is the most private thing this store holds, and
+   * nothing downstream may hand one human another's text. A review nobody
+   * has drafted on, or one that does not exist, reads back as an empty list.
+   *
+   * Throws `StoreUnreadableError` when any row cannot be parsed, rather than
+   * leaving it out: a draft dropped from this answer reads as "nothing here
+   * holds text", which is the one direction that destroys data.
+   */
+  listLocalDrafts(localId: number): ReviewDraft[]
+  /**
    * One human's per-file viewed state on one local review. An absent row reads
    * back as an empty record — nothing viewed yet is the ordinary state, not an
    * error — while a present-but-unparseable row throws `StoreUnreadableError`.
@@ -535,6 +653,262 @@ export interface DirectStore {
    * is an unchanged `ReviewSummary`.
    */
   putLocalSubmittedReview(localId: number, review: ReviewSummary): void
+  /**
+   * Remove one local review and every row keyed to it, in ONE transaction, and
+   * report how many rows each table gave up.
+   *
+   * All six tables the local keyspace owns are emptied together: the review row,
+   * its snapshot envelope, its threads, its submitted review summaries, and the
+   * drafts and viewed state of EVERY human who holds any on it. Those last two
+   * are keyed by the human AND the review, and it is the review that is going
+   * away — so narrowing the delete to one human would leave another human's rows
+   * behind under an id that no longer names anything and that the monotonic
+   * high-water mark guarantees will never be minted again.
+   *
+   * Deleting a review therefore deletes drafts, which nothing else in this store
+   * does. That is deliberate and it is narrow: this call answers an explicit act
+   * of removal, and nothing that runs on its own may reach it. A background sweep
+   * that reclaimed drafts would destroy the one thing here that cannot be rebuilt
+   * from git.
+   *
+   * It touches NO pull-request-keyed table. `snapshots`, `audit_log` and
+   * `pr_author` are facts about the client repository, and a review that never
+   * reached that repository has no standing to remove one. It touches no
+   * `immutables` row and no `blobs` row either: both are content-addressed and
+   * shared — one compare key may back a pull request and several local reviews at
+   * once — so removing one here would be a cascade from a review into storage it
+   * does not own. Whether a cached half is still needed is a question about
+   * references across the whole store, never a side effect of one delete.
+   *
+   * ONE transaction, because a partial delete does not degrade gracefully. An
+   * envelope, a thread or a draft left behind under a removed review is a
+   * permanent leak: the only enumeration of local reviews reads the review row
+   * this call removes, so nothing lists the leftovers and no caller is told an id
+   * still needs a second pass. They are not even dangerous in the ordinary way —
+   * the high-water mark never re-issues the id, so no later review inherits them
+   * — they simply sit there, unlistable, holding a human's unsubmitted text. So
+   * either all six tables give up their rows or none does, and a persist that
+   * fails surfaces as `StoreWriteError` rather than as a success that removed
+   * part of it.
+   *
+   * An id that names no review removes nothing and returns all-zero counts,
+   * without throwing. A retried removal has to be safe, and "already gone" is the
+   * outcome the caller asked for.
+   */
+  deleteLocalReview(localId: number): LocalReviewDeletion
+
+  // ——— what the immutable cache is still holding, and what still needs it ———
+  /**
+   * Every `compareKey` a LIVE snapshot references — from the pull-request
+   * snapshot table AND the local one — with duplicates collapsed and the result
+   * sorted ascending.
+   *
+   * Both tables, because one compare key can back a pull request and a local
+   * review at the same time: the immutable half is content-addressed by the SHAs
+   * git produced locally and knows nothing about which kind of review asked for
+   * it. A set built from one table alone reports every key held only by the other
+   * as referenced by nothing at all.
+   *
+   * FAIL CLOSED, and this is the contract's whole substance. A row whose stored
+   * envelope will not parse, or whose `compareKey` is absent, empty, or not a
+   * string, throws `StoreUnreadableError` and the read aborts. No row is ever
+   * skipped. The asymmetry is what forces it: this is a set of things that are
+   * still NEEDED, so a row left out does not make the answer smaller, it makes
+   * the answer wrong in the single direction that destroys data. A skipped row
+   * reads exactly as "this snapshot references nothing", and every immutable half
+   * it really did reference becomes unreferenced.
+   *
+   * What that costs is worth spelling out, because the instinct is that it is
+   * cheap. An immutable half removed while a live snapshot still names it does
+   * not degrade — the read that re-assembles that snapshot refuses outright, so
+   * the review becomes unopenable. And the usual comfort, that the half is
+   * derived data a re-sync rebuilds, does not hold for a local review whose
+   * branch has since been rewritten: the comparison that produced the key cannot
+   * be recomputed from a repository that no longer contains those commits. So a
+   * short answer here is worth less than no answer, and there is deliberately no
+   * partial answer to be had.
+   *
+   * Sorted ascending so the answer is stable and comparable between calls. The
+   * order carries no meaning; fixing it keeps a caller from reading meaning into
+   * whatever the storage engine happened to return.
+   */
+  listLiveCompareKeys(): string[]
+  /**
+   * Every key the `immutables` table holds, sorted ascending — INCLUDING keys no
+   * snapshot references any more.
+   *
+   * The orphans are the entire point. `immutables` is cache-forever with no TTL,
+   * and nothing in its schema records when a row was written, so what is stored
+   * can only be judged against what is referenced — a read that quietly returned
+   * the referenced ones would be answering with the question. Orphans are the
+   * ordinary state of this table rather than a fault: a branch that is rebased
+   * mints a fresh compare key on every sync and leaves the previous one behind.
+   */
+  listImmutableKeys(): string[]
+  /**
+   * Remove the named rows from the immutable cache, keeping every key a live
+   * snapshot still references.
+   *
+   * REFERENCE-BASED, never age-based. A key is removed only because no row in
+   * either snapshot table names it. Nothing about how long a row has sat here
+   * enters the decision, and no column records it either — a half a live
+   * snapshot names is needed however long ago the review it belongs to was last
+   * synced, and a half nothing names is reclaimable the moment it is written.
+   *
+   * The live set is recomputed HERE, inside the same transaction as the deletes,
+   * which is why this takes candidates rather than a verdict. A caller reads the
+   * stored set and the live set, subtracts, and calls; between those reads and
+   * this statement another writer can persist a snapshot naming one of the keys
+   * it is about to propose. Removing that key STRANDS the envelope: the read
+   * that re-assembles the snapshot finds no immutable half and refuses outright
+   * rather than returning a half-empty one, so the review will not open again —
+   * and on the local path there is no second tier to rebuild the half from, since
+   * a rewritten branch no longer holds the commits its compare key names.
+   * Recomputing under the write lock closes that window. A candidate that became
+   * live is simply left alone rather than refused: it is the ordinary outcome of
+   * a concurrent sync, not a caller's mistake, and the cost of keeping it is one
+   * row until the next reclamation.
+   *
+   * `BEGIN IMMEDIATE` rather than the deferred transaction a plain call opens,
+   * because this READS before it writes. A deferred transaction takes its read
+   * snapshot at the recompute and asks for the write lock at the first delete, so
+   * a commit landing in between makes that snapshot stale and SQLite refuses the
+   * upgrade WITHOUT consulting the busy handler — waiting cannot refresh a
+   * snapshot that is already stale. Taking the lock up front turns the wait into
+   * a plain busy wait the connection's timeout does cover, and it is what makes
+   * the recomputed set current at the moment the deletes run.
+   *
+   * FAIL CLOSED: a snapshot envelope that will not parse, or that names no usable
+   * key, throws `StoreUnreadableError` and the transaction aborts with nothing
+   * removed. Skipping that row instead would read as "this snapshot references
+   * nothing", which turns every half it really did reference into a candidate —
+   * the one direction that destroys data.
+   *
+   * Touches `immutables` and nothing else. Not `blobs`, which is content-
+   * addressed by git blob SHA and shares no key space with a comparison; not a
+   * draft, which is irreplaceable local work no reclamation may reach; and not
+   * `snapshots`, which this READS to build the live set and never writes.
+   *
+   * Duplicates among the keys collapse, and a key that names no row removes
+   * nothing — so a repeated call over an already-reclaimed cache reports zero
+   * rather than failing. A failed persist surfaces as `StoreWriteError` with the
+   * whole transaction rolled back, never as a success that removed part of it.
+   */
+  deleteImmutables(keys: string[]): ImmutableDeletion
+
+  // ——— what the blob table is holding, and what still names it ———
+  /**
+   * Every git blob SHA the `blobs` table holds, sorted ascending — INCLUDING
+   * SHAs no stored comparison names any more.
+   *
+   * The unreferenced ones are the entire point, exactly as they are for the
+   * immutable cache. `blobs` is append-only with no TTL and nothing in its
+   * schema records when a row was written, so what is stored can only be judged
+   * against what references it; a read that quietly returned the referenced ones
+   * would be answering with the question. Unreferenced rows are the ordinary
+   * state of this table rather than a fault: a rebased branch mints a fresh
+   * compare key on every sync, and the file contents behind the previous one are
+   * stored again under whatever SHAs the new comparison names.
+   *
+   * Sorted so the answer is stable and comparable between calls. The order
+   * carries no meaning; fixing it keeps a caller from reading meaning into
+   * whatever the storage engine happened to return.
+   */
+  listBlobShas(): string[]
+  /**
+   * Every git blob SHA a STORED COMPARISON references — the union of both sides
+   * of every path in every `immutables` row's `blobIndex` — with duplicates
+   * collapsed and the result sorted ascending.
+   *
+   * The `immutables` table is the whole of the reference set, because it is the
+   * only place a blob SHA is ever recorded: a snapshot envelope names a compare
+   * key and nothing else, and the index behind that key is what names bytes. So
+   * a blob is referenced exactly when some cached half still names it, and a
+   * half that no snapshot references keeps its bytes alive until that half is
+   * itself reclaimed. That ordering is deliberate — reclaiming halves first and
+   * bytes second means the byte pass never has to reason about which comparison
+   * is live, only about which ones are still stored.
+   *
+   * BOTH SIDES of every path, never the head alone. A base-side SHA is what a
+   * comment anchored to the left of a diff is resolved through, and an index
+   * walked head-only reports every unchanged base blob as referenced by nothing.
+   *
+   * FAIL CLOSED, and this is the contract's whole substance. A row whose stored
+   * JSON will not parse, whose `blobIndex` is not an object, or whose per-path
+   * entry names a side that is neither `null` nor a non-empty string, throws
+   * `StoreUnreadableError` and the read aborts. No row and no path is ever
+   * skipped. The asymmetry forces it: this is a set of bytes that are still
+   * NEEDED, so a row left out does not make the answer smaller, it asserts that
+   * the comparison references no content at all, and every blob it really did
+   * name becomes reclaimable.
+   *
+   * What that costs is worth spelling out. Blob bytes are content-addressed and
+   * therefore SHARED — one row backs every comparison whose index names that
+   * SHA, across pull requests and local reviews alike — so bytes removed on the
+   * strength of a skipped row break reviews that had nothing to do with the one
+   * being reclaimed. On the pull-request path the loss is repairable: the next
+   * sync re-fetches the blob from GitHub. On the local path there is no such
+   * tier, and once the branch has been rewritten and its pinned refs dropped,
+   * the row was the only copy in existence.
+   *
+   * A SHA that is present but not a non-empty string is refused on the same
+   * terms as a malformed one. `blobs.sha` is TEXT, so an empty string or a
+   * number can match no row there; they are as unusable as an absent SHA and
+   * harder to notice, which is why the guard is a type check rather than a pair
+   * of equality tests. A side that is genuinely `null` is not a refusal at all —
+   * an added file has no base and a removed one has no head, and both are
+   * ordinary.
+   */
+  listReferencedBlobShas(): string[]
+  /**
+   * Remove the named rows from the blob table, keeping every SHA a stored
+   * comparison still references.
+   *
+   * REFERENCE-BASED, never age-based. A SHA is removed only because no
+   * `immutables` row names it on either side of any path. Nothing about how long
+   * a row has sat here enters the decision, and no column records it either.
+   *
+   * The reference set is recomputed HERE, inside the same transaction as the
+   * deletes, which is why this takes candidates rather than a verdict. A caller
+   * reads the stored set and the referenced set, subtracts, and calls; between
+   * those reads and this statement another writer can cache a half whose index
+   * names one of the SHAs it is about to propose. Removing those bytes does not
+   * make a review refuse to open — it makes it open WRONG, which is worse,
+   * because nothing reports it: the reconcile pass resolves a pending comment's
+   * anchor text through a blob read, an absent blob reads as "there is no
+   * content to match against", and the classifier marks the comment LOST. A
+   * reviewer's anchors go missing in bulk with no error anywhere. Recomputing
+   * under the write lock closes that window; a candidate that became referenced
+   * is left alone rather than refused, which is the ordinary outcome of a
+   * concurrent sync and costs one row until the next reclamation.
+   *
+   * `BEGIN IMMEDIATE` rather than the deferred transaction a plain call opens,
+   * because this READS before it writes. A deferred transaction takes its read
+   * snapshot at the recompute and asks for the write lock at the first delete, so
+   * a commit landing in between makes that snapshot stale and SQLite refuses the
+   * upgrade WITHOUT consulting the busy handler. Taking the lock up front turns
+   * the wait into a plain busy wait the connection's timeout does cover.
+   *
+   * FAIL CLOSED: an `immutables` row that will not parse, or whose index is not
+   * a walkable shape, throws `StoreUnreadableError` and the transaction aborts
+   * with nothing removed. Skipping that row instead would read as "this
+   * comparison names no content", which turns every blob it really did name into
+   * a candidate — the one direction that destroys bytes.
+   *
+   * Touches `blobs` and nothing else. Not `immutables`, which this READS to build
+   * the reference set and never writes; not a draft, which is irreplaceable local
+   * work no reclamation may reach; and not a snapshot envelope in either table.
+   * And never a blob a stored comparison still names, not even to force a fresh
+   * fetch — the content-addressed table is the reason a warm re-sync is cheap,
+   * and invalidating it on purpose would be a cache clear wearing a
+   * reclamation's name.
+   *
+   * Duplicates among the SHAs collapse, and a SHA that names no row removes
+   * nothing — so a repeated call over an already-reclaimed table reports zero
+   * rather than failing. A failed persist surfaces as `StoreWriteError` with the
+   * whole transaction rolled back, never as a success that removed part of it.
+   */
+  deleteBlobs(shas: string[]): BlobDeletion
 
   /** Close the underlying database handle (tests + shutdown). */
   close(): void
@@ -547,6 +921,197 @@ function parseRow<T>(table: string, rowKey: string, json: string): T {
   } catch (err) {
     throw new StoreUnreadableError(table, rowKey, err)
   }
+}
+
+/**
+ * Add the compare keys named by one snapshot table's rows to `into`, refusing
+ * every row it cannot answer for.
+ *
+ * FAIL CLOSED is the whole of it. Each row is parsed and each extracted key is
+ * checked, and anything that does not yield a non-empty string throws
+ * `StoreUnreadableError`, naming the row. Nothing is skipped, because the set
+ * being built is a set of things that are STILL NEEDED: a row left out of it does
+ * not shrink the answer, it asserts that the snapshot references nothing, and
+ * every immutable half that snapshot really did reference becomes unreferenced.
+ * The damage that follows is not graceful — the read that re-assembles a snapshot
+ * refuses outright when its immutable half is gone, so the review becomes
+ * unopenable — and the usual comfort that a derived half can be rebuilt by
+ * re-syncing does not hold for a local review whose branch has been rewritten
+ * since, because the comparison cannot be recomputed from commits the repository
+ * no longer has.
+ *
+ * The envelope is parsed here rather than reduced to one field by SQLite's
+ * `json_extract`, and the choice is about which row a failure can name. Over a
+ * column holding one malformed document, `json_extract` raises from the
+ * STATEMENT: the whole result set is abandoned and nothing in the error says
+ * which row was unparseable. `StoreUnreadableError` tells a human to repair or
+ * remove the row, and a failure that cannot say which row makes that
+ * unactionable. Parsing per row also keeps this read on the same doctrine, and
+ * the same `parseRow`, as every other read of these two columns — so there is no
+ * second interpretation of a stored envelope that could drift from the first.
+ *
+ * A key that is present but not a non-empty string is refused on the same terms
+ * as an absent one. `immutables.compare_key` is TEXT, so an empty string or a
+ * number can match no row there; they are as unusable as a missing key and
+ * harder to notice, which is exactly why the guard is a type check and not a pair
+ * of equality tests.
+ *
+ * `table` and `keyColumn` are interpolated into the statement and are therefore
+ * module literals from the two call sites — nothing a request can supply reaches
+ * this SQL.
+ */
+function collectCompareKeys(
+  db: Database,
+  table: string,
+  keyColumn: string,
+  into: Set<string>,
+): void {
+  const rows = db.query(`SELECT ${keyColumn} AS row_key, data FROM ${table}`).all() as {
+    row_key: number
+    data: string
+  }[]
+  for (const row of rows) {
+    const rowKey = String(row.row_key)
+    const compareKey: unknown = parseRow<StoredSnapshotEnvelope>(table, rowKey, row.data)
+      .compareKey
+    if (typeof compareKey !== 'string' || compareKey.length === 0) {
+      throw new StoreUnreadableError(
+        table,
+        rowKey,
+        new Error(
+          'the stored snapshot envelope names no usable compareKey, so the immutable ' +
+            'half it depends on cannot be identified',
+        ),
+      )
+    }
+    into.add(compareKey)
+  }
+}
+
+/**
+ * Every `compareKey` a live snapshot references, across BOTH snapshot tables.
+ *
+ * ONE definition, called by the public read and by the recheck the delete path
+ * runs inside its own transaction, so "still needed" cannot come to mean two
+ * different things in the two places that ask it. A second copy is exactly where
+ * the two tables would drift apart, and a live set that lost one of them does not
+ * answer a smaller question — it reports every key held only by the missing table
+ * as referenced by nothing at all, which is the input a reclamation acts on.
+ *
+ * Both tables, because one compare key can back a pull request and a local review
+ * at the same time: the immutable half is content-addressed by the SHAs git
+ * produced locally and knows nothing about which kind of review asked for it.
+ *
+ * A set rather than a list, so a key two snapshots share is counted once. The
+ * question is which halves are needed, never how many references each has.
+ */
+function liveCompareKeys(db: Database): Set<string> {
+  const keys = new Set<string>()
+  collectCompareKeys(db, 'snapshots', 'pr_number', keys)
+  collectCompareKeys(db, 'local_snapshots', 'local_id', keys)
+  return keys
+}
+
+/**
+ * Refuse one `immutables` row, naming it and saying what about its blob index
+ * could not be walked. One spelling of the refusal, so every guard below reports
+ * the same way and a human is told which row to repair or remove.
+ */
+function unwalkableIndex(compareKey: string, detail: string): StoreUnreadableError {
+  return new StoreUnreadableError(
+    'immutables',
+    compareKey,
+    new Error(
+      `${detail}, so the blob SHAs this comparison depends on cannot be identified`,
+    ),
+  )
+}
+
+/**
+ * Add every blob SHA one stored comparison's index names to `into`, walking BOTH
+ * sides of every path.
+ *
+ * The walk is the same one the provisioning path performs when it decides which
+ * bytes a snapshot needs: entries of the index, `base` then `head`, nulls
+ * skipped, and a SHA that appears on several paths counted once because the
+ * table is content-addressed and a path is only a display hint. Provisioning
+ * pairs each SHA with a representative path because it has a `FileBlob` to
+ * build; this needs the set alone. The two must agree on which SHAs an index
+ * names, or bytes one of them provisions are bytes the other proposes to remove
+ * — so the sides walked, and the treatment of a null side, are the part that is
+ * held identical rather than the return shape.
+ *
+ * FAIL CLOSED at every step. An index that is not a walkable object, an entry
+ * that is not an object, and a side that is neither `null` nor a non-empty
+ * string all refuse the whole read. Skipping any of them would shrink a set of
+ * things that are still NEEDED, and a shrunken reference set is how live bytes
+ * become candidates for deletion.
+ */
+function addBlobShas(compareKey: string, blobIndex: unknown, into: Set<string>): void {
+  if (typeof blobIndex !== 'object' || blobIndex === null || Array.isArray(blobIndex)) {
+    throw unwalkableIndex(compareKey, 'the stored comparison has no walkable blob index')
+  }
+  for (const [path, sides] of Object.entries(blobIndex as Record<string, unknown>)) {
+    if (typeof sides !== 'object' || sides === null || Array.isArray(sides)) {
+      throw unwalkableIndex(compareKey, `the blob index entry for "${path}" is not a pair of sides`)
+    }
+    const entry = sides as { base?: unknown; head?: unknown }
+    for (const side of ['base', 'head'] as const) {
+      const sha: unknown = entry[side]
+      // A genuinely absent side is ordinary rather than a fault: an added file
+      // has no base and a removed one has no head.
+      if (sha === null) continue
+      if (typeof sha !== 'string' || sha.length === 0) {
+        throw unwalkableIndex(
+          compareKey,
+          `the ${side} side of "${path}" is neither absent nor a usable blob SHA`,
+        )
+      }
+      into.add(sha)
+    }
+  }
+}
+
+/**
+ * Every blob SHA a stored comparison references, across the WHOLE immutable
+ * cache.
+ *
+ * ONE definition, called by the public read and by the recheck the delete path
+ * runs inside its own transaction, so "still needed" cannot come to mean two
+ * different things in the two places that ask it. A second copy is exactly where
+ * they would drift apart, and a reference set that lost part of the table does
+ * not answer a smaller question — it reports every SHA named only by the missing
+ * part as referenced by nothing at all, which is the input a reclamation acts on.
+ *
+ * EVERY row, with no join to either snapshot table. A cached half that no
+ * snapshot names still holds a claim on its bytes: it is a cache entry a warm
+ * re-sync of that comparison will reuse, and reclaiming its content while
+ * keeping the index that names it would leave a half that reassembles into a
+ * snapshot whose blobs are gone. Halves are reclaimed by their own pass first;
+ * what survives it is what speaks for the bytes. Restricting this to the halves
+ * one KIND of review references is the failure the whole read is shaped against
+ * — the immutable cache is shared, so a set built from the local side alone
+ * proposes every pull request's blobs for deletion, and content-addressing means
+ * those bytes are frequently the same bytes.
+ *
+ * A set rather than a list, so a SHA several comparisons share is counted once.
+ * The question is which bytes are needed, never how many references each has.
+ */
+function referencedBlobShas(db: Database): Set<string> {
+  const shas = new Set<string>()
+  const rows = db.query('SELECT compare_key, data FROM immutables').all() as {
+    compare_key: string
+    data: string
+  }[]
+  for (const row of rows) {
+    const stored = parseRow<StoredImmutable>('immutables', row.compare_key, row.data)
+    const immutable: unknown = stored.immutable
+    if (typeof immutable !== 'object' || immutable === null) {
+      throw unwalkableIndex(row.compare_key, 'the stored row carries no comparison')
+    }
+    addBlobShas(row.compare_key, (immutable as { blobIndex?: unknown }).blobIndex, shas)
+  }
+  return shas
 }
 
 /**
@@ -1396,6 +1961,15 @@ export function openDirectStore(
       })
     },
 
+    listLocalDrafts(localId: number): ReviewDraft[] {
+      const rows = db
+        .query('SELECT human_id, data FROM local_drafts WHERE local_id = ? ORDER BY human_id ASC')
+        .all(localId) as { human_id: string; data: string }[]
+      return rows.map((row) =>
+        parseRow<ReviewDraft>('local_drafts', `${row.human_id}/${localId}`, row.data),
+      )
+    },
+
     getLocalViewed(humanId: string, localId: number): FileViewedState {
       const row = db
         .query('SELECT data FROM local_viewed WHERE human_id = ? AND local_id = ?')
@@ -1485,6 +2059,193 @@ export function openDirectStore(
       // cache a pull request's does. Nothing about the immutable half is
       // pull-request-shaped: it is addressed by the SHAs git produced locally.
       writeSnapshotRows('local_snapshots', 'local_id', snapshot)
+    },
+
+    deleteLocalReview(localId: number): LocalReviewDeletion {
+      return write('local_reviews+dependents', () => {
+        const counts: LocalReviewDeletion = {
+          reviewsDeleted: 0,
+          snapshotsDeleted: 0,
+          threadsDeleted: 0,
+          submittedReviewsDeleted: 0,
+          draftsDeleted: 0,
+          viewedDeleted: 0,
+        }
+        // The six statements in the order `createLocalTables` declares the six
+        // tables, so what this removes can be read against what the keyspace
+        // creates instead of being taken on trust. A table added to the keyspace
+        // and forgotten here leaves rows behind under an id that is never minted
+        // again — a permanent leak no listing surfaces, since the only
+        // enumeration of local reviews reads the row this statement removed.
+        //
+        // `local_reviews` is keyed by `id` and the other five by `local_id`;
+        // they name the same review and the column names differ, which is the
+        // one place a copy-paste would silently match nothing and still report a
+        // successful delete of zero rows.
+        //
+        // NO predicate on age, on `last_synced_at`, or on anything else that
+        // moves with the clock. This removes exactly the rows of exactly the
+        // review it was given, because it answers an explicit act; a time-based
+        // condition here would make the same statement reach rows nobody named.
+        //
+        // A plain deferred transaction, where the rest of this file opens its
+        // transactions with `BEGIN IMMEDIATE`, and the difference is that those
+        // READ before they write. A deferred transaction takes its read snapshot
+        // at the first statement and asks for the write lock afterwards, which is
+        // what makes a read-then-write racy; here the first statement is already
+        // a write, so the read snapshot and the write lock are taken together and
+        // there is no window between them. A competing writer therefore surfaces
+        // as plain `SQLITE_BUSY`, which the connection's busy timeout waits out.
+        const tx = db.transaction(() => {
+          counts.reviewsDeleted = db.run('DELETE FROM local_reviews WHERE id = ?', [
+            localId,
+          ]).changes
+          counts.snapshotsDeleted = db.run('DELETE FROM local_snapshots WHERE local_id = ?', [
+            localId,
+          ]).changes
+          counts.threadsDeleted = db.run('DELETE FROM local_threads WHERE local_id = ?', [
+            localId,
+          ]).changes
+          counts.submittedReviewsDeleted = db.run(
+            'DELETE FROM local_reviews_submitted WHERE local_id = ?',
+            [localId],
+          ).changes
+          counts.draftsDeleted = db.run('DELETE FROM local_drafts WHERE local_id = ?', [
+            localId,
+          ]).changes
+          counts.viewedDeleted = db.run('DELETE FROM local_viewed WHERE local_id = ?', [
+            localId,
+          ]).changes
+        })
+        tx()
+        return counts
+      })
+    },
+
+    listLiveCompareKeys(): string[] {
+      // The same `liveCompareKeys` the delete path rechecks with, so the set a
+      // caller subtracts against and the set the removal is finally judged by
+      // are one definition rather than two that agree today.
+      //
+      // Not wrapped in `write()`, like every other read in this file. That
+      // wrapper exists to give a failed MUTATION a type a caller can act on, and
+      // there is no mutation here to have failed — a database this cannot read
+      // would be reported as a persist failure for a persist nobody asked for.
+      // The refusal this read does raise is a `StoreUnreadableError`, which the
+      // wrapper would have passed through unchanged anyway.
+      //
+      // Sorted so the answer is stable and comparable between calls. The order
+      // means nothing; fixing it stops a caller reading meaning into whatever
+      // order the storage engine happened to return.
+      return [...liveCompareKeys(db)].sort()
+    },
+
+    listImmutableKeys(): string[] {
+      // Every row, with no predicate — no age, no `created_at`, nothing that
+      // moves with the clock. There is no such column to filter on here, and
+      // that absence is the constraint made physical: what the cache holds can
+      // only be judged against what references it.
+      const rows = db
+        .query('SELECT compare_key FROM immutables ORDER BY compare_key ASC')
+        .all() as { compare_key: string }[]
+      return rows.map((row) => row.compare_key)
+    },
+
+    deleteImmutables(keys: string[]): ImmutableDeletion {
+      return write('immutables', () => {
+        const removed: string[] = []
+        const tx = db.transaction(() => {
+          // Emptied on entry rather than at declaration, so a transaction the
+          // engine runs a second time cannot report the first attempt's
+          // removals alongside its own.
+          removed.length = 0
+          // Recomputed inside the transaction, under the write lock the
+          // immediate begin below has already taken. This is the whole guard:
+          // a snapshot persisted after the caller subtracted its sets is live
+          // here, and its half is left where it is.
+          const live = liveCompareKeys(db)
+          // A set, so a key named twice is one statement and one entry in the
+          // report rather than a count that exceeds the rows that existed.
+          for (const key of new Set(keys)) {
+            // Under-removal costs disk until the next reclamation. Over-removal
+            // makes a review unopenable, and on the local path unrecoverably so.
+            if (live.has(key)) continue
+            const result = db.run('DELETE FROM immutables WHERE compare_key = ?', [key])
+            // Counted from the statement rather than from the request, so a key
+            // that matched no row is absent from the report instead of inflating
+            // it. A repeat over an already-reclaimed cache reports zero.
+            if (result.changes > 0) removed.push(key)
+          }
+        })
+        // Immediate, because the recompute above is a READ every delete below it
+        // depends on. A deferred begin would take its read snapshot at that
+        // recompute and ask for the write lock afterwards, and SQLite refuses
+        // that upgrade without consulting the busy handler once another commit
+        // has landed — a wait cannot refresh a snapshot that is already stale.
+        tx.immediate()
+        return { count: removed.length, removed }
+      })
+    },
+
+    listBlobShas(): string[] {
+      // Every row, with no predicate — no age, no `created_at`, nothing that
+      // moves with the clock. There is no such column to filter on here, and
+      // that absence is the constraint made physical: what the table holds can
+      // only be judged against what references it.
+      const rows = db.query('SELECT sha FROM blobs ORDER BY sha ASC').all() as {
+        sha: string
+      }[]
+      return rows.map((row) => row.sha)
+    },
+
+    listReferencedBlobShas(): string[] {
+      // The same `referencedBlobShas` the delete path rechecks with, so the set
+      // a caller subtracts against and the set the removal is finally judged by
+      // are one definition rather than two that agree today.
+      //
+      // Not wrapped in `write()`, like every other read in this file. That
+      // wrapper exists to give a failed MUTATION a type a caller can act on, and
+      // there is no mutation here to have failed. The refusal this read does
+      // raise is a `StoreUnreadableError`, which the wrapper would have passed
+      // through unchanged anyway.
+      return [...referencedBlobShas(db)].sort()
+    },
+
+    deleteBlobs(shas: string[]): BlobDeletion {
+      return write('blobs', () => {
+        const removed: string[] = []
+        const tx = db.transaction(() => {
+          // Emptied on entry rather than at declaration, so a transaction the
+          // engine runs a second time cannot report the first attempt's
+          // removals alongside its own.
+          removed.length = 0
+          // Recomputed inside the transaction, under the write lock the
+          // immediate begin below has already taken. This is the whole guard: a
+          // comparison cached after the caller subtracted its sets is referenced
+          // here, and its bytes are left where they are.
+          const referenced = referencedBlobShas(db)
+          // A set, so a SHA named twice is one statement and one entry in the
+          // report rather than a count that exceeds the rows that existed.
+          for (const sha of new Set(shas)) {
+            // Under-removal costs disk until the next reclamation. Over-removal
+            // silently unmoors a reviewer's pending comments, and on the local
+            // path it destroys the only copy of the content they anchored to.
+            if (referenced.has(sha)) continue
+            const result = db.run('DELETE FROM blobs WHERE sha = ?', [sha])
+            // Counted from the statement rather than from the request, so a SHA
+            // that matched no row is absent from the report instead of inflating
+            // it. A repeat over an already-reclaimed table reports zero.
+            if (result.changes > 0) removed.push(sha)
+          }
+        })
+        // Immediate, because the recompute above is a READ every delete below it
+        // depends on. A deferred begin would take its read snapshot at that
+        // recompute and ask for the write lock afterwards, and SQLite refuses
+        // that upgrade without consulting the busy handler once another commit
+        // has landed — a wait cannot refresh a snapshot that is already stale.
+        tx.immediate()
+        return { count: removed.length, removed }
+      })
     },
 
     close(): void {
