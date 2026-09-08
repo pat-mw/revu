@@ -10,7 +10,7 @@
  * report XML. So there is exactly one copy of the contract assertions, held to
  * over both transports, and this file only orchestrates and summarizes.
  *
- * The seven legs. Four drive the pull-request suite; three drive the
+ * The eight legs. Four drive the pull-request suite; four drive the
  * local-review suite — the same contract methods answered for a review of a
  * local branch pair that has no pull request, which needs no token and no
  * network in ANY transport, so every one of those legs is required and in-gate.
@@ -29,7 +29,7 @@
  *      which is stood up during on-prem deployment, so this leg is deferred and
  *      never fails the matrix in the network-free gate.
  *   E (required, in-gate): the local-review suite over the in-process mock —
- *      the oracle whose semantics the other two local legs are held to.
+ *      the oracle whose semantics the other three local legs are held to.
  *   F (required, in-gate): the local-review suite over revud-mock via real HTTP,
  *      spawned exactly as leg B is.
  *   G (required, in-gate): the local-review suite over the DIRECT engine —
@@ -38,6 +38,14 @@
  *      why the local direct leg is required where the GitHub direct leg (C) is
  *      not: C needs a token and a network to have anything to talk to, G needs
  *      neither, so nothing about the environment can excuse skipping it.
+ *   H (required, in-gate): the local-review suite over the BROKER assembly —
+ *      the same engine, but assembled by the shared boot assembler from a
+ *      broker-shaped context and broker-shaped parts (a poll cache, a stamping
+ *      write decorator, a workspace clone that has an origin remote). G proves
+ *      the engine serves the contract; H proves a boot other than direct mode's
+ *      wires that engine up at all, which is a different claim and was for a
+ *      time a false one. It needs no token and no network either, so it is
+ *      required for the same reason G is.
  *
  * Honesty rule: an optional leg that cannot run logs an explicit
  * `skipped: <required secret/env> absent` line. It is NEVER reported as a silent
@@ -268,8 +276,8 @@ function main(): void {
     }),
   )
 
-  // Legs E, F, G: the local-review suite over every in-gate transport. All
-  // three are required — a review of a local branch pair needs no token and no
+  // Legs E, F, G, H: the local-review suite over every in-gate transport. All
+  // four are required — a review of a local branch pair needs no token and no
   // network, so no leg here has an environmental reason to skip.
   results.push(
     runSuiteLeg({
@@ -293,6 +301,14 @@ function main(): void {
       name: 'direct engine over a seeded local repo (local reviews)',
       required: true,
       testFile: 'packages/revud/src/direct/conformance-local.test.ts',
+    }),
+  )
+  results.push(
+    runSuiteLeg({
+      id: 'H',
+      name: 'broker boot assembly over a seeded local clone (local reviews)',
+      required: true,
+      testFile: 'packages/revud/src/direct/conformance-broker-local.test.ts',
     }),
   )
 
