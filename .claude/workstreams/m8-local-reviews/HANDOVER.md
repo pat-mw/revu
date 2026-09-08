@@ -5,7 +5,7 @@
    #69). This is the only branch in flight.
 2. `env -u GH_TOKEN -u GITHUB_TOKEN TZ=UTC bun run check`, then `bun run conformance:matrix` — the matrix now
    has a required leg **H**.
-3. `gh pr list` → this ticket's PR against `main`, and **#85 still open** (`board/m8-closeout`). #85 carries
+3. `gh pr list` → **[#86](https://github.com/pat-mw/revu/pull/86)** (this ticket, against `main`) and **#85 still open** (`board/m8-closeout`). #85 carries
    M8.13–M8.17, `AUDIT-2026-09-02.*` and `AUDIT-DISPOSITION.md`, none of which are on `main` — so a branch cut
    from `main` (this one included) does not see those tickets. Expect a small conflict on `BOARD.md`, `LOG.md`
    and `HANDOVER.md` when #85 and this PR both land; both edit their own regions and the resolution is

@@ -11,7 +11,7 @@ Workstream: [`MILESTONE.md`](./MILESTONE.md) · Handover: [`HANDOVER.md`](./HAND
 ## In flight right now
 
 **In flight: M8.18** — the local-review surface in the broker boot, on `m8.18/broker-local-surface`, based on
-`main`.
+`main`, open as [#86](https://github.com/pat-mw/revu/pull/86).
 
 **The M8 chain merged on 2026-09-08.** Every implementation PR (#73–#84) and the design/board PR (#69) are on
 `main`; the twelve implementation tickets are Done. Two things did **not** merge and are still open work: the
